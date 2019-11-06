@@ -10,8 +10,8 @@ edition = "2018"
 bollard = {git = "https://github.com/akshayknarayan/bollard", branch = "std-future" }
 bytes = "0.4"
 failure = "0.1"
-futures-util-preview = "0.3.0-alpha.19"
-hyper = {version = "0.13.0-alpha.4", features = ["unstable-stream"]}
+futures-util-preview = "=0.3.0-alpha.19"
+hyper = {version = "=0.13.0-alpha.4", features = ["unstable-stream"]}
 hyper-unix-connector = "0.1.0"
 prost = "0.5"
 prost-derive = "0.5"
@@ -23,7 +23,10 @@ regex = "1"
 lazy_static = "1"
 slog-async = "2"
 tokio = "=0.2.0-alpha.6"
-tonic = "0.1.0-alpha.3"
+tower = "=0.3.0-alpha.2"
+tonic = "=0.1.0-alpha.5"
+serde  = "1"
+serde_json = "1"
 
 [build-dependencies]
-tonic-build = "0.1.0-alpha.3"
+tonic-build = "=0.1.0-alpha.5"
