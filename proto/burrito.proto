@@ -1,0 +1,27 @@
+syntax = "proto3";
+package burrito;
+
+service Connection {
+    rpc Listen (ListenRequest) returns (ListenReply);
+    rpc Open (OpenRequest) returns (OpenReply);
+}
+
+message ListenRequest {
+    // service-level address to listen on
+    string service_addr = 1;
+}
+
+message ListenReply {
+    // pipe address the service should listen at
+    string listen_addr = 1;
+}
+
+message OpenRequest {
+    // service-level destination address of the connection
+    string dst_addr = 1;
+}
+
+message OpenReply {
+    // pipe address to connect to
+    string send_addr = 1;
+}
