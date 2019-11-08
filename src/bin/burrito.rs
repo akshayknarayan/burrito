@@ -29,14 +29,18 @@ async fn main() -> Result<(), failure::Error> {
     let docker_proxy_server = hyper::server::Server::builder(uc).serve(make_service);
     slog::info!(log, "docker proxy starting"; "listening at" => ?&opt.docker_in_addr, "proxying to" => ?&opt.docker_out_addr);
 
-    let burrito = burrito::BurritoNet::new(opt.burrito_coordinator_addr, log.new(slog::o!("server" => "burrito_net")));
+    let burrito = burrito::BurritoNet::new(
+        opt.burrito_coordinator_addr,
+        log.new(slog::o!("server" => "burrito_net")),
+    );
     let burrito_addr = burrito.listen_path();
     let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr)?.into();
     let burrito_service = burrito.start_burritonet()?;
-    let burrito_rpc_server = hyper::server::Server::builder(uc).serve(hyper::service::make_service_fn(move |_| {
-        let bs = burrito_service.clone();
-        async move {Ok::<_, hyper::Error>(bs)}
-    }));
+    let burrito_rpc_server =
+        hyper::server::Server::builder(uc).serve(hyper::service::make_service_fn(move |_| {
+            let bs = burrito_service.clone();
+            async move { Ok::<_, hyper::Error>(bs) }
+        }));
     slog::info!(log, "burrito net starting"; "listening at" => ?&burrito_addr);
 
     let both_servers = futures_util::future::join(docker_proxy_server, burrito_rpc_server);
