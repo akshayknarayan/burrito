@@ -19,7 +19,10 @@ async fn main() -> Result<(), failure::Error> {
 
     use hyper_unix_connector::UnixConnector;
     let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr)?.into();
-    let make_service = burrito::MakeDockerProxy{out_addr: out_addr.clone(), log: log.clone()};
+    let make_service = burrito::MakeDockerProxy {
+        out_addr: out_addr.clone(),
+        log: log.clone(),
+    };
     let server = hyper::server::Server::builder(uc).serve(make_service);
 
     slog::info!(log, "starting"; "listening at" => ?&opt.in_addr, "proxying to" => ?&opt.out_addr);

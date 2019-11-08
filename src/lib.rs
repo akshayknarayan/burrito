@@ -1,16 +1,14 @@
 //! Container manager
 
-use bollard::{container::Config};
+use bollard::container::Config;
+use core::task::{Context, Poll};
 use failure::Error;
-use hyper::{
-    Body, Client, Request, Response, StatusCode,
-};
-use hyper_unix_connector::{UnixClient};
-use std::future::Future;
+use futures_util::future::FutureExt;
+use hyper::{Body, Client, Request, Response, StatusCode};
+use hyper_unix_connector::UnixClient;
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
-use core::task::{Poll, Context};
-        use futures_util::future::FutureExt;
 
 pub fn logger() -> slog::Logger {
     use slog::Drain;
@@ -28,7 +26,7 @@ pub struct MakeDockerProxy {
 impl<T> tower::Service<T> for MakeDockerProxy {
     type Response = DockerProxy;
     type Error = failure::Error;
-    type Future = Pin<Box<dyn Future<Output=Result<Self::Response, Self::Error>> + Sync + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Sync + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Ok(()).into()
@@ -50,7 +48,7 @@ impl<T> tower::Service<T> for MakeDockerProxy {
 /// Proxy for connections to the docker api.
 /// Adds a burrito mountpoint.
 #[derive(Debug)]
-pub struct DockerProxy{
+pub struct DockerProxy {
     out_addr: std::path::PathBuf,
     client: hyper::client::Client<UnixClient, Body>,
     log: slog::Logger,
@@ -59,7 +57,7 @@ pub struct DockerProxy{
 impl tower::Service<Request<Body>> for DockerProxy {
     type Response = Response<Body>;
     type Error = hyper::Error;
-    type Future = Pin<Box<dyn Future<Output=Result<Self::Response, Self::Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Ok(()).into()
@@ -80,8 +78,10 @@ impl tower::Service<Request<Body>> for DockerProxy {
                     "body" => ?req.body(),
                 );
 
-                Box::pin(DockerProxy::rewrite_create_container_request(req, self.log.clone()))
-                    as Pin<Box<dyn Future<Output = _> + Send>>
+                Box::pin(DockerProxy::rewrite_create_container_request(
+                    req,
+                    self.log.clone(),
+                )) as Pin<Box<dyn Future<Output = _> + Send>>
             }
             _ => {
                 // log the request
@@ -91,8 +91,7 @@ impl tower::Service<Request<Body>> for DockerProxy {
                     "body" => ?req.body(),
                 );
 
-                Box::pin(async move { Ok(req) })
-                    as Pin<Box<dyn Future<Output = _> + Send>>
+                Box::pin(async move { Ok(req) }) as Pin<Box<dyn Future<Output = _> + Send>>
             }
         };
 
@@ -111,7 +110,7 @@ impl tower::Service<Request<Body>> for DockerProxy {
                         // else just forward the request
                         DockerProxy::forward_request(req, oa, cl, lg).await
                     }
-                },
+                }
                 Err(e) => error_response(e),
             }
         }) as Pin<_>
@@ -171,105 +170,115 @@ impl DockerProxy {
         Ok::<_, Error>(Request::from_parts(parts, body.into()))
     }
 
-    async fn forward_request(req: Request<Body>, addr: std::path::PathBuf, client: hyper::client::Client<UnixClient, Body>, log: slog::Logger) -> Result<Response<Body>, hyper::Error> {
-                    let mut req: Request<Body> = req;
-                    let uri = hyper_unix_connector::Uri::new(
-                        addr,
-                        req.uri()
-                        .path_and_query()
-                        .map(|x| x.as_str())
-                        .unwrap_or_else(|| ""),
+    async fn forward_request(
+        req: Request<Body>,
+        addr: std::path::PathBuf,
+        client: hyper::client::Client<UnixClient, Body>,
+        log: slog::Logger,
+    ) -> Result<Response<Body>, hyper::Error> {
+        let mut req: Request<Body> = req;
+        let uri = hyper_unix_connector::Uri::new(
+            addr,
+            req.uri()
+                .path_and_query()
+                .map(|x| x.as_str())
+                .unwrap_or_else(|| ""),
+        );
+        *req.uri_mut() = uri.into();
+
+        client
+            .request(req)
+            .map(move |resp| {
+                if let Ok(ref r) = resp {
+                    // log the response
+                    slog::trace!(log, "got response";
+                        "code" => ?r.status(),
+                        "headers" => ?r.headers(),
+                        "body" => ?r.body(),
                     );
-                    *req.uri_mut() = uri.into();
+                }
 
-                    client
-                        .request(req)
-                        .map(move |resp| {
-                            if let Ok(ref r) = resp {
-                                // log the response
-                                slog::trace!(log, "got response";
-                                    "code" => ?r.status(),
-                                    "headers" => ?r.headers(),
-                                    "body" => ?r.body(),
-                                );
-                            }
-
-                            resp
-                        })
-                    .await
+                resp
+            })
+            .await
     }
 
-    async fn handle_upgrade(req: Request<Body>, addr: std::path::PathBuf, client: hyper::client::Client<UnixClient, Body>, log: slog::Logger) -> Result<Response<Body>, hyper::Error> {
-        use futures_util::try_stream::TryStreamExt;
+    async fn handle_upgrade(
+        req: Request<Body>,
+        addr: std::path::PathBuf,
+        client: hyper::client::Client<UnixClient, Body>,
+        log: slog::Logger,
+    ) -> Result<Response<Body>, hyper::Error> {
         use futures_util::stream::StreamExt;
-                let (parts, mut body) = req.into_parts();
-                let payload: hyper::Chunk = body.by_ref().try_concat().await?;
-                let payload_str = String::from_utf8(payload.to_vec()).expect("body utf8");
-                slog::trace!(log, "upgrade request body"; "body" => &payload_str);
-                // reassemble request
-                let req = Request::from_parts(parts, Body::from(payload));
-                let request_upgrade_fut = body.on_upgrade();
+        use futures_util::try_stream::TryStreamExt;
+        let (parts, mut body) = req.into_parts();
+        let payload: hyper::Chunk = body.by_ref().try_concat().await?;
+        let payload_str = String::from_utf8(payload.to_vec()).expect("body utf8");
+        slog::trace!(log, "upgrade request body"; "body" => &payload_str);
+        // reassemble request
+        let req = Request::from_parts(parts, Body::from(payload));
+        let request_upgrade_fut = body.on_upgrade();
 
-                // forward request 
-                let resp = DockerProxy::forward_request(req, addr, client, log.clone()).await;
+        // forward request
+        let resp = DockerProxy::forward_request(req, addr, client, log.clone()).await;
 
-                let (parts, mut body) = resp?.into_parts();
-                let payload: hyper::Chunk = body.by_ref().try_concat().await?;
-                let payload_str = String::from_utf8(payload.to_vec()).expect("body utf8");
-                slog::trace!(log, "upgrade response body"; "body" => &payload_str);
-                // reassemble response
-                let resp = Response::from_parts(parts, Body::from(payload));
-                let response_upgrade_fut = body.on_upgrade();
+        let (parts, mut body) = resp?.into_parts();
+        let payload: hyper::Chunk = body.by_ref().try_concat().await?;
+        let payload_str = String::from_utf8(payload.to_vec()).expect("body utf8");
+        slog::trace!(log, "upgrade response body"; "body" => &payload_str);
+        // reassemble response
+        let resp = Response::from_parts(parts, Body::from(payload));
+        let response_upgrade_fut = body.on_upgrade();
 
-                let copier_log = log.clone();
+        let copier_log = log.clone();
 
-                // copy between request_upgrade_fut <--> response_upgrade_fut until both are EOFed
-                hyper::rt::spawn(async move {
-                    let (req_upgrade, resp_upgrade) = futures_util::future::join(request_upgrade_fut, response_upgrade_fut).await;
+        // copy between request_upgrade_fut <--> response_upgrade_fut until both are EOFed
+        hyper::rt::spawn(async move {
+            let (req_upgrade, resp_upgrade) =
+                futures_util::future::join(request_upgrade_fut, response_upgrade_fut).await;
 
-                    let req_upgrade = match req_upgrade {
-                        Ok(r) => r,
-                        Err(e) => {
-                            slog::warn!(copier_log, "Upgrade error"; "err" => ?e);
-                            return ();
-                        }
-                    };
-                    let resp_upgrade = match resp_upgrade {
-                        Ok(r) => r,
-                        Err(e) => {
-                            slog::warn!(copier_log, "Upgrade error"; "err" => ?e);
-                            return ();
-                        }
-                    };
+            let req_upgrade = match req_upgrade {
+                Ok(r) => r,
+                Err(e) => {
+                    slog::warn!(copier_log, "Upgrade error"; "err" => ?e);
+                    return ();
+                }
+            };
+            let resp_upgrade = match resp_upgrade {
+                Ok(r) => r,
+                Err(e) => {
+                    slog::warn!(copier_log, "Upgrade error"; "err" => ?e);
+                    return ();
+                }
+            };
 
-                    let (mut req_read, mut req_write) = tokio::io::split(req_upgrade);
-                    let (mut resp_read, mut resp_write) = tokio::io::split(resp_upgrade);
+            let (mut req_read, mut req_write) = tokio::io::split(req_upgrade);
+            let (mut resp_read, mut resp_write) = tokio::io::split(resp_upgrade);
 
-                    let l2 = log.clone();
-                    hyper::rt::spawn(async move {
-                        use tokio::io::AsyncReadExt;
-                        if let Err(e) =  req_read.copy(&mut resp_write).await {
-                            slog::warn!(l2, "Upgrade error"; "err" => ?e);
-                        };
-                    });
+            let l2 = log.clone();
+            hyper::rt::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                if let Err(e) = req_read.copy(&mut resp_write).await {
+                    slog::warn!(l2, "Upgrade error"; "err" => ?e);
+                };
+            });
 
-                    let l3 = log.clone();
-                    hyper::rt::spawn(async move {
-                        use tokio::io::AsyncReadExt;
-                        if let Err(e) =  resp_read.copy(&mut req_write).await {
-                            slog::warn!(l3, "Upgrade error"; "err" => ?e);
-                        };
-                    });
-                });
+            let l3 = log.clone();
+            hyper::rt::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                if let Err(e) = resp_read.copy(&mut req_write).await {
+                    slog::warn!(l3, "Upgrade error"; "err" => ?e);
+                };
+            });
+        });
 
-                Ok(resp)
+        Ok(resp)
     }
 }
 
 fn error_response(e: Error) -> Result<Response<Body>, hyper::Error> {
     let e = format!("{:?}", e);
-    let st =
-        futures_util::stream::once(async move { Ok::<_, Error>(e) });
+    let st = futures_util::stream::once(async move { Ok::<_, Error>(e) });
     Ok(Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(Body::wrap_stream(st))
@@ -289,20 +298,32 @@ pub mod burritonet {
 ///
 /// Services register with the listen() RPC.
 /// Clients call the open() RPC with a service-level address to get the address to connect to.
-#[derive(Default)]
 pub struct BurritoNet {
     root: std::path::PathBuf,
     route_table: std::sync::Mutex<HashMap<String, String>>,
-}
-
-impl BurritoNet {
-    fn listen_path(&self) -> std::path::PathBuf {
-        self.root.join("controller")
-    }
+    log: slog::Logger,
 }
 
 use burritonet::server::{Connection, ConnectionServer};
 use burritonet::{ListenReply, ListenRequest, OpenReply, OpenRequest};
+
+impl BurritoNet {
+    pub fn new(root: Option<std::path::PathBuf>, log: slog::Logger) -> Self {
+        BurritoNet {
+            root: root.unwrap_or_else(|| std::path::PathBuf::from("/tmp/burrito")),
+            route_table: Default::default(),
+            log,
+        }
+    }
+
+    pub fn listen_path(&self) -> std::path::PathBuf {
+        self.root.join("controller")
+    }
+
+    pub fn start_burritonet(self) -> Result<ConnectionServer<BurritoNet>, Error> {
+        Ok(ConnectionServer::new(self))
+    }
+}
 
 #[tonic::async_trait]
 impl Connection for BurritoNet {
@@ -340,6 +361,10 @@ impl Connection for BurritoNet {
                 })
         }?; // release route_table lock
 
+        slog::info!(self.log, "New service listening";
+            "addr" => ?listen_addr,
+        );
+
         let reply = burritonet::ListenReply {
             listen_addr: listen_addr.clone(),
         };
@@ -366,6 +391,10 @@ impl Connection for BurritoNet {
                 })?
                 .to_string()
         }; // release route_table lock
+        
+        slog::info!(self.log, "Service connecting to";
+            "addr" => ?send_addr,
+        );
 
         let reply = burritonet::OpenReply { send_addr };
         Ok(tonic::Response::new(reply))
