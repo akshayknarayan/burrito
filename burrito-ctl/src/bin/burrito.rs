@@ -4,10 +4,10 @@ use structopt::StructOpt;
 #[structopt(name = "burrito")]
 struct Opt {
     #[structopt(short, long)]
-    docker_in_addr: std::path::PathBuf,
+    in_addr_docker: std::path::PathBuf,
 
     #[structopt(short, long)]
-    docker_out_addr: std::path::PathBuf,
+    out_addr_docker: std::path::PathBuf,
 
     #[structopt(short, long)]
     burrito_coordinator_addr: Option<std::path::PathBuf>,
@@ -16,20 +16,20 @@ struct Opt {
 #[tokio::main]
 async fn main() -> Result<(), failure::Error> {
     let opt = Opt::from_args();
-    let log = burrito::logger();
+    let log = burrito_ctl::logger();
 
-    let docker_out_addr = opt.docker_out_addr.clone();
+    let out_addr_docker = opt.out_addr_docker.clone();
 
     use hyper_unix_connector::UnixConnector;
-    let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.docker_in_addr)?.into();
-    let make_service = burrito::MakeDockerProxy {
-        out_addr: docker_out_addr.clone(),
+    let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr_docker)?.into();
+    let make_service = burrito_ctl::MakeDockerProxy {
+        out_addr: out_addr_docker.clone(),
         log: log.new(slog::o!("server" => "docker_proxy")),
     };
     let docker_proxy_server = hyper::server::Server::builder(uc).serve(make_service);
-    slog::info!(log, "docker proxy starting"; "listening at" => ?&opt.docker_in_addr, "proxying to" => ?&opt.docker_out_addr);
+    slog::info!(log, "docker proxy starting"; "listening at" => ?&opt.in_addr_docker, "proxying to" => ?&opt.out_addr_docker);
 
-    let burrito = burrito::BurritoNet::new(
+    let burrito = burrito_ctl::BurritoNet::new(
         opt.burrito_coordinator_addr,
         log.new(slog::o!("server" => "burrito_net")),
     );

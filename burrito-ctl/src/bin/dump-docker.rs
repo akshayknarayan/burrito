@@ -13,13 +13,13 @@ struct Opt {
 #[tokio::main]
 async fn main() -> Result<(), failure::Error> {
     let opt = Opt::from_args();
-    let log = burrito::logger();
+    let log = burrito_ctl::logger();
 
     let out_addr = opt.out_addr.clone();
 
     use hyper_unix_connector::UnixConnector;
     let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr)?.into();
-    let make_service = burrito::MakeDockerProxy {
+    let make_service = burrito_ctl::MakeDockerProxy {
         out_addr: out_addr.clone(),
         log: log.clone(),
     };

@@ -1,0 +1,32 @@
+[package]
+name = "burrito-ctl"
+version = "0.1.0"
+authors = ["Akshay Narayan <akshayn@mit.edu>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bollard = {git = "https://github.com/akshayknarayan/bollard", branch = "std-future" }
+bytes = "0.4"
+failure = "0.1"
+futures-util-preview = "=0.3.0-alpha.19"
+hyper-unix-connector = "0.1.0"
+hyper = {version = "=0.13.0-alpha.4", features = ["unstable-stream"]}
+lazy_static = "1"
+prost = "0.5"
+prost-derive = "0.5"
+rand = "0.7"
+regex = "1"
+serde  = "1"
+serde_json = "1"
+slog = "2"
+slog-async = "2"
+slog-term = "2"
+structopt = "0.3"
+tokio = "=0.2.0-alpha.6"
+tonic = "=0.1.0-alpha.5"
+tower = "=0.3.0-alpha.2"
+
+[build-dependencies]
+tonic-build = "=0.1.0-alpha.5"
