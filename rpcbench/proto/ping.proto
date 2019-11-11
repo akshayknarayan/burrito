@@ -1,0 +1,22 @@
+syntax = "proto3";
+package Ping;
+
+service Ping {
+    rpc Ping (PingParams) returns (Pong);
+}
+
+message PingParams {
+    enum Work {
+        IMMEDIATE = 0;
+        CONST = 1; // work as duration in us
+        POISSON = 2; // work as mean duration in us
+        BUSY_TIME_CONST = 3; // work as busy-spin duration in us
+        BUSY_WORK_CONST = 4; // work as number of operations to perform
+    }
+    Work work = 1;
+    int64 amount = 2;
+}
+
+message Pong {
+    int64 duration_us = 1;
+}
