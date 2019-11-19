@@ -10,7 +10,49 @@ mod rpc {
     tonic::include_proto!("burrito");
 }
 
+/// Burrito-aware URI type.
+pub struct Uri<'a> {
+    /// path + query string
+    inner: std::borrow::Cow<'a, str>,
+}
+
+impl<'a> Into<hyper::Uri> for Uri<'a> {
+    fn into(self) -> hyper::Uri {
+        self.inner.as_ref().parse().unwrap()
+    }
+}
+
+impl<'a> Uri<'a> {
+    pub fn new(addr: &str, path: &'a str) -> Self {
+        let host = hex::encode(addr.as_bytes());
+        let s = format!("burrito://{}:0{}", host, path);
+        Uri {
+            inner: std::borrow::Cow::Owned(s),
+        }
+    }
+
+    pub fn socket_path(uri: &hyper::Uri) -> Option<String> {
+        use hex::FromHex;
+        uri.host()
+            .iter()
+            .filter_map(|host| {
+                Vec::from_hex(host)
+                    .ok()
+                    .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+            })
+            .next()
+    }
+
+    pub fn socket_path_dest(dest: &hyper::client::connect::Destination) -> Option<String> {
+        format!("burrito://{}", dest.host())
+            .parse()
+            .ok()
+            .and_then(|uri| Self::socket_path(&uri))
+    }
+}
+
 #[pin_project]
+#[derive(Debug)]
 pub enum Conn {
     Unix(#[pin] tokio::net::UnixStream),
     Tcp(#[pin] tokio::net::TcpStream),
@@ -47,8 +89,34 @@ impl tokio::io::AsyncWrite for Conn {
     conn_impl_fn!(poll_shutdown |self: Pin<&mut Self>, cx: &mut Context<'_>| -> Poll<std::io::Result<()>> ;;);
 }
 
+// TODO This is not usable until tonic clients have swappable backend connections/resolvers.
+// Currently we will use the "unix" feature instead of this.
+#[derive(Clone)]
 pub struct Client {
     burrito_client: rpc::client::ConnectionClient<tonic::transport::channel::Channel>,
+}
+
+impl Client {
+    pub async fn new(burrito_ctl_addr: &str) -> Result<Self, Error> {
+        let addr: hyper::Uri = hyper_unix_connector::Uri::new(burrito_ctl_addr, "/").into();
+        let burrito_client = rpc::client::ConnectionClient::connect(addr).await?;
+        Ok(Self { burrito_client })
+    }
+
+    pub async fn resolve(&self, dst: hyper::client::connect::Destination) -> Result<String, Error> {
+        // TODO check if scheme is burrito
+        let mut cl = self.burrito_client.clone();
+        let addr = cl
+            .open(rpc::OpenRequest {
+                dst_addr: Uri::socket_path_dest(&dst).expect("burrito path"),
+            })
+            .await?
+            .into_inner()
+            .send_addr;
+
+        // connect to it
+        Ok(addr)
+    }
 }
 
 impl hyper::client::connect::Connect for Client {
@@ -62,18 +130,9 @@ impl hyper::client::connect::Connect for Client {
     >;
 
     fn connect(&self, dst: hyper::client::connect::Destination) -> Self::Future {
-        let mut cl = self.burrito_client.clone();
+        let cl = self.clone();
         Box::pin(async move {
-            // ask burrito-ctl where to connect to
-            let send_addr = cl
-                .open(rpc::OpenRequest {
-                    dst_addr: dst.host().to_owned(),
-                })
-                .await?
-                .into_inner()
-                .send_addr;
-
-            // TODO deal with remote TCP addrs
+            let send_addr = cl.resolve(dst).await?;
 
             // connect to it
             let st = tokio::net::UnixStream::connect(&send_addr).await?;

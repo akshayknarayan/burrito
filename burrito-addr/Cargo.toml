@@ -16,8 +16,9 @@ prost = "0.5"
 prost-derive = "0.5"
 bytes = "0.4"
 pin-project = "0.4"
-hyper-unix-connector = "0.1.0"
+hyper-unix-connector = "0.1.1"
 futures-util-preview = "0.3.0-alpha.19"
+hex = "0.4"
 
 [dev-dependencies]
 slog = {version = "2", features = ["max_level_trace"]}

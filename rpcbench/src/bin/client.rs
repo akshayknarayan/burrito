@@ -4,6 +4,8 @@ use structopt::StructOpt;
 #[structopt(name = "ping_client")]
 struct Opt {
     #[structopt(short, long)]
+    enable_burrito: bool,
+    #[structopt(short, long)]
     addr: String,
     #[structopt(short, long)]
     work: i32,
@@ -17,8 +19,25 @@ struct Opt {
 async fn main() -> Result<(), failure::Error> {
     let opt = Opt::from_args();
 
+    //   let addr: hyper::Uri = hyper_unix_connector::Uri::new(burrito_ctl_addr, "/").into();
+    //   let mut cl = rpc::client::ConnectionClient::connect(addr).await?;
+    //   let listen_addr = cl
+    //       .listen(rpc::ListenRequest {
+    //           service_addr: service_addr.to_owned(),
+    //       })
+    //       .await?
+
+    let addr = if opt.enable_burrito {
+        let cl = burrito_addr::Client::new("/tmp/burrito/controller").await?;
+        let a = burrito_addr::Uri::new("rpcbench", "/");
+        let d = hyper::client::connect::Destination::try_from_uri(a.into())?;
+        cl.resolve(d).await?
+    } else {
+        opt.addr
+    };
+
     let durs = rpcbench::client_ping(
-        opt.addr,
+        addr,
         rpcbench::PingParams {
             work: rpcbench::Work::from_i32(opt.work)
                 .ok_or_else(|| failure::format_err!("Invalid work value"))?
