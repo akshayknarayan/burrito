@@ -65,16 +65,19 @@ impl Connection for BurritoNet {
             .expect("Generating pipe address failed");
 
         {
-            self.route_table
+            if let Some(s) = self
+                .route_table
                 .lock()
                 .expect("Route table lock poisoned")
                 .insert(service_addr.clone(), listen_addr.clone())
-                .ok_or_else(|| {
-                    tonic::Status::new(
-                        tonic::Code::AlreadyExists,
-                        format!("Service address {} already in use", &service_addr),
-                    )
-                })
+            {
+                Err(tonic::Status::new(
+                    tonic::Code::AlreadyExists,
+                    format!("Service address {} already in use at {}", &service_addr, &s),
+                ))
+            } else {
+                Ok(())
+            }
         }?; // release route_table lock
 
         slog::info!(self.log, "New service listening";
