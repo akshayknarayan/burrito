@@ -35,7 +35,7 @@ async fn main() -> Result<(), failure::Error> {
     );
     let burrito_addr = burrito.listen_path();
     let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr)?.into();
-    let burrito_service = burrito.start_burritonet()?;
+    let burrito_service = burrito.start()?;
     let burrito_rpc_server =
         hyper::server::Server::builder(uc).serve(hyper::service::make_service_fn(move |_| {
             let bs = burrito_service.clone();

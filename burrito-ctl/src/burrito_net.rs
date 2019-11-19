@@ -36,7 +36,7 @@ impl BurritoNet {
         self.root.join("controller")
     }
 
-    pub fn start_burritonet(self) -> Result<ConnectionServer<BurritoNet>, Error> {
+    pub fn start(self) -> Result<ConnectionServer<BurritoNet>, Error> {
         Ok(ConnectionServer::new(self))
     }
 }
