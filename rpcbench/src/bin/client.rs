@@ -19,14 +19,6 @@ struct Opt {
 async fn main() -> Result<(), failure::Error> {
     let opt = Opt::from_args();
 
-    //   let addr: hyper::Uri = hyper_unix_connector::Uri::new(burrito_ctl_addr, "/").into();
-    //   let mut cl = rpc::client::ConnectionClient::connect(addr).await?;
-    //   let listen_addr = cl
-    //       .listen(rpc::ListenRequest {
-    //           service_addr: service_addr.to_owned(),
-    //       })
-    //       .await?
-
     let addr = if opt.enable_burrito {
         let cl = burrito_addr::Client::new("/tmp/burrito/controller").await?;
         let a = burrito_addr::Uri::new("rpcbench", "/");
