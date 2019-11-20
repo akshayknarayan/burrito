@@ -6,12 +6,13 @@ struct Opt {
     #[structopt(short, long)]
     addr: String,
 
-    #[structopt(short, long, default_value = "/tmp/burrito/controller")]
-    burrito_ctl_addr: String,
+    #[structopt(short, long, default_value = "/tmp/burrito")]
+    burrito_root: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), failure::Error> {
+    let log = burrito_ctl::logger();
     let opt = Opt::from_args();
 
     use std::str::FromStr;
@@ -21,7 +22,7 @@ async fn main() -> Result<(), failure::Error> {
             .serve(addr)
             .await?;
     } else {
-        let srv = burrito_addr::Server::start("rpcbench", &opt.burrito_ctl_addr).await?;
+        let srv = burrito_addr::Server::start(&opt.addr, &opt.burrito_root, Some(&log)).await?;
 
         let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
         hyper::server::Server::builder(srv)

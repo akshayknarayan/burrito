@@ -11,7 +11,8 @@ hyper = {version = "=0.13.0-alpha.4", features = ["unstable-stream"]}
 tokio = "=0.2.0-alpha.6"
 failure = "0.1"
 #tonic = "=0.1.0-alpha.5"
-tonic = {path = "../../tonic/tonic", features = ["unix"] }
+#tonic = {path = "../../tonic/tonic", features = ["unix"] }
+tonic = {git = "https://github.com/akshayknarayan/tonic", features = ["unix"]}
 prost = "0.5"
 prost-derive = "0.5"
 bytes = "0.4"
@@ -19,11 +20,9 @@ pin-project = "0.4"
 hyper-unix-connector = "0.1.1"
 futures-util-preview = "0.3.0-alpha.19"
 hex = "0.4"
-
-[dev-dependencies]
+burrito-ctl = {path = "../burrito-ctl"}
 slog = {version = "2", features = ["max_level_trace"]}
 slog-term = "2"
-burrito-ctl = {path = "../burrito-ctl"}
 
 [build-dependencies]
 tonic-build = "=0.1.0-alpha.5"

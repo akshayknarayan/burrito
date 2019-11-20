@@ -5,6 +5,8 @@ use core::{
 };
 use failure::Error;
 use pin_project::{pin_project, project};
+use slog::{debug, trace};
+use std::path::{Path, PathBuf};
 
 mod rpc {
     tonic::include_proto!("burrito");
@@ -89,33 +91,58 @@ impl tokio::io::AsyncWrite for Conn {
     conn_impl_fn!(poll_shutdown |self: Pin<&mut Self>, cx: &mut Context<'_>| -> Poll<std::io::Result<()>> ;;);
 }
 
-// TODO This is not usable until tonic clients have swappable backend connections/resolvers.
+// TODO This is not fully usable until tonic clients have swappable backend connections/resolvers.
 // Currently we will use the "unix" feature instead of this.
 #[derive(Clone)]
 pub struct Client {
+    burrito_root: PathBuf,
     burrito_client: rpc::client::ConnectionClient<tonic::transport::channel::Channel>,
+    log: slog::Logger,
 }
 
 impl Client {
-    pub async fn new(burrito_ctl_addr: &str) -> Result<Self, Error> {
+    pub async fn new(burrito_root: impl AsRef<Path>, log: &slog::Logger) -> Result<Self, Error> {
+        let burrito_ctl_addr = burrito_root.as_ref().join(burrito_ctl::CONTROLLER_ADDRESS);
+        let burrito_root = burrito_root.as_ref().to_path_buf();
+        trace!(log, "burrito-addr connecting to burrito-ctl"; "burrito_root" => ?&burrito_root, "burrito_ctl_addr" => ?&burrito_ctl_addr);
+
         let addr: hyper::Uri = hyper_unix_connector::Uri::new(burrito_ctl_addr, "/").into();
         let burrito_client = rpc::client::ConnectionClient::connect(addr).await?;
-        Ok(Self { burrito_client })
+        trace!(log, "burrito-addr connected to burrito-ctl");
+        Ok(Self {
+            burrito_root,
+            burrito_client,
+            log: log.clone(),
+        })
     }
 
-    pub async fn resolve(&self, dst: hyper::client::connect::Destination) -> Result<String, Error> {
+    pub async fn resolve(
+        &mut self,
+        dst: hyper::client::connect::Destination,
+    ) -> Result<String, Error> {
         // TODO check if scheme is burrito
-        let mut cl = self.burrito_client.clone();
-        let addr = cl
-            .open(rpc::OpenRequest {
-                dst_addr: Uri::socket_path_dest(&dst).expect("burrito path"),
-            })
+
+        let dst_addr = Uri::socket_path_dest(&dst)
+            .ok_or_else(|| failure::format_err!("Could not get socket path for Destination"))?;
+        let dst_addr_log = dst_addr.clone();
+
+        trace!(self.log, "Resolving burrito address"; "addr" => &dst_addr);
+
+        let addr = self
+            .burrito_client
+            .open(rpc::OpenRequest { dst_addr })
             .await?
             .into_inner()
             .send_addr;
 
-        // connect to it
-        Ok(addr)
+        debug!(self.log, "Resolved burrito address"; "burrito addr" => &dst_addr_log, "resolved addr" => &addr);
+
+        Ok(self
+            .burrito_root
+            .join(addr)
+            .into_os_string()
+            .into_string()
+            .expect("OS string as valid string"))
     }
 }
 
@@ -130,7 +157,7 @@ impl hyper::client::connect::Connect for Client {
     >;
 
     fn connect(&self, dst: hyper::client::connect::Destination) -> Self::Future {
-        let cl = self.clone();
+        let mut cl = self.clone();
         Box::pin(async move {
             let send_addr = cl.resolve(dst).await?;
 
@@ -146,7 +173,16 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn start(service_addr: &str, burrito_ctl_addr: &str) -> Result<Self, Error> {
+    pub async fn start(
+        service_addr: &str,
+        burrito_root: impl AsRef<Path>,
+        log: Option<&slog::Logger>,
+    ) -> Result<Self, Error> {
+        let burrito_ctl_addr = burrito_root.as_ref().join(burrito_ctl::CONTROLLER_ADDRESS);
+        let burrito_root = burrito_root.as_ref().to_path_buf();
+        if let Some(l) = log {
+            trace!(l, "Connecting to burrito-ctl"; "addr" => ?&burrito_ctl_addr, "root" => ?&burrito_root);
+        }
         // ask local burrito-ctl where to listen
         let addr: hyper::Uri = hyper_unix_connector::Uri::new(burrito_ctl_addr, "/").into();
         let mut cl = rpc::client::ConnectionClient::connect(addr).await?;
@@ -158,9 +194,12 @@ impl Server {
             .into_inner()
             .listen_addr;
 
-        // TODO also listen on local TCP
+        if let Some(l) = log {
+            trace!(l, "Got listening address"; "addr" => ?&listen_addr, "root" => ?&burrito_root);
+        }
 
-        let ul = tokio::net::UnixListener::bind(listen_addr)?;
+        // TODO also listen on local TCP
+        let ul = tokio::net::UnixListener::bind(burrito_root.join(listen_addr))?;
         Ok(Self { ul })
     }
 }
@@ -246,9 +285,10 @@ mod test {
         let mut rt = tokio::runtime::current_thread::Runtime::new()?;
 
         rt.block_on(async move {
-            tokio::spawn(async move { start_burrito_ctl(&log).await.expect("Burrito Ctl") });
+            let l = log.clone();
+            tokio::spawn(async move { start_burrito_ctl(&l).await.expect("Burrito Ctl") });
             block_for(std::time::Duration::from_millis(100)).await;
-            Server::start("test-service", "./tmp-test-bn/controller")
+            Server::start("test-service", "./tmp-test-bn", Some(&log))
                 .await
                 .expect("start server")
         });

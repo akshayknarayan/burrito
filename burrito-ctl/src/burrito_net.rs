@@ -5,6 +5,8 @@ pub mod rpc {
     tonic::include_proto!("burrito");
 }
 
+pub const CONTROLLER_ADDRESS: &str = "controller";
+
 /// Manages the inter-container network.
 ///
 /// Jobs:
@@ -14,6 +16,8 @@ pub mod rpc {
 ///
 /// Services register with the listen() RPC.
 /// Clients call the open() RPC with a service-level address to get the address to connect to.
+///
+/// Note: the returned path must be joined with the burrito root path to be useful.
 pub struct BurritoNet {
     root: std::path::PathBuf,
     route_table: std::sync::Mutex<HashMap<String, String>>,
@@ -33,7 +37,7 @@ impl BurritoNet {
     }
 
     pub fn listen_path(&self) -> std::path::PathBuf {
-        self.root.join("controller")
+        self.root.join(CONTROLLER_ADDRESS)
     }
 
     pub fn start(self) -> Result<ConnectionServer<BurritoNet>, Error> {
@@ -53,16 +57,10 @@ impl Connection for BurritoNet {
         use rand::Rng;
         let rng = rand::thread_rng();
 
-        let p: String = rng
+        let listen_addr: String = rng
             .sample_iter(&rand::distributions::Alphanumeric)
             .take(10)
             .collect();
-        let listen_addr = self
-            .root
-            .join(p)
-            .into_os_string()
-            .into_string()
-            .expect("Generating pipe address failed");
 
         {
             if let Some(s) = self
@@ -81,13 +79,11 @@ impl Connection for BurritoNet {
         }?; // release route_table lock
 
         slog::info!(self.log, "New service listening";
+            "service" => &service_addr,
             "addr" => ?listen_addr,
         );
 
-        let reply = ListenReply {
-            listen_addr: listen_addr.clone(),
-        };
-        Ok(tonic::Response::new(reply))
+        Ok(tonic::Response::new(ListenReply { listen_addr }))
     }
 
     async fn open(
@@ -111,11 +107,11 @@ impl Connection for BurritoNet {
                 .to_string()
         }; // release route_table lock
 
-        slog::info!(self.log, "Service connecting to";
+        slog::info!(self.log, "Service connection request";
+            "service" => &dst_addr,
             "addr" => ?send_addr,
         );
 
-        let reply = OpenReply { send_addr };
-        Ok(tonic::Response::new(reply))
+        Ok(tonic::Response::new(OpenReply { send_addr }))
     }
 }

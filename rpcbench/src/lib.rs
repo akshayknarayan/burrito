@@ -119,11 +119,12 @@ mod test {
         rt.block_on(async move {
             let l = log.clone();
             tokio::spawn(async move { start_burrito_ctl(&l).await.expect("Burrito Ctl") });
-            tokio::spawn(async move { start_sever_burrito().await.expect("RPC Server") });
+            let l = log.clone();
+            tokio::spawn(async move { start_sever_burrito(&l).await.expect("RPC Server") });
             block_for(std::time::Duration::from_millis(100)).await;
 
-            trace!(&log, "connecting to burrito controller"; "controller" => "./tmp-test-bn/controller");
-            let cl = burrito_addr::Client::new("./tmp-test-bn/controller").await?;
+            trace!(&log, "connecting to burrito controller"; "burrito_root" => "./tmp-test-bn");
+            let mut cl = burrito_addr::Client::new("./tmp-test-bn", &log).await?;
             let a = burrito_addr::Uri::new("test-rpcbench", "/");
             let d = hyper::client::connect::Destination::try_from_uri(a.into())?;
             let addr = cl.resolve(d).await?;
@@ -143,8 +144,8 @@ mod test {
         })
     }
 
-    async fn start_sever_burrito() -> Result<(), Error> {
-        let srv = burrito_addr::Server::start("test-rpcbench", "./tmp-test-bn/controller").await?;
+    async fn start_sever_burrito(log: &slog::Logger) -> Result<(), Error> {
+        let srv = burrito_addr::Server::start("test-rpcbench", "./tmp-test-bn", Some(log)).await?;
 
         let ping_srv = super::PingServer::new(super::Server);
         hyper::server::Server::builder(srv)
