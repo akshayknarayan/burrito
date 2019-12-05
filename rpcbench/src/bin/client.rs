@@ -22,6 +22,7 @@ async fn main() -> Result<(), failure::Error> {
     let opt = Opt::from_args();
 
     let durs = if let Some(root) = opt.burrito_root {
+        // burrito mode
         let cl = burrito_addr::Client::new(root, &log).await?;
         let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
         trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
@@ -38,6 +39,7 @@ async fn main() -> Result<(), failure::Error> {
         )
         .await?
     } else {
+        // raw unix mode
         let addr: hyper::Uri = hyper_unix_connector::Uri::new(opt.addr, "/").into();
         trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
         rpcbench::client_ping(
