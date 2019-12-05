@@ -70,16 +70,23 @@ impl Ping for Server {
     }
 }
 
-pub async fn client_ping<A>(
+/// Issue many requests to a tonic endpoint.
+pub async fn client_ping<A, C>(
     addr: A,
+    connector: C,
     msg: PingParams,
     iters: usize,
 ) -> Result<Vec<(i64, i64)>, Error>
 where
     A: std::convert::TryInto<tonic::transport::Endpoint>,
     A::Error: Send + Sync + std::error::Error + 'static,
+    C: tower_make::MakeConnection<hyper::Uri> + Send + Clone + 'static,
+    C::Connection: Unpin + Send + 'static,
+    C::Future: Send + 'static,
+    C::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
 {
-    let mut client = ping::client::PingClient::connect(addr.try_into()?).await?;
+    let mut client =
+        ping::client::PingClient::connect_with_connector(addr.try_into()?, connector).await?;
     let mut durs = vec![];
 
     for _ in 0..iters {
@@ -124,14 +131,11 @@ mod test {
             block_for(std::time::Duration::from_millis(100)).await;
 
             trace!(&log, "connecting to burrito controller"; "burrito_root" => "./tmp-test-bn");
-            let mut cl = burrito_addr::Client::new("./tmp-test-bn", &log).await?;
-            let a = burrito_addr::Uri::new("test-rpcbench", "/");
-            let d = hyper::client::connect::Destination::try_from_uri(a.into())?;
-            let addr = cl.resolve(d).await?;
-            trace!(&log, "got service address"; "service" => "test-rpcbench", "addr" => &addr);
-            let addr: hyper::Uri = hyper_unix_connector::Uri::new(addr, "/").into();
+            let cl = burrito_addr::Client::new("./tmp-test-bn", &log).await?;
+            let a: hyper::Uri = burrito_addr::Uri::new("test-rpcbench").into();
             super::client_ping(
-                addr,
+                a,
+                cl,
                 super::PingParams {
                     work: super::Work::Immediate as i32,
                     amount: 0,

@@ -15,16 +15,27 @@ prost = "0.5"
 prost-derive = "0.5"
 tokio = "=0.2.0-alpha.6"
 tower = "=0.3.0-alpha.2"
+tower-make = "=0.3.0-alpha.2a"
 #tonic = "=0.1.0-alpha.5"
-#tonic = {path = "../../tonic/tonic", features = ["unix"]}
-tonic = {git = "https://github.com/akshayknarayan/tonic", features = ["unix"]}
+tonic = {path = "../../tonic/tonic"}
 structopt = "0.3"
 burrito-addr = {path = "../burrito-addr"}
 hyper = {version = "=0.13.0-alpha.4", features = ["unstable-stream"]}
 burrito-ctl = {path = "../burrito-ctl"}
 slog = {version = "2", features = ["max_level_trace"]}
 slog-term = "2"
-hyper-unix-connector = "0.1.1"
+hyper-unix-connector = { version = "0.1.3", optional = true }
+
+[dev-dependencies]
+hyper-unix-connector = "0.1.3"
 
 [build-dependencies]
-tonic-build = "=0.1.0-alpha.5"
+#tonic-build = "=0.1.0-alpha.5"
+tonic-build = {path = "../../tonic/tonic-build"}
+
+[features]
+unix-connector = ["hyper-unix-connector"]
+
+[[bin]]
+name = "client"
+required-features = ["unix-connector"]
