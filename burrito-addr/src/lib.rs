@@ -59,6 +59,7 @@ impl<'a> Uri<'a> {
     }
 }
 
+/// A wrapper around a unix or tcp socket.
 #[pin_project]
 #[derive(Debug)]
 pub enum Conn {
@@ -97,6 +98,9 @@ impl tokio::io::AsyncWrite for Conn {
     conn_impl_fn!(poll_shutdown |self: Pin<&mut Self>, cx: &mut Context<'_>| -> Poll<std::io::Result<()>> ;;);
 }
 
+/// Resolves a burrito address to a [`Conn`].
+///
+/// Connects to burrito-ctl to resolve.
 #[derive(Clone)]
 pub struct Client {
     burrito_root: PathBuf,
@@ -194,6 +198,9 @@ impl Service<hyper::Uri> for Client {
     }
 }
 
+/// Listens at a burrito address.
+///
+/// Registers with burrito-ctl, then listens for incoming connections on the provided address.
 pub struct Server {
     ul: tokio::net::UnixListener,
 }
