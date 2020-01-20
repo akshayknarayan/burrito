@@ -9,7 +9,7 @@ mod ping {
     tonic::include_proto!("ping");
 }
 
-pub use ping::server::{Ping, PingServer};
+pub use ping::ping_server::{Ping, PingServer};
 pub use ping::{ping_params::Work, PingParams, Pong};
 
 #[derive(Clone, Debug)]
@@ -39,12 +39,11 @@ impl Ping for Server {
             Work::Immediate => (),
             Work::Const => {
                 let completion_time = then + std::time::Duration::from_micros(amt);
-
-                tokio::timer::delay(completion_time).await;
+                tokio::time::delay_until(tokio::time::Instant::from_std(completion_time)).await;
             }
             Work::Poisson => {
                 let completion_time = then + gen_poisson_duration(amt as f64)?;
-                tokio::timer::delay(completion_time).await;
+                tokio::time::delay_until(tokio::time::Instant::from_std(completion_time)).await;
             }
             Work::BusyTimeConst => {
                 let completion_time = then + std::time::Duration::from_micros(amt);
@@ -80,15 +79,16 @@ pub async fn client_ping<A, C>(
 where
     A: std::convert::TryInto<tonic::transport::Endpoint>,
     A::Error: Send + Sync + std::error::Error + 'static,
-    C: tower_make::MakeConnection<hyper::Uri> + Send + Clone + 'static,
+    C: tower_make::MakeConnection<hyper::Uri> + Send + 'static,
     C::Connection: Unpin + Send + 'static,
     C::Future: Send + 'static,
-    C::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+    Box<dyn std::error::Error + Send + Sync>: From<C::Error> + Send + 'static,
 {
-    let mut client =
-        ping::client::PingClient::connect_with_connector(addr.try_into()?, connector).await?;
-    let mut durs = vec![];
+    let endpoint = addr.try_into()?;
+    let channel = endpoint.connect_with_connector(connector).await?;
+    let mut client = ping::ping_client::PingClient::new(channel);
 
+    let mut durs = vec![];
     for _ in 0..iters {
         let then = std::time::Instant::now();
         let req = tonic::Request::new(msg.clone());
@@ -119,16 +119,19 @@ mod test {
     use slog::{debug, trace};
 
     #[test]
+    // The sleeps are unfortunate, but there's not really a way to tell when
+    // a server has started serving :(
     fn ping() -> Result<(), Error> {
         let log = test_logger();
-        let mut rt = tokio::runtime::current_thread::Runtime::new()?;
+        let mut rt = tokio::runtime::Runtime::new()?;
 
         rt.block_on(async move {
             let l = log.clone();
             tokio::spawn(async move { start_burrito_ctl(&l).await.expect("Burrito Ctl") });
+            block_for(std::time::Duration::from_millis(200)).await;
             let l = log.clone();
             tokio::spawn(async move { start_sever_burrito(&l).await.expect("RPC Server") });
-            block_for(std::time::Duration::from_millis(100)).await;
+            block_for(std::time::Duration::from_millis(200)).await;
 
             trace!(&log, "connecting to burrito controller"; "burrito_root" => "./tmp-test-bn");
             let cl = burrito_addr::Client::new("./tmp-test-bn", &log).await?;
@@ -149,9 +152,14 @@ mod test {
     }
 
     async fn start_sever_burrito(log: &slog::Logger) -> Result<(), Error> {
-        let srv = burrito_addr::Server::start("test-rpcbench", "./tmp-test-bn", Some(log)).await?;
+        let l2 = log.clone();
 
+        // get serving address
+        let srv = burrito_addr::Server::start("test-rpcbench", "./tmp-test-bn", Some(log)).await?;
         let ping_srv = super::PingServer::new(super::Server);
+
+        trace!(l2, "spawning test-rpcbench");
+
         hyper::server::Server::builder(srv)
             .serve(hyper::service::make_service_fn(move |_| {
                 let ps = ping_srv.clone();
@@ -185,14 +193,13 @@ mod test {
             }));
 
         let l2 = log.clone();
-        trace!(l2, "spawning");
+        trace!(l2, "spawning burrito_ctl");
         burrito_rpc_server.await?;
         Ok(())
     }
 
     async fn block_for(d: std::time::Duration) {
-        let when = tokio::clock::now() + d;
-        tokio::timer::delay(when).await;
+        tokio::time::delay_for(d).await;
     }
 
     pub(crate) fn test_logger() -> slog::Logger {

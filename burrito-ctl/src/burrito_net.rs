@@ -24,7 +24,7 @@ pub struct BurritoNet {
     log: slog::Logger,
 }
 
-use rpc::server::{Connection, ConnectionServer};
+use rpc::connection_server::{Connection, ConnectionServer};
 use rpc::{ListenReply, ListenRequest, OpenReply, OpenRequest};
 
 impl BurritoNet {

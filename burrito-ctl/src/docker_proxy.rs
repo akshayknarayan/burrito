@@ -111,10 +111,10 @@ impl DockerProxy {
         req: hyper::Request<Body>,
         log: slog::Logger,
     ) -> Result<hyper::Request<Body>, Error> {
-        use futures_util::try_stream::TryStreamExt;
+        use futures_util::stream::TryStreamExt;
 
         let (mut parts, body) = req.into_parts();
-        let payload: hyper::Chunk = body.try_concat().await?;
+        let payload: Vec<u8> = body.map_ok(|x| x.to_vec()).try_concat().await?;
         let mut cfg: Config<String> = serde_json::from_slice(&payload).map_err(|e| {
             let payload_str = String::from_utf8(payload.to_vec()).expect("body utf8");
             slog::warn!(log, "payload parse failed";
@@ -150,7 +150,7 @@ impl DockerProxy {
 
         let cfg_body = serde_json::to_vec(&cfg)?;
         let body_len = cfg_body.len();
-        let body = hyper::Chunk::from(cfg_body);
+        let body = hyper::body::Bytes::from(cfg_body);
 
         if let Some(v) = parts.headers.get_mut("content-length") {
             *v = body_len.into();
@@ -198,12 +198,12 @@ impl DockerProxy {
         client: hyper::client::Client<UnixClient, Body>,
         log: slog::Logger,
     ) -> Result<Response<Body>, hyper::Error> {
-        use futures_util::stream::StreamExt;
-        use futures_util::try_stream::TryStreamExt;
+        use futures_util::stream::{StreamExt, TryStreamExt};
+
         let (parts, mut body) = req.into_parts();
-        let payload: hyper::Chunk = body.by_ref().try_concat().await?;
-        let payload_str = String::from_utf8(payload.to_vec()).expect("body utf8");
-        slog::trace!(log, "upgrade request body"; "body" => &payload_str);
+        let payload: Vec<u8> = body.by_ref().map_ok(|x| x.to_vec()).try_concat().await?;
+        let payload_str = std::str::from_utf8(&payload).expect("body utf8");
+        slog::trace!(log, "upgrade request body"; "body" => payload_str);
         // reassemble request
         let req = Request::from_parts(parts, Body::from(payload));
         let request_upgrade_fut = body.on_upgrade();
@@ -212,9 +212,9 @@ impl DockerProxy {
         let resp = DockerProxy::forward_request(req, addr, client, log.clone()).await;
 
         let (parts, mut body) = resp?.into_parts();
-        let payload: hyper::Chunk = body.by_ref().try_concat().await?;
-        let payload_str = String::from_utf8(payload.to_vec()).expect("body utf8");
-        slog::trace!(log, "upgrade response body"; "body" => &payload_str);
+        let payload: Vec<u8> = body.by_ref().map_ok(|x| x.to_vec()).try_concat().await?;
+        let payload_str = std::str::from_utf8(&payload).expect("body utf8");
+        slog::trace!(log, "upgrade response body"; "body" => payload_str);
         // reassemble response
         let resp = Response::from_parts(parts, Body::from(payload));
         let response_upgrade_fut = body.on_upgrade();
@@ -222,7 +222,7 @@ impl DockerProxy {
         let copier_log = log.clone();
 
         // copy between request_upgrade_fut <--> response_upgrade_fut until both are EOFed
-        hyper::rt::spawn(async move {
+        tokio::spawn(async move {
             let (req_upgrade, resp_upgrade) =
                 futures_util::future::join(request_upgrade_fut, response_upgrade_fut).await;
 
@@ -245,17 +245,15 @@ impl DockerProxy {
             let (mut resp_read, mut resp_write) = tokio::io::split(resp_upgrade);
 
             let l2 = log.clone();
-            hyper::rt::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                if let Err(e) = req_read.copy(&mut resp_write).await {
+            tokio::spawn(async move {
+                if let Err(e) = tokio::io::copy(&mut req_read, &mut resp_write).await {
                     slog::warn!(l2, "Upgrade error"; "err" => ?e);
                 };
             });
 
             let l3 = log.clone();
-            hyper::rt::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                if let Err(e) = resp_read.copy(&mut req_write).await {
+            tokio::spawn(async move {
+                if let Err(e) = tokio::io::copy(&mut resp_read, &mut req_write).await {
                     slog::warn!(l3, "Upgrade error"; "err" => ?e);
                 };
             });
