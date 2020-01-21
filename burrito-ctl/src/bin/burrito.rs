@@ -21,7 +21,10 @@ async fn main() -> Result<(), failure::Error> {
     let out_addr_docker = opt.out_addr_docker.clone();
 
     use hyper_unix_connector::UnixConnector;
-    let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr_docker)?.into();
+    let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr_docker).map_err(|e| {
+        slog::error!(log, "Could not bind to docker proxy address"; "addr" => ?&opt.in_addr_docker, "err" => ?e);
+        e
+    })?.into();
     let make_service = burrito_ctl::MakeDockerProxy {
         out_addr: out_addr_docker.clone(),
         log: log.new(slog::o!("server" => "docker_proxy")),
@@ -34,7 +37,10 @@ async fn main() -> Result<(), failure::Error> {
         log.new(slog::o!("server" => "burrito_net")),
     );
     let burrito_addr = burrito.listen_path();
-    let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr)?.into();
+    let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr).map_err(|e| {
+        slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
+        e
+    })?.into();
     let burrito_service = burrito.start()?;
     let burrito_rpc_server =
         hyper::server::Server::builder(uc).serve(hyper::service::make_service_fn(move |_| {
