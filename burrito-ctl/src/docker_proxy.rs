@@ -175,6 +175,10 @@ impl DockerProxy {
         );
         *req.uri_mut() = uri.into();
 
+        slog::trace!(&log, "forwarding request";
+            "path" => ?req.uri().path_and_query(),
+        );
+
         client
             .request(req)
             .map(move |resp| {
