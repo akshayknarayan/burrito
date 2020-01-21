@@ -23,17 +23,10 @@ hyper = {version = "0.13", features = ["stream"]}
 burrito-ctl = {path = "../burrito-ctl"}
 slog = {version = "2", features = ["max_level_trace"]}
 slog-term = "2"
-hyper-unix-connector = { version = "0.1.3", optional = true }
+hyper-unix-connector = "0.1"
 
 [dev-dependencies]
-hyper-unix-connector = "0.1.3"
+hyper-unix-connector = "0.1"
 
 [build-dependencies]
 tonic-build = "0.1"
-
-[features]
-unix-connector = ["hyper-unix-connector"]
-
-[[bin]]
-name = "client"
-required-features = ["unix-connector"]
