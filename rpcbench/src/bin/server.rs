@@ -1,3 +1,4 @@
+use slog::info;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -17,11 +18,13 @@ async fn main() -> Result<(), failure::Error> {
 
     use std::str::FromStr;
     if let Ok(addr) = std::net::SocketAddr::from_str(&opt.addr) {
+        info!(&log, "TCP mode"; "addr" => ?&opt.addr);
         tonic::transport::Server::builder()
             .add_service(rpcbench::PingServer::new(rpcbench::Server))
             .serve(addr)
             .await?;
     } else if let Ok(l) = tokio::net::UnixListener::bind(&opt.addr) {
+        info!(&log, "UDS mode"; "addr" => ?&opt.addr);
         let srv = hyper_unix_connector::UnixConnector::from(l);
         let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
         hyper::server::Server::builder(srv)
@@ -31,6 +34,7 @@ async fn main() -> Result<(), failure::Error> {
             }))
             .await?;
     } else {
+        info!(&log, "burrito mode"; "burrito_root" => ?&opt.burrito_root, "addr" => ?&opt.addr);
         let srv = burrito_addr::Server::start(&opt.addr, &opt.burrito_root, Some(&log)).await?;
         let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
         hyper::server::Server::builder(srv)

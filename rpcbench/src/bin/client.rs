@@ -1,4 +1,4 @@
-use slog::trace;
+use slog::{info, trace};
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -29,12 +29,14 @@ async fn main() -> Result<(), failure::Error> {
 
     let durs = if let Some(root) = opt.burrito_root {
         // burrito mode
+        info!(&log, "burrito mode"; "burrito_root" => ?root, "addr" => ?&opt.addr);
         let cl = burrito_addr::Client::new(root, &log).await?;
         let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
         trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
         rpcbench::client_ping(addr, cl, pp, opt.iters).await?
     } else if opt.addr.starts_with("http") {
         // raw tcp mode
+        info!(&log, "TCP mode"; "addr" => ?&opt.addr);
         use std::str::FromStr;
         let http = hyper::client::connect::HttpConnector::new();
         let addr: hyper::Uri = hyper::Uri::from_str(&opt.addr)?;
@@ -42,8 +44,8 @@ async fn main() -> Result<(), failure::Error> {
         rpcbench::client_ping(addr, http, pp, opt.iters).await?
     } else {
         // raw unix mode
+        info!(&log, "UDS mode"; "addr" => ?&opt.addr);
         let addr: hyper::Uri = hyper_unix_connector::Uri::new(opt.addr, "/").into();
-        trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
         rpcbench::client_ping(addr, hyper_unix_connector::UnixClient, pp, opt.iters).await?
     };
 
