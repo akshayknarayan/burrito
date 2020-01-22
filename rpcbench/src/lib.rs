@@ -77,19 +77,19 @@ pub async fn client_ping<A, C>(
     iters: usize,
 ) -> Result<Vec<(i64, i64)>, Error>
 where
-    A: std::convert::TryInto<tonic::transport::Endpoint>,
+    A: std::convert::TryInto<tonic::transport::Endpoint> + Clone,
     A::Error: Send + Sync + std::error::Error + 'static,
-    C: tower_make::MakeConnection<hyper::Uri> + Send + 'static,
+    C: tower_make::MakeConnection<hyper::Uri> + Send + 'static + Clone,
     C::Connection: Unpin + Send + 'static,
     C::Future: Send + 'static,
     Box<dyn std::error::Error + Send + Sync>: From<C::Error> + Send + 'static,
 {
-    let endpoint = addr.try_into()?;
-    let channel = endpoint.connect_with_connector(connector).await?;
-    let mut client = ping::ping_client::PingClient::new(channel);
-
     let mut durs = vec![];
     for _ in 0..iters {
+        let ctr = connector.clone();
+        let endpoint = addr.clone().try_into()?;
+        let channel = endpoint.connect_with_connector(ctr).await?;
+        let mut client = ping::ping_client::PingClient::new(channel);
         let then = std::time::Instant::now();
         let req = tonic::Request::new(msg.clone());
         let response = client.ping(req).await?;
