@@ -21,9 +21,17 @@ async fn main() -> Result<(), failure::Error> {
             .add_service(rpcbench::PingServer::new(rpcbench::Server))
             .serve(addr)
             .await?;
+    } else if let Ok(l) = tokio::net::UnixListener::bind(&opt.addr) {
+        let srv = hyper_unix_connector::UnixConnector::from(l);
+        let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
+        hyper::server::Server::builder(srv)
+            .serve(hyper::service::make_service_fn(move |_| {
+                let ps = ping_srv.clone();
+                async move { Ok::<_, hyper::Error>(ps) }
+            }))
+            .await?;
     } else {
         let srv = burrito_addr::Server::start(&opt.addr, &opt.burrito_root, Some(&log)).await?;
-
         let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
         hyper::server::Server::builder(srv)
             .serve(hyper::service::make_service_fn(move |_| {
