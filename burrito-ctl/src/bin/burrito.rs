@@ -20,6 +20,7 @@ async fn main() -> Result<(), failure::Error> {
 
     let out_addr_docker = opt.out_addr_docker.clone();
 
+    std::fs::remove_file(&opt.in_addr_docker).unwrap_or_default(); // ignore error if file was not present
     use hyper_unix_connector::UnixConnector;
     let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr_docker).map_err(|e| {
         slog::error!(log, "Could not bind to docker proxy address"; "addr" => ?&opt.in_addr_docker, "err" => ?e);
@@ -37,6 +38,7 @@ async fn main() -> Result<(), failure::Error> {
         log.new(slog::o!("server" => "burrito_net")),
     );
     let burrito_addr = burrito.listen_path();
+    std::fs::remove_file(&burrito_addr).unwrap_or_default(); // ignore error if file was not present
     let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr).map_err(|e| {
         slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
         e
