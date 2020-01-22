@@ -1,6 +1,5 @@
 //! RPC utility library that connects either to a remote machine
 //! or to a local pipe depending on what burrito-ctl says
-#![feature(test)]
 
 use failure::Error;
 use std::convert::TryInto;
@@ -54,7 +53,7 @@ impl Ping for Server {
             Work::BusyWorkConst => {
                 let k = 2350845.545;
                 for i in 0..amt {
-                    core::hint::black_box(f64::sqrt(k * i as f64));
+                    criterion::black_box(f64::sqrt(k * i as f64));
                 }
             }
         }
