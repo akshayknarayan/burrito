@@ -11,8 +11,8 @@ pub const CONTROLLER_ADDRESS: &str = "controller";
 ///
 /// Jobs:
 /// 1. Maintain service addresses
-/// 2. if local, return remote pipe address
-/// 3. TODO if remote, establish a connection with the right machine and splice the pipe with that
+/// 2. if local, return local pipe address to connect to: "unix://<addr>"
+/// 3. if remote, return remote tcp address: "http(s)://<addr>"
 ///
 /// Services register with the listen() RPC.
 /// Clients call the open() RPC with a service-level address to get the address to connect to.

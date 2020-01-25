@@ -10,6 +10,9 @@ struct Opt {
     out_addr_docker: std::path::PathBuf,
 
     #[structopt(short, long)]
+    force_burrito: bool,
+
+    #[structopt(short, long)]
     burrito_coordinator_addr: Option<std::path::PathBuf>,
 }
 
@@ -38,7 +41,20 @@ async fn main() -> Result<(), failure::Error> {
         log.new(slog::o!("server" => "burrito_net")),
     );
     let burrito_addr = burrito.listen_path();
-    std::fs::remove_file(&burrito_addr).unwrap_or_default(); // ignore error if file was not present
+
+    // if force_burrito, then we are ok with hijacking /controller, potentially from another
+    // instance of burrito. Might cause bad things.
+    // TODO docker-proxy above might want a similar option, although things are stateless there (except for attached ttys)
+    if opt.force_burrito {
+        std::fs::remove_file(&burrito_addr).unwrap_or_default(); // ignore error if file was not present
+    }
+
+    let ba = burrito_addr.clone();
+    ctrlc::set_handler(move || {
+        std::fs::remove_file(&ba).expect("Remove file for currently listening controller");
+        std::process::exit(0);
+    })?;
+
     let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr).map_err(|e| {
         slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
         e
