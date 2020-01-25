@@ -3,17 +3,17 @@ package burrito
 import (
 	"context"
 
-	burrito "github.com/akshayknarayan/burrito/resolv-go/proto"
+	rpc "github.com/akshayknarayan/burrito/resolv-go/proto"
 	grpc "google.golang.org/grpc"
 )
 
-func getConnClient(root string) (burrito.ConnectionClient, error) {
+func getConnClient(root string) (rpc.ConnectionClient, error) {
 	conn, err := grpc.Dial(root)
 	if err != nil {
 		return nil, err
 	}
 
-	return burrito.NewConnectionClient(conn), nil
+	return rpc.NewConnectionClient(conn), nil
 
 }
 
@@ -24,7 +24,7 @@ func Listen(root string, addr string) (string, error) {
 	}
 
 	ctx := context.Background()
-	reply, err := cc.Listen(ctx, &burrito.ListenRequest{ServiceAddr: addr})
+	reply, err := cc.Listen(ctx, &rpc.ListenRequest{ServiceAddr: addr})
 	if err != nil {
 		return "", err
 
@@ -40,7 +40,7 @@ func Connect(root string, addr string) (string, error) {
 	}
 
 	ctx := context.Background()
-	reply, err := cc.Open(ctx, &burrito.OpenRequest{DstAddr: addr})
+	reply, err := cc.Open(ctx, &rpc.OpenRequest{DstAddr: addr})
 	if err != nil {
 		return "", err
 
