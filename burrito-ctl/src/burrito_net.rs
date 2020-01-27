@@ -112,6 +112,10 @@ impl Connection for BurritoNet {
             "addr" => ?send_addr,
         );
 
-        Ok(tonic::Response::new(OpenReply { send_addr }))
+        // TODO support remote TCP addrs
+        Ok(tonic::Response::new(OpenReply {
+            send_addr,
+            addr_type: rpc::open_reply::AddrType::Unix as _,
+        }))
     }
 }

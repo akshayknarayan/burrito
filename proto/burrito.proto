@@ -24,4 +24,10 @@ message OpenRequest {
 message OpenReply {
     // pipe address to connect to
     string send_addr = 1;
+    // address type
+    enum AddrType {
+        UNIX = 0;
+        TCP = 1;
+    }
+    AddrType addr_type = 2;
 }
