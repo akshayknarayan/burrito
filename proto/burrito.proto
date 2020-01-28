@@ -9,6 +9,8 @@ service Connection {
 message ListenRequest {
     // service-level address to listen on
     string service_addr = 1;
+    // network port service is listening at
+    string listen_port = 2;
 }
 
 message ListenReply {

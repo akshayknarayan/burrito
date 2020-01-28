@@ -14,6 +14,25 @@ struct Opt {
 
     #[structopt(short, long)]
     burrito_coordinator_addr: Option<std::path::PathBuf>,
+
+    #[structopt(short, long)]
+    redis_addr: String,
+
+    #[structopt(short, long = "net_addr")]
+    net_addrs: Option<Vec<std::net::IpAddr>>,
+}
+
+fn get_net_addrs() -> Result<Vec<std::net::IpAddr>, failure::Error> {
+    let hostname_ret = std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .expect("failed to exec hostname")
+        .stdout;
+
+    let ips = String::from_utf8(hostname_ret)?;
+    ips.split_whitespace()
+        .map(|s| s.parse().map_err(failure::Error::from))
+        .collect()
 }
 
 #[tokio::main]
@@ -36,10 +55,19 @@ async fn main() -> Result<(), failure::Error> {
     let docker_proxy_server = hyper::server::Server::builder(uc).serve(make_service);
     slog::info!(log, "docker proxy starting"; "listening at" => ?&opt.in_addr_docker, "proxying to" => ?&opt.out_addr_docker);
 
+    let net_addrs = if let None = opt.net_addrs {
+        get_net_addrs()?
+    } else {
+        opt.net_addrs.unwrap()
+    };
+
     let burrito = burrito_ctl::BurritoNet::new(
         opt.burrito_coordinator_addr,
+        net_addrs.into_iter().map(|a| a.to_string()),
+        &opt.redis_addr,
         log.new(slog::o!("server" => "burrito_net")),
-    );
+    )
+    .await?;
     let burrito_addr = burrito.listen_path();
 
     // if force_burrito, then we are ok with hijacking /controller, potentially from another
