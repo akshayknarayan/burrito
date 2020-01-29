@@ -19,7 +19,7 @@ hyper-unix-connector = "0.1.4"
 futures-util = "0.3"
 hex = "0.4"
 burrito-ctl = {path = "../burrito-ctl"}
-slog = {version = "2", features = ["max_level_trace"]}
+slog = "2"
 slog-term = "2"
 
 [build-dependencies]
