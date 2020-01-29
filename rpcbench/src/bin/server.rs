@@ -5,7 +5,13 @@ use structopt::StructOpt;
 #[structopt(name = "ping_server")]
 struct Opt {
     #[structopt(short, long)]
-    addr: String,
+    unix_addr: Option<std::path::PathBuf>,
+
+    #[structopt(short, long)]
+    burrito_addr: Option<String>,
+
+    #[structopt(short, long)]
+    port: u16,
 
     #[structopt(short, long, default_value = "/tmp/burrito")]
     burrito_root: String,
@@ -16,15 +22,9 @@ async fn main() -> Result<(), failure::Error> {
     let log = burrito_ctl::logger();
     let opt = Opt::from_args();
 
-    use std::str::FromStr;
-    if let Ok(addr) = std::net::SocketAddr::from_str(&opt.addr) {
-        info!(&log, "TCP mode"; "addr" => ?&opt.addr);
-        tonic::transport::Server::builder()
-            .add_service(rpcbench::PingServer::new(rpcbench::Server))
-            .serve(addr)
-            .await?;
-    } else if let Ok(l) = tokio::net::UnixListener::bind(&opt.addr) {
-        info!(&log, "UDS mode"; "addr" => ?&opt.addr);
+    if let Some(path) = opt.unix_addr {
+        info!(&log, "UDS mode"; "addr" => ?&path);
+        let l = tokio::net::UnixListener::bind(&path)?;
         let srv = hyper_unix_connector::UnixConnector::from(l);
         let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
         hyper::server::Server::builder(srv)
@@ -33,9 +33,13 @@ async fn main() -> Result<(), failure::Error> {
                 async move { Ok::<_, hyper::Error>(ps) }
             }))
             .await?;
-    } else {
-        info!(&log, "burrito mode"; "burrito_root" => ?&opt.burrito_root, "addr" => ?&opt.addr);
-        let srv = burrito_addr::Server::start(&opt.addr, &opt.burrito_root, Some(&log)).await?;
+        return Ok(());
+    }
+
+    if let Some(addr) = opt.burrito_addr {
+        info!(&log, "burrito mode"; "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => opt.port);
+        let srv =
+            burrito_addr::Server::start(&addr, opt.port, &opt.burrito_root, Some(&log)).await?;
         let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
         hyper::server::Server::builder(srv)
             .serve(hyper::service::make_service_fn(move |_| {
@@ -43,7 +47,15 @@ async fn main() -> Result<(), failure::Error> {
                 async move { Ok::<_, hyper::Error>(ps) }
             }))
             .await?;
+        return Ok(());
     }
+
+    info!(&log, "TCP mode"; "port" => opt.port);
+    let addr = format!("0.0.0.0:{}", opt.port).parse()?;
+    tonic::transport::Server::builder()
+        .add_service(rpcbench::PingServer::new(rpcbench::Server))
+        .serve(addr)
+        .await?;
 
     Ok(())
 }

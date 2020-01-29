@@ -174,12 +174,17 @@ impl hyper::service::Service<hyper::Uri> for Client {
 ///
 /// Registers with burrito-ctl, then listens for incoming connections on the provided address.
 pub struct Server {
+    conns: Option<
+        std::pin::Pin<std::boxed::Box<dyn tokio::stream::Stream<Item = Result<Conn, Error>>>>,
+    >,
+    tl: tokio::net::TcpListener,
     ul: tokio::net::UnixListener,
 }
 
 impl Server {
     pub async fn start(
         service_addr: &str,
+        port: u16,
         burrito_root: impl AsRef<Path>,
         log: Option<&slog::Logger>,
     ) -> Result<Self, Error> {
@@ -197,9 +202,11 @@ impl Server {
             .await?;
         let mut cl = rpc::connection_client::ConnectionClient::new(channel);
 
+        let port_string = port.to_string();
         let listen_addr = cl
             .listen(rpc::ListenRequest {
                 service_addr: service_addr.to_owned(),
+                listen_port: port_string,
             })
             .await?
             .into_inner()
@@ -209,31 +216,91 @@ impl Server {
             trace!(l, "Got listening address"; "addr" => ?&listen_addr, "root" => ?&burrito_root);
         }
 
-        // TODO also listen on local TCP
+        let tl = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
         let ul = tokio::net::UnixListener::bind(burrito_root.join(listen_addr))?;
-        Ok(Self { ul })
+        let mut s = Self {
+            tl,
+            ul,
+            conns: None,
+        };
+
+        s.make_stream();
+        Ok(s)
+    }
+
+    fn make_stream(&mut self) {
+        use futures_util::stream::TryStreamExt;
+
+        // Why the `mem::transmute`??
+        //
+        // Without it, borrow checker is worried that self.(tl|us).incoming()
+        // takes the lifetime of self, which has some lifetime. But, to use the stream it must have lifetime 'static:
+        //
+        //    Compiling burrito-addr v0.1.0 (/home/akshayn/burrito/burrito-addr)
+        // error[E0495]: cannot infer an appropriate lifetime for autoref due to conflicting requirements
+        //    --> burrito-addr/src/lib.rs:235:26
+        //     |
+        // 235 |         let ts = self.tl.incoming().map_ok(|s| Conn::Tcp(s));
+        //     |                          ^^^^^^^^
+        //     |
+        // note: first, the lifetime cannot outlive the anonymous lifetime #1 defined on the method body at 232:5...
+        //    --> burrito-addr/src/lib.rs:232:5
+        //     |
+        // 232 | /     fn make_stream(&mut self) {
+        // 233 | |         use futures_util::stream::TryStreamExt;
+        // 234 | |
+        // 235 | |         let ts = self.tl.incoming().map_ok(|s| Conn::Tcp(s));
+        // ...   |
+        // 240 | |         ));
+        // 241 | |     }
+        //     | |_____^
+        // note: ...so that reference does not outlive borrowed content
+        //    --> burrito-addr/src/lib.rs:235:18
+        //     |
+        // 235 |         let ts = self.tl.incoming().map_ok(|s| Conn::Tcp(s));
+        //     |                  ^^^^^^^
+        //     = note: but, the lifetime must be valid for the static lifetime...
+        //     = note: ...so that the expression is assignable:
+        //             expected std::option::Option<std::pin::Pin<std::boxed::Box<(dyn futures_core::stream::Stream<Item = std::result::Result<Conn, failure::error::Error>> + 'static)>>>
+        //                found std::option::Option<std::pin::Pin<std::boxed::Box<dyn futures_core::stream::Stream<Item = std::result::Result<Conn, failure::error::Error>>>>>
+        //
+        // However, this is actually fine: borrow checker is only worried that the listeners'
+        // lifetimes might end before the future. But, this won't happen, since they all live in
+        // self.
+        //
+        // So, we lie to rust about the lifetime of the stream.
+
+        let ts: tokio::net::tcp::Incoming<'static> =
+            unsafe { std::mem::transmute(self.tl.incoming()) };
+        let ts = ts.map_ok(|s| Conn::Tcp(s));
+        let us: tokio::net::unix::Incoming<'static> =
+            unsafe { std::mem::transmute(self.ul.incoming()) };
+        let us = us.map_ok(|s| Conn::Unix(s));
+
+        self.conns = Some(Box::pin(
+            futures_util::stream::select(ts, us).map_err(|e| Error::from(e)),
+        ));
     }
 }
 
+// Prevent destructuring due to transmute above
+impl Drop for Server {
+    fn drop(&mut self) {}
+}
+
 impl hyper::server::accept::Accept for Server {
-    type Conn = tokio::net::UnixStream;
+    type Conn = Conn;
     type Error = Error;
 
     fn poll_accept(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
-        use futures_util::future::{FutureExt, TryFutureExt};
+        if let None = self.conns {
+            return Poll::Pending;
+        }
 
-        // TODO once also listening on TCP,
-        // use futures_util::select!() to listen on both
-        let f = self
-            .ul
-            .accept()
-            .map_ok(|(s, _a)| s)
-            .map_err(|e| e.into())
-            .map(|f| Some(f));
-        Future::poll(Box::pin(f).as_mut(), cx)
+        self.conns.as_mut().unwrap().as_mut().poll_next(cx)
     }
 }
 
