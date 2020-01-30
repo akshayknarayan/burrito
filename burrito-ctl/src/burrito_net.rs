@@ -39,6 +39,8 @@ impl BurritoNet {
     /// # Arguments
     /// root: The filesystem root of BurritoNet's unix pipes. Default is /tmp/burrito
     ///
+    /// log: Logger instance.
+    ///
     /// local_public_addrs: What is/are the public IP address(es) of this machine?
     ///   Callers should be able to get this information either because:
     ///   1. BurritoNet is running on the host/baremetal.
@@ -55,17 +57,21 @@ impl BurritoNet {
     ///   So, we have to figure it out for the service.
     ///
     /// redis_addr: The address, in redis format:
+    ///   From https://docs.rs/redis/0.15.1/redis/
     ///   `The URL format is redis://[:<passwd>@]<hostname>[:port][/<db>]`
     ///   If Unix socket support is available you can use a unix URL in this format:
     ///   `redis+unix:///[:<passwd>@]<path>[?db=<db>]`
-    ///  See also https://docs.rs/redis/0.15.1/redis/
     ///
-    /// log: Logger instance.
+    ///   Why is this necessary?
+    ///   The redis instance needs to be accessible from all hosts running burrito-ctl. So, we
+    ///   can't start it ourselves because then a coordination mechanism would be needed to pick a common redis
+    ///   server among each host's burrito-ctl, which is what we are using redis for in the first
+    ///   place.
     pub async fn new(
         root: Option<std::path::PathBuf>,
         local_public_addrs: impl IntoIterator<Item = String>,
         redis_addr: &str,
-        log: slog::Logger,
+        log: slog::Logger, // TODO make optional
     ) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)?;
         let redis_listen_connection =
