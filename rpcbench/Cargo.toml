@@ -28,6 +28,7 @@ hyper-unix-connector = "0.1"
 
 [dev-dependencies]
 hyper-unix-connector = "0.1"
+redis = "0.15"
 
 [build-dependencies]
 tonic-build = "0.1"

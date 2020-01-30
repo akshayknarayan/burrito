@@ -301,74 +301,8 @@ impl hyper::server::accept::Accept for Server {
         }
 
         self.conns.as_mut().unwrap().as_mut().poll_next(cx)
-    }
-}
 
-#[cfg(test)]
-mod test {
-    use failure::Error;
-    use slog::{debug, error, trace};
 
-    use super::Server;
 
-    pub(crate) fn test_logger() -> slog::Logger {
-        use slog::Drain;
-        let plain = slog_term::PlainSyncDecorator::new(slog_term::TestStdoutWriter);
-        let drain = slog_term::FullFormat::new(plain).build().fuse();
-        slog::Logger::root(drain, slog::o!())
-    }
-
-    async fn block_for(d: std::time::Duration) {
-        tokio::time::delay_for(d).await;
-    }
-
-    async fn start_burrito_ctl(log: &slog::Logger) -> Result<(), Error> {
-        trace!(&log, "removing"; "dir" => "./tmp-test-bn/");
-        std::fs::remove_dir_all("./tmp-test-bn/").unwrap_or_default();
-        trace!(&log, "creating"; "dir" => "./tmp-test-bn/");
-        std::fs::create_dir_all("./tmp-test-bn/")?;
-        use burrito_ctl::BurritoNet;
-        let bn = BurritoNet::new(
-            Some(std::path::PathBuf::from("./tmp-test-bn/")),
-            log.clone(),
-        );
-
-        let burrito_addr = bn.listen_path();
-        debug!(&log, "burrito_addr"; "addr" => ?&burrito_addr);
-        use hyper_unix_connector::UnixConnector;
-        let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr)?.into();
-        let bn = bn.start()?;
-        let burrito_rpc_server =
-            hyper::server::Server::builder(uc).serve(hyper::service::make_service_fn(move |_| {
-                let bs = bn.clone();
-                async move { Ok::<_, hyper::Error>(bs) }
-            }));
-
-        let l2 = log.clone();
-        trace!(l2, "spawning burrito_rpc_server");
-        let s = burrito_rpc_server.await;
-        if let Err(e) = s {
-            error!(l2, "burrito_rpc_server crashed"; "err" => ?e);
-            panic!(e)
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_server_start() -> Result<(), Error> {
-        let log = test_logger();
-        let mut rt = tokio::runtime::Runtime::new()?;
-
-        rt.block_on(async move {
-            let l = log.clone();
-            tokio::spawn(async move { start_burrito_ctl(&l).await.expect("Burrito Ctl") });
-            block_for(std::time::Duration::from_millis(100)).await;
-            Server::start("test-service", "./tmp-test-bn", Some(&log))
-                .await
-                .expect("start server")
-        });
-
-        Ok(())
     }
 }
