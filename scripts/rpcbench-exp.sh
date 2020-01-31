@@ -43,7 +43,7 @@ sudo ./target/release/burrito \
 burritoctl=$!
 sleep 15
 
-#sudo docker build -t rpcbench:$1 .
+sudo docker build -t rpcbench:$1 .
 sudo docker ps -a | grep -v redis | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f > /dev/null 2> /dev/null
 sleep 2
 
