@@ -1,4 +1,4 @@
-use slog::info;
+use slog::{info, warn};
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -11,7 +11,7 @@ struct Opt {
     burrito_addr: Option<String>,
 
     #[structopt(short, long)]
-    port: u16,
+    port: Option<u16>,
 
     #[structopt(short, long, default_value = "/tmp/burrito")]
     burrito_root: String,
@@ -36,10 +36,16 @@ async fn main() -> Result<(), failure::Error> {
         return Ok(());
     }
 
+    if opt.port.is_none() {
+        warn!(&log, "Must specify port if not using unix address");
+        failure::bail!("Must specify port if not using unix address");
+    }
+
+    let port = opt.port.unwrap();
+
     if let Some(addr) = opt.burrito_addr {
-        info!(&log, "burrito mode"; "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => opt.port);
-        let srv =
-            burrito_addr::Server::start(&addr, opt.port, &opt.burrito_root, Some(&log)).await?;
+        info!(&log, "burrito mode"; "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => port);
+        let srv = burrito_addr::Server::start(&addr, port, &opt.burrito_root, Some(&log)).await?;
         let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
         hyper::server::Server::builder(srv)
             .serve(hyper::service::make_service_fn(move |_| {
@@ -50,8 +56,8 @@ async fn main() -> Result<(), failure::Error> {
         return Ok(());
     }
 
-    info!(&log, "TCP mode"; "port" => opt.port);
-    let addr = format!("0.0.0.0:{}", opt.port).parse()?;
+    info!(&log, "TCP mode"; "port" => port);
+    let addr = format!("0.0.0.0:{}", port).parse()?;
     tonic::transport::Server::builder()
         .add_service(rpcbench::PingServer::new(rpcbench::Server))
         .serve(addr)

@@ -18,7 +18,7 @@ struct Opt {
     #[structopt(short, long)]
     redis_addr: String,
 
-    #[structopt(short, long = "net_addr")]
+    #[structopt(short, long = "net-addr")]
     net_addrs: Option<Vec<std::net::IpAddr>>,
 }
 

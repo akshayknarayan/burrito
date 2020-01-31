@@ -6,14 +6,15 @@ if [ -z "$1" ]; then
 fi
 
 mkdir ./$1
+cargo build --release
 
 echo "==> baremetal tcp"
 # server
-cargo run --release --bin server -- --addr "[::1]:4242" &
+./target/release/server --port "4242" &
 server=$!
 sleep 2
 # client
-cargo run --bin client --release -- --addr "http://[::1]:4242" --iters 10000 --work 4 --amount 1000 2> /dev/null > $1/work_sqrts_1000-iters_10000_tcp_localhost_baremetal.data
+./target/release/client --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 2> /dev/null > $1/work_sqrts_1000-iters_10000_tcp_localhost_baremetal.data
 kill -9 $server
 
 sleep 2
@@ -21,49 +22,67 @@ sleep 2
 echo "==> baremetal unix"
 # server
 rm -rf /tmp/burrito/server
-cargo run --release --bin server -- --addr "/tmp/burrito/server" &
+./target/release/server --unix-addr "/tmp/burrito/server" &
 server=$!
 sleep 2
 # client
-cargo run --release --bin client -- --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 2> /dev/null > $1/work_sqrts_1000-iters_10000_unix_localhost_baremetal.data
+./target/release/client --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 2> /dev/null > $1/work_sqrts_1000-iters_10000_unix_localhost_baremetal.data
 kill -9 $server
 
 sleep 2
 echo "--> start burrito-ctl"
-sudo ./target/release/burrito -i /var/run/docker.sock -o /var/run/burrito-docker.sock > $1/burritoctl.log 2> $1/burritoctl.log &
+sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f rpcbench-redis
+sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+docker_host_addr=$(sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock  docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' bridge)
+sudo ./target/release/burrito \
+    -i /var/run/docker.sock \
+    -o /var/run/burrito-docker.sock \
+    --redis-addr "redis://localhost:6379" \
+    --net-addr=$docker_host_addr \
+    > $1/burritoctl.log 2> $1/burritoctl.log &
 burritoctl=$!
+sleep 15
 
-sleep 2
-sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f > /dev/null 2> /dev/null
+#sudo docker build -t rpcbench:$1 .
+sudo docker ps -a | grep -v redis | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f > /dev/null 2> /dev/null
 sleep 2
 
 echo "==> container tcp"
 # server
-sudo screen -d -m docker run -it rpcbench:latest server -- --addr="0.0.0.0:4242" &
-sleep 10
-container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' `sudo docker ps | awk '{print $1}' | tail -n 1`)
+sudo docker run --name rpcbench-server -d  rpcbench:$1 server -- --port="4242"
+sleep 15
+container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-server)
 
 # client 
-sudo docker run -it rpcbench:latest client -- \
+sudo docker run -it rpcbench:$1 client -- \
     --addr http://$container_ip:4242 \
     --amount 1000 -w 4 -i 10000 \
     2> /dev/null > $1/work_sqrts_1000-iters_10000_tcp_localhost_docker.data
 
 sleep 2
-sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
+sudo docker ps -a | grep -v redis | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f > /dev/null 2> /dev/null
 sleep 2
 
 echo "==> container unix (burrito)"
 # server
-sudo screen -d -m docker run -it rpcbench:latest server -- --addr="rpcbench" --burrito-root="/burrito" > $1/burrito_localhost_docker_rpcserver.log 2> $1/burrito_localhost_docker_rpcserver.log &
+sudo docker run --name rpcbench-server -d rpcbench:$1 server --\
+    --burrito-addr="rpcbench" \
+    --burrito-root="/burrito" \
+    --port="4242"
 sleep 15
 # client
-sudo docker run -it rpcbench:latest client -- --addr="rpcbench" --amount 1000 -w 4 -i 10000 --burrito-root="/burrito" 2> /dev/null > $1/work_sqrts_1000-iters_10000_burrito_localhost_docker.data
+sudo docker run -it rpcbench:$1 client --\
+    --addr="rpcbench" \
+    --burrito-root="/burrito" \
+    --amount 1000 -w 4 -i 10000 \
+    2> /dev/null > $1/work_sqrts_1000-iters_10000_burrito_localhost_docker.data
 
 sleep 2
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
+sleep 2
 
-sudo kill -9 $burritoctl
+sudo kill -INT $burritoctl
+sudo pkill -INT burrito
 
 python3 ./scripts/rpcbench-parse.py $1/work*.data > $1/combined.data
 ./scripts/rpcbench-plot.r $1/combined.data $1/rpcs.pdf
