@@ -7,13 +7,13 @@ struct Opt {
     #[structopt(short, long)]
     unix_addr: Option<std::path::PathBuf>,
 
-    #[structopt(short, long)]
+    #[structopt(long)]
     burrito_addr: Option<String>,
 
     #[structopt(short, long)]
     port: Option<u16>,
 
-    #[structopt(short, long, default_value = "/tmp/burrito")]
+    #[structopt(long, default_value = "/tmp/burrito")]
     burrito_root: String,
 }
 

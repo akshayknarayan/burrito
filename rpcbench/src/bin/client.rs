@@ -6,11 +6,11 @@ use structopt::StructOpt;
 struct Opt {
     #[structopt(short, long)]
     burrito_root: Option<String>,
-    #[structopt(short, long)]
+    #[structopt(long)]
     addr: String,
     #[structopt(short, long)]
     work: i32,
-    #[structopt(short, long)]
+    #[structopt(long)]
     amount: i64,
     #[structopt(short, long)]
     iters: usize,
