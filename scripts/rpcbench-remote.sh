@@ -83,7 +83,7 @@ echo "==> Docker TCP"
 ssh $1 sudo docker rm -f rpcbench-server
 ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name server -- --port="4242"
 sleep 4
-sudo docker run -it $image_name client -- --addr http://$1:4242 --amount 1000 -w 4 -i 10000 \
+sudo docker run -it $image_name client --addr http://$1:4242 --amount 1000 -w 4 -i 10000 \
     -o ~/burrito/$out/work_sqrts_1000-iters_10000_tcp_remote_docker.data \
     > ~/burrito/$out/work_sqrts_1000-iters_10000_tcp_remote_docker.log
 echo "-> docker TCP done"
@@ -93,7 +93,7 @@ echo "==> Burrito"
 ssh $1 sudo docker rm -f rpcbench-server
 ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name server -- --port="4242" --burrito-addr="pingserver" --burrito-root="/burrito"
 sleep 4
-sudo docker run -it $image_name client -- --addr "pingserver" \
+sudo docker run -it $image_name client --addr "pingserver" \
     --burrito-root="/burrito" --amount 1000 -w 4 -i 10000 \
     -o ~/burrito/$out/work_sqrts_1000-iters_10000_burrito_remote_docker.data \
     > ~/burrito/$out/work_sqrts_1000-iters_10000_burrito_remote_docker.log

@@ -1,3 +1,4 @@
-target/
 .git/
 *.txt
+*.data
+*.log

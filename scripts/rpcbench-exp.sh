@@ -59,7 +59,7 @@ sleep 15
 container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-server)
 
 # client 
-sudo docker run -it rpcbench:$out client -- \
+sudo docker run -it rpcbench:$out client \
     --addr http://$container_ip:4242 \
     --amount 1000 -w 4 -i 10000 \
     -o $out/work_sqrts_1000-iters_10000_tcp_localhost_docker.data \
@@ -71,13 +71,13 @@ sleep 2
 
 echo "==> container unix (burrito)"
 # server
-sudo docker run --name rpcbench-server -d rpcbench:$out server --\
+sudo docker run --name rpcbench-server -d rpcbench:$out server \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
     --port="4242"
 sleep 15
 # client
-sudo docker run -it rpcbench:$out client --\
+sudo docker run -it rpcbench:$out client \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
     --amount 1000 -w 4 -i 10000 \
