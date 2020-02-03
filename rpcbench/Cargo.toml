@@ -7,24 +7,28 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+burrito-addr = {path = "../burrito-addr"}
+burrito-ctl = {path = "../burrito-ctl"}
 bytes = "0.4"
 criterion = "0.3"
 failure = "0.1"
-rand = "0.7"
-rand_distr = "0.2"
+hyper-unix-connector = "0.1"
+hyper = {version = "0.13", features = ["stream"]}
 prost = "0.6"
 prost-derive = "0.6"
-tokio = "0.2"
-tower = "0.3"
-tower-make = "0.3"
-tonic = "0.1"
-structopt = "0.3"
-burrito-addr = {path = "../burrito-addr"}
-hyper = {version = "0.13", features = ["stream"]}
-burrito-ctl = {path = "../burrito-ctl"}
+rand = "0.7"
+rand_distr = "0.2"
 slog = "2"
 slog-term = "2"
-hyper-unix-connector = "0.1"
+structopt = "0.3"
+tokio = "0.2"
+tonic = "0.1"
+tower = "0.3"
+tower-make = "0.3"
+tracing = "0.1"
+tracing-futures = "0.2"
+tracing-timing  = "0.2"
+tracing-subscriber = "0.1"
 
 [dev-dependencies]
 hyper-unix-connector = "0.1"

@@ -40,7 +40,8 @@ ssh_server=$!
 sleep 4
 
 ./target/release/client --addr "http://$1:4242" --iters 10000 --work 4 --amount 1000 \
-    > $out/work_sqrts_1000-iters_10000_tcp_remote_baremetal.data
+    -o $out/work_sqrts_1000-iters_10000_tcp_remote_baremetal.data \
+    > $out/work_sqrts_1000-iters_10000_tcp_remote_baremetal.log
 
 kill -9 $ssh_server
 ssh $1 "ps aux | grep \"release.*server\" | awk '{print \$2}' | head -n1 | xargs kill -9"
@@ -82,7 +83,9 @@ echo "==> Docker TCP"
 ssh $1 sudo docker rm -f rpcbench-server
 ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name server -- --port="4242"
 sleep 4
-sudo docker run -it $image_name client -- --addr http://$1:4242 --amount 1000 -w 4 -i 10000 > ~/burrito/$out/work_sqrts_1000-iters_10000_tcp_remote_docker.data
+sudo docker run -it $image_name client -- --addr http://$1:4242 --amount 1000 -w 4 -i 10000 \
+    -o ~/burrito/$out/work_sqrts_1000-iters_10000_tcp_remote_docker.data \
+    > ~/burrito/$out/work_sqrts_1000-iters_10000_tcp_remote_docker.log
 echo "-> docker TCP done"
 sleep 2
 
@@ -90,7 +93,11 @@ echo "==> Burrito"
 ssh $1 sudo docker rm -f rpcbench-server
 ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name server -- --port="4242" --burrito-addr="pingserver" --burrito-root="/burrito"
 sleep 4
-sudo docker run -it $image_name client -- --addr "pingserver" --burrito-root="/burrito" --amount 1000 -w 4 -i 10000 > ~/burrito/$out/work_sqrts_1000-iters_10000_burrito_remote_docker.data
+sudo docker run -it $image_name client -- --addr "pingserver" \
+    --burrito-root="/burrito" --amount 1000 -w 4 -i 10000 \
+    -o ~/burrito/$out/work_sqrts_1000-iters_10000_burrito_remote_docker.data \
+    > ~/burrito/$out/work_sqrts_1000-iters_10000_burrito_remote_docker.log
+
 sleep 2
 echo "-> burrito done"
 
@@ -101,3 +108,6 @@ sleep 2
 sudo kill -INT $burritoctl
 sudo pkill -INT burrito
 ssh $1 "cd ~/burrito && sudo pkill -INT burrito"
+
+python3 ./scripts/rpcbench-parse.py $out/work*.data > $out/combined.data
+./scripts/rpcbench-plot.r $out/combined.data $out/rpcs.pdf

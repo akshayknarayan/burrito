@@ -1,5 +1,6 @@
 use slog::{info, trace};
 use structopt::StructOpt;
+use tracing_timing::{Builder, Histogram};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "ping_client")]
@@ -14,6 +15,8 @@ struct Opt {
     amount: i64,
     #[structopt(short, long)]
     iters: usize,
+    #[structopt(short, long)]
+    out_file: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -26,6 +29,13 @@ async fn main() -> Result<(), failure::Error> {
             .ok_or_else(|| failure::format_err!("Invalid work value"))? as i32,
         amount: opt.amount,
     };
+
+    let subscriber = Builder::default().build(|| Histogram::new_with_max(1_000_000, 2).unwrap());
+    let sid = subscriber.downcaster();
+    let d = tracing::Dispatch::new(subscriber);
+
+    //tracing_subscriber::fmt::init();
+    tracing::dispatcher::set_global_default(d.clone()).expect("set tracing global default");
 
     let durs = if let Some(root) = opt.burrito_root {
         // burrito mode
@@ -49,9 +59,28 @@ async fn main() -> Result<(), failure::Error> {
         rpcbench::client_ping(addr, hyper_unix_connector::UnixClient, pp, opt.iters).await?
     };
 
-    println!("Total_us,Server_us");
-    for (t, s) in durs {
-        println!("{},{}", t, s);
+    sid.downcast(&d).unwrap().force_synchronize();
+    sid.downcast(&d).unwrap().with_histograms(|hs| {
+        for (span_group, hs) in hs {
+            println!("span_group: {}", span_group);
+            for (event_group, h) in hs {
+                println!(
+                    "{}:{}: {}ns",
+                    span_group,
+                    event_group,
+                    h.value_at_quantile(0.5)
+                );
+            }
+        }
+    });
+
+    if let Some(path) = opt.out_file {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        write!(&mut f, "Total_us,Server_us")?;
+        for (t, s) in durs {
+            write!(&mut f, "{},{}", t, s)?;
+        }
     }
 
     Ok(())

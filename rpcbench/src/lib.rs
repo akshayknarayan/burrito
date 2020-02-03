@@ -3,6 +3,8 @@
 
 use failure::Error;
 use std::convert::TryInto;
+use tracing::{span, trace, Level};
+use tracing_futures::Instrument;
 
 mod ping {
     tonic::include_proto!("ping");
@@ -20,6 +22,8 @@ impl Ping for Server {
         &self,
         req: tonic::Request<PingParams>,
     ) -> Result<tonic::Response<Pong>, tonic::Status> {
+        let span = span!(Level::DEBUG, "ping()", req = ?req);
+        let _span = span.enter();
         let then = std::time::Instant::now();
         let ping_req = req.into_inner();
 
@@ -51,6 +55,8 @@ impl Ping for Server {
                 }
             }
             Work::BusyWorkConst => {
+                // copy from shenango:
+                // https://github.com/shenango/shenango/blob/master/apps/synthetic/src/fakework.rs#L54
                 let k = 2350845.545;
                 for i in 0..amt {
                     criterion::black_box(f64::sqrt(k * i as f64));
@@ -69,6 +75,7 @@ impl Ping for Server {
 }
 
 /// Issue many requests to a tonic endpoint.
+#[tracing::instrument(skip(addr, connector))]
 pub async fn client_ping<A, C>(
     addr: A,
     connector: C,
@@ -84,15 +91,25 @@ where
     Box<dyn std::error::Error + Send + Sync>: From<C::Error> + Send + 'static,
 {
     let mut durs = vec![];
-    for _ in 0..iters {
+    for i in 0..iters {
+        trace!(iter = i, "start_loop");
         let ctr = connector.clone();
         let endpoint = addr.clone().try_into()?;
-        let channel = endpoint.connect_with_connector(ctr).await?;
-        let mut client = ping::ping_client::PingClient::new(channel);
+
         let then = std::time::Instant::now();
+        let channel = endpoint
+            .connect_with_connector(ctr)
+            .instrument(span!(Level::DEBUG, "connection_establish"))
+            .await?;
+        trace!(iter = i, "connected");
+        let mut client = ping::ping_client::PingClient::new(channel);
         let req = tonic::Request::new(msg.clone());
-        let response = client.ping(req).await?;
+        let response = client
+            .ping(req)
+            .instrument(span!(Level::DEBUG, "rpc_ping"))
+            .await?;
         let elap = then.elapsed().as_micros().try_into()?;
+        trace!(iter = i, time = elap, "ping done");
         durs.push((elap, response.into_inner().duration_us));
     }
 
