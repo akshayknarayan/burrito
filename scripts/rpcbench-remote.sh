@@ -69,7 +69,7 @@ image_name=rpcbench:`git rev-parse --short HEAD`
 sudo docker build -t $image_name . &
 local_docker_build=$!
 remote_commit=$(ssh $1 "cd ~/burrito && git rev-parse --short HEAD")
-if [-ne $remote_commit `git rev-parse --short HEAD`]; then
+if [ -ne $remote_commit `git rev-parse --short HEAD` ]; then
     echo "Remote commit $remote_commit != local commit `git rev-parse --short HEAD`"
     exit 3;
 fi
@@ -81,24 +81,25 @@ sleep 2
 
 echo "==> Docker TCP"
 ssh $1 sudo docker rm -f rpcbench-server
-ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name server -- --port="4242"
+ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./server --port="4242"
 sleep 4
-sudo docker run -it $image_name client --addr http://$1:4242 --amount 1000 -w 4 -i 10000 \
-    -o ~/burrito/$out/work_sqrts_1000-iters_10000_tcp_remote_docker.data \
-    > ~/burrito/$out/work_sqrts_1000-iters_10000_tcp_remote_docker.log
+sudo docker run --name rpcclient -it $image_name ./client --addr http://$1:4242 --amount 1000 -w 4 -i 10000 \
+    -o ./work_sqrts_1000-iters_10000_tcp_remote_docker.data \
+    > $out/work_sqrts_1000-iters_10000_tcp_remote_docker.log
+sudo docker cp rpcclient:/app/work_sqrts_1000-iters_10000_tcp_remote_docker.data $out/work_sqrts_1000-iters_10000_tcp_remote_docker.data
 echo "-> docker TCP done"
 sleep 2
 
 echo "==> Burrito"
+sudo docker rm -f rpcclient
 ssh $1 sudo docker rm -f rpcbench-server
-ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name server -- --port="4242" --burrito-addr="pingserver" --burrito-root="/burrito"
+ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./server --port="4242" --burrito-addr="pingserver" --burrito-root="/burrito"
 sleep 4
-sudo docker run -it $image_name client --addr "pingserver" \
+sudo docker run --name rpcclient -it $image_name ./client --addr "pingserver" \
     --burrito-root="/burrito" --amount 1000 -w 4 -i 10000 \
-    -o ~/burrito/$out/work_sqrts_1000-iters_10000_burrito_remote_docker.data \
-    > ~/burrito/$out/work_sqrts_1000-iters_10000_burrito_remote_docker.log
-
-sleep 2
+    -o ./work_sqrts_1000-iters_10000_burrito_remote_docker.data \
+    > ./$out/work_sqrts_1000-iters_10000_burrito_remote_docker.log
+sudo docker cp rpcclient:/app/work_sqrts_1000-iters_10000_burrito_remote_docker.data $out/work_sqrts_1000-iters_10000_burrito_remote_docker.data
 echo "-> burrito done"
 
 sleep 2

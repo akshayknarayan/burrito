@@ -77,9 +77,9 @@ async fn main() -> Result<(), failure::Error> {
     if let Some(path) = opt.out_file {
         use std::io::Write;
         let mut f = std::fs::File::create(path)?;
-        write!(&mut f, "Total_us,Server_us")?;
+        write!(&mut f, "Total_us,Server_us\n")?;
         for (t, s) in durs {
-            write!(&mut f, "{},{}", t, s)?;
+            write!(&mut f, "{},{}\n", t, s)?;
         }
     }
 
