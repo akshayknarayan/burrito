@@ -120,7 +120,10 @@ impl Client {
         })
     }
 
-    pub async fn resolve(&mut self, dst: hyper::Uri) -> Result<String, Error> {
+    pub async fn resolve(
+        &mut self,
+        dst: hyper::Uri,
+    ) -> Result<(String, rpc::open_reply::AddrType), Error> {
         ensure!(
             dst.scheme_str().map(|s| s == "burrito").is_some(),
             "URL scheme does not match: {:?}",
@@ -133,21 +136,33 @@ impl Client {
 
         trace!(self.log, "Resolving burrito address"; "addr" => &dst_addr);
 
-        let addr = self
+        let resp = self
             .burrito_client
             .open(rpc::OpenRequest { dst_addr })
             .await?
-            .into_inner()
-            .send_addr;
+            .into_inner();
 
-        debug!(self.log, "Resolved burrito address"; "burrito addr" => &dst_addr_log, "resolved addr" => &addr);
+        let addr = resp.send_addr;
+        let addr_type = resp.addr_type;
 
-        Ok(self
-            .burrito_root
-            .join(addr)
-            .into_os_string()
-            .into_string()
-            .expect("OS string as valid string"))
+        debug!(self.log, "Resolved burrito address"; "burrito addr" => &dst_addr_log, "addr_type" => ?addr_type, "resolved addr" => &addr);
+
+        // It's somewhat unfortunate to have to match twice, once here and once in impl Service::call.
+        // Could just return the string and handle there, but that would expose the message abstraction.
+        match addr_type {
+            a if a == rpc::open_reply::AddrType::Unix as i32 => Ok((
+                self.burrito_root
+                    .join(addr)
+                    .into_os_string()
+                    .into_string()
+                    .expect("OS string as valid string"),
+                rpc::open_reply::AddrType::Unix,
+            )),
+            a if a == rpc::open_reply::AddrType::Tcp as i32 => {
+                Ok((addr, rpc::open_reply::AddrType::Tcp))
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -163,9 +178,17 @@ impl hyper::service::Service<hyper::Uri> for Client {
     fn call(&mut self, dst: hyper::Uri) -> Self::Future {
         let mut cl = self.clone();
         Box::pin(async move {
-            let path = cl.resolve(dst).await?;
-            let st = tokio::net::UnixStream::connect(&path).await?;
-            Ok(Conn::Unix(st))
+            let (addr, addr_type) = cl.resolve(dst).await?;
+            Ok(match addr_type {
+                rpc::open_reply::AddrType::Unix => {
+                    let st = tokio::net::UnixStream::connect(&addr).await?;
+                    Conn::Unix(st)
+                }
+                rpc::open_reply::AddrType::Tcp => {
+                    let st = tokio::net::TcpStream::connect(&addr).await?;
+                    Conn::Tcp(st)
+                }
+            })
         })
     }
 }
