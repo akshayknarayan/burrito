@@ -7,20 +7,20 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hyper = {version = "0.13", features = ["stream"]}
-tokio = "0.2"
-failure = "0.1"
-tonic = "0.1"
-prost = "0.6"
-prost-derive = "0.6"
+burrito-ctl = {path = "../burrito-ctl"}
 bytes = "0.4"
-pin-project = "0.4"
-hyper-unix-connector = "0.1.4"
+failure = "0.1"
 futures-util = "0.3"
 hex = "0.4"
-burrito-ctl = {path = "../burrito-ctl"}
-slog = "2"
-slog-term = "2"
+hyper-unix-connector = "0.1.4"
+hyper = {version = "0.13", features = ["stream"]}
+pin-project = "0.4"
+prost = "0.6"
+prost-derive = "0.6"
+tokio = "0.2"
+tonic = "0.1"
+tracing = "0.1"
+tracing-futures = "0.2"
 
 [build-dependencies]
 tonic-build = "0.1"

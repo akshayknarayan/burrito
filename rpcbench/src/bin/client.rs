@@ -30,7 +30,7 @@ async fn main() -> Result<(), failure::Error> {
     let durs = if let Some(root) = opt.burrito_root {
         // burrito mode
         info!(&log, "burrito mode"; "burrito_root" => ?root, "addr" => ?&opt.addr);
-        let cl = burrito_addr::Client::new(root, &log).await?;
+        let cl = burrito_addr::Client::new(root).await?;
         let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
         trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
         rpcbench::client_ping(addr, cl, pp, opt.iters).await?
