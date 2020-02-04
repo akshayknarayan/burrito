@@ -12,6 +12,7 @@ burrito-ctl = {path = "../burrito-ctl"}
 bytes = "0.4"
 criterion = "0.3"
 failure = "0.1"
+http-body = "0.3"
 hyper-unix-connector = "0.1"
 hyper = {version = "0.13", features = ["stream"]}
 prost = "0.6"

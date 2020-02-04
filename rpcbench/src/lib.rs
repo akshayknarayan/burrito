@@ -103,17 +103,36 @@ where
             .await?;
         trace!(iter = i, "connected");
         let mut client = ping::ping_client::PingClient::new(channel);
-        let req = tonic::Request::new(msg.clone());
-        let response = client
-            .ping(req)
-            .instrument(span!(Level::DEBUG, "rpc_ping"))
-            .await?;
-        let elap = then.elapsed().as_micros().try_into()?;
-        trace!(iter = i, time = elap, "ping done");
-        durs.push((elap, response.into_inner().duration_us));
+        let (tot, srv) = do_one_ping(&mut client, msg.clone()).await?;
+        durs.push((tot, srv));
+        let elap: i64 = then.elapsed().as_micros().try_into()?;
+        trace!(iter = i, time = tot, "end_loop");
     }
 
     Ok(durs)
+}
+
+#[tracing::instrument(skip(client, msg))]
+async fn do_one_ping<T>(
+    client: &mut ping::ping_client::PingClient<T>,
+    msg: PingParams,
+) -> Result<(i64, i64), Error>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody>,
+    T::ResponseBody: tonic::body::Body + http_body::Body + Send + 'static,
+    T::Error: Into<dyn std::error::Error>,
+    <T::ResponseBody as http_body::Body>::Error: Into<dyn std::error::Error> + Send,
+{
+    let req = tonic::Request::new(msg.clone());
+    let then = std::time::Instant::now();
+    let response = client
+        .ping(req)
+        .instrument(span!(Level::DEBUG, "rpc_ping"))
+        .await?;
+    let elap = then.elapsed().as_micros().try_into()?;
+    let srv_dur = response.into_inner().duration_us;
+    trace!(time = elap, server_time = srv_dur, "ping done");
+    Ok((elap, srv_dur))
 }
 
 fn gen_poisson_duration(amt: f64) -> Result<std::time::Duration, tonic::Status> {
