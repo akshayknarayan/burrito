@@ -109,16 +109,17 @@ ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./serv
 sleep 4
 sudo docker run --name rpcclient1 -it $image_name ./client --addr "pingserver" \
     --burrito-root="/burrito" --amount 1000 -w 4 -i 10000 --reqs-per-iter 1 \
-    -o ./work_sqrts_1000-iters_10000_periter_1_tcp_remote_docker.data \
-    > $out/work_sqrts_1000-iters_10000_periter_1_tcp_remote_docker.log
+    -o ./work_sqrts_1000-iters_10000_periter_1_burrito_remote_docker.data \
+    > $out/work_sqrts_1000-iters_10000_periter_1_burrito_remote_docker.log
 sudo docker cp rpcclient1:/app/work_sqrts_1000-iters_10000_periter_1_burrito_remote_docker.data $out/work_sqrts_1000-iters_10000_periter_1_burrito_remote_docker.data
+echo "-> burrito 1 done"
 sleep 2
 sudo docker run --name rpcclient3 -it $image_name ./client --addr "pingserver" \
     --burrito-root="/burrito" --amount 1000 -w 4 -i 10000 --reqs-per-iter 3 \
-    -o ./work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.data \
-    > $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.log
+    -o ./work_sqrts_1000-iters_10000_periter_3_burrito_remote_docker.data \
+    > $out/work_sqrts_1000-iters_10000_periter_3_burrito_remote_docker.log
 sudo docker cp rpcclient3:/app/work_sqrts_1000-iters_10000_periter_3_burrito_remote_docker.data $out/work_sqrts_1000-iters_10000_periter_3_burrito_remote_docker.data
-echo "-> burrito done"
+echo "-> burrito 3 done"
 
 sleep 2
 ssh $1 sudo docker rm -f rpcbench-server

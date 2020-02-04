@@ -33,7 +33,21 @@ async fn main() -> Result<(), failure::Error> {
     };
 
     let per_iter = opt.reqs_per_iter;
-    let subscriber = Builder::default().build(|| Histogram::new_with_max(1_000_000, 2).unwrap());
+    let subscriber = Builder::default()
+        .no_span_recursion()
+        .events(|e: &tracing::Event| {
+            let mut val = String::new();
+            let mut f = |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                if field.name() == "message" {
+                    val.push_str(&format!(" {:?} ", value));
+                } else if field.name() == "which" {
+                    val.push_str(&format!(" which={:?} ", value));
+                };
+            };
+            e.record(&mut f);
+            val
+        })
+        .build(|| Histogram::new_with_max(1_000_000, 2).unwrap());
     let sid = subscriber.downcaster();
     let d = tracing::Dispatch::new(subscriber);
 

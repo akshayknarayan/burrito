@@ -4,6 +4,7 @@
 use failure::Error;
 use std::convert::TryInto;
 use tracing::{span, trace, Level};
+use tracing_futures::Instrument;
 
 mod ping {
     tonic::include_proto!("ping");
@@ -97,14 +98,18 @@ where
         let endpoint = addr.clone().try_into()?;
 
         let then = std::time::Instant::now();
-        let channel = endpoint.connect_with_connector(ctr).await?;
+        let channel = endpoint
+            .connect_with_connector(ctr)
+            .instrument(span!(Level::DEBUG, "connector"))
+            .await?;
         trace!(iter = i, "connected");
         let mut client = ping::ping_client::PingClient::new(channel);
 
         for j in 0..reqs_per_iter {
+            trace!(iter = i, which = j, "ping_start");
             let (tot, srv) = do_one_ping(&mut client, msg.clone()).await?;
             durs.push((tot, srv));
-            trace!(iter = i, which = j, "ping");
+            trace!(iter = i, which = j, "ping_end");
         }
 
         let elap: i64 = then.elapsed().as_micros().try_into()?;
@@ -125,13 +130,11 @@ where
     <T::ResponseBody as http_body::Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync + 'static>> + Send,
 {
-    trace!("ping start");
     let req = tonic::Request::new(msg.clone());
     let then = std::time::Instant::now();
     let response = client.ping(req).await?;
     let elap = then.elapsed().as_micros().try_into()?;
     let srv_dur = response.into_inner().duration_us;
-    trace!(time = elap, server_time = srv_dur, "ping done");
     Ok((elap, srv_dur))
 }
 
