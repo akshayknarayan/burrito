@@ -88,11 +88,15 @@ async fn main() -> Result<(), failure::Error> {
         for (span_group, hs) in hs {
             for (event_group, h) in hs {
                 println!(
-                    "{} {}:{}: {}ns",
+                    "{} {}:{}: {} {} {} {} {}",
                     per_iter,
                     span_group,
                     event_group,
-                    h.value_at_quantile(0.5)
+                    h.min(),
+                    h.value_at_quantile(0.25),
+                    h.value_at_quantile(0.5),
+                    h.value_at_quantile(0.75),
+                    h.max(),
                 );
             }
         }
