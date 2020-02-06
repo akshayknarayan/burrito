@@ -5,3 +5,6 @@ members = [
     "rpcbench",
     "burrito-addr",
 ]
+
+[profile.release]
+debug = true
