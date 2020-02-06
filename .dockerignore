@@ -1,4 +1,7 @@
 .git/
+target/
+!target/release/server
+!target/release/client
 *.txt
 *.data
 *.log

@@ -2,6 +2,7 @@ use failure::Error;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::trace;
 
 pub mod rpc {
     tonic::include_proto!("burrito");
@@ -97,7 +98,73 @@ impl BurritoNet {
         tokio::spawn(s.listen_updates());
         Ok(ConnectionServer::new(self))
     }
+}
 
+#[tonic::async_trait]
+impl Connection for BurritoNet {
+    #[allow(clippy::cognitive_complexity)]
+    async fn listen(
+        &self,
+        request: tonic::Request<ListenRequest>,
+    ) -> Result<tonic::Response<ListenReply>, tonic::Status> {
+        trace!("listen() start");
+        // service_addr is what other services will call open() with
+        let req = request.into_inner();
+        let service_addr = req.service_addr;
+        let listen_port = req.listen_port;
+        let net_addrs: Vec<String> = self
+            .local_public_addrs
+            .iter()
+            .map(|ref a| format!("{}:{}", a, &listen_port))
+            .collect();
+
+        tokio::spawn(redis_insert(
+            self.redis_listen_connection.clone(),
+            service_addr.clone(),
+            net_addrs.into_iter(),
+            listen_port,
+            self.log.clone(),
+        ));
+
+        let listen_addr = get_addr();
+        self.route_table_insert(&service_addr, &listen_addr).await?;
+        trace!("listen() done");
+
+        slog::info!(self.log, "New service listening";
+            "service" => &service_addr,
+            "addr" => ?listen_addr,
+        );
+
+        trace!("listen() returning");
+        Ok(tonic::Response::new(ListenReply { listen_addr }))
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    async fn open(
+        &self,
+        request: tonic::Request<OpenRequest>,
+    ) -> Result<tonic::Response<OpenReply>, tonic::Status> {
+        trace!("open() start");
+        let dst_addr = request.into_inner().dst_addr;
+
+        let (send_addr, addr_type) = self.route_table_get(&dst_addr).await?;
+        trace!("open() done");
+
+        slog::trace!(self.log, "Service connection request";
+            "service" => &dst_addr,
+            "addr" => ?send_addr,
+        );
+
+        trace!("open() returning");
+
+        Ok(tonic::Response::new(OpenReply {
+            send_addr,
+            addr_type: addr_type as _,
+        }))
+    }
+}
+
+impl BurritoNet {
     // redis schema:
     //
     // key "services": a set. keys are service names.
@@ -137,107 +204,89 @@ impl BurritoNet {
 
         Ok(())
     }
-}
 
-#[tonic::async_trait]
-impl Connection for BurritoNet {
-    async fn listen(
+    #[allow(clippy::cognitive_complexity)]
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn route_table_insert(
         &self,
-        request: tonic::Request<ListenRequest>,
-    ) -> Result<tonic::Response<ListenReply>, tonic::Status> {
-        // service_addr is what other services will call open() with
-        let req = request.into_inner();
-        let service_addr = req.service_addr;
-        let listen_port = req.listen_port;
-        let net_addrs: Vec<String> = self
-            .local_public_addrs
-            .iter()
-            .map(|ref a| format!("{}:{}", a, &listen_port))
-            .collect();
-
-        let listen_addr = {
-            use rand::Rng;
-            let rng = rand::thread_rng();
-
-            let listen_addr: String = rng
-                .sample_iter(&rand::distributions::Alphanumeric)
-                .take(10)
-                .collect();
-            listen_addr
-        };
-
-        let sa = service_addr.clone();
-        let l2 = self.log.clone();
-        let l_conn = self.redis_listen_connection.clone();
-        tokio::spawn(async move {
-            let mut r = redis::pipe();
-            r.atomic().cmd("SADD").arg("services").arg(&sa).ignore();
-            for net_addr in net_addrs {
-                r.cmd("SADD").arg(&sa).arg(&net_addr);
-            }
-
-            let r: redis::RedisResult<()> = r.query_async(&mut *l_conn.lock().await).await;
-            if let Err(e) = r {
-                slog::warn!(l2, "Could not write new service to redis"; "err" => ?e);
-            }
-        });
-
-        {
-            if let Some(s) = self.route_table.lock().await.insert(
-                service_addr.clone(),
-                (listen_addr.clone(), rpc::open_reply::AddrType::Unix),
-            ) {
-                Err(tonic::Status::new(
-                    tonic::Code::AlreadyExists,
-                    format!(
-                        "Service address {} already in use at {}",
-                        &service_addr, &s.0
-                    ),
-                ))
-            } else {
-                Ok(())
-            }
-        }?; // release route_table lock
-
-        slog::info!(self.log, "New service listening";
-            "service" => &service_addr,
-            "addr" => ?listen_addr,
-        );
-
-        Ok(tonic::Response::new(ListenReply { listen_addr }))
+        service_addr: &str,
+        listen_addr: &str,
+    ) -> Result<(), tonic::Status> {
+        trace!("routetable insert start");
+        if let Some(s) = self.route_table.lock().await.insert(
+            service_addr.to_string(),
+            (listen_addr.to_string(), rpc::open_reply::AddrType::Unix),
+        ) {
+            trace!("routetable insert end");
+            Err(tonic::Status::new(
+                tonic::Code::AlreadyExists,
+                format!(
+                    "Service address {} already in use at {}",
+                    &service_addr, &s.0
+                ),
+            ))
+        } else {
+            trace!("routetable insert end");
+            Ok(())
+        }
     }
 
-    async fn open(
+    #[allow(clippy::cognitive_complexity)]
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn route_table_get(
         &self,
-        request: tonic::Request<OpenRequest>,
-    ) -> Result<tonic::Response<OpenReply>, tonic::Status> {
-        let dst_addr = request.into_inner().dst_addr;
-
+        dst_addr: &str,
+    ) -> Result<(String, rpc::open_reply::AddrType), tonic::Status> {
+        trace!("routetable get start");
         // Look up the service addr to translate.
         //
         // It's possible that a recently-registered remote service has not yet been polled into
         // route_table (see `listen_updates`) when this is called.
         // Treat as a cache miss, or treat route_table as truth? Treat as truth for now.
-        let (send_addr, addr_type): (String, rpc::open_reply::AddrType) = {
-            let tbl = self.route_table.lock().await;
-            let (send_addr, addr_type) = tbl.get(&dst_addr).ok_or_else(|| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Unknown service address {}", dst_addr),
-                )
-            })?;
+        let tbl = self.route_table.lock().await;
+        trace!("routetable get locked");
+        let (send_addr, addr_type) = tbl.get(dst_addr).ok_or_else(|| {
+            tonic::Status::new(
+                tonic::Code::Unknown,
+                format!("Unknown service address {}", dst_addr),
+            )
+        })?;
 
-            (send_addr.clone(), *addr_type)
-        };
-
-        slog::info!(self.log, "Service connection request";
-            "service" => &dst_addr,
-            "addr" => ?send_addr,
-        );
-
-        Ok(tonic::Response::new(OpenReply {
-            send_addr,
-            addr_type: addr_type as _,
-        }))
+        trace!("routetable get end");
+        Ok((send_addr.clone(), *addr_type))
     }
+}
+
+#[tracing::instrument(level = "debug", skip(conn, net_addrs, log))]
+async fn redis_insert(
+    conn: Arc<Mutex<redis::aio::Connection>>,
+    sa: String,
+    net_addrs: impl Iterator<Item = String>,
+    listen_port: String,
+    log: slog::Logger,
+) {
+    trace!("redis insert start");
+    let mut r = redis::pipe();
+    r.atomic().cmd("SADD").arg("services").arg(&sa).ignore();
+    for net_addr in net_addrs {
+        r.cmd("SADD").arg(&sa).arg(&net_addr);
+    }
+
+    let r: redis::RedisResult<()> = r.query_async(&mut *conn.lock().await).await;
+    if let Err(e) = r {
+        slog::warn!(log, "Could not write new service to redis"; "err" => ?e);
+    }
+
+    trace!("redis insert done");
+}
+
+fn get_addr() -> String {
+    use rand::Rng;
+    let rng = rand::thread_rng();
+
+    let listen_addr: String = rng
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(10)
+        .collect();
+    listen_addr
 }

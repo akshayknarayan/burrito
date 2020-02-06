@@ -57,12 +57,13 @@ sudo ./target/release/burrito \
     -o /var/run/burrito-docker.sock \
     --redis-addr "redis://localhost:6379" \
     --net-addr=$3 \
+    --tracing-file $out/burritoctl-tracing.trace \
     > $out/burritoctl-local.log 2> $out/burritoctl-local.log &
 burritoctl=$!
 
 echo "--> start burrito-ctl on $1"
 ssh $1 "mkdir -p ~/burrito/$out"
-ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o /var/run/burrito-docker.sock --redis-addr \"redis://$3:6379\" --net-addr=$1 > $out/burritoctl-local.log 2> $out/burritoctl-local.log" &
+ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o /var/run/burrito-docker.sock --redis-addr \"redis://$3:6379\" --net-addr=$1 --tracing-file $out/burritoctl-tracing.trace > $out/burritoctl-local.log 2> $out/burritoctl-local.log" &
 
 sleep 4
 image_name=rpcbench:`git rev-parse --short HEAD`

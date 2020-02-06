@@ -42,6 +42,7 @@ sudo ./target/release/burrito \
     -o /var/run/burrito-docker.sock \
     --redis-addr "redis://localhost:6379" \
     --net-addr=$docker_host_addr \
+    --tracing-file $out/burritoctl-tracing.trace \
     > $out/burritoctl.log 2> $out/burritoctl.log &
 burritoctl=$!
 sleep 15
