@@ -1,7 +1,7 @@
 use failure::Error;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::trace;
 
 pub mod rpc {
@@ -25,7 +25,7 @@ pub const CONTROLLER_ADDRESS: &str = "controller";
 pub struct BurritoNet {
     root: std::path::PathBuf,
     local_public_addrs: Vec<String>,
-    route_table: Arc<Mutex<HashMap<String, (String, rpc::open_reply::AddrType)>>>,
+    route_table: Arc<RwLock<HashMap<String, (String, rpc::open_reply::AddrType)>>>,
     log: slog::Logger,
     redis_client: redis::Client,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
@@ -190,7 +190,7 @@ impl BurritoNet {
         use redis::AsyncCommands;
         let srvs: Vec<String> = con.smembers("services").await?;
 
-        let mut tbl = self.route_table.lock().await;
+        let mut tbl = self.route_table.write().await;
         for srv in srvs {
             if !tbl.contains_key(&srv) {
                 let addrs = con
@@ -213,7 +213,7 @@ impl BurritoNet {
         listen_addr: &str,
     ) -> Result<(), tonic::Status> {
         trace!("routetable insert start");
-        if let Some(s) = self.route_table.lock().await.insert(
+        if let Some(s) = self.route_table.write().await.insert(
             service_addr.to_string(),
             (listen_addr.to_string(), rpc::open_reply::AddrType::Unix),
         ) {
@@ -243,7 +243,7 @@ impl BurritoNet {
         // It's possible that a recently-registered remote service has not yet been polled into
         // route_table (see `listen_updates`) when this is called.
         // Treat as a cache miss, or treat route_table as truth? Treat as truth for now.
-        let tbl = self.route_table.lock().await;
+        let tbl = self.route_table.read().await;
         trace!("routetable get locked");
         let (send_addr, addr_type) = tbl.get(dst_addr).ok_or_else(|| {
             tonic::Status::new(
