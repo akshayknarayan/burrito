@@ -50,6 +50,7 @@ async fn main() -> Result<(), failure::Error> {
     let burrito = burrito_ctl::StaticResolver::new(
         opt.burrito_coordinator_addr,
         &format!("{}", opt.resolve_to),
+        "tcp".into(),
     );
     let burrito_addr = burrito.listen_path();
 

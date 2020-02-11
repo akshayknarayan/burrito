@@ -4,6 +4,7 @@ members = [
     "burrito-ctl",
     "rpcbench",
     "burrito-addr",
+    "static-test",
 ]
 
 [profile.release]
