@@ -18,3 +18,6 @@ pub use docker_proxy::*;
 
 pub mod burrito_net;
 pub use burrito_net::*;
+
+pub mod static_net;
+pub use static_net::*;
