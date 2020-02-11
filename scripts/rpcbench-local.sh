@@ -37,7 +37,7 @@ echo "--> start burrito-ctl"
 sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker ps -a | awk '{print $out}' | tail -n +2 | xargs sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f
 sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name rpcbench-redis -d -p 6379:6379 redis:5
 docker_host_addr=$(sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock  docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' bridge)
-sudo ./target/release/burrito \
+sudo perf record -g -o $out/burritoctl.perf.data ./target/release/burrito \
     -i /var/run/docker.sock \
     -o /var/run/burrito-docker.sock \
     --redis-addr "redis://localhost:6379" \

@@ -52,7 +52,7 @@ sleep 4
 echo "--> start burrito-ctl"
 sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f rpcbench-redis
 sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name rpcbench-redis -d -p 6379:6379 redis:5
-sudo ./target/release/burrito \
+sudo perf record -g -o $out/burritoctl-local.perf.data ./target/release/burrito \
     -i /var/run/docker.sock \
     -o /var/run/burrito-docker.sock \
     --redis-addr "redis://localhost:6379" \
