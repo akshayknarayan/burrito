@@ -19,6 +19,8 @@ struct Opt {
     reqs_per_iter: usize,
     #[structopt(short, long)]
     out_file: Option<std::path::PathBuf>,
+    #[structopt(long)]
+    static_resolver: bool,
 }
 
 #[tokio::main]
@@ -57,10 +59,18 @@ async fn main() -> Result<(), failure::Error> {
     let durs = if let Some(root) = opt.burrito_root {
         // burrito mode
         info!(&log, "burrito mode"; "burrito_root" => ?root, "addr" => ?&opt.addr);
-        let cl = burrito_addr::Client::new(root).await?;
-        let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
-        trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
-        rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
+        if !opt.static_resolver {
+            let cl = burrito_addr::Client::new(root).await?;
+            let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
+            trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
+            rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
+        } else {
+            let cl =
+                burrito_addr::staticnet::StaticClient::new(std::path::PathBuf::from(root)).await;
+            let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
+            trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
+            rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
+        }
     } else if opt.addr.starts_with("http") {
         // raw tcp mode
         info!(&log, "TCP mode"; "addr" => ?&opt.addr);

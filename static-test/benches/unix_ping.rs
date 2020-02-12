@@ -25,7 +25,7 @@ fn unix_ping(c: &mut Criterion) {
     // start the server
     std::thread::spawn(|| {
         let sr = StaticResolver::new(
-            std::path::PathBuf::from("./tmp-test-sr"),
+            Some(std::path::PathBuf::from("./tmp-test-sr")),
             "127.0.0.1:4242",
             "tcp",
         );

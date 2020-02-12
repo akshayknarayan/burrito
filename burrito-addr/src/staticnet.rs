@@ -1,22 +1,33 @@
+use super::Conn;
 use super::{rpc, Uri};
 use burrito_ctl::SRMsg;
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use failure::{bail, ensure, format_err, Error};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::trace;
 
 /// For benchmarking purposes, a burrito resolver client that connects to a static,
 /// fixed-buffer-write UDS server
+#[derive(Debug, Clone)]
 pub struct StaticClient {
     burrito_root: PathBuf,
-    uc: tokio::net::UnixStream,
+    uc: Arc<Mutex<tokio::net::UnixStream>>,
 }
 
 impl StaticClient {
     pub async fn new(burrito_root: std::path::PathBuf) -> Self {
         let controller_addr = burrito_root.join(burrito_ctl::burrito_net::CONTROLLER_ADDRESS);
-        let uc = tokio::net::UnixStream::connect(controller_addr)
-            .await
-            .expect("connect failed");
+        let uc = Arc::new(Mutex::new(
+            tokio::net::UnixStream::connect(controller_addr)
+                .await
+                .expect("connect failed"),
+        ));
         StaticClient { burrito_root, uc }
     }
 
@@ -66,10 +77,12 @@ impl StaticClient {
     async fn write_into_sk(&mut self, msg: &SRMsg) -> Result<(), Error> {
         use tokio::io::AsyncWriteExt;
 
+        let mut uc = self.uc.lock().await;
+
         let req: Vec<u8> = bincode::serialize(&msg)?;
         let req_len = req.len() as u32;
-        self.uc.write_all(&req_len.to_le_bytes()).await?;
-        self.uc.write_all(&req).await?;
+        uc.write_all(&req_len.to_le_bytes()).await?;
+        uc.write_all(&req).await?;
         Ok(())
     }
 
@@ -77,8 +90,10 @@ impl StaticClient {
         use tokio::io::AsyncReadExt;
         let mut buf = [0u8; 128];
 
+        let mut uc = self.uc.lock().await;
+
         let len_to_read = loop {
-            self.uc.read_exact(&mut buf[0..4]).await?;
+            uc.read_exact(&mut buf[0..4]).await?;
 
             // unsafe transmute ok because endianness is guaranteed to be the
             // same on either side of a UDS
@@ -95,11 +110,38 @@ impl StaticClient {
             }
         };
 
-        self.uc
-            .read_exact(&mut buf[0..len_to_read as usize])
-            .await?;
+        uc.read_exact(&mut buf[0..len_to_read as usize]).await?;
 
         Ok(bincode::deserialize(&buf[0..len_to_read as usize])?)
+    }
+}
+
+impl hyper::service::Service<hyper::Uri> for StaticClient {
+    type Response = Conn;
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, dst: hyper::Uri) -> Self::Future {
+        let mut cl = self.clone();
+        Box::pin(async move {
+            let (addr, addr_type) = cl.resolve(dst).await?;
+            Ok(match addr_type {
+                rpc::open_reply::AddrType::Unix => {
+                    let st = tokio::net::UnixStream::connect(&addr).await?;
+                    trace!("Connected");
+                    Conn::Unix(st)
+                }
+                rpc::open_reply::AddrType::Tcp => {
+                    let st = tokio::net::TcpStream::connect(&addr).await?;
+                    trace!("Connected");
+                    Conn::Tcp(st)
+                }
+            })
+        })
     }
 }
 
@@ -116,7 +158,7 @@ mod test {
         // start the server
         std::thread::spawn(|| {
             let sr = StaticResolver::new(
-                std::path::PathBuf::from("./tmp-test-sr"),
+                Some(std::path::PathBuf::from("./tmp-test-sr")),
                 "127.0.0.1:4242",
                 "tcp",
             );

@@ -15,9 +15,9 @@ pub struct StaticResolver {
 }
 
 impl StaticResolver {
-    pub fn new(root: std::path::PathBuf, addr: &str, addrtype: &str) -> Self {
+    pub fn new(root: Option<std::path::PathBuf>, addr: &str, addrtype: &str) -> Self {
         StaticResolver {
-            root,
+            root: root.unwrap_or_else(|| std::path::PathBuf::from("/tmp/burrito")),
             response: SRMsg(addr.into(), addrtype.into()),
         }
     }

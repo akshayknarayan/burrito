@@ -14,7 +14,7 @@ enum Opt {
 #[derive(Debug, StructOpt)]
 struct Server {
     #[structopt(short, long)]
-    burrito_coordinator_addr: std::path::PathBuf,
+    burrito_coordinator_addr: Option<std::path::PathBuf>,
 
     #[structopt(long)]
     resolve_to: std::net::SocketAddr,
