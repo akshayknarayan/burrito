@@ -124,7 +124,6 @@ impl Client {
         })
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn resolve(
         &mut self,
         dst: hyper::Uri,
@@ -139,11 +138,12 @@ impl Client {
             .ok_or_else(|| format_err!("Could not get socket path for Destination"))?;
         let dst_addr_log = dst_addr.clone();
 
-        trace!(addr = ?&dst_addr, "Resolving burrito address");
+        trace!(addr = ?&dst_addr, "Resolving_burrito_address");
 
         let resp = self
             .burrito_client
             .open(rpc::OpenRequest { dst_addr })
+            .instrument(span!(Level::DEBUG, "resolve_rpc"))
             .await?
             .into_inner();
 
@@ -152,7 +152,7 @@ impl Client {
         let addr_type = rpc::open_reply::AddrType::from_i32(addr_type)
             .ok_or_else(|| failure::format_err!("Invalid AddrType {}", addr_type))?;
 
-        trace!(addr = ?&dst_addr_log, addr_type = ?addr_type, resolved_addr = ?&addr, "Resolved burrito address");
+        trace!(addr = ?&dst_addr_log, addr_type = ?addr_type, resolved_addr = ?&addr, "Resolved_burrito_address");
 
         // It's somewhat unfortunate to have to match twice, once here and once in impl Service::call.
         // Could just return the string and handle there, but that would expose the message abstraction.
@@ -182,22 +182,15 @@ impl hyper::service::Service<hyper::Uri> for Client {
     fn call(&mut self, dst: hyper::Uri) -> Self::Future {
         let mut cl = self.clone();
         Box::pin(async move {
-            let (addr, addr_type) = cl
-                .resolve(dst)
-                .instrument(span!(Level::DEBUG, "resolve"))
-                .await?;
+            let (addr, addr_type) = cl.resolve(dst).await?;
             Ok(match addr_type {
                 rpc::open_reply::AddrType::Unix => {
-                    let st = tokio::net::UnixStream::connect(&addr)
-                        .instrument(span!(Level::DEBUG, "UnixStream::connect"))
-                        .await?;
+                    let st = tokio::net::UnixStream::connect(&addr).await?;
                     trace!("Connected");
                     Conn::Unix(st)
                 }
                 rpc::open_reply::AddrType::Tcp => {
-                    let st = tokio::net::TcpStream::connect(&addr)
-                        .instrument(span!(Level::DEBUG, "TcpStream::connect"))
-                        .await?;
+                    let st = tokio::net::TcpStream::connect(&addr).await?;
                     trace!("Connected");
                     Conn::Tcp(st)
                 }

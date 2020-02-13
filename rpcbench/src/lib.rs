@@ -132,7 +132,10 @@ where
 {
     let req = tonic::Request::new(msg.clone());
     let then = std::time::Instant::now();
-    let response = client.ping(req).await?;
+    let response = client
+        .ping(req)
+        .instrument(span!(Level::DEBUG, "tonic_ping"))
+        .await?;
     let elap = then.elapsed().as_micros().try_into()?;
     let srv_dur = response.into_inner().duration_us;
     Ok((elap, srv_dur))
