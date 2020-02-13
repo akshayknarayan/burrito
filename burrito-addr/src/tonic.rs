@@ -48,6 +48,9 @@ impl Client {
         })
     }
 
+    /// Resolves a [`hyper::Uri`] to an [`Addr`].
+    ///
+    /// The [`hyper::Uri`] must have the uri scheme `burrito`.
     pub async fn resolve(&mut self, dst: hyper::Uri) -> Result<crate::conn::Addr, Error> {
         let dst_addr = Uri::socket_path(&dst)?;
 
@@ -93,10 +96,7 @@ impl hyper::service::Service<hyper::Uri> for Client {
 
     fn call(&mut self, dst: hyper::Uri) -> Self::Future {
         let mut cl = self.clone();
-        Box::pin(async move {
-            let addr = cl.resolve(dst).await?;
-            addr.connect().await
-        })
+        Box::pin(async move { cl.resolve(dst).await?.connect().await })
     }
 }
 

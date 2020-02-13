@@ -12,8 +12,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::trace;
 
-/// For benchmarking purposes, a burrito resolver client that connects to a static,
-/// fixed-buffer-write UDS server
+/// A burrito resolver client that connects to a UDS server.
+/// The wire protocol prefixes messages with their length in u32, followed by
+/// [`bincode`](https://crates.io/crates/bincode)-encoded [`SRMsg`].
 #[derive(Debug, Clone)]
 pub struct StaticClient {
     burrito_root: PathBuf,
@@ -31,24 +32,20 @@ impl StaticClient {
         StaticClient { burrito_root, uc }
     }
 
+    /// Resolves a [`hyper::Uri`] to an [`Addr`].
+    ///
+    /// The [`hyper::Uri`] must have the uri scheme `burrito`.
     pub async fn resolve(&mut self, dst: hyper::Uri) -> Result<Addr, Error> {
         let dst_addr = Uri::socket_path(&dst)?;
-
         trace!(addr = ?&dst_addr, "Resolving_burrito_address");
-
         self.write_into_sk(&SRMsg(dst_addr, "burrito".into()))
             .await?;
-
         trace!("wrote into sk");
-
         let resp = self.read_from_sk().await?;
         let addr = resp.0;
         let addr_type = resp.1;
-
         trace!(resolved_addr = ?&addr, "Resolved_burrito_address");
 
-        // It's somewhat unfortunate to have to match twice, once here and once in impl Service::call.
-        // Could just return the string and handle there, but that would expose the message abstraction.
         match addr_type.as_str() {
             "unix" => Ok(crate::conn::Addr::Unix(
                 self.burrito_root
@@ -99,7 +96,6 @@ impl StaticClient {
         };
 
         uc.read_exact(&mut buf[0..len_to_read as usize]).await?;
-
         Ok(bincode::deserialize(&buf[0..len_to_read as usize])?)
     }
 }
@@ -115,10 +111,7 @@ impl hyper::service::Service<hyper::Uri> for StaticClient {
 
     fn call(&mut self, dst: hyper::Uri) -> Self::Future {
         let mut cl = self.clone();
-        Box::pin(async move {
-            let addr = cl.resolve(dst).await?;
-            addr.connect().await
-        })
+        Box::pin(async move { cl.resolve(dst).await?.connect().await })
     }
 }
 
