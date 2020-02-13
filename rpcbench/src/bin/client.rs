@@ -60,14 +60,13 @@ async fn main() -> Result<(), failure::Error> {
         // burrito mode
         if !opt.static_resolver {
             info!(&log, "burrito mode"; "burrito_root" => ?root, "addr" => ?&opt.addr);
-            let cl = burrito_addr::Client::new(root).await?;
+            let cl = burrito_addr::tonic::Client::new(root).await?;
             let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
             trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
             rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
         } else {
             info!(&log, "static burrito mode"; "burrito_root" => ?root, "addr" => ?&opt.addr);
-            let cl =
-                burrito_addr::staticnet::StaticClient::new(std::path::PathBuf::from(root)).await;
+            let cl = burrito_addr::bincode::StaticClient::new(std::path::PathBuf::from(root)).await;
             let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
             trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
             rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?

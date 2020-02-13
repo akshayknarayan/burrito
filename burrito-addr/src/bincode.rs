@@ -1,12 +1,12 @@
-use super::Conn;
-use super::{rpc, Uri};
+use super::uri::Uri;
+use super::{Addr, Conn};
 use burrito_ctl::SRMsg;
 use core::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
-use failure::{bail, ensure, format_err, Error};
+use failure::{bail, Error};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -31,19 +31,8 @@ impl StaticClient {
         StaticClient { burrito_root, uc }
     }
 
-    pub async fn resolve(
-        &mut self,
-        dst: hyper::Uri,
-    ) -> Result<(String, rpc::open_reply::AddrType), Error> {
-        ensure!(
-            dst.scheme_str().map(|s| s == "burrito").is_some(),
-            "URL scheme does not match: {:?}",
-            dst.scheme_str()
-        );
-
-        let dst_addr = Uri::socket_path(&dst)
-            .ok_or_else(|| format_err!("Could not get socket path for Destination"))?;
-        let dst_addr_log = dst_addr.clone();
+    pub async fn resolve(&mut self, dst: hyper::Uri) -> Result<Addr, Error> {
+        let dst_addr = Uri::socket_path(&dst)?;
 
         trace!(addr = ?&dst_addr, "Resolving_burrito_address");
 
@@ -56,20 +45,19 @@ impl StaticClient {
         let addr = resp.0;
         let addr_type = resp.1;
 
-        trace!(addr = ?&dst_addr_log, addr_type = ?addr_type, resolved_addr = ?&addr, "Resolved_burrito_address");
+        trace!(resolved_addr = ?&addr, "Resolved_burrito_address");
 
         // It's somewhat unfortunate to have to match twice, once here and once in impl Service::call.
         // Could just return the string and handle there, but that would expose the message abstraction.
         match addr_type.as_str() {
-            "unix" => Ok((
+            "unix" => Ok(crate::conn::Addr::Unix(
                 self.burrito_root
                     .join(addr)
                     .into_os_string()
                     .into_string()
                     .expect("OS string as valid string"),
-                rpc::open_reply::AddrType::Unix,
             )),
-            "tcp" => Ok((addr, rpc::open_reply::AddrType::Tcp)),
+            "tcp" => Ok(crate::conn::Addr::Tcp(addr)),
             _ => unreachable!(),
         }
     }
@@ -128,19 +116,8 @@ impl hyper::service::Service<hyper::Uri> for StaticClient {
     fn call(&mut self, dst: hyper::Uri) -> Self::Future {
         let mut cl = self.clone();
         Box::pin(async move {
-            let (addr, addr_type) = cl.resolve(dst).await?;
-            Ok(match addr_type {
-                rpc::open_reply::AddrType::Unix => {
-                    let st = tokio::net::UnixStream::connect(&addr).await?;
-                    trace!("Connected");
-                    Conn::Unix(st)
-                }
-                rpc::open_reply::AddrType::Tcp => {
-                    let st = tokio::net::TcpStream::connect(&addr).await?;
-                    trace!("Connected");
-                    Conn::Tcp(st)
-                }
-            })
+            let addr = cl.resolve(dst).await?;
+            addr.connect().await
         })
     }
 }
@@ -183,9 +160,12 @@ mod test {
             .block_on(async move {
                 let mut sc = StaticClient::new(std::path::PathBuf::from("./tmp-test-sr")).await;
                 let addr: hyper::Uri = crate::Uri::new("staticping").into();
-                let (addr, atype) = sc.resolve(addr).await.unwrap();
-                assert_eq!(addr, "127.0.0.1:4242");
-                assert_eq!(atype, rpc::open_reply::AddrType::Tcp);
+                let addr = sc.resolve(addr).await.unwrap();
+
+                match addr {
+                    crate::Addr::Tcp(addr) => assert_eq!(addr, "127.0.0.1:4242"),
+                    _ => panic!("wrong address"),
+                }
             });
     }
 }

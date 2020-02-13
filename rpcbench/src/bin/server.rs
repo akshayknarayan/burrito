@@ -45,7 +45,7 @@ async fn main() -> Result<(), failure::Error> {
 
     if let Some(addr) = opt.burrito_addr {
         info!(&log, "burrito mode"; "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => port);
-        let srv = burrito_addr::Server::start(&addr, port, &opt.burrito_root).await?;
+        let srv = burrito_addr::tonic::Server::start(&addr, port, &opt.burrito_root).await?;
         let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
         hyper::server::Server::builder(srv)
             .serve(hyper::service::make_service_fn(move |_| {

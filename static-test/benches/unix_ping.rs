@@ -1,21 +1,27 @@
-use burrito_addr::staticnet::*;
+use burrito_addr::bincode::*;
 use burrito_ctl::StaticResolver;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::cell::RefCell;
+use std::ops::DerefMut;
 
 async fn ping() {
     // ping from a client
     let mut sc = StaticClient::new(std::path::PathBuf::from("./tmp-test-sr")).await;
-    let addr: hyper::Uri = burrito_addr::Uri::new("staticping").into();
-    let (addr, _) = sc.resolve(addr).await.unwrap();
-    assert_eq!(addr, "127.0.0.1:4242");
+    do_ping(&mut sc).await;
 }
 
-async fn ping_reuse(sc: &RefCell<burrito_addr::staticnet::StaticClient>) {
-    let mut sc = sc.borrow_mut();
+async fn ping_reuse(sc: &RefCell<StaticClient>) {
+    let sc = sc.borrow_mut();
+    do_ping(sc).await;
+}
+
+async fn do_ping<T: DerefMut<Target = StaticClient>>(mut sc: T) {
     let addr: hyper::Uri = burrito_addr::Uri::new("staticping").into();
-    let (addr, _) = sc.resolve(addr).await.unwrap();
-    assert_eq!(addr, "127.0.0.1:4242");
+    let addr = sc.resolve(addr).await.unwrap();
+    match addr {
+        burrito_addr::Addr::Tcp(addr) => assert_eq!(addr, "127.0.0.1:4242"),
+        _ => panic!("wrong address"),
+    }
 }
 
 fn unix_ping(c: &mut Criterion) {
@@ -62,7 +68,7 @@ fn unix_ping(c: &mut Criterion) {
             .unwrap()
             .block_on(async move {
                 let sc = RefCell::new(
-                    burrito_addr::staticnet::StaticClient::new(std::path::PathBuf::from(
+                    burrito_addr::bincode::StaticClient::new(std::path::PathBuf::from(
                         "./tmp-test-sr",
                     ))
                     .await,

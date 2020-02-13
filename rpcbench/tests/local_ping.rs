@@ -23,7 +23,7 @@ fn local_ping() -> Result<(), Error> {
         block_for(std::time::Duration::from_millis(200)).await;
 
         trace!(&log, "connecting to burrito controller"; "burrito_root" => "./tmp-test-bn");
-        let cl = burrito_addr::Client::new("./tmp-test-bn").await?;
+        let cl = burrito_addr::tonic::Client::new("./tmp-test-bn").await?;
         let a: hyper::Uri = burrito_addr::Uri::new("test-rpcbench").into();
         rpcbench::client_ping(
             a,
@@ -45,7 +45,7 @@ async fn start_sever_burrito(log: &slog::Logger) -> Result<(), Error> {
     let l2 = log.clone();
 
     // get serving address
-    let srv = burrito_addr::Server::start("test-rpcbench", 42425, "./tmp-test-bn").await?;
+    let srv = burrito_addr::tonic::Server::start("test-rpcbench", 42425, "./tmp-test-bn").await?;
     let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
 
     trace!(l2, "spawning test-rpcbench");

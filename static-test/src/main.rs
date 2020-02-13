@@ -88,7 +88,7 @@ async fn server_main(opt: Server) -> Result<(), failure::Error> {
 #[tracing::instrument]
 async fn client_main(opt: Client) -> Result<(), failure::Error> {
     let then = tokio::time::Instant::now();
-    let mut sc = burrito_addr::staticnet::StaticClient::new(opt.burrito_coordinator_addr).await;
+    let mut sc = burrito_addr::bincode::StaticClient::new(opt.burrito_coordinator_addr).await;
     let connect_dur = then.elapsed();
 
     info!("connected");
