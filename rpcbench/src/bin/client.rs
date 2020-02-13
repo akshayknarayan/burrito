@@ -47,7 +47,7 @@ async fn main() -> Result<(), failure::Error> {
             e.record(&mut f);
             val
         })
-        .build(|| Histogram::new_with_max(1_000_000, 2).unwrap());
+        .build(|| Histogram::new_with_max(10_000_000, 2).unwrap());
     let sid = subscriber.downcaster();
     let d = tracing::Dispatch::new(subscriber);
 
@@ -84,23 +84,31 @@ async fn main() -> Result<(), failure::Error> {
     };
 
     sid.downcast(&d).unwrap().force_synchronize();
-    sid.downcast(&d).unwrap().with_histograms(|hs| {
-        for (span_group, hs) in hs {
-            for (event_group, h) in hs {
-                println!(
-                    "{} {}:{}: {} {} {} {} {}",
-                    per_iter,
-                    span_group,
-                    event_group,
-                    h.min(),
-                    h.value_at_quantile(0.25),
-                    h.value_at_quantile(0.5),
-                    h.value_at_quantile(0.75),
-                    h.max(),
-                );
+
+    if let Some(ref path) = opt.out_file {
+        use std::io::Write;
+        let path = path.with_extension("trace");
+        let mut f = std::fs::File::create(path)?;
+        sid.downcast(&d).unwrap().with_histograms(|hs| {
+            for (span_group, hs) in hs {
+                for (event_group, h) in hs {
+                    write!(
+                        &mut f,
+                        "{} {}:{}: {} {} {} {} {}\n",
+                        per_iter,
+                        span_group,
+                        event_group,
+                        h.min(),
+                        h.value_at_quantile(0.25),
+                        h.value_at_quantile(0.5),
+                        h.value_at_quantile(0.75),
+                        h.max(),
+                    )
+                    .expect("write to trace file");
+                }
             }
-        }
-    });
+        });
+    }
 
     if let Some(path) = opt.out_file {
         use std::io::Write;
