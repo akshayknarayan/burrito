@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use tracing::{span, trace, Level};
 use tracing_futures::Instrument;
 
+pub mod staticnet;
 mod rpc {
     tonic::include_proto!("burrito");
 }
