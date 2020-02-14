@@ -4,7 +4,10 @@ members = [
     "burrito-ctl",
     "rpcbench",
     "burrito-addr",
+    "burrito-flatbuf",
     "static-test",
+    "burrito-util",
+    "burrito-flatbuf",
 ]
 
 [profile.release]

@@ -1,0 +1,25 @@
+table ListenRequest {
+    /// service-level address to listen on
+    service_addr:string;
+    /// network port service is listening at
+    listen_port:uint16;
+}
+
+table ListenReply {
+    /// pipe address the service should listen at
+    listen_addr:string;
+}
+
+table OpenRequest {
+    /// service-level destination address of the connection
+    dst_addr:string;
+}
+    
+enum AddrType : byte { NoDefault = 0, Unix, Tcp }
+
+table OpenReply {
+    /// pipe address to connect to
+    send_addr:string;
+    /// address type
+    addr_type:AddrType;
+}

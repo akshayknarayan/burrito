@@ -11,7 +11,9 @@ bincode = "1"
 burrito-ctl = {path = "../burrito-ctl"}
 bytes = "0.4"
 failure = "0.1"
+flatbuffers = "0.6"
 futures-util = "0.3"
+futures-sink = "0.3"
 hex = "0.4"
 hyper-unix-connector = "0.1.4"
 hyper = {version = "0.13", features = ["stream"]}
@@ -19,9 +21,12 @@ pin-project = "0.4"
 prost = "0.6"
 prost-derive = "0.6"
 tokio = {version = "0.2", features = ["full"]}
+tokio-tower = "0.3"
+tower-service = "0.3"
 tonic = "0.1"
 tracing = "0.1"
 tracing-futures = "0.2"
 
 [build-dependencies]
 tonic-build = "0.1"
+flatc-rust = "0.1"

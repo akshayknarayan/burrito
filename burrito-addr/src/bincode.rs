@@ -82,7 +82,7 @@ impl StaticClient {
 
             // unsafe transmute ok because endianness is guaranteed to be the
             // same on either side of a UDS
-            // will read only the firself.uc sizeof(u32) = 4 bytes
+            // will read only the first sizeof(u32) = 4 bytes
             let len_to_read: u32 = unsafe { std::mem::transmute_copy(&buf) };
 
             if len_to_read == 0 {
