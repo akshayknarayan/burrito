@@ -1,3 +1,4 @@
+use burrito_flatbuf as flatbuf;
 use failure::Error;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,10 +94,65 @@ impl BurritoNet {
     }
 
     /// Returns a `Service` which can be passed to `hyper::service::make_service_fn`.
-    pub fn start(self) -> Result<ConnectionServer<BurritoNet>, Error> {
+    pub fn into_hyper_service(self) -> Result<ConnectionServer<BurritoNet>, Error> {
         let s = self.clone();
         tokio::spawn(s.listen_updates());
         Ok(ConnectionServer::new(self))
+    }
+
+    pub async fn serve_flatbuf_on<S, E>(self, sk: S) -> Result<(), Error>
+    where
+        S: tokio::stream::Stream<Item = Result<tokio::net::UnixStream, E>>,
+        E: std::error::Error,
+    {
+        use futures_util::stream::StreamExt;
+        tokio::spawn(self.clone().listen_updates());
+        sk.for_each_concurrent(None, |st| {
+            //let this = self.clone();
+            async {
+                let mut st = st.expect("Accept failed");
+                let mut write_buf = burrito_flatbuf::FlatBufferBuilder::new_with_capacity(128);
+                let mut read_buf = [0u8; 128];
+
+                // read req
+                let (len, msg_type) = burrito_util::read_msg_with_type(&mut st, &mut read_buf)
+                    .await
+                    .expect("read request");
+                let msg = &read_buf[..len];
+
+                match msg_type as usize {
+                    flatbuf::LISTEN_REQUEST => {
+                        let msg = flatbuf::ListenRequest::from(msg);
+                        let addr = self.do_listen(&msg.service_addr, msg.port).await.unwrap();
+
+                        let msg = flatbuf::ListenReply { addr };
+                        msg.onto(&mut write_buf);
+                        let msg = write_buf.finished_data();
+                        burrito_util::write_msg(&mut st, Some(flatbuf::LISTEN_REPLY as u32), msg)
+                            .await
+                            .unwrap();
+                    }
+                    flatbuf::OPEN_REQUEST => {
+                        let msg = flatbuf::OpenRequest::from(msg);
+                        let (send_addr, addr_type) =
+                            self.route_table_get(&msg.dst_addr).await.unwrap();
+                        let msg = match addr_type {
+                            rpc::open_reply::AddrType::Unix => flatbuf::OpenReply::Unix(send_addr),
+                            rpc::open_reply::AddrType::Tcp => flatbuf::OpenReply::Tcp(send_addr),
+                        };
+
+                        msg.onto(&mut write_buf);
+                        let msg = write_buf.finished_data();
+                        burrito_util::write_msg(&mut st, Some(flatbuf::OPEN_REPLY as u32), msg)
+                            .await
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        })
+        .await;
+        Ok(())
     }
 }
 
@@ -112,30 +168,12 @@ impl Connection for BurritoNet {
         let req = request.into_inner();
         let service_addr = req.service_addr;
         let listen_port = req.listen_port;
-        let net_addrs: Vec<String> = self
-            .local_public_addrs
-            .iter()
-            .map(|ref a| format!("{}:{}", a, &listen_port))
-            .collect();
 
-        tokio::spawn(redis_insert(
-            self.redis_listen_connection.clone(),
-            service_addr.clone(),
-            net_addrs.into_iter(),
-            listen_port,
-            self.log.clone(),
-        ));
+        let listen_addr = self
+            .do_listen(&service_addr, listen_port.parse().unwrap())
+            .await
+            .map_err(|e| tonic::Status::new(tonic::Code::AlreadyExists, format!("{}", e)))?;
 
-        let listen_addr = get_addr();
-        self.route_table_insert(&service_addr, &listen_addr).await?;
-        trace!("listen() done");
-
-        slog::info!(self.log, "New service listening";
-            "service" => &service_addr,
-            "addr" => ?listen_addr,
-        );
-
-        trace!("listen() returning");
         Ok(tonic::Response::new(ListenReply { listen_addr }))
     }
 
@@ -144,10 +182,10 @@ impl Connection for BurritoNet {
         &self,
         request: tonic::Request<OpenRequest>,
     ) -> Result<tonic::Response<OpenReply>, tonic::Status> {
-        trace!("open() start");
         let dst_addr = request.into_inner().dst_addr;
 
-        let (send_addr, addr_type) = self.route_table_get(&dst_addr).await?;
+        trace!("open() start");
+        let (send_addr, addr_type) = self.route_table_get(&dst_addr).await.unwrap(); // TODO NOW
         trace!("open() done");
 
         slog::trace!(self.log, "Service connection request";
@@ -165,6 +203,34 @@ impl Connection for BurritoNet {
 }
 
 impl BurritoNet {
+    async fn do_listen(&self, service_addr: &str, listen_port: u16) -> Result<String, Error> {
+        let net_addrs: Vec<String> = self
+            .local_public_addrs
+            .iter()
+            .map(|ref a| format!("{}:{}", a, &listen_port))
+            .collect();
+
+        tokio::spawn(redis_insert(
+            self.redis_listen_connection.clone(),
+            service_addr.to_string(),
+            net_addrs.into_iter(),
+            listen_port,
+            self.log.clone(),
+        ));
+
+        let listen_addr = get_addr();
+        self.route_table_insert(&service_addr, &listen_addr).await?;
+        trace!("listen() done");
+
+        slog::info!(self.log, "New service listening";
+            "service" => &service_addr,
+            "addr" => ?listen_addr,
+        );
+
+        trace!("listen() returning");
+        Ok(listen_addr)
+    }
+
     // redis schema:
     //
     // key "services": a set. keys are service names.
@@ -211,19 +277,17 @@ impl BurritoNet {
         &self,
         service_addr: &str,
         listen_addr: &str,
-    ) -> Result<(), tonic::Status> {
+    ) -> Result<(), failure::Error> {
         trace!("routetable insert start");
         if let Some(s) = self.route_table.write().await.insert(
             service_addr.to_string(),
             (listen_addr.to_string(), rpc::open_reply::AddrType::Unix),
         ) {
             trace!("routetable insert end");
-            Err(tonic::Status::new(
-                tonic::Code::AlreadyExists,
-                format!(
-                    "Service address {} already in use at {}",
-                    &service_addr, &s.0
-                ),
+            Err(failure::format_err!(
+                "Service address {} already in use at {}",
+                &service_addr,
+                &s.0
             ))
         } else {
             trace!("routetable insert end");
@@ -236,7 +300,7 @@ impl BurritoNet {
     async fn route_table_get(
         &self,
         dst_addr: &str,
-    ) -> Result<(String, rpc::open_reply::AddrType), tonic::Status> {
+    ) -> Result<(String, rpc::open_reply::AddrType), failure::Error> {
         trace!("routetable get start");
         // Look up the service addr to translate.
         //
@@ -245,12 +309,9 @@ impl BurritoNet {
         // Treat as a cache miss, or treat route_table as truth? Treat as truth for now.
         let tbl = self.route_table.read().await;
         trace!("routetable get locked");
-        let (send_addr, addr_type) = tbl.get(dst_addr).ok_or_else(|| {
-            tonic::Status::new(
-                tonic::Code::Unknown,
-                format!("Unknown service address {}", dst_addr),
-            )
-        })?;
+        let (send_addr, addr_type) = tbl
+            .get(dst_addr)
+            .ok_or_else(|| failure::format_err!("Unknown service address {}", dst_addr))?;
 
         trace!("routetable get end");
         Ok((send_addr.clone(), *addr_type))
@@ -262,7 +323,7 @@ async fn redis_insert(
     conn: Arc<Mutex<redis::aio::Connection>>,
     sa: String,
     net_addrs: impl Iterator<Item = String>,
-    listen_port: String,
+    listen_port: u16,
     log: slog::Logger,
 ) {
     trace!("redis insert start");

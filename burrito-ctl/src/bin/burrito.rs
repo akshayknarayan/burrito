@@ -96,7 +96,7 @@ async fn main() -> Result<(), failure::Error> {
         slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
         e
     })?.into();
-    let burrito_service = burrito.start()?;
+    let burrito_service = burrito.into_hyper_service()?;
     let burrito_rpc_server = hyper::server::Server::builder(uc)
         .serve(hyper::service::make_service_fn(move |_| {
             let bs = burrito_service.clone();

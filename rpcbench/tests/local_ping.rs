@@ -78,7 +78,7 @@ pub async fn start_burrito_ctl(redis_addr: &str, log: &slog::Logger) -> Result<(
     debug!(&log, "burrito_addr"; "addr" => ?&burrito_addr);
     use hyper_unix_connector::UnixConnector;
     let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr)?.into();
-    let bn = bn.start()?;
+    let bn = bn.into_hyper_service()?;
     let burrito_rpc_server =
         hyper::server::Server::builder(uc).serve(hyper::service::make_service_fn(move |_| {
             let bs = bn.clone();

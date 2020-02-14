@@ -1,3 +1,9 @@
+//! Flatbuffer format for burrito schema.
+//!
+//! TODO move to tokio-tower via [`tokio-codec`](https://docs.rs/tokio-util/0.2.0/tokio_util/codec/index.html)
+//! Currently this is done manually.
+
+use burrito_flatbuf::{ListenReply, ListenRequest, OpenReply, OpenRequest};
 use core::{
     future::Future,
     pin::Pin,
@@ -8,86 +14,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::trace;
 
-#[allow(unused_imports, unused)]
-mod serialization {
-    include!(concat!(env!("OUT_DIR"), "/burrito_generated.rs"));
-}
-
-#[derive(Debug)]
-struct OpenRequest {
-    dst_addr: String,
-}
-
-impl OpenRequest {
-    fn onto(&self, msg: &mut flatbuffers::FlatBufferBuilder) {
-        let dst_addr_field = msg.create_string(&self.dst_addr);
-        let req = serialization::OpenRequest::create(
-            msg,
-            &serialization::OpenRequestArgs {
-                dst_addr: Some(dst_addr_field),
-            },
-        );
-
-        msg.finish(req, None);
-    }
-}
-
-#[derive(Clone)]
-struct UnixSt {
-    st: Arc<Mutex<tokio::net::UnixStream>>,
-}
-
-impl UnixSt {
-    async fn new(controller_addr: impl AsRef<Path>) -> Result<Self, failure::Error> {
-        let st = tokio::net::UnixStream::connect(controller_addr).await?;
-
-        Ok(Self {
-            st: Arc::new(Mutex::new(st)),
-        })
-    }
-
-    async fn write_msg(&mut self, msg: &[u8]) -> Result<(), failure::Error> {
-        use tokio::io::AsyncWriteExt;
-        let mut cl = self.st.lock().await;
-
-        cl.write_all(&msg.len().to_le_bytes()).await?;
-        cl.write_all(msg).await?;
-        Ok(())
-    }
-
-    async fn read_msg(&mut self, buf: &mut [u8]) -> Result<usize, failure::Error> {
-        use tokio::io::AsyncReadExt;
-
-        let mut cl = self.st.lock().await;
-
-        let len_to_read = loop {
-            cl.read_exact(&mut buf[0..4]).await?;
-
-            // unsafe transmute ok because endianness is guaranteed to be the
-            // same on either side of a UDS
-            // will read only the first sizeof(u32) = 4 bytes
-            let len_to_read: u32 = unsafe { std::mem::transmute_copy(&buf) };
-
-            if len_to_read == 0 {
-                tokio::task::yield_now().await;
-                continue;
-            } else if len_to_read as usize > buf.len() {
-                failure::bail!("message size too large: {:?} > 128", len_to_read);
-            } else {
-                break len_to_read;
-            }
-        };
-
-        cl.read_exact(&mut buf[0..len_to_read as usize]).await?;
-        Ok(len_to_read as usize)
-    }
-}
-
 #[derive(Clone)]
 pub struct Client {
     burrito_root: PathBuf,
-    st: UnixSt,
-    buf: flatbuffers::FlatBufferBuilder<'static>,
+    st: Arc<Mutex<tokio::net::UnixStream>>,
+    buf: burrito_flatbuf::FlatBufferBuilder<'static>,
 }
 
 impl Client {
@@ -104,13 +35,19 @@ impl Client {
         let controller_addr = burrito_root.join(burrito_ctl::burrito_net::CONTROLLER_ADDRESS);
 
         // connect to burrito-ctl
-        let st = UnixSt::new(controller_addr).await?;
+        //
+        // The Arc<Mutex<_>> is only necessary because of the implementation of hyper::Service.
+        // If we had existential types (https://github.com/rust-lang/rust/issues/63063), we could
+        // instead write impl Future<Output=_> without having to Box::pin.
+        let st = Arc::new(Mutex::new(
+            tokio::net::UnixStream::connect(controller_addr).await?,
+        ));
         trace!("burrito-addr connected to burrito-ctl");
 
         Ok(Self {
             burrito_root,
             st,
-            buf: flatbuffers::FlatBufferBuilder::new_with_capacity(128),
+            buf: burrito_flatbuf::FlatBufferBuilder::new_with_capacity(128),
         })
     }
 
@@ -118,29 +55,25 @@ impl Client {
         let dst_addr = crate::Uri::socket_path(&dst)?;
         trace!(addr = ?&dst_addr, "Resolving_burrito_address");
         let msg = OpenRequest { dst_addr };
-
         msg.onto(&mut self.buf);
         let msg = self.buf.finished_data();
 
-        self.st.write_msg(msg).await?;
+        let mut st = self.st.lock().await;
+
+        burrito_util::write_msg(&mut *st, Some(burrito_flatbuf::OPEN_REQUEST as u32), msg).await?;
 
         let mut buf = [0u8; 128];
-        let len_to_read = self.st.read_msg(&mut buf).await?;
+        let (len, msg_type) = burrito_util::read_msg_with_type(&mut *st, &mut buf).await?;
+        let buf = &buf[..len];
 
-        let open_reply_reader =
-            flatbuffers::get_root::<serialization::OpenReply>(&buf[0..len_to_read as usize]);
+        let msg = match msg_type as usize {
+            burrito_flatbuf::OPEN_REPLY => OpenReply::from(buf),
+            _ => unreachable!(),
+        };
 
-        if let None = open_reply_reader.send_addr() {
-            failure::bail!("message didn't include send addr");
-        }
-
-        Ok(match open_reply_reader.addr_type() {
-            serialization::AddrType::Unix => {
-                crate::Addr::Unix(open_reply_reader.send_addr().unwrap().to_string())
-            }
-            serialization::AddrType::Tcp => {
-                crate::Addr::Tcp(open_reply_reader.send_addr().unwrap().to_string())
-            }
+        Ok(match msg {
+            OpenReply::Unix(addr) => crate::Addr::Unix(addr),
+            OpenReply::Tcp(addr) => crate::Addr::Tcp(addr),
         })
     }
 }
@@ -160,27 +93,6 @@ impl hyper::service::Service<hyper::Uri> for Client {
     }
 }
 
-#[derive(Debug)]
-struct ListenRequest {
-    service_addr: String,
-    port: u16,
-}
-
-impl ListenRequest {
-    fn onto(&self, msg: &mut flatbuffers::FlatBufferBuilder) {
-        let service_addr_field = msg.create_string(&self.service_addr);
-        let req = serialization::ListenRequest::create(
-            msg,
-            &serialization::ListenRequestArgs {
-                service_addr: Some(service_addr_field),
-                listen_port: self.port,
-            },
-        );
-
-        msg.finish(req, None);
-    }
-}
-
 pub struct Server {
     tl: tokio::net::TcpListener,
     ul: tokio::net::UnixListener,
@@ -193,16 +105,16 @@ impl Server {
         port: u16,
         burrito_root: impl AsRef<Path>,
     ) -> Result<Self, failure::Error> {
-        let burrito_ctl_addr = burrito_root.as_ref().join(burrito_ctl::CONTROLLER_ADDRESS);
-        let burrito_root = burrito_root.as_ref().to_path_buf();
+        let burrito_root = burrito_root.as_ref();
+        let burrito_ctl_addr = burrito_root.join(burrito_ctl::CONTROLLER_ADDRESS);
         trace!(addr = ?&burrito_ctl_addr, root = ?&burrito_root, "Connecting to burrito-ctl");
 
         // ask local burrito-ctl where to listen
-        let mut st = UnixSt::new(burrito_ctl_addr).await?;
+        let mut st = tokio::net::UnixStream::connect(burrito_ctl_addr).await?;
         trace!("Connected to burrito-ctl");
 
         // do listen() rpc
-        let mut buf = flatbuffers::FlatBufferBuilder::new_with_capacity(128);
+        let mut buf = burrito_flatbuf::FlatBufferBuilder::new_with_capacity(128);
         let msg = ListenRequest {
             service_addr: service_addr.to_string(),
             port,
@@ -210,17 +122,18 @@ impl Server {
 
         msg.onto(&mut buf);
         let msg = buf.finished_data();
-        st.write_msg(msg).await?;
+        burrito_util::write_msg(&mut st, Some(burrito_flatbuf::LISTEN_REQUEST as u32), msg).await?;
 
         let mut buf = [0u8; 128];
-        let len_to_read = st.read_msg(&mut buf).await?;
+        let (len, msg_type) = burrito_util::read_msg_with_type(&mut st, &mut buf).await?;
+        let buf = &buf[..len];
 
-        let listen_reply_reader =
-            flatbuffers::get_root::<serialization::ListenReply>(&buf[0..len_to_read as usize]);
+        let msg = match msg_type as usize {
+            burrito_flatbuf::LISTEN_REPLY => ListenReply::from(buf),
+            _ => unreachable!(),
+        };
 
-        let listen_addr = listen_reply_reader
-            .listen_addr()
-            .ok_or_else(|| failure::format_err!("message didn't include listen addr"))?;
+        let listen_addr = msg.addr;
 
         trace!(addr = ?&listen_addr, root = ?&burrito_root, "Got listening address");
 
