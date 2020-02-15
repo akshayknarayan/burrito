@@ -10,50 +10,38 @@ mkdir ./$out
 cargo build --release
 
 echo "==> baremetal tcp"
-# server
 ./target/release/server --port "4242" &
 server=$!
 sleep 2
-# client
-./target/release/client --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
-    -o $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_baremetal.data
-kill -9 $server
 
+./target/release/client --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
+    -o $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_baremetal.data || exit 1
+kill -9 $server
 sleep 2
 
 echo "==> baremetal unix"
-# server
 rm -rf /tmp/burrito/server
 ./target/release/server --unix-addr "/tmp/burrito/server" &
 server=$!
 sleep 2
-# client
 ./target/release/client --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
-    -o $out/work_sqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data
+    -o $out/work_sqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data || exit 1
 kill -9 $server
 
+echo "==> container tcp"
+echo "-> start docker-proxy"
 sleep 2
-echo "--> start burrito-ctl"
-sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker ps -a | awk '{print $out}' | tail -n +2 | xargs sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f
-sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name rpcbench-redis -d -p 6379:6379 redis:5
-docker_host_addr=$(sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock  docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' bridge)
-sudo perf record -g -o $out/burritoctl.perf.data ./target/release/burrito \
+sudo ./target/release/dump-docker \
     -i /var/run/docker.sock \
     -o /var/run/burrito-docker.sock \
-    --redis-addr "redis://localhost:6379" \
-    --net-addr=$docker_host_addr \
-    --tracing-file $out/burritoctl-tracing.trace \
-    > $out/burritoctl.log 2> $out/burritoctl.log &
+    > $out/dumpdocker-local.log 2> $out/dumpdocker-local.log &
 burritoctl=$!
-sleep 15
+sleep 5
 
-image_name=rpcbench:`git rev-parse --short HEAD`
-echo $image_name
-sudo docker build -t $image_name .
-sudo docker ps -a | grep -v redis | awk '{print $out}' | tail -n +2 | xargs sudo docker rm -f > /dev/null 2> /dev/null
-sleep 2
+docker_host_addr=$(sudo docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' bridge)
+image_name=rpcbench-local:`git rev-parse --short HEAD`
+sudo docker build -t $image_name . || exit 1
 
-echo "==> container tcp"
 # server
 sudo docker run --name rpcbench-server -d $image_name ./server --port="4242"
 sleep 4
@@ -65,34 +53,43 @@ sudo docker run --name lrpcclient -it $image_name ./client \
     --addr http://$container_ip:4242 \
     --amount 1000 -w 4 -i 10000 \
     --reqs-per-iter 3 \
-    -o ./work_sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data
-sudo docker cp lrpcclient:/app/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data \
-    $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data
-sudo docker cp lrpcclient:/app/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.trace \
-    $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.trace
-
-sleep 2
-sudo docker ps -a | grep -v redis | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f > /dev/null 2> /dev/null
-sleep 2
+    -o ./res.data || exit 1
+sudo docker cp lrpcclient:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data
+sudo docker cp lrpcclient:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.trace
 
 echo "==> container unix (burrito)"
-# server
+echo " -> stop all containers"
+sudo docker ps -a | awk '{print $out}' | tail -n +2 | xargs sudo docker rm -f
+echo "--> start redis"
+sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+echo "--> stop docker-proxy"
+sudo kill -INT $burritoctl # kill dump-docker
+sleep 2
+echo "--> start burrito-ctl (tonic)"
+sudo ./target/release/burrito \
+    -i /var/run/docker.sock \
+    -o /var/run/burrito-docker.sock \
+    --redis-addr "redis://localhost:6379" \
+    --net-addr=$docker_host_addr \
+    --tracing-file $out/burritoctl-tonic-local.trace \
+    --burrito-proto "tonic" \
+    > $out/burritoctl-tonic-local.log 2> $out/burritoctl-tonic-local.log &
+burritoctl=$!
 sudo docker run --name rpcbench-server -d $image_name ./server \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
+    --burrito-proto="tonic" \
     --port="4242"
-sleep 4
-# client
+sleep 2
 sudo docker run --name lrpcclient -it $image_name ./client \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
+    --burrito-proto="tonic" \
     --amount 1000 -w 4 -i 10000 \
     --reqs-per-iter 3 \
-    -o ./work_sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.data
-sudo docker cp lrpcclient:/app/work_sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.data \
-    $out/work_sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.data
-sudo docker cp lrpcclient:/app/work_sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.trace \
-    $out/work_sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.trace
+    -o ./res.data || exit 1
+sudo docker cp lrpcclient:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_localhost_docker.data
+sudo docker cp lrpcclient:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_localhost_docker.trace
 
 sleep 2
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
@@ -101,5 +98,34 @@ sleep 2
 sudo kill -INT $burritoctl
 sudo pkill -INT burrito
 
-python3 ./scripts/rpcbench-parse.py $out/work*.data > $out/combined.data
-./scripts/rpcbench-plot.r $out/combined.data $out/rpcs.pdf
+sleep 2
+echo "==> Burrito with flatbuf resolver"
+
+echo "--> stop burrito-ctl (tonic)"
+sudo kill -INT $burritoctl # kill dump-docker
+sleep 2
+echo "--> stop burrito-ctl (flatbuf)"
+sudo ./target/release/burrito \
+    -i /var/run/docker.sock \
+    -o /var/run/burrito-docker.sock \
+    --redis-addr "redis://localhost:6379" \
+    --net-addr=$docker_host_addr \
+    --tracing-file $out/burritoctl-flatbuf-tracing.trace \
+    --burrito-mode "flatbuf" \
+    > $out/burritoctl-flatbuf.log 2> $out/burritoctl-flatbuf.log &
+burritoctl=$!
+sudo docker run --name rpcbench-server -d $image_name ./server \
+    --burrito-addr="rpcbench" \
+    --burrito-root="/burrito" \
+    --burrito-proto "flatbuf" \
+    --port="4242"
+sleep 2
+sudo docker run --name lrpcclient -it $image_name ./client \
+    --addr="rpcbench" \
+    --burrito-root="/burrito" \
+    --burrito-proto "flatbuf" \
+    --amount 1000 -w 4 -i 10000 \
+    --reqs-per-iter 3 \
+    -o ./res.data || exit 1
+sudo docker cp lrpcclient:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_localhost_docker.data
+sudo docker cp lrpcclient:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_localhost_docker.trace

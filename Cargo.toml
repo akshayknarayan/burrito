@@ -1,13 +1,12 @@
 [workspace]
 
 members = [
-    "burrito-ctl",
-    "rpcbench",
     "burrito-addr",
+    "burrito-ctl",
     "burrito-flatbuf",
-    "static-test",
     "burrito-util",
-    "burrito-flatbuf",
+    "rpcbench",
+    "static-test",
 ]
 
 [profile.release]
