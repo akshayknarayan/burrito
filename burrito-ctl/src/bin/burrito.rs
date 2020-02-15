@@ -24,6 +24,9 @@ struct Opt {
 
     #[structopt(long)]
     tracing_file: Option<std::path::PathBuf>,
+
+    #[structopt(long, default_value = "flatbuf")]
+    burrito_proto: String,
 }
 
 fn get_net_addrs() -> Result<Vec<std::net::IpAddr>, failure::Error> {
@@ -50,6 +53,7 @@ async fn main() -> Result<(), failure::Error> {
         write_tracing(p.clone(), &log);
     }
 
+    // get docker-proxy serving future
     std::fs::remove_file(&opt.in_addr_docker).unwrap_or_default(); // ignore error if file was not present
     use hyper_unix_connector::UnixConnector;
     let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr_docker).map_err(|e| {
@@ -63,6 +67,7 @@ async fn main() -> Result<(), failure::Error> {
     let docker_proxy_server = hyper::server::Server::builder(uc).serve(make_service);
     slog::info!(log, "docker proxy starting"; "listening at" => ?&opt.in_addr_docker, "proxying to" => ?&opt.out_addr_docker);
 
+    // get burrito-ctl serving future
     let net_addrs = if let None = opt.net_addrs {
         get_net_addrs()?
     } else {
@@ -91,15 +96,27 @@ async fn main() -> Result<(), failure::Error> {
         std::process::exit(0);
     })?;
 
-    let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr).map_err(|e| {
-        slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
-        e
-    })?.into();
-    let burrito_rpc_server = burrito.serve_tonic_on(uc);
-    slog::info!(log, "burrito net starting"; "listening at" => ?&burrito_addr);
+    slog::info!(log, "burrito net starting"; "proto" => &opt.burrito_proto, "listening at" => ?&burrito_addr);
+    let both_servers = match &opt.burrito_proto {
+        x if x == "tonic" => {
+            let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr).map_err(|e| {
+                slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
+                e
+            })?.into();
+            futures_util::future::join(docker_proxy_server, burrito.serve_tonic_on(uc)).await
+        }
+        x if x == "flatbuf" => {
+            let mut uc = tokio::net::UnixListener::bind(&burrito_addr).map_err(|e| {
+                slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
+                e
+            })?;
+            futures_util::future::join(docker_proxy_server, burrito.serve_flatbuf_on(uc.incoming()))
+                .await
+        }
+        x => failure::bail!("Unknown burrito protocol {:?}", &x),
+    };
 
-    let both_servers = futures_util::future::join(docker_proxy_server, burrito_rpc_server);
-    match both_servers.await {
+    match both_servers {
         (Err(e1), Err(e2)) => {
             slog::crit!(log, "crash"; "docker_proxy" => ?e1, "burrito_rpc" => ?e2);
         }
