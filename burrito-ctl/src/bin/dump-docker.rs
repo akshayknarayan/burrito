@@ -17,6 +17,7 @@ async fn main() -> Result<(), failure::Error> {
 
     let out_addr = opt.out_addr.clone();
 
+    std::fs::remove_file(&opt.in_addr).unwrap_or_default(); // ignore error if file was not present
     use hyper_unix_connector::UnixConnector;
     let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr)?.into();
     let make_service = burrito_ctl::MakeDockerProxy {
