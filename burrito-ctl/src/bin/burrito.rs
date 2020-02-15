@@ -1,5 +1,4 @@
 use structopt::StructOpt;
-use tracing_futures::Instrument;
 use tracing_timing::{Builder, Histogram};
 
 #[derive(Debug, StructOpt)]
@@ -96,13 +95,7 @@ async fn main() -> Result<(), failure::Error> {
         slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
         e
     })?.into();
-    let burrito_service = burrito.into_hyper_service()?;
-    let burrito_rpc_server = hyper::server::Server::builder(uc)
-        .serve(hyper::service::make_service_fn(move |_| {
-            let bs = burrito_service.clone();
-            async move { Ok::<_, hyper::Error>(bs) }
-        }))
-        .instrument(tracing::span!(tracing::Level::DEBUG, "burrito-ctl"));
+    let burrito_rpc_server = burrito.serve_tonic_on(uc);
     slog::info!(log, "burrito net starting"; "listening at" => ?&burrito_addr);
 
     let both_servers = futures_util::future::join(docker_proxy_server, burrito_rpc_server);
@@ -126,18 +119,6 @@ async fn main() -> Result<(), failure::Error> {
 fn write_tracing(p: std::path::PathBuf, log: &slog::Logger) {
     let subscriber = Builder::default()
         .no_span_recursion()
-        //.events(|e: &tracing::Event| {
-        //    let mut val = String::new();
-        //    let mut f = |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
-        //        if field.name() == "message" {
-        //            val.push_str(&format!(" {:?} ", value));
-        //        } else if field.name() == "which" {
-        //            val.push_str(&format!(" which={:?} ", value));
-        //        };
-        //    };
-        //    e.record(&mut f);
-        //    val
-        //})
         .build(|| Histogram::new_with_max(10_000_000, 2).unwrap());
     let sid = subscriber.downcaster();
     let d = tracing::Dispatch::new(subscriber);
@@ -158,8 +139,9 @@ fn write_tracing(p: std::path::PathBuf, log: &slog::Logger) {
             Err(_) => return,
         };
 
+        // force_synchronize in theory drops events, but
+        // the refresh() way appears to not work...
         sid.downcast(&d).unwrap().force_synchronize();
-
         sid.downcast(&d).unwrap().with_histograms(|hs| {
             //for (_, hs) in hs.iter_mut() {
             //    for (_, h) in hs {

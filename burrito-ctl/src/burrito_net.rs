@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::trace;
+use tracing_futures::Instrument;
 
 pub mod rpc {
     tonic::include_proto!("burrito");
@@ -98,6 +99,25 @@ impl BurritoNet {
         let s = self.clone();
         tokio::spawn(s.listen_updates());
         Ok(ConnectionServer::new(self))
+    }
+
+    /// Returns a future which will serve BurritoNet RPCs over hyper/tonic/gRPC.
+    ///
+    /// Calls [`BurritoNet::into_hyper_service`] internally.
+    pub async fn serve_tonic_on<L>(self, uc: L) -> Result<(), Error>
+    where
+        L: hyper::server::accept::Accept<Conn = tokio::net::UnixStream>,
+        L::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let s = self.into_hyper_service()?;
+        hyper::server::Server::builder(uc)
+            .serve(hyper::service::make_service_fn(move |_| {
+                let s = s.clone();
+                async move { Ok::<_, hyper::Error>(s) }
+            }))
+            .instrument(tracing::span!(tracing::Level::DEBUG, "burrito-ctl"))
+            .await
+            .map_err(|e| e.into())
     }
 
     pub async fn serve_flatbuf_on<S, E>(self, sk: S) -> Result<(), Error>
