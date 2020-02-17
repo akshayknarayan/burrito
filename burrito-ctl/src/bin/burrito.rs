@@ -51,6 +51,8 @@ async fn main() -> Result<(), failure::Error> {
 
     if let Some(ref p) = opt.tracing_file {
         write_tracing(p.clone(), &log);
+    } else {
+        tracing_subscriber::fmt::init();
     }
 
     // get docker-proxy serving future
@@ -140,7 +142,6 @@ fn write_tracing(p: std::path::PathBuf, log: &slog::Logger) {
     let sid = subscriber.downcaster();
     let d = tracing::Dispatch::new(subscriber);
 
-    //tracing_subscriber::fmt::init();
     tracing::dispatcher::set_global_default(d.clone()).expect("set tracing global default");
 
     let log = log.clone();

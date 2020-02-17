@@ -53,8 +53,11 @@ async fn main() -> Result<(), failure::Error> {
     let sid = subscriber.downcaster();
     let d = tracing::Dispatch::new(subscriber);
 
-    //tracing_subscriber::fmt::init();
-    tracing::dispatcher::set_global_default(d.clone()).expect("set tracing global default");
+    if let None = opt.out_file {
+        tracing_subscriber::fmt::init();
+    } else {
+        tracing::dispatcher::set_global_default(d.clone()).expect("set tracing global default");
+    }
 
     let durs = if let Some(root) = opt.burrito_root {
         // burrito mode
