@@ -69,13 +69,13 @@ async fn main() -> Result<(), failure::Error> {
                 trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
                 rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
             }
-            x if x == "flatbuf" => {
+            x if x == "bincode" => {
                 let cl =
                     burrito_addr::bincode::StaticClient::new(std::path::PathBuf::from(root)).await;
                 trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
                 rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
             }
-            x if x == "bincode" => {
+            x if x == "flatbuf" => {
                 let cl = burrito_addr::flatbuf::Client::new(std::path::PathBuf::from(root)).await?;
                 trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
                 rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
