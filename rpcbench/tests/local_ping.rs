@@ -4,7 +4,7 @@ use slog::{debug, error, trace};
 #[test]
 // The sleeps are unfortunate, but there's not really a way to tell when
 // a server has started serving :(
-fn local_ping() -> Result<(), Error> {
+fn local_tonic_ping() -> Result<(), Error> {
     let log = test_logger();
     let mut rt = tokio::runtime::Runtime::new()?;
 
@@ -13,17 +13,21 @@ fn local_ping() -> Result<(), Error> {
         let redis = start_redis(&l, 42423);
 
         tokio::spawn(async move {
-            start_burrito_ctl(&redis.get_addr(), &l)
+            start_tonic_burrito_ctl(&redis.get_addr(), &l)
                 .await
                 .expect("Burrito Ctl")
         });
         block_for(std::time::Duration::from_millis(200)).await;
         let l = log.clone();
-        tokio::spawn(async move { start_sever_burrito(&l).await.expect("RPC Server") });
+        tokio::spawn(async move {
+            start_rpcbench_tonic_server_burrito(&l)
+                .await
+                .expect("RPC Server")
+        });
         block_for(std::time::Duration::from_millis(200)).await;
 
-        trace!(&log, "connecting to burrito controller"; "burrito_root" => "./tmp-test-bn");
-        let cl = burrito_addr::tonic::Client::new("./tmp-test-bn").await?;
+        trace!(&log, "connecting to burrito controller"; "burrito_root" => "./tmp-tonic-bn");
+        let cl = burrito_addr::tonic::Client::new("./tmp-tonic-bn").await?;
         let a: hyper::Uri = burrito_addr::Uri::new("test-rpcbench").into();
         rpcbench::client_ping(
             a,
@@ -41,11 +45,55 @@ fn local_ping() -> Result<(), Error> {
     })
 }
 
-async fn start_sever_burrito(log: &slog::Logger) -> Result<(), Error> {
+#[test]
+fn local_flatbuf_ping() -> Result<(), Error> {
+    let log = test_logger();
+    let mut rt = tokio::runtime::Runtime::new()?;
+    tracing_subscriber::fmt::init();
+
+    rt.block_on(async move {
+        let l = log.clone();
+        let redis = start_redis(&l, 42422);
+
+        tokio::spawn(async move {
+            start_flatbuf_burrito_ctl(&redis.get_addr(), &l)
+                .await
+                .expect("burrito-ctl")
+        });
+        block_for(std::time::Duration::from_millis(200)).await;
+        let l = log.clone();
+        tokio::spawn(async move {
+            start_rpcbench_flatbuf_server_burrito(&l)
+                .await
+                .expect("RPC Server")
+        });
+        block_for(std::time::Duration::from_millis(200)).await;
+
+        debug!(&log, "connecting to burrito controller"; "burrito_root" => "./tmp-flatbuf-bn");
+        let cl = burrito_addr::flatbuf::Client::new("./tmp-flatbuf-bn").await?;
+        let a: hyper::Uri = burrito_addr::Uri::new("test-rpcbench").into();
+        rpcbench::client_ping(
+            a,
+            cl,
+            rpcbench::PingParams {
+                work: rpcbench::Work::Immediate as i32,
+                amount: 0,
+            },
+            1, // iters
+            1, // reqs per iter
+        )
+        .await?;
+
+        Ok(())
+    })
+}
+
+async fn start_rpcbench_flatbuf_server_burrito(log: &slog::Logger) -> Result<(), Error> {
     let l2 = log.clone();
 
     // get serving address
-    let srv = burrito_addr::tonic::Server::start("test-rpcbench", 42425, "./tmp-test-bn").await?;
+    let srv =
+        burrito_addr::flatbuf::Server::start("test-rpcbench", 42426, "./tmp-flatbuf-bn").await?;
     let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
 
     trace!(l2, "spawning test-rpcbench");
@@ -60,14 +108,62 @@ async fn start_sever_burrito(log: &slog::Logger) -> Result<(), Error> {
     Ok(())
 }
 
-pub async fn start_burrito_ctl(redis_addr: &str, log: &slog::Logger) -> Result<(), Error> {
-    trace!(&log, "removing"; "dir" => "./tmp-test-bn/");
-    std::fs::remove_dir_all("./tmp-test-bn/").unwrap_or_default();
-    trace!(&log, "creating"; "dir" => "./tmp-test-bn/");
-    std::fs::create_dir_all("./tmp-test-bn/")?;
+pub async fn start_flatbuf_burrito_ctl(redis_addr: &str, log: &slog::Logger) -> Result<(), Error> {
+    trace!(&log, "removing"; "dir" => "./tmp-flatbuf-bn/");
+    std::fs::remove_dir_all("./tmp-flatbuf-bn/").unwrap_or_default();
+    trace!(&log, "creating"; "dir" => "./tmp-flatbuf-bn/");
+    std::fs::create_dir_all("./tmp-flatbuf-bn/")?;
 
     let bn = burrito_ctl::BurritoNet::new(
-        Some(std::path::PathBuf::from("./tmp-test-bn/")),
+        Some(std::path::PathBuf::from("./tmp-flatbuf-bn/")),
+        vec!["127.0.0.1".to_string()],
+        redis_addr,
+        log.clone(),
+    )
+    .await?;
+
+    let burrito_addr = bn.listen_path();
+    debug!(&log, "burrito-ctl addr"; "addr" => ?&burrito_addr);
+    let mut uc = tokio::net::UnixListener::bind(&burrito_addr)?;
+    let burrito_rpc_server = bn.serve_flatbuf_on(uc.incoming());
+
+    trace!(&log, "spawning flatbuf burrito_rpc_server");
+    let s = burrito_rpc_server.await;
+    if let Err(e) = s {
+        error!(&log, "burrito_rpc_server crashed"; "err" => ?e);
+        panic!(e)
+    }
+
+    Ok(())
+}
+
+async fn start_rpcbench_tonic_server_burrito(log: &slog::Logger) -> Result<(), Error> {
+    let l2 = log.clone();
+
+    // get serving address
+    let srv = burrito_addr::tonic::Server::start("test-rpcbench", 42425, "./tmp-tonic-bn").await?;
+    let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
+
+    trace!(l2, "spawning test-rpcbench");
+
+    hyper::server::Server::builder(srv)
+        .serve(hyper::service::make_service_fn(move |_| {
+            let ps = ping_srv.clone();
+            async move { Ok::<_, hyper::Error>(ps) }
+        }))
+        .await?;
+
+    Ok(())
+}
+
+pub async fn start_tonic_burrito_ctl(redis_addr: &str, log: &slog::Logger) -> Result<(), Error> {
+    trace!(&log, "removing"; "dir" => "./tmp-tonic-bn/");
+    std::fs::remove_dir_all("./tmp-tonic-bn/").unwrap_or_default();
+    trace!(&log, "creating"; "dir" => "./tmp-tonic-bn/");
+    std::fs::create_dir_all("./tmp-tonic-bn/")?;
+
+    let bn = burrito_ctl::BurritoNet::new(
+        Some(std::path::PathBuf::from("./tmp-tonic-bn/")),
         vec!["127.0.0.1".to_string()],
         redis_addr,
         log.clone(),
@@ -106,18 +202,8 @@ pub struct Redis {
 
 impl Redis {
     pub fn start(log: &slog::Logger, port: u16) -> Result<Self, Error> {
-        let mut kill = std::process::Command::new("sudo")
-            .args(&[
-                "DOCKER_HOST=unix:///var/run/burrito-docker.sock",
-                "docker",
-                "rm",
-                "-f",
-                "test-burritoctl-redis",
-            ])
-            .spawn()
-            .expect("Could not spawn docker rm");
-
-        kill.wait().expect("Error waiting on docker rm");
+        let name = format!("test-burritoctl-redis-{:?}", port);
+        kill_redis(port);
 
         let mut redis = std::process::Command::new("sudo")
             .args(&[
@@ -125,7 +211,7 @@ impl Redis {
                 "docker",
                 "run",
                 "--name",
-                "test-burritoctl-redis",
+                &name,
                 "-d",
                 "-p",
                 &format!("{}:6379", port),
@@ -161,19 +247,23 @@ impl Redis {
 
 impl Drop for Redis {
     fn drop(&mut self) {
-        let mut kill = std::process::Command::new("sudo")
-            .args(&[
-                "DOCKER_HOST=unix:///var/run/burrito-docker.sock",
-                "docker",
-                "rm",
-                "-f",
-                "test-burritoctl-redis",
-            ])
-            .spawn()
-            .expect("Could not spawn docker rm");
-
-        kill.wait().expect("Error waiting on docker rm");
+        kill_redis(self.port);
     }
+}
+fn kill_redis(port: u16) {
+    let name = format!("test-burritoctl-redis-{:?}", port);
+    let mut kill = std::process::Command::new("sudo")
+        .args(&[
+            "DOCKER_HOST=unix:///var/run/burrito-docker.sock",
+            "docker",
+            "rm",
+            "-f",
+            &name,
+        ])
+        .spawn()
+        .expect("Could not spawn docker rm");
+
+    kill.wait().expect("Error waiting on docker rm");
 }
 
 pub fn test_logger() -> slog::Logger {
