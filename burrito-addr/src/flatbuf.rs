@@ -71,8 +71,16 @@ impl Client {
             _ => unreachable!(),
         };
 
+        trace!(resolved_addr = ?&msg, "Resolved_burrito_address");
+
         Ok(match msg {
-            OpenReply::Unix(addr) => crate::Addr::Unix(addr),
+            OpenReply::Unix(addr) => crate::Addr::Unix(
+                self.burrito_root
+                    .join(addr)
+                    .into_os_string()
+                    .into_string()
+                    .expect("OS string as valid string"),
+            ),
             OpenReply::Tcp(addr) => crate::Addr::Tcp(addr),
         })
     }
