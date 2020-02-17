@@ -130,8 +130,8 @@ impl BurritoNet {
         sk.for_each_concurrent(None, |st| {
             async {
                 let mut st = st.expect("Accept failed");
-                let mut write_buf = burrito_flatbuf::FlatBufferBuilder::new_with_capacity(128);
-                let mut read_buf = [0u8; 128];
+                let mut write_buf = burrito_flatbuf::FlatBufferBuilder::new_with_capacity(1024);
+                let mut read_buf = [0u8; 512];
 
                 // service this connection indefinitely
                 loop {
@@ -191,6 +191,8 @@ impl BurritoNet {
                         }
                         _ => unreachable!(),
                     }
+
+                    write_buf.reset();
                 }
             }
         })

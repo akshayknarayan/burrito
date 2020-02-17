@@ -47,7 +47,7 @@ impl Client {
         Ok(Self {
             burrito_root,
             st,
-            buf: burrito_flatbuf::FlatBufferBuilder::new_with_capacity(128),
+            buf: burrito_flatbuf::FlatBufferBuilder::new_with_capacity(512),
         })
     }
 
@@ -61,8 +61,9 @@ impl Client {
         let mut st = self.st.lock().await;
 
         burrito_util::write_msg(&mut *st, Some(burrito_flatbuf::OPEN_REQUEST as u32), msg).await?;
+        self.buf.reset();
 
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 512];
         let (len, msg_type) = burrito_util::read_msg_with_type(&mut *st, &mut buf).await?;
         let buf = &buf[..len];
 
@@ -122,7 +123,7 @@ impl Server {
         trace!("Connected to burrito-ctl");
 
         // do listen() rpc
-        let mut buf = burrito_flatbuf::FlatBufferBuilder::new_with_capacity(128);
+        let mut buf = burrito_flatbuf::FlatBufferBuilder::new_with_capacity(512);
         let msg = ListenRequest {
             service_addr: service_addr.to_string(),
             port,
@@ -132,7 +133,7 @@ impl Server {
         let msg = buf.finished_data();
         burrito_util::write_msg(&mut st, Some(burrito_flatbuf::LISTEN_REQUEST as u32), msg).await?;
 
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 512];
         let (len, msg_type) = burrito_util::read_msg_with_type(&mut st, &mut buf).await?;
         let buf = &buf[..len];
 
@@ -178,7 +179,7 @@ impl hyper::server::accept::Accept for Server {
 //inner: Arc<Mutex<pipeline::Client<UnixTransport, TokioError, OpenRequest>>>,
 //let inner = Arc::new(Mutex::new(pipeline::client::Client::new(UnixTransport {
 //    st,
-//    buf: flatbuffers::FlatBufferBuilder::new_with_capacity(128),
+//    buf: flatbuffers::FlatBufferBuilder::new_with_capacity(1024),
 //    curr_msg: None,
 //})));
 // tokio-tower way
