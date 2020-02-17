@@ -133,40 +133,64 @@ impl BurritoNet {
                 let mut write_buf = burrito_flatbuf::FlatBufferBuilder::new_with_capacity(128);
                 let mut read_buf = [0u8; 128];
 
-                // read req
-                let (len, msg_type) = burrito_util::read_msg_with_type(&mut st, &mut read_buf)
-                    .await
-                    .expect("read request");
-                let msg = &read_buf[..len];
-
-                match msg_type as usize {
-                    flatbuf::LISTEN_REQUEST => {
-                        let msg = flatbuf::ListenRequest::from(msg);
-                        let addr = self.do_listen(&msg.service_addr, msg.port).await.unwrap();
-
-                        let msg = flatbuf::ListenReply { addr };
-                        msg.onto(&mut write_buf);
-                        let msg = write_buf.finished_data();
-                        burrito_util::write_msg(&mut st, Some(flatbuf::LISTEN_REPLY as u32), msg)
-                            .await
-                            .unwrap();
-                    }
-                    flatbuf::OPEN_REQUEST => {
-                        let msg = flatbuf::OpenRequest::from(msg);
-                        let (send_addr, addr_type) =
-                            self.route_table_get(&msg.dst_addr).await.unwrap();
-                        let msg = match addr_type {
-                            rpc::open_reply::AddrType::Unix => flatbuf::OpenReply::Unix(send_addr),
-                            rpc::open_reply::AddrType::Tcp => flatbuf::OpenReply::Tcp(send_addr),
+                // service this connection indefinitely
+                loop {
+                    // read req
+                    let (len, msg_type) =
+                        match burrito_util::read_msg_with_type(&mut st, &mut read_buf).await {
+                            Ok(s) => s,
+                            Err(_) => return,
                         };
 
-                        msg.onto(&mut write_buf);
-                        let msg = write_buf.finished_data();
-                        burrito_util::write_msg(&mut st, Some(flatbuf::OPEN_REPLY as u32), msg)
+                    let msg = &read_buf[..len];
+
+                    match msg_type as usize {
+                        flatbuf::LISTEN_REQUEST => {
+                            let msg = flatbuf::ListenRequest::from(msg);
+                            let addr = self.do_listen(&msg.service_addr, msg.port).await.unwrap();
+
+                            let msg = flatbuf::ListenReply { addr };
+                            msg.onto(&mut write_buf);
+                            let msg = write_buf.finished_data();
+                            if burrito_util::write_msg(
+                                &mut st,
+                                Some(flatbuf::LISTEN_REPLY as u32),
+                                msg,
+                            )
                             .await
-                            .unwrap();
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        flatbuf::OPEN_REQUEST => {
+                            let msg = flatbuf::OpenRequest::from(msg);
+                            let (send_addr, addr_type) =
+                                self.route_table_get(&msg.dst_addr).await.unwrap();
+                            let msg = match addr_type {
+                                rpc::open_reply::AddrType::Unix => {
+                                    flatbuf::OpenReply::Unix(send_addr)
+                                }
+                                rpc::open_reply::AddrType::Tcp => {
+                                    flatbuf::OpenReply::Tcp(send_addr)
+                                }
+                            };
+
+                            msg.onto(&mut write_buf);
+                            let msg = write_buf.finished_data();
+                            if burrito_util::write_msg(
+                                &mut st,
+                                Some(flatbuf::OPEN_REPLY as u32),
+                                msg,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        _ => unreachable!(),
                     }
-                    _ => unreachable!(),
                 }
             }
         })
