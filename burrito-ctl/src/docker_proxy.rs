@@ -233,14 +233,14 @@ impl DockerProxy {
             let req_upgrade = match req_upgrade {
                 Ok(r) => r,
                 Err(e) => {
-                    slog::warn!(copier_log, "Upgrade error"; "err" => ?e);
+                    slog::warn!(copier_log, "Upgrade error"; "where" => "request upgrade", "err" => ?e);
                     return;
                 }
             };
             let resp_upgrade = match resp_upgrade {
                 Ok(r) => r,
                 Err(e) => {
-                    slog::warn!(copier_log, "Upgrade error"; "err" => ?e);
+                    slog::warn!(copier_log, "Upgrade error"; "where" => "response upgrade", "err" => ?e);
                     return;
                 }
             };
@@ -251,14 +251,14 @@ impl DockerProxy {
             let l2 = log.clone();
             tokio::spawn(async move {
                 if let Err(e) = tokio::io::copy(&mut req_read, &mut resp_write).await {
-                    slog::warn!(l2, "Upgrade error"; "err" => ?e);
+                    slog::warn!(l2, "Upgrade error"; "where" => "copy req -> resp", "err" => ?e);
                 };
             });
 
             let l3 = log.clone();
             tokio::spawn(async move {
                 if let Err(e) = tokio::io::copy(&mut resp_read, &mut req_write).await {
-                    slog::warn!(l3, "Upgrade error"; "err" => ?e);
+                    slog::warn!(l3, "Upgrade error"; "where" => "copy resp -> req", "err" => ?e);
                 };
             });
         });
