@@ -128,7 +128,6 @@ impl BurritoNet {
         use futures_util::stream::StreamExt;
         tokio::spawn(self.clone().listen_updates());
         sk.for_each_concurrent(None, |st| {
-            //let this = self.clone();
             async {
                 let mut st = st.expect("Accept failed");
                 let mut write_buf = burrito_flatbuf::FlatBufferBuilder::new_with_capacity(128);
