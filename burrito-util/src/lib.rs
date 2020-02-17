@@ -3,7 +3,9 @@
 //! Will wrap the buffer with its length.
 
 use byteorder::{ByteOrder, LittleEndian};
+use tracing::{instrument, trace};
 
+#[instrument(level = "debug", skip(cl, msg))]
 pub async fn write_msg(
     mut cl: impl tokio::io::AsyncWrite + Unpin,
     msg_type: Option<u32>,
@@ -49,26 +51,32 @@ async fn read_len(
     })
 }
 
+#[instrument(level = "debug", skip(cl, buf))]
 pub async fn read_msg(
     mut cl: impl tokio::io::AsyncRead + Unpin,
     buf: &mut [u8],
 ) -> Result<usize, failure::Error> {
     use tokio::io::AsyncReadExt;
 
+    trace!("read_msg start");
     let len_to_read = read_len(&mut cl, buf).await?;
     cl.read_exact(&mut buf[0..len_to_read]).await?;
+    trace!(msg_len = len_to_read, "read_msg end");
     Ok(len_to_read)
 }
 
+#[instrument(level = "debug", skip(cl, buf))]
 pub async fn read_msg_with_type(
     mut cl: impl tokio::io::AsyncRead + Unpin,
     buf: &mut [u8],
 ) -> Result<(usize, u32), failure::Error> {
     use tokio::io::AsyncReadExt;
 
+    trace!("read_msg_with_type start");
     let len_to_read = read_len(&mut cl, buf).await?;
     let msg_type = read_u32(&mut cl, buf).await?;
     cl.read_exact(&mut buf[0..len_to_read as usize]).await?;
+    trace!(msg_len = len_to_read, msg_type, "read_msg_with_type end");
     Ok((len_to_read as usize, msg_type))
 }
 
