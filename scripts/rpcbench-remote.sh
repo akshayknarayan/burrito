@@ -26,6 +26,8 @@ if [ $ok -gt 0 ]; then
     exit 2;
 fi
 
+ssh $1 mkdir ~/burrito/$out
+
 cargo build --release &
 local_build=$!
 ssh $1 "cd ~/burrito && ~/.cargo/bin/cargo build --release" &
@@ -55,7 +57,6 @@ ssh $1 "cd ~/burrito && sudo ./target/release/dump-docker -i /var/run/docker.soc
 sleep 4
 
 image_name=rpcbench:`git rev-parse --short HEAD`
-image_name=rpcbench:`git rev-parse --short HEAD`
 sudo docker build -t $image_name . &
 local_docker_build=$!
 ssh 10.1.1.6 "cd ~/burrito && sudo docker build -t $image_name ." &
@@ -64,7 +65,7 @@ echo "-> build docker image $image_name"
 wait $local_docker_build $remote_docker_build
 sleep 2
 
-sudo docker rm -f rpcclient3 || exit 1
+sudo docker rm -f rpcclient3
 ssh $1 sudo docker rm -f rpcbench-server
 ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./server --port="4242"
 sleep 4
@@ -81,8 +82,10 @@ echo "--> start redis"
 sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
 
 echo "--> stop docker-proxy"
-sudo kill -INT $burritoctl # kill dump-docker
-ssh $1 "cd ~/burrito && sudo pkill -INT dump-docker"
+sudo kill -9 $burritoctl # kill dump-docker
+sudo pkill -9 dump-docker
+ssh $1 "cd ~/burrito && sudo pkill -9 dump-docker && rm -f /tmp/burrito/controller"
+rm -f /tmp/burrito/controller # need to rm, dump-docker doesn't have the signal handler to rm TODO
 sleep 2
 
 echo "--> start burrito-ctl (tonic) locally"
@@ -98,7 +101,7 @@ burritoctl=$!
 
 echo "--> start burrito-ctl (tonic) on $1"
 ssh $1 "mkdir -p ~/burrito/$out"
-ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o /var/run/burrito-docker.sock --redis-addr \"redis://$3:6379\" --net-addr=$3 --tracing-file $out/burritoctl-tonic-remote.trace  --burrito-mode \"tonic\" > $out/burritoctl-tonic-remote.log 2> $out/burritoctl-tonic-remote.log &"
+ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o /var/run/burrito-docker.sock --redis-addr \"redis://$3:6379\" --net-addr=$1 --tracing-file $out/burritoctl-tonic-remote.trace --burrito-proto \"tonic\" > $out/burritoctl-tonic-remote.log 2> $out/burritoctl-tonic-remote.log &"
 
 sudo docker rm -f rpcclient1 rpcclient3
 ssh $1 sudo docker rm -f rpcbench-server
@@ -153,7 +156,7 @@ burritoctl=$!
 
 echo "--> start burrito-ctl (flatbuf) on $1"
 ssh $1 "mkdir -p ~/burrito/$out"
-ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o /var/run/burrito-docker.sock --redis-addr \"redis://$3:6379\" --net-addr=$3 --tracing-file $out/burritoctl-flatbuf-remote.trace --burrito-mode \"flatbuf\" > $out/burritoctl-flatbuf-remote.log 2> $out/burritoctl-flatbuf-remote.log &"
+ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o /var/run/burrito-docker.sock --redis-addr \"redis://$3:6379\" --net-addr=$1 --tracing-file $out/burritoctl-flatbuf-remote.trace --burrito-proto \"flatbuf\" > $out/burritoctl-flatbuf-remote.log 2> $out/burritoctl-flatbuf-remote.log &"
 
 sudo docker rm -f rpcclient1 rpcclient3
 ssh $1 sudo docker rm -f rpcbench-server

@@ -38,8 +38,12 @@ sudo ./target/release/dump-docker \
 burritoctl=$!
 sleep 5
 
+sleep 2
+sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
+sleep 2
+
 docker_host_addr=$(sudo docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' bridge)
-image_name=rpcbench-local:`git rev-parse --short HEAD`
+image_name=rpcbench:`git rev-parse --short HEAD`
 sudo docker build -t $image_name . || exit 1
 
 # server
@@ -59,11 +63,12 @@ sudo docker cp lrpcclient:/app/res.trace $out/work_sqrts_1000-iters_10000_perite
 
 echo "==> container unix (burrito)"
 echo " -> stop all containers"
-sudo docker ps -a | awk '{print $out}' | tail -n +2 | xargs sudo docker rm -f
+sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 echo "--> start redis"
 sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
 echo "--> stop docker-proxy"
 sudo kill -INT $burritoctl # kill dump-docker
+sudo pkill -INT dump-docker
 sleep 2
 echo "--> start burrito-ctl (tonic)"
 sudo ./target/release/burrito \
@@ -75,6 +80,7 @@ sudo ./target/release/burrito \
     --burrito-proto "tonic" \
     > $out/burritoctl-tonic-local.log 2> $out/burritoctl-tonic-local.log &
 burritoctl=$!
+sleep 2
 sudo docker run --name rpcbench-server -d $image_name ./server \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
@@ -95,25 +101,27 @@ sleep 2
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 sleep 2
 
-sudo kill -INT $burritoctl
-sudo pkill -INT burrito
-
-sleep 2
 echo "==> Burrito with flatbuf resolver"
-
-echo "--> stop burrito-ctl (tonic)"
-sudo kill -INT $burritoctl # kill dump-docker
+echo "--> start redis"
+sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
 sleep 2
-echo "--> stop burrito-ctl (flatbuf)"
+echo "--> stop burrito-ctl (tonic)"
+sudo kill -INT $burritoctl
+sudo pkill -INT dump-docker 2> /dev/null
+sudo pkill -INT burrito 2> /dev/null
+sleep 2
+echo "--> start burrito-ctl (flatbuf)"
 sudo ./target/release/burrito \
     -i /var/run/docker.sock \
     -o /var/run/burrito-docker.sock \
+    -f \
     --redis-addr "redis://localhost:6379" \
     --net-addr=$docker_host_addr \
     --tracing-file $out/burritoctl-flatbuf-tracing.trace \
-    --burrito-mode "flatbuf" \
+    --burrito-proto "flatbuf" \
     > $out/burritoctl-flatbuf.log 2> $out/burritoctl-flatbuf.log &
 burritoctl=$!
+sleep 2
 sudo docker run --name rpcbench-server -d $image_name ./server \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
@@ -129,3 +137,5 @@ sudo docker run --name lrpcclient -it $image_name ./client \
     -o ./res.data || exit 1
 sudo docker cp lrpcclient:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_localhost_docker.data
 sudo docker cp lrpcclient:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_localhost_docker.trace
+
+python3 ./scripts/rpcbench-parse.py $out/work*.data > $out/combined.data

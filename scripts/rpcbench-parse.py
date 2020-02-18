@@ -3,16 +3,17 @@
 import sys
 import re
 
-file_re = re.compile(r"work_(sqrts)_([0-9]+)-iters_([0-9]+)_(\w+)_(\w+)_(\w+)\.data")
+file_re = re.compile(r"work_(\w+)_([0-9]+)-iters_([0-9]+)_periter_([0-9]+)_(\S+?)_(\w+)_(\w+)\.data")
 def parse_filename(fn: str):
     m = file_re.search(fn)
     return {
         'work_type': m[1],
         'work_amount': m[2],
         'iters': m[3],
-        'proto': m[4],
-        'machine': m[5],
-        'container': m[6],
+        'reqs_per_iter': m[4],
+        'proto': m[5],
+        'machine': m[6],
+        'container': m[7],
     }
 
 def read_file(fn: str, first: bool):
