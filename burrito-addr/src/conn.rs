@@ -16,12 +16,12 @@ impl Addr {
         Ok(match self {
             Self::Unix(addr) => {
                 let st = tokio::net::UnixStream::connect(&addr).await?;
-                trace!("Connected");
+                trace!("burrito-addr::Conn Connected");
                 Conn::Unix(st)
             }
             Self::Tcp(addr) => {
                 let st = tokio::net::TcpStream::connect(&addr).await?;
-                trace!("Connected");
+                trace!("burrito-addr::Conn Connected");
                 Conn::Tcp(st)
             }
         })

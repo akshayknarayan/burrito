@@ -108,8 +108,8 @@ where
         for j in 0..reqs_per_iter {
             trace!(iter = i, which = j, "ping_start");
             let (tot, srv) = do_one_ping(&mut client, msg.clone()).await?;
-            durs.push((tot, srv));
             trace!(iter = i, which = j, "ping_end");
+            durs.push((tot, srv));
         }
 
         let elap: i64 = then.elapsed().as_micros().try_into()?;
