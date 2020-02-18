@@ -99,6 +99,7 @@ where
 
         let then = std::time::Instant::now();
         let channel = endpoint
+            .tcp_nodelay(false)
             .connect_with_connector(ctr)
             .instrument(span!(Level::DEBUG, "connector"))
             .await?;
