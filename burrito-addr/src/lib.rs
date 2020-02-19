@@ -31,6 +31,7 @@ fn poll_select_accept(
     match Pin::new(&mut ti).poll_accept(cx) {
         Poll::Pending => (),
         Poll::Ready(Ok(s)) => {
+            // https://eklitzke.org/the-caveats-of-tcp-nodelay
             s.set_nodelay(true)
                 .expect("set nodelay on accepted connection");
             return Poll::Ready(Some(Ok(Conn::Tcp(s))));
