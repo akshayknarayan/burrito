@@ -86,7 +86,8 @@ async fn main() -> Result<(), failure::Error> {
         // raw tcp mode
         info!(&log, "TCP mode"; "addr" => ?&opt.addr);
         use std::str::FromStr;
-        let http = hyper::client::connect::HttpConnector::new();
+        let mut http = hyper::client::connect::HttpConnector::new();
+        http.set_nodelay(true);
         let addr: hyper::Uri = hyper::Uri::from_str(&opt.addr)?;
 
         rpcbench::client_ping(addr, http, pp, opt.iters, opt.reqs_per_iter).await?

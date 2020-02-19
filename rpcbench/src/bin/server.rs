@@ -81,6 +81,7 @@ async fn main() -> Result<(), failure::Error> {
     info!(&log, "TCP mode"; "port" => port);
     let addr = format!("0.0.0.0:{}", port).parse()?;
     tonic::transport::Server::builder()
+        .tcp_nodelay(true)
         .add_service(rpcbench::PingServer::new(rpcbench::Server))
         .serve(addr)
         .await?;
