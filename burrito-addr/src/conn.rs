@@ -21,7 +21,7 @@ impl Addr {
             }
             Self::Tcp(addr) => {
                 let st = tokio::net::TcpStream::connect(&addr).await?;
-                st.set_nodelay(false)?;
+                st.set_nodelay(true)?;
                 trace!("burrito-addr::Conn Connected");
                 Conn::Tcp(st)
             }

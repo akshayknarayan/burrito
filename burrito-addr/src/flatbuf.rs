@@ -164,7 +164,7 @@ impl hyper::server::accept::Accept for Server {
         let this = &mut *self;
 
         let tf = this.tl.accept().map_ok(|(s, _)| {
-            s.set_nodelay(false)
+            s.set_nodelay(true)
                 .expect("set nodelay on accepted connection");
             crate::Conn::Tcp(s)
         });
