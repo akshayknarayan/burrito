@@ -163,7 +163,11 @@ impl hyper::server::accept::Accept for Server {
         use futures_util::future::{FutureExt, TryFutureExt};
         let this = &mut *self;
 
-        let tf = this.tl.accept().map_ok(|(s, _)| crate::Conn::Tcp(s));
+        let tf = this.tl.accept().map_ok(|(s, _)| {
+            s.set_nodelay(false)
+                .expect("set nodelay on accepted connection");
+            crate::Conn::Tcp(s)
+        });
         let uf = this.ul.accept().map_ok(|(s, _)| crate::Conn::Unix(s));
 
         let mut f = futures_util::future::select(Box::pin(tf), Box::pin(uf))
