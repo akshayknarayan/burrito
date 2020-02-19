@@ -68,11 +68,13 @@ sleep 2
 sudo docker rm -f rpcclient3
 ssh $1 sudo docker rm -f rpcbench-server
 ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./server --port="4242"
+sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.pcap -i 10gp1 port 4242 &
 sleep 4
 sudo docker run --name rpcclient3 -it $image_name \
     ./client --addr http://$1:4242 --amount 1000 -w 4 -i 10000 --reqs-per-iter 3 -o ./res.data || exit 1
 sudo docker cp rpcclient3:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.data
 sudo docker cp rpcclient3:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.trace
+sudo pkill tcpdump
 echo "-> docker TCP done"
 sleep 2
 
@@ -111,6 +113,7 @@ ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./serv
     --burrito-proto="tonic" \
     --port="4242"
 sleep 2
+sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.pcap -i 10gp1 port 4242 &
 sudo docker run --name rpcclient3 -it $image_name ./client \
     --addr "pingserver" \
     --burrito-root="/burrito" \
@@ -120,6 +123,7 @@ sudo docker run --name rpcclient3 -it $image_name ./client \
     -o ./res.data || exit 1
 sudo docker cp rpcclient3:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.data
 sudo docker cp rpcclient3:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.trace
+sudo pkill tcpdump
 echo "-> burrito (tonic) done"
 
 sleep 2
@@ -128,18 +132,14 @@ sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 ssh $1 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 sleep 2
 
-sudo kill -INT $burritoctl
-sudo pkill -INT burrito
-ssh $1 "cd ~/burrito && sudo pkill -INT burrito"
-sleep 2
-
 echo "==> Burrito (flatbuf)"
 sudo docker rm -f rpcbench-redis
 echo "--> start redis"
 sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
 
 echo "--> stop burrito-ctl (flatbuf)"
-sudo kill -INT $burritoctl # kill dump-docker
+sudo kill -INT $burritoctl
+sudo pkill -INT burrito
 ssh $1 "cd ~/burrito && sudo pkill -INT burrito"
 sleep 2
 
@@ -166,6 +166,7 @@ ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./serv
     --burrito-proto="flatbuf" \
     --port="4242"
 sleep 2
+sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_remote_docker.pcap -i 10gp1 port 4242 &
 sudo docker run --name rpcclient3 -it $image_name ./client \
     --addr "pingserver" \
     --burrito-root="/burrito" \
@@ -175,6 +176,7 @@ sudo docker run --name rpcclient3 -it $image_name ./client \
     -o ./res.data || exit 1
 sudo docker cp rpcclient3:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_remote_docker.data
 sudo docker cp rpcclient3:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_remote_docker.trace
+sudo pkill tcpdump
 echo "-> burrito (flatbuf) done"
 
 sleep 2
