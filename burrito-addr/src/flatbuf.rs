@@ -160,22 +160,8 @@ impl hyper::server::accept::Accept for Server {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
-        use futures_util::future::{FutureExt, TryFutureExt};
         let this = &mut *self;
-
-        let tf = this.tl.accept().map_ok(|(s, _)| {
-            s.set_nodelay(true)
-                .expect("set nodelay on accepted connection");
-            crate::Conn::Tcp(s)
-        });
-        let uf = this.ul.accept().map_ok(|(s, _)| crate::Conn::Unix(s));
-
-        let mut f = futures_util::future::select(Box::pin(tf), Box::pin(uf))
-            .map(|either_stream| either_stream.factor_first().0)
-            .map_err(failure::Error::from)
-            .map(|f| Some(f));
-
-        Pin::new(&mut f).poll(cx)
+        super::poll_select_accept(this.ul.incoming(), this.tl.incoming(), cx)
     }
 }
 
