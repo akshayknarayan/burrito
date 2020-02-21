@@ -32,7 +32,6 @@ tracing-timing  = "0.3"
 tracing-subscriber = "0.2"
 
 [dev-dependencies]
-hyper-unix-connector = "0.1"
 redis = "0.15"
 
 [build-dependencies]
