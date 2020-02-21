@@ -17,10 +17,10 @@ pub enum Op {
 /// - responses, val = Some if update and rest copied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Msg {
-    id: usize,
-    op: Op,
-    key: String,
-    val: Option<String>,
+    pub(crate) id: usize,
+    pub(crate) op: Op,
+    pub(crate) key: String,
+    pub(crate) val: Option<String>,
 }
 
 impl Msg {
@@ -28,40 +28,46 @@ impl Msg {
         &self.key
     }
 
-    pub fn val(&self) -> Option<&str> {
-        self.val.map(|s| s.as_str())
+    pub fn val(&self) -> Option<String> {
+        self.val.clone()
+    }
+
+    pub fn into_kv(self) -> (String, Option<String>) {
+        (self.key, self.val)
     }
 
     pub fn op(&self) -> Op {
         self.op
     }
 
-    pub fn get_req(key: String) -> Self {
+    pub fn get_req(key: impl Into<String>) -> Self {
         Msg {
             id: get_id(),
             op: Op::Get,
-            key,
+            key: key.into(),
             val: None,
         }
     }
 
-    pub fn put_req(key: String, val: String) -> Self {
+    pub fn put_req(key: impl Into<String>, val: impl Into<String>) -> Self {
         Msg {
             id: get_id(),
             op: Op::Put,
-            key,
-            val: Some(val),
+            key: key.into(),
+            val: Some(val.into()),
         }
     }
 
-    pub fn resp(self, val: Option<String>) -> Self {
-        Msg { val, ..self }
+    pub fn resp(self, val: impl Into<Option<String>>) -> Self {
+        Msg {
+            val: val.into(),
+            ..self
+        }
     }
 }
 
 fn get_id() -> usize {
     use rand::Rng;
-    let rng = rand::thread_rng();
-
+    let mut rng = rand::thread_rng();
     rng.gen()
 }
