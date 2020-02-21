@@ -53,7 +53,7 @@ async fn main() -> Result<(), failure::Error> {
                 let srv =
                     burrito_addr::tonic::Server::start(&addr, port, &opt.burrito_root).await?;
                 let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
-                hyper::server::Server::builder(srv)
+                hyper::server::Server::builder(hyper::server::accept::from_stream(srv))
                     .serve(hyper::service::make_service_fn(move |_| {
                         let ps = ping_srv.clone();
                         async move { Ok::<_, hyper::Error>(ps) }
@@ -65,7 +65,7 @@ async fn main() -> Result<(), failure::Error> {
                 let srv =
                     burrito_addr::flatbuf::Server::start(&addr, port, &opt.burrito_root).await?;
                 let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
-                hyper::server::Server::builder(srv)
+                hyper::server::Server::builder(hyper::server::accept::from_stream(srv))
                     .serve(hyper::service::make_service_fn(move |_| {
                         let ps = ping_srv.clone();
                         async move { Ok::<_, hyper::Error>(ps) }

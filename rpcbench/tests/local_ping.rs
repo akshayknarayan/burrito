@@ -98,7 +98,7 @@ async fn start_rpcbench_flatbuf_server_burrito(log: &slog::Logger) -> Result<(),
 
     trace!(l2, "spawning test-rpcbench");
 
-    hyper::server::Server::builder(srv)
+    hyper::server::Server::builder(hyper::server::accept::from_stream(srv))
         .serve(hyper::service::make_service_fn(move |_| {
             let ps = ping_srv.clone();
             async move { Ok::<_, hyper::Error>(ps) }
@@ -146,7 +146,7 @@ async fn start_rpcbench_tonic_server_burrito(log: &slog::Logger) -> Result<(), E
 
     trace!(l2, "spawning test-rpcbench");
 
-    hyper::server::Server::builder(srv)
+    hyper::server::Server::builder(hyper::server::accept::from_stream(srv))
         .serve(hyper::service::make_service_fn(move |_| {
             let ps = ping_srv.clone();
             async move { Ok::<_, hyper::Error>(ps) }

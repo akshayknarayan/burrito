@@ -109,6 +109,7 @@ pub struct Server {
 }
 
 impl Server {
+    // Maybe rename this to listen()
     #[tracing::instrument(level = "debug", skip(burrito_root))]
     pub async fn start(
         service_addr: &str,
@@ -146,14 +147,10 @@ impl Server {
     }
 }
 
-impl hyper::server::accept::Accept for Server {
-    type Conn = Conn;
-    type Error = Error;
+impl futures_util::stream::Stream for Server {
+    type Item = Result<Conn, Error>;
 
-    fn poll_accept(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         super::poll_select_accept(this.ul.incoming(), this.tl.incoming(), cx)
     }
