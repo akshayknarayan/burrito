@@ -10,21 +10,21 @@ mkdir ./$out
 cargo build --release
 
 echo "==> baremetal tcp"
-./target/release/server --port "4242" &
+./target/release/pingserver --port "4242" &
 server=$!
 sleep 2
 
-./target/release/client --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
+./target/release/pingclient --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
     -o $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_baremetal.data || exit 1
 kill -9 $server
 sleep 2
 
 echo "==> baremetal unix"
 rm -rf /tmp/burrito/server
-./target/release/server --unix-addr "/tmp/burrito/server" &
+./target/release/pingserver --unix-addr "/tmp/burrito/server" &
 server=$!
 sleep 2
-./target/release/client --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
+./target/release/pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
     -o $out/work_sqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data || exit 1
 kill -9 $server
 
@@ -47,13 +47,13 @@ image_name=rpcbench:`git rev-parse --short HEAD`
 sudo docker build -t $image_name . || exit 1
 
 # server
-sudo docker run --name rpcbench-server -d $image_name ./server --port="4242"
+sudo docker run --name rpcbench-server -d $image_name ./pingserver --port="4242"
 sleep 4
 container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-server)
 echo "container ip: $container_ip"
 
 # client 
-sudo docker run --name lrpcclient -it $image_name ./client \
+sudo docker run --name lrpcclient -it $image_name ./pingclient \
     --addr http://$container_ip:4242 \
     --amount 1000 -w 4 -i 10000 \
     --reqs-per-iter 3 \
@@ -81,13 +81,13 @@ sudo ./target/release/burrito \
     > $out/burritoctl-tonic-local.log 2> $out/burritoctl-tonic-local.log &
 burritoctl=$!
 sleep 2
-sudo docker run --name rpcbench-server -d $image_name ./server \
+sudo docker run --name rpcbench-server -d $image_name ./pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
     --burrito-proto="tonic" \
     --port="4242"
 sleep 2
-sudo docker run --name lrpcclient -it $image_name ./client \
+sudo docker run --name lrpcclient -it $image_name ./pingclient \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
     --burrito-proto="tonic" \
@@ -122,13 +122,13 @@ sudo ./target/release/burrito \
     > $out/burritoctl-flatbuf.log 2> $out/burritoctl-flatbuf.log &
 burritoctl=$!
 sleep 2
-sudo docker run --name rpcbench-server -d $image_name ./server \
+sudo docker run --name rpcbench-server -d $image_name ./pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
     --burrito-proto "flatbuf" \
     --port="4242"
 sleep 2
-sudo docker run --name lrpcclient -it $image_name ./client \
+sudo docker run --name lrpcclient -it $image_name ./pingclient \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
     --burrito-proto "flatbuf" \

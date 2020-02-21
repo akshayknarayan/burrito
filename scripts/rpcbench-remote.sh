@@ -36,10 +36,10 @@ wait $local_build $remote_build
 
 echo "==> Baremetal TCP"
 ssh $1 "ps aux | grep \"release.*server\" | awk '{print \$2}' | head -n1 | xargs kill -9"
-ssh $1 "cd ~/burrito && ./target/release/server --port \"4242\"" &
+ssh $1 "cd ~/burrito && ./target/release/pingserver --port \"4242\"" &
 ssh_server=$!
 sleep 2
-./target/release/client --addr "http://$1:4242" -i 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
+./target/release/pingclient --addr "http://$1:4242" -i 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
     -o $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_baremetal.data || exit 1
 kill -9 $ssh_server
 ssh $1 "ps aux | grep \"release.*server\" | awk '{print \$2}' | head -n1 | xargs kill -9"
@@ -67,11 +67,11 @@ sleep 2
 
 sudo docker rm -f rpcclient3
 ssh $1 sudo docker rm -f rpcbench-server
-ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./server --port="4242"
+ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./pingserver --port="4242"
 sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.pcap -i 10gp1 port 4242 &
 sleep 4
 sudo docker run --name rpcclient3 -it $image_name \
-    ./client --addr http://$1:4242 --amount 1000 -w 4 -i 10000 --reqs-per-iter 3 -o ./res.data || exit 1
+    ./pingclient --addr http://$1:4242 --amount 1000 -w 4 -i 10000 --reqs-per-iter 3 -o ./res.data || exit 1
 sudo docker cp rpcclient3:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.data
 sudo docker cp rpcclient3:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.trace
 sudo pkill tcpdump
@@ -107,14 +107,14 @@ ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o
 
 sudo docker rm -f rpcclient1 rpcclient3
 ssh $1 sudo docker rm -f rpcbench-server
-ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./server \
+ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./pingserver \
     --burrito-addr="pingserver" \
     --burrito-root="/burrito" \
     --burrito-proto="tonic" \
     --port="4242"
 sleep 2
 sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.pcap -i 10gp1 port 4242 &
-sudo docker run --name rpcclient3 -it $image_name ./client \
+sudo docker run --name rpcclient3 -it $image_name ./pingclient \
     --addr "pingserver" \
     --burrito-root="/burrito" \
     --burrito-proto="tonic" \
@@ -160,14 +160,14 @@ ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o
 
 sudo docker rm -f rpcclient1 rpcclient3
 ssh $1 sudo docker rm -f rpcbench-server
-ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./server \
+ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./pingserver \
     --burrito-addr="pingserver" \
     --burrito-root="/burrito" \
     --burrito-proto="flatbuf" \
     --port="4242"
 sleep 2
 sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_remote_docker.pcap -i 10gp1 port 4242 &
-sudo docker run --name rpcclient3 -it $image_name ./client \
+sudo docker run --name rpcclient3 -it $image_name ./pingclient \
     --addr "pingserver" \
     --burrito-root="/burrito" \
     --burrito-proto="flatbuf" \
