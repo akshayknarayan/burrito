@@ -15,3 +15,14 @@ tokio-tower = "0.3"
 tower-service = "0.3"
 futures-util = "0.3"
 tokio = {version = "0.2.11", features = ["full"]}
+slog = "2"
+slog-term = "2"
+structopt = "0.3"
+burrito-addr = {path = "../burrito-addr"}
+burrito-ctl = {path = "../burrito-ctl"}
+tracing = "0.1"
+tracing-futures = "0.2"
+tracing-timing  = "0.3"
+tracing-subscriber = "0.2"
+hyper = {version = "0.13", features = ["stream"]}
+hyper-unix-connector = "0.1"
