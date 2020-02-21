@@ -1,0 +1,3 @@
+[submodule "ycsbc-mock"]
+	path = ycsbc-mock
+	url = git@github.com:apanda/ycsbc-mock.git
