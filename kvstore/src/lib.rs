@@ -4,6 +4,7 @@ use futures_util::future::Ready;
 use std::error::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tower::pipeline;
+type StdError = Box<dyn Error + Send + Sync + 'static>;
 
 mod kv;
 mod msg;
@@ -39,25 +40,59 @@ impl tower_service::Service<msg::Msg> for Store {
 }
 
 /// Serve a Store on `st`.
-pub async fn server(
-    st: impl AsyncWrite + AsyncRead + Unpin,
-) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+pub async fn server(st: impl AsyncWrite + AsyncRead + Unpin) -> Result<(), StdError> {
     let st = AsyncBincodeStream::from(st).for_async();
     Ok(pipeline::Server::new(st, Store::default())
         .await
         .expect("server crashed"))
 }
 
-/// Connect to a Kv service using `st`.
+/// Get a client service.
 pub fn client(
     st: impl AsyncWrite + AsyncRead + Unpin + Send + 'static,
-) -> impl tower_service::Service<
-    msg::Msg,
-    Response = msg::Msg,
-    Error = Box<dyn Error + Send + Sync + 'static>,
-> {
+) -> impl tower_service::Service<msg::Msg, Response = msg::Msg, Error = StdError> {
     let st: AsyncBincodeStream<_, msg::Msg, _, _> = AsyncBincodeStream::from(st).for_async();
-    pipeline::Client::<_, Box<dyn Error + Send + Sync + 'static>, _>::new(st)
+    pipeline::Client::<_, StdError, _>::new(st)
+}
+
+/// Connect to a Kv service.
+pub struct Client<S>(S);
+
+impl<C> From<C>
+    for Client<
+        pipeline::Client<
+            AsyncBincodeStream<C, msg::Msg, msg::Msg, async_bincode::AsyncDestination>,
+            StdError,
+            msg::Msg,
+        >,
+    >
+where
+    C: AsyncWrite + AsyncRead + Unpin + Send + 'static,
+{
+    fn from(st: C) -> Self {
+        Self(pipeline::Client::new(
+            AsyncBincodeStream::from(st).for_async(),
+        ))
+    }
+}
+
+impl<S> Client<S>
+where
+    S: tower_service::Service<msg::Msg, Response = msg::Msg, Error = StdError>,
+{
+    pub async fn update(&mut self, key: String, val: String) -> Result<Option<String>, StdError> {
+        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx)).await?;
+        let req = msg::Msg::put_req(key, val);
+        let resp = self.0.call(req).await?;
+        Ok(resp.into_kv().1)
+    }
+
+    pub async fn get(&mut self, key: String) -> Result<Option<String>, StdError> {
+        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx)).await?;
+        let req = msg::Msg::get_req(key);
+        let resp = self.0.call(req).await?;
+        Ok(resp.into_kv().1)
+    }
 }
 
 #[cfg(test)]
