@@ -9,6 +9,8 @@ type StdError = Box<dyn Error + Send + Sync + 'static>;
 mod kv;
 mod msg;
 
+pub use msg::Msg;
+
 #[derive(Debug, Default)]
 pub struct Store {
     inner: kv::Kv,

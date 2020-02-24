@@ -1,0 +1,24 @@
+[package]
+name = "kvstore-ycsb"
+version = "0.1.0"
+authors = ["Akshay Narayan <akshayn@mit.edu>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hyper = {version = "0.13", features = ["stream"]}
+hyper-unix-connector = "0.1.4"
+tracing = "0.1"
+tracing-futures = "0.2"
+tokio = {version = "0.2.11", features = ["full"]}
+futures-util = "0.3"
+tower-service = "0.3"
+kvstore = {path = "../kvstore"}
+
+[dev-dependencies]
+criterion = "0.3"
+
+[[bench]]
+name = "ycsb"
+harness = false

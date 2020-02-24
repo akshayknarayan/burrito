@@ -1,3 +1,3 @@
 [submodule "ycsbc-mock"]
-	path = ycsbc-mock
+	path = kvstore-ycsb/ycsbc-mock
 	url = git@github.com:apanda/ycsbc-mock.git

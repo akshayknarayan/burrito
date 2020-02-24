@@ -87,20 +87,22 @@ where
     let mut durs = vec![];
     let num = accesses.len();
     tracing::trace!("starting accesses");
+    let access_start = tokio::time::Instant::now();
     for o in accesses {
-        let span = tracing::span!(tracing::Level::TRACE, "do_operation", op = ?&o);
-        let _enter = span.enter();
         let then = tokio::time::Instant::now();
         match o {
             Op::Get(_, k) => cl.get(k).await?,
             Op::Update(_, k, v) => cl.update(k, v).await?,
         };
 
-        tracing::trace!("did operation");
         durs.push(then.elapsed());
     }
 
-    tracing::trace!("finished {:?} accesses", num);
+    tracing::info!(
+        "finished {:?} accesses in {:?}",
+        num,
+        access_start.elapsed()
+    );
     Ok(durs)
 }
 
