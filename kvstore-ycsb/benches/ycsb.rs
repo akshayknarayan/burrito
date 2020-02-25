@@ -199,10 +199,78 @@ fn ycsb_wrkb_chan(c: &mut Criterion) {
     });
 }
 
+fn ycsb_wrkb_msgkv(c: &mut Criterion) {
+    c.bench_function("ycsb_wrkb_msgkv", |b| {
+        let mut kv = kvstore::Kv::default();
+
+        for o in ops(std::path::PathBuf::from("./ycsbc-mock/wrkloadb5000-1.load")).expect("loads") {
+            match o {
+                Op::Get(_, k) => kv.get(&k).map(|s| s.to_owned()),
+                Op::Update(_, k, v) => kv.put(&k, Some(v)),
+            };
+        }
+
+        let mut store = kvstore::Store::from(kv);
+        let mut rt = tokio::runtime::Runtime::new().unwrap();
+
+        let mut accesses = ops(std::path::PathBuf::from(
+            "./ycsbc-mock/wrkloadb5000-1.access",
+        ))
+        .expect("accesses")
+        .into_iter()
+        .cycle();
+
+        b.iter(|| {
+            let o = accesses.next().unwrap();
+            let req = match o {
+                Op::Get(_, k) => kvstore::Msg::get_req(k),
+                Op::Update(_, k, v) => kvstore::Msg::put_req(k, v),
+            };
+
+            rt.block_on(async {
+                futures_util::future::poll_fn(|cx| store.poll_ready(cx))
+                    .await
+                    .unwrap();
+                store.call(req).await.expect("serv"); // throw away response
+            });
+        });
+    });
+}
+
+fn ycsb_wrkb_kv(c: &mut Criterion) {
+    c.bench_function("ycsb_wrkb_kv", |b| {
+        let mut kv = kvstore::Kv::default();
+
+        for o in ops(std::path::PathBuf::from("./ycsbc-mock/wrkloadb5000-1.load")).expect("loads") {
+            match o {
+                Op::Get(_, k) => kv.get(&k).map(|s| s.to_owned()),
+                Op::Update(_, k, v) => kv.put(&k, Some(v)),
+            };
+        }
+
+        let mut accesses = ops(std::path::PathBuf::from(
+            "./ycsbc-mock/wrkloadb5000-1.access",
+        ))
+        .expect("accesses")
+        .into_iter()
+        .cycle();
+
+        b.iter(|| {
+            let o = accesses.next().unwrap();
+            match o {
+                Op::Get(_, k) => kv.get(&k).map(|s| s.to_owned()),
+                Op::Update(_, k, v) => kv.put(&k, Some(v)),
+            };
+        });
+    });
+}
+
 criterion_group!(
     benches,
     ycsb_wrkb_ser_tcp,
     ycsb_wrkb_ser_unix,
-    ycsb_wrkb_chan
+    ycsb_wrkb_chan,
+    ycsb_wrkb_msgkv,
+    ycsb_wrkb_kv,
 );
 criterion_main!(benches);

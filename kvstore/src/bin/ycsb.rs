@@ -72,23 +72,23 @@ where
     let st = resolver.call(addr).await.map_err(|e| e.into())?;
     let mut cl = kvstore::Client::from(st);
 
-    tracing::trace!("starting loads");
     // don't need to time the loads.
     for o in loads {
+        tracing::trace!("starting load");
         match o {
             Op::Get(_, k) => cl.get(k).await?,
             Op::Update(_, k, v) => cl.update(k, v).await?,
         };
+
+        tracing::trace!("finished load");
     }
 
-    tracing::trace!("finished loads");
-
-    // now, measure latency and throughput for the accesses.
+    // now, measure the accesses.
     let mut durs = vec![];
     let num = accesses.len();
-    tracing::trace!("starting accesses");
     let access_start = tokio::time::Instant::now();
     for o in accesses {
+        tracing::trace!("starting access");
         let then = tokio::time::Instant::now();
         match o {
             Op::Get(_, k) => cl.get(k).await?,
@@ -96,6 +96,7 @@ where
         };
 
         durs.push(then.elapsed());
+        tracing::trace!("finished access");
     }
 
     tracing::info!(

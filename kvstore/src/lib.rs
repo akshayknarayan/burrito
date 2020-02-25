@@ -4,16 +4,25 @@ use futures_util::future::Ready;
 use std::error::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tower::pipeline;
+use tracing::{span, Level};
+use tracing_futures::Instrument;
 type StdError = Box<dyn Error + Send + Sync + 'static>;
 
 mod kv;
 mod msg;
 
+pub use kv::Kv;
 pub use msg::Msg;
 
 #[derive(Debug, Default)]
 pub struct Store {
     inner: kv::Kv,
+}
+
+impl From<kv::Kv> for Store {
+    fn from(inner: kv::Kv) -> Self {
+        Self { inner }
+    }
 }
 
 impl tower_service::Service<msg::Msg> for Store {
@@ -82,17 +91,35 @@ impl<S> Client<S>
 where
     S: tower_service::Service<msg::Msg, Response = msg::Msg, Error = StdError>,
 {
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn update(&mut self, key: String, val: String) -> Result<Option<String>, StdError> {
-        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx)).await?;
+        tracing::trace!("starting update");
+        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx))
+            .instrument(span!(Level::DEBUG, "update:poll_ready"))
+            .await?;
         let req = msg::Msg::put_req(key, val);
-        let resp = self.0.call(req).await?;
+        let resp = self
+            .0
+            .call(req)
+            .instrument(span!(Level::DEBUG, "update:call"))
+            .await?;
+        tracing::trace!("finished update");
         Ok(resp.into_kv().1)
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn get(&mut self, key: String) -> Result<Option<String>, StdError> {
-        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx)).await?;
+        tracing::trace!("starting get");
+        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx))
+            .instrument(span!(Level::DEBUG, "get:poll_ready"))
+            .await?;
         let req = msg::Msg::get_req(key);
-        let resp = self.0.call(req).await?;
+        let resp = self
+            .0
+            .call(req)
+            .instrument(span!(Level::DEBUG, "get:call"))
+            .await?;
+        tracing::trace!("finished get");
         Ok(resp.into_kv().1)
     }
 }
