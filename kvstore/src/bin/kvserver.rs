@@ -4,6 +4,8 @@ use slog::{info, warn};
 use std::error::Error;
 use structopt::StructOpt;
 
+type StdError = Box<dyn Error + Send + Sync + 'static>;
+
 #[derive(Debug, StructOpt)]
 #[structopt(name = "kvserver")]
 struct Opt {
@@ -16,6 +18,9 @@ struct Opt {
     #[structopt(short, long)]
     port: Option<u16>,
 
+    #[structopt(short, long)]
+    num_shards: Option<usize>,
+
     #[structopt(long, default_value = "/tmp/burrito")]
     burrito_root: String,
 
@@ -23,26 +28,39 @@ struct Opt {
     burrito_proto: String,
 }
 
-async fn serve<S, C, E>(li: S)
-where
-    S: futures_util::stream::Stream<Item = Result<C, E>> + Send + 'static,
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-    E: Into<Box<dyn Error + Sync + Send + 'static>> + std::fmt::Debug + Unpin + Send,
-{
-    kvstore::shard_server(vec![li], |_| 0).await.unwrap()
+fn shard_addrs(num_shards: usize, base_addr: &str) -> Vec<String> {
+    let mut addrs = vec![base_addr.to_owned()];
+    addrs.extend((1..num_shards + 1).map(|i| format!("{}-shard{}", base_addr, i)));
+    addrs
+}
+
+fn tcp_shard_addrs(num_shards: usize, base_port: u16) -> Vec<String> {
+    (0..num_shards + 1)
+        .map(|i| format!("0.0.0.0:{}", base_port + (i as u16)))
+        .collect()
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Sync + Send + 'static>> {
+async fn main() -> Result<(), StdError> {
     let log = burrito_ctl::logger();
     let opt = Opt::from_args();
+    let num_shards = opt.num_shards.unwrap_or(0);
+    let shard_fn = move |m: &kvstore::Msg| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = ahash::AHasher::default();
+        m.key().hash(&mut hasher);
+        hasher.finish() as usize % num_shards
+    };
 
     info!(&log, "KV Server");
 
     if let Some(path) = opt.unix_addr {
         info!(&log, "UDS mode"; "addr" => ?&path);
-        let l = tokio::net::UnixListener::bind(&path)?;
-        serve(l.into_incoming()).await;
+        let ls: Result<Vec<_>, StdError> = shard_addrs(num_shards, path.to_str().unwrap())
+            .into_iter()
+            .map(|path| Ok(tokio::net::UnixListener::bind(&path)?.into_incoming()))
+            .collect();
+        kvstore::shard_server(ls?, shard_fn).await?;
         return Ok(());
     }
 
@@ -54,16 +72,33 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send + 'static>> {
     let port = opt.port.unwrap();
 
     if let Some(addr) = opt.burrito_addr {
+        let root = opt.burrito_root.clone();
+        let addrs = shard_addrs(num_shards, &addr)
+            .into_iter()
+            .zip((0..num_shards + 1).map(|x| port + (x as u16)))
+            .zip(std::iter::repeat(opt.burrito_root));
         match opt.burrito_proto {
             x if x == "tonic" => {
-                info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => port);
-                serve(burrito_addr::tonic::Server::start(&addr, port, &opt.burrito_root).await?)
+                info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&root, "addr" => ?&addr, "tcp port" => port);
+                let ls: Result<Vec<_>, StdError> =
+                    futures_util::future::join_all(addrs.map(|((a, p), root)| async move {
+                        Ok(burrito_addr::tonic::Server::start(&a, p, &root).await?)
+                    }))
                     .await
+                    .into_iter()
+                    .collect();
+                kvstore::shard_server(ls?, shard_fn).await?;
             }
             x if x == "flatbuf" => {
-                info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => port);
-                serve(burrito_addr::flatbuf::Server::start(&addr, port, &opt.burrito_root).await?)
+                info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&root, "addr" => ?&addr, "tcp port" => port);
+                let ls: Result<Vec<_>, StdError> =
+                    futures_util::future::join_all(addrs.map(|((a, p), root)| async move {
+                        Ok(burrito_addr::flatbuf::Server::start(&a, p, &root).await?)
+                    }))
                     .await
+                    .into_iter()
+                    .collect();
+                kvstore::shard_server(ls?, shard_fn).await?;
             }
             x => Err(format!("Unknown burrito protocol {:?}", &x))?,
         };
@@ -72,14 +107,21 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send + 'static>> {
     }
 
     info!(&log, "TCP mode"; "port" => port);
-    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
-    let l = tokio::net::TcpListener::bind(addr).await?;
-    let l = l.into_incoming().map_ok(|st| {
-        st.set_nodelay(true).unwrap();
-        st
-    });
-    serve(l).await;
+    let ls: Result<Vec<_>, _> =
+        futures_util::future::join_all(tcp_shard_addrs(num_shards, port).into_iter().map(
+            |addr| async move {
+                let l = tokio::net::TcpListener::bind(addr).await?;
+                Ok::<_, StdError>(l.into_incoming().map_ok(|st| {
+                    st.set_nodelay(true).unwrap();
+                    st
+                }))
+            },
+        ))
+        .await
+        .into_iter()
+        .collect();
 
+    kvstore::shard_server(ls?, shard_fn).await?;
     Ok(())
 }
