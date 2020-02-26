@@ -19,6 +19,7 @@ incoming = "0.1"
 
 [dev-dependencies]
 criterion = "0.3"
+ahash = "0.3"
 
 [[bench]]
 name = "ycsb"

@@ -256,6 +256,106 @@ fn ycsb_wrkb_kv(c: &mut Criterion) {
     });
 }
 
+async fn serve_shards(
+    num_shards: usize,
+    shard_fn: impl Fn(&kvstore::Msg) -> usize + 'static,
+) -> Result<(), StdError> {
+    let ls: Result<Vec<_>, _> =
+        futures_util::future::join_all((0..num_shards + 1).map(|i| async move {
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 57283 + i).parse()?;
+            let l = tokio::net::TcpListener::bind(addr).await?;
+            Ok::<_, StdError>(l.into_incoming().map_ok(|st| {
+                st.set_nodelay(true).unwrap();
+                st
+            }))
+        }))
+        .await
+        .into_iter()
+        .collect();
+    kvstore::shard_server(ls?, shard_fn).await
+}
+
+fn ycsb_wrkb_scaling(num_shards: usize, c: &mut Criterion) {
+    c.bench_function(&format!("ycsb_wrkloadb_{}shards", num_shards), |b| {
+        let mut rt = tokio::runtime::Runtime::new().unwrap();
+
+        let mut cl = rt.block_on(async {
+            let shard_fn = move |m: &kvstore::Msg| {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = ahash::AHasher::default();
+                m.key().hash(&mut hasher);
+                hasher.finish() as usize % num_shards
+            };
+            tokio::spawn(serve_shards(num_shards, shard_fn));
+
+            // client: connect to sharder base address
+            let mut resolver = hyper::client::connect::HttpConnector::new();
+            resolver.set_nodelay(true);
+            let addr: hyper::Uri = hyper::Uri::from_str("http://127.0.0.1:57283").unwrap();
+            futures_util::future::poll_fn(|cx| resolver.poll_ready(cx))
+                .await
+                .unwrap();
+            let st = resolver.call(addr).await.expect("resolver");
+            let mut cl = kvstore::Client::from(st);
+
+            // don't need to time the loads.
+            for o in
+                ops(std::path::PathBuf::from("./ycsbc-mock/wrkloadb5000-1.load")).expect("loads")
+            {
+                match o {
+                    Op::Get(_, k) => cl.get(k).await.unwrap(),
+                    Op::Update(_, k, v) => cl.update(k, v).await.unwrap(),
+                };
+            }
+
+            cl
+        });
+
+        let mut accesses = ops(std::path::PathBuf::from(
+            "./ycsbc-mock/wrkloadb5000-1.access",
+        ))
+        .expect("accesses")
+        .into_iter()
+        .cycle();
+
+        b.iter(|| {
+            rt.block_on(async {
+                let o = accesses.next().unwrap();
+                match o {
+                    Op::Get(_, k) => cl.get(k).await.unwrap(),
+                    Op::Update(_, k, v) => cl.update(k, v).await.unwrap(),
+                };
+            });
+        });
+    });
+}
+
+macro_rules! ycsb_wrkb_shards {
+    ($name: ident, $n: expr => $($snames:ident),+) => {
+        fn $name(c: &mut Criterion) {
+            ycsb_wrkb_scaling($n, c)
+        }
+
+        criterion_group!(numshards, $($snames),+,$name);
+    };
+    ($name: ident, $n: expr; $($names: ident, $ns: expr);+ => $($snames:ident),+) => {
+        fn $name(c: &mut Criterion) {
+            ycsb_wrkb_scaling($n, c)
+        }
+
+        ycsb_wrkb_shards!($($names, $ns)+ => $name,$($snames),+);
+    };
+    ($name: ident, $n: expr; $($names: ident, $ns: expr);+) => {
+        fn $name(c: &mut Criterion) {
+            ycsb_wrkb_scaling($n, c)
+        }
+
+        ycsb_wrkb_shards!($($names, $ns);+ => $name);
+    };
+}
+
+ycsb_wrkb_shards!(yscb_wrkb_1shard, 1; ycsb_wrkb_2shard, 2; ycsb_wrkb_3shard, 3);
+
 criterion_group!(
     benches,
     ycsb_wrkb_ser_tcp,
@@ -264,4 +364,4 @@ criterion_group!(
     ycsb_wrkb_msgkv,
     ycsb_wrkb_kv,
 );
-criterion_main!(benches);
+criterion_main!(benches, numshards);
