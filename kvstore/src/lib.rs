@@ -12,6 +12,7 @@ use tokio_tower::pipeline;
 use tower_service::Service;
 use tracing::{span, Level};
 use tracing_futures::Instrument;
+
 type StdError = Box<dyn Error + Send + Sync + 'static>;
 
 mod kv;
@@ -56,13 +57,6 @@ impl tower_service::Service<msg::Msg> for Store {
     }
 }
 
-/// Serve a Store on `st`.
-///
-/// This makes a new store just for `st`, so should only be used for testing.
-pub async fn server(st: impl AsyncWrite + AsyncRead + Unpin) -> Result<(), StdError> {
-    Ok(serve(st, Store::default()).await)
-}
-
 /// Serve `srv` on `st`.
 pub async fn serve(
     st: impl AsyncWrite + AsyncRead + Unpin,
@@ -85,8 +79,8 @@ pub async fn shard_server<S, C, E>(
 ) -> Result<(), StdError>
 where
     S: Stream<Item = Result<C, E>> + Send + 'static,
-    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    E: Into<Box<dyn Error + Sync + Send + 'static>> + std::fmt::Debug + Unpin + Send + 'static,
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    E: Into<Box<dyn Error + Sync + Send + 'static>> + std::fmt::Debug + Unpin + Send,
 {
     let mut shard_listeners = shard_listeners.into_iter();
     // the first shard_listener is the sharder
@@ -96,13 +90,15 @@ where
 
     // start the shards
     let shards: Vec<_> = shard_listeners
-        .map(|listener| {
+        .map(move |listener| {
             let srv = tower_buffer::Buffer::new(Store::default(), 10);
             let shard_srv = srv.clone();
 
             // serve srv on listener
             tokio::spawn(async move {
-                listener.for_each_concurrent(None, move |st| serve(st.unwrap(), srv.clone()))
+                listener
+                    .for_each_concurrent(None, move |st| serve(st.unwrap(), srv.clone()))
+                    .await
             });
 
             shard_srv
@@ -119,7 +115,7 @@ where
         return Ok(());
     }
 
-    let shard_fn = std::rc::Rc::new(shard_fn);
+    let shard_fn = std::sync::Arc::new(shard_fn);
 
     // start the sharder
     sharder_listen
@@ -220,9 +216,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::StdError;
     use crate::msg;
     use std::error::Error;
+    use tokio::io::{AsyncRead, AsyncWrite};
     use tower_service::Service;
+
+    async fn server(st: impl AsyncWrite + AsyncRead + Unpin) -> Result<(), StdError> {
+        Ok(super::serve(st, super::Store::default()).await)
+    }
 
     macro_rules! assert_match {
         ($eq:pat, $x:expr) => {{
@@ -242,7 +244,7 @@ mod tests {
 
         rt.block_on(async move {
             let (c, s) = tokio::net::UnixStream::pair()?;
-            tokio::spawn(super::server(s));
+            tokio::spawn(server(s));
 
             let mut c = super::client(c);
             futures_util::future::poll_fn(|cx| c.poll_ready(cx)).await?;

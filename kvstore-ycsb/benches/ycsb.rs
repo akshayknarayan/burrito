@@ -1,5 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use futures_util::stream::StreamExt;
+use futures_util::stream::{StreamExt, TryStreamExt};
+use incoming::IntoIncoming;
 use kvstore_ycsb::{ops, Op};
 use std::error::Error;
 use std::str::FromStr;
@@ -8,16 +9,12 @@ use tower_service::Service;
 type StdError = Box<dyn Error + Send + Sync + 'static>;
 
 async fn serve_tcp() -> Result<(), StdError> {
-    let mut l = tokio::net::TcpListener::bind("127.0.0.1:57282").await?;
-    l.incoming()
-        .for_each_concurrent(None, |st| {
-            async move {
-                kvstore::server(st.unwrap()).await.unwrap();
-            }
-        })
-        .await;
-
-    Ok(())
+    let l = tokio::net::TcpListener::bind("127.0.0.1:57282").await?;
+    let l = l.into_incoming().map_ok(|st| {
+        st.set_nodelay(true).unwrap();
+        st
+    });
+    kvstore::shard_server(vec![l], |_| 0).await
 }
 
 fn ycsb_wrkb_ser_tcp(c: &mut Criterion) {
@@ -72,15 +69,11 @@ fn ycsb_wrkb_ser_tcp(c: &mut Criterion) {
 
 async fn serve_unix(ready: tokio::sync::oneshot::Sender<()>) {
     std::fs::remove_file("./bench-unix").unwrap_or_default();
-    let mut l = tokio::net::UnixListener::bind("./bench-unix").expect("unix bind");
+    let l = tokio::net::UnixListener::bind("./bench-unix")
+        .expect("unix bind")
+        .into_incoming();
     ready.send(()).expect("ready sender");
-    l.incoming()
-        .for_each_concurrent(None, |st| {
-            async move {
-                kvstore::server(st.unwrap()).await.unwrap();
-            }
-        })
-        .await;
+    kvstore::shard_server(vec![l], |_| 0).await.unwrap();
 }
 
 fn ycsb_wrkb_ser_unix(c: &mut Criterion) {
@@ -140,16 +133,14 @@ async fn serve_chan(
     out: tokio::sync::mpsc::Sender<kvstore::Msg>,
 ) {
     let st = kvstore::Store::default();
-    inc.fold(st, |mut st, m| {
-        async {
-            let mut o = out.clone();
-            futures_util::future::poll_fn(|cx| st.poll_ready(cx))
-                .await
-                .unwrap();
-            let resp = st.call(m).await.expect("serv");
-            o.send(resp).await.expect("snd");
-            st
-        }
+    inc.fold(st, |mut st, m| async {
+        let mut o = out.clone();
+        futures_util::future::poll_fn(|cx| st.poll_ready(cx))
+            .await
+            .unwrap();
+        let resp = st.call(m).await.expect("serv");
+        o.send(resp).await.expect("snd");
+        st
     })
     .await;
 }

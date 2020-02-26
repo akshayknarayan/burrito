@@ -28,3 +28,4 @@ hyper = {version = "0.13", features = ["stream"]}
 hyper-unix-connector = "0.1"
 hashbrown = "0.7"
 tower-buffer = "0.3"
+incoming = "0.1"

@@ -1,7 +1,7 @@
-use futures_util::stream::StreamExt;
+use futures_util::stream::TryStreamExt;
+use incoming::IntoIncoming;
 use slog::{info, warn};
 use std::error::Error;
-use std::future::Future;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -23,17 +23,13 @@ struct Opt {
     burrito_proto: String,
 }
 
-fn serve<S, C, E>(li: S) -> impl Future<Output = ()>
+async fn serve<S, C, E>(li: S)
 where
-    S: futures_util::stream::Stream<Item = Result<C, E>>,
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    E: Into<Box<dyn Error + Sync + Send + 'static>> + std::fmt::Debug,
+    S: futures_util::stream::Stream<Item = Result<C, E>> + Send + 'static,
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    E: Into<Box<dyn Error + Sync + Send + 'static>> + std::fmt::Debug + Unpin + Send,
 {
-    li.for_each_concurrent(None, |st| {
-        async move {
-            kvstore::server(st.unwrap()).await.unwrap();
-        }
-    })
+    kvstore::shard_server(vec![li], |_| 0).await.unwrap()
 }
 
 #[tokio::main]
@@ -45,8 +41,8 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send + 'static>> {
 
     if let Some(path) = opt.unix_addr {
         info!(&log, "UDS mode"; "addr" => ?&path);
-        let mut l = tokio::net::UnixListener::bind(&path)?;
-        serve(l.incoming()).await;
+        let l = tokio::net::UnixListener::bind(&path)?;
+        serve(l.into_incoming()).await;
         return Ok(());
     }
 
@@ -78,17 +74,12 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send + 'static>> {
     info!(&log, "TCP mode"; "port" => port);
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
-    // can't use generic serve() because we need to set tcp_nodelay(true)
-    let mut l = tokio::net::TcpListener::bind(addr).await?;
-    l.incoming()
-        .for_each_concurrent(None, |st| {
-            async move {
-                let st = st.unwrap();
-                st.set_nodelay(true).unwrap();
-                kvstore::server(st).await.unwrap()
-            }
-        })
-        .await;
+    let l = tokio::net::TcpListener::bind(addr).await?;
+    let l = l.into_incoming().map_ok(|st| {
+        st.set_nodelay(true).unwrap();
+        st
+    });
+    serve(l).await;
 
     Ok(())
 }
