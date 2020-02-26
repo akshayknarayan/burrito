@@ -1,9 +1,15 @@
 use async_bincode::AsyncBincodeStream;
 use core::task::{Context, Poll};
-use futures_util::future::Ready;
+use futures_util::{
+    future::Ready,
+    never::Never,
+    sink::SinkExt,
+    stream::{Stream, StreamExt},
+};
 use std::error::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tower::pipeline;
+use tower_service::Service;
 use tracing::{span, Level};
 use tracing_futures::Instrument;
 type StdError = Box<dyn Error + Send + Sync + 'static>;
@@ -27,7 +33,7 @@ impl From<kv::Kv> for Store {
 
 impl tower_service::Service<msg::Msg> for Store {
     type Response = msg::Msg;
-    type Error = futures_util::never::Never;
+    type Error = Never;
     type Future = Ready<Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -51,11 +57,99 @@ impl tower_service::Service<msg::Msg> for Store {
 }
 
 /// Serve a Store on `st`.
+///
+/// This makes a new store just for `st`, so should only be used for testing.
 pub async fn server(st: impl AsyncWrite + AsyncRead + Unpin) -> Result<(), StdError> {
-    let st = AsyncBincodeStream::from(st).for_async();
-    Ok(pipeline::Server::new(st, Store::default())
+    Ok(serve(st, Store::default()).await)
+}
+
+/// Serve `srv` on `st`.
+pub async fn serve(
+    st: impl AsyncWrite + AsyncRead + Unpin,
+    srv: impl tower_service::Service<msg::Msg, Response = msg::Msg>,
+) {
+    let st: AsyncBincodeStream<_, msg::Msg, _, _> = AsyncBincodeStream::from(st).for_async();
+    pipeline::Server::new(st, srv)
         .await
-        .expect("server crashed"))
+        .map_err(|_| ()) // argh, bincode::Error is not Debug
+        .expect("shard crashed")
+}
+
+/// Serve multiple Store shards on `shard_listeners`.
+///
+/// Each shard will listen on the provided listener. In addition, we use `shard_fn` to steer
+/// requests from the first provided listener to the correct shard.
+pub async fn shard_server<S, C, E>(
+    shard_listeners: impl IntoIterator<Item = S>,
+    shard_fn: impl Fn(&Msg) -> usize + 'static,
+) -> Result<(), StdError>
+where
+    S: Stream<Item = Result<C, E>> + Send + 'static,
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    E: Into<Box<dyn Error + Sync + Send + 'static>> + std::fmt::Debug + Unpin + Send + 'static,
+{
+    let mut shard_listeners = shard_listeners.into_iter();
+    // the first shard_listener is the sharder
+    let sharder_listen = shard_listeners
+        .next()
+        .ok_or_else(|| String::from("must provide at least one listener"))?;
+
+    // start the shards
+    let shards: Vec<_> = shard_listeners
+        .map(|listener| {
+            let srv = tower_buffer::Buffer::new(Store::default(), 10);
+            let shard_srv = srv.clone();
+
+            // serve srv on listener
+            tokio::spawn(async move {
+                listener.for_each_concurrent(None, move |st| serve(st.unwrap(), srv.clone()))
+            });
+
+            shard_srv
+        })
+        .collect();
+
+    // if shards.len() == 0, then there can only be one shard: sharder_listen. So, we just serve directly and
+    // ignore `shard_fn`.
+    if shards.is_empty() {
+        let srv = tower_buffer::Buffer::new(Store::default(), 10);
+        sharder_listen
+            .for_each_concurrent(None, move |st| serve(st.unwrap(), srv.clone()))
+            .await;
+        return Ok(());
+    }
+
+    let shard_fn = std::rc::Rc::new(shard_fn);
+
+    // start the sharder
+    sharder_listen
+        .for_each_concurrent(None, |st| {
+            let mut shards = shards.clone();
+            let shard_fn = shard_fn.clone();
+            async move {
+                let mut resps = futures_util::stream::FuturesOrdered::new();
+                let mut st: AsyncBincodeStream<C, msg::Msg, msg::Msg, _> =
+                    AsyncBincodeStream::from(st.unwrap()).for_async();
+
+                loop {
+                    tokio::select! {
+                        Some(Ok(req)) = st.next() => {
+                            // call the right shard and push the future onto the out-queue
+                            let srv = &mut shards[shard_fn(&req)];
+                            resps.push(srv.call(req));
+                        }
+                        Some(Ok(resp)) = resps.next() => {
+                            // this clause is basically equivalent to st.send_all(resps)
+                            // but the compiler is unhappy about error types in that case.
+                            st.send(resp).await.unwrap();
+                        }
+                    };
+                }
+            }
+        })
+        .await;
+
+    Ok(())
 }
 
 /// Get a client service.

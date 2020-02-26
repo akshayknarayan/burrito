@@ -5,7 +5,7 @@ use std::future::Future;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
-#[structopt(name = "ping_server")]
+#[structopt(name = "kvserver")]
 struct Opt {
     #[structopt(short, long)]
     unix_addr: Option<std::path::PathBuf>,

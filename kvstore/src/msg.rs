@@ -24,6 +24,10 @@ pub struct Msg {
 }
 
 impl Msg {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
     pub fn key(&self) -> &str {
         &self.key
     }
