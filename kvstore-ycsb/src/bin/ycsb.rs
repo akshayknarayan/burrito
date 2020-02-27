@@ -57,49 +57,78 @@ where
 
     // now, measure the accesses.
     let st = resolver.call(addr).await.map_err(|e| e.into())?;
+    let srv = tower_buffer::Buffer::new(kvstore::client(st), 2_000);
 
-    // accesses group_by client
-    let mut access_by_client: HashMap<usize, Vec<Op>> = Default::default();
-    for o in accesses {
-        let k = o.client_id();
-        access_by_client.entry(k).or_default().push(o);
-    }
-
-    let srv = tower_buffer::Buffer::new(kvstore::client(st), access_by_client.len());
-
-    // each client issues its requests closed-loop. So we get one future per client, resolving to a
-    // Result<Vec<durations, _>>.
+    // make all the futures at once, tower_buffer will deal with the rest.
     use futures_util::stream::{FuturesUnordered, TryStreamExt};
-    let reqs: FuturesUnordered<_> = access_by_client
+    let reqs: FuturesUnordered<_> = accesses
         .into_iter()
-        .map(|(_, ops)| {
+        .map(|o| {
             let mut cl = kvstore::Client::from(srv.clone());
-            let mut durs = vec![];
             async move {
-                for o in ops {
-                    tracing::trace!("starting access");
-                    let then = tokio::time::Instant::now();
-                    match o {
-                        Op::Get(_, k) => cl.get(k).await?,
-                        Op::Update(_, k, v) => cl.update(k, v).await?,
-                    };
+                tracing::trace!("starting access");
+                let then = tokio::time::Instant::now();
+                match o {
+                    Op::Get(_, k) => cl.get(k).await?,
+                    Op::Update(_, k, v) => cl.update(k, v).await?,
+                };
 
-                    tracing::trace!("finished access");
-                    durs.push(then.elapsed())
-                }
-
-                Ok::<_, StdError>(durs)
+                tracing::trace!("finished access");
+                Ok::<_, StdError>(then.elapsed())
             }
         })
         .collect();
 
     // do the accesses.
     let access_start = tokio::time::Instant::now();
-    let durs: Vec<Vec<_>> = reqs.try_collect().await?;
+    let durs: Vec<_> = reqs.try_collect().await?;
     let access_end = access_start.elapsed();
-
-    let durs = durs.into_iter().flat_map(|x| x.into_iter()).collect();
     Ok((durs, access_end))
+
+    //// now, measure the accesses.
+    //let st = resolver.call(addr).await.map_err(|e| e.into())?;
+
+    // accesses group_by client
+    //let mut access_by_client: HashMap<usize, Vec<Op>> = Default::default();
+    //for o in accesses {
+    //    let k = o.client_id();
+    //    access_by_client.entry(k).or_default().push(o);
+    //}
+
+    //let srv = tower_buffer::Buffer::new(kvstore::client(st), access_by_client.len());
+
+    //// each client issues its requests closed-loop. So we get one future per client, resolving to a
+    //// Result<Vec<durations, _>>.
+    //use futures_util::stream::{FuturesUnordered, TryStreamExt};
+    //let reqs: FuturesUnordered<_> = access_by_client
+    //    .into_iter()
+    //    .map(|(_, ops)| {
+    //        let mut cl = kvstore::Client::from(srv.clone());
+    //        let mut durs = vec![];
+    //        async move {
+    //            for o in ops {
+    //                tracing::trace!("starting access");
+    //                let then = tokio::time::Instant::now();
+    //                match o {
+    //                    Op::Get(_, k) => cl.get(k).await?,
+    //                    Op::Update(_, k, v) => cl.update(k, v).await?,
+    //                };
+
+    //                tracing::trace!("finished access");
+    //                durs.push(then.elapsed())
+    //            }
+
+    //            Ok::<_, StdError>(durs)
+    //        }
+    //    })
+    //    .collect();
+
+    //// do the accesses.
+    //let access_start = tokio::time::Instant::now();
+    //let durs: Vec<Vec<_>> = reqs.try_collect().await?;
+    //let access_end = access_start.elapsed();
+    //let durs = durs.into_iter().flat_map(|x| x.into_iter()).collect();
+    //Ok((durs, access_end))
 }
 
 #[tokio::main]

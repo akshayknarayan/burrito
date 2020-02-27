@@ -10,7 +10,7 @@ use std::error::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tower::pipeline;
 use tower_service::Service;
-use tracing::{span, Level};
+use tracing::{span, trace, Level};
 use tracing_futures::Instrument;
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
@@ -73,6 +73,7 @@ pub async fn serve(
 ///
 /// Each shard will listen on the provided listener. In addition, we use `shard_fn` to steer
 /// requests from the first provided listener to the correct shard.
+#[tracing::instrument(level = "debug", skip(shard_listeners, shard_fn))]
 pub async fn shard_server<S, C, E>(
     shard_listeners: impl IntoIterator<Item = S>,
     shard_fn: impl Fn(&Msg) -> usize + 'static,
@@ -91,7 +92,7 @@ where
     // start the shards
     let shards: Vec<_> = shard_listeners
         .map(move |listener| {
-            let srv = tower_buffer::Buffer::new(Store::default(), 10);
+            let srv = tower_buffer::Buffer::new(Store::default(), 100);
             let shard_srv = srv.clone();
 
             // serve srv on listener
@@ -108,7 +109,7 @@ where
     // if shards.len() == 0, then there can only be one shard: sharder_listen. So, we just serve directly and
     // ignore `shard_fn`.
     if shards.is_empty() {
-        let srv = tower_buffer::Buffer::new(Store::default(), 10);
+        let srv = tower_buffer::Buffer::new(Store::default(), 100);
         sharder_listen
             .for_each_concurrent(None, move |st| serve(st.unwrap(), srv.clone()))
             .await;
@@ -128,27 +129,35 @@ where
                     AsyncBincodeStream::from(st.unwrap()).for_async();
 
                 loop {
+                    trace!(queue = resps.len(), "loop start");
                     tokio::select! {
                         Some(Ok(req)) = st.next() => {
                             // call the right shard and push the future onto the out-queue
                             let srv = &mut shards[shard_fn(&req)];
 
                             // maybe don't await this in the sharder loop
+                            trace!("poll_ready for service");
                             if let Err(_) = futures_util::future::poll_fn(|cx| srv.poll_ready(cx)).await {
                                 break;
                             }
-
+                            
+                            trace!("ready, pushing call future");
                             resps.push(srv.call(req));
                         }
                         Some(Ok(resp)) = resps.next() => {
                             // this clause is basically equivalent to st.send_all(resps)
                             // but the compiler is unhappy about error types in that case.
+                            trace!("start send resp");
                             st.send(resp).await.unwrap();
+                            trace!("finish send resp");
                         }
                         else => break,
                     };
+
+                    trace!(queue = resps.len(), "loop end");
                 }
             }
+            .instrument(span!(Level::TRACE, "sharder"))
         })
         .await;
 

@@ -3,6 +3,7 @@ use incoming::IntoIncoming;
 use slog::{info, warn};
 use std::error::Error;
 use structopt::StructOpt;
+use tracing_timing::{Builder, Histogram};
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -43,6 +44,7 @@ fn tcp_shard_addrs(num_shards: usize, base_port: u16) -> Vec<String> {
 #[tokio::main]
 async fn main() -> Result<(), StdError> {
     let log = burrito_ctl::logger();
+    write_tracing(&log);
     let opt = Opt::from_args();
     let num_shards = match opt.num_shards {
         None | Some(1) => 0, // having 1 shard is pointless, same as 0, might as well avoid the extra channel sends.
@@ -127,4 +129,35 @@ async fn main() -> Result<(), StdError> {
 
     kvstore::shard_server(ls?, shard_fn).await?;
     Ok(())
+}
+
+fn write_tracing(log: &slog::Logger) {
+    let subscriber = Builder::default()
+        .no_span_recursion()
+        .build(|| Histogram::new_with_max(10_000_000, 2).unwrap());
+    let sid = subscriber.downcaster();
+    let d = tracing::Dispatch::new(subscriber);
+
+    tracing::dispatcher::set_global_default(d.clone()).expect("set tracing global default");
+
+    let log = log.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        sid.downcast(&d).unwrap().force_synchronize();
+        sid.downcast(&d).unwrap().with_histograms(|hs| {
+            for (span_group, hs) in hs {
+                for (event_group, h) in hs {
+                    let tag = format!("{}:{}", span_group, event_group);
+                    slog::info!(&log, "tracing"; "event" => &tag,
+                        "min" => h.min(),
+                        "p25" => h.value_at_quantile(0.25),
+                        "p50" => h.value_at_quantile(0.5),
+                        "p75" => h.value_at_quantile(0.75),
+                        "max" => h.max(),
+                        "cnt" => h.len(),
+                    );
+                }
+            }
+        });
+    });
 }
