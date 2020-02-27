@@ -1,6 +1,5 @@
 use kvstore_ycsb::{ops, Op};
 use slog::info;
-use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 use structopt::StructOpt;
@@ -24,111 +23,6 @@ struct Opt {
 
     #[structopt(short, long)]
     out_file: Option<std::path::PathBuf>,
-}
-
-#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
-async fn start<R, E, C>(
-    mut resolver: R,
-    addr: hyper::Uri,
-    loads: Vec<Op>,
-    accesses: Vec<Op>,
-) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
-where
-    R: tower_service::Service<hyper::Uri, Response = C, Error = E>,
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    E: Into<StdError>,
-{
-    futures_util::future::poll_fn(|cx| resolver.poll_ready(cx))
-        .await
-        .map_err(|e| e.into())?;
-    let st = resolver.call(addr.clone()).await.map_err(|e| e.into())?;
-    let mut cl = kvstore::Client::from_stream(st);
-
-    // don't need to time the loads.
-    for o in loads {
-        tracing::trace!("starting load");
-        match o {
-            Op::Get(_, k) => cl.get(k).await?,
-            Op::Update(_, k, v) => cl.update(k, v).await?,
-        };
-
-        tracing::trace!("finished load");
-    }
-
-    // now, measure the accesses.
-    let st = resolver.call(addr).await.map_err(|e| e.into())?;
-    let srv = tower_buffer::Buffer::new(kvstore::client(st), 2_000);
-
-    // make all the futures at once, tower_buffer will deal with the rest.
-    use futures_util::stream::{FuturesUnordered, TryStreamExt};
-    let reqs: FuturesUnordered<_> = accesses
-        .into_iter()
-        .map(|o| {
-            let mut cl = kvstore::Client::from(srv.clone());
-            async move {
-                tracing::trace!("starting access");
-                let then = tokio::time::Instant::now();
-                match o {
-                    Op::Get(_, k) => cl.get(k).await?,
-                    Op::Update(_, k, v) => cl.update(k, v).await?,
-                };
-
-                tracing::trace!("finished access");
-                Ok::<_, StdError>(then.elapsed())
-            }
-        })
-        .collect();
-
-    // do the accesses.
-    let access_start = tokio::time::Instant::now();
-    let durs: Vec<_> = reqs.try_collect().await?;
-    let access_end = access_start.elapsed();
-    Ok((durs, access_end))
-
-    //// now, measure the accesses.
-    //let st = resolver.call(addr).await.map_err(|e| e.into())?;
-
-    // accesses group_by client
-    //let mut access_by_client: HashMap<usize, Vec<Op>> = Default::default();
-    //for o in accesses {
-    //    let k = o.client_id();
-    //    access_by_client.entry(k).or_default().push(o);
-    //}
-
-    //let srv = tower_buffer::Buffer::new(kvstore::client(st), access_by_client.len());
-
-    //// each client issues its requests closed-loop. So we get one future per client, resolving to a
-    //// Result<Vec<durations, _>>.
-    //use futures_util::stream::{FuturesUnordered, TryStreamExt};
-    //let reqs: FuturesUnordered<_> = access_by_client
-    //    .into_iter()
-    //    .map(|(_, ops)| {
-    //        let mut cl = kvstore::Client::from(srv.clone());
-    //        let mut durs = vec![];
-    //        async move {
-    //            for o in ops {
-    //                tracing::trace!("starting access");
-    //                let then = tokio::time::Instant::now();
-    //                match o {
-    //                    Op::Get(_, k) => cl.get(k).await?,
-    //                    Op::Update(_, k, v) => cl.update(k, v).await?,
-    //                };
-
-    //                tracing::trace!("finished access");
-    //                durs.push(then.elapsed())
-    //            }
-
-    //            Ok::<_, StdError>(durs)
-    //        }
-    //    })
-    //    .collect();
-
-    //// do the accesses.
-    //let access_start = tokio::time::Instant::now();
-    //let durs: Vec<Vec<_>> = reqs.try_collect().await?;
-    //let access_end = access_start.elapsed();
-    //let durs = durs.into_iter().flat_map(|x| x.into_iter()).collect();
-    //Ok((durs, access_end))
 }
 
 #[tokio::main]
@@ -234,4 +128,109 @@ async fn main() -> Result<(), StdError> {
     }
 
     Ok(())
+}
+
+#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
+async fn start<R, E, C>(
+    mut resolver: R,
+    addr: hyper::Uri,
+    loads: Vec<Op>,
+    accesses: Vec<Op>,
+) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
+where
+    R: tower_service::Service<hyper::Uri, Response = C, Error = E>,
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    E: Into<StdError>,
+{
+    futures_util::future::poll_fn(|cx| resolver.poll_ready(cx))
+        .await
+        .map_err(|e| e.into())?;
+    let st = resolver.call(addr.clone()).await.map_err(|e| e.into())?;
+    let mut cl = kvstore::Client::from_stream(st);
+
+    // don't need to time the loads.
+    for o in loads {
+        tracing::trace!("starting load");
+        match o {
+            Op::Get(_, k) => cl.get(k).await?,
+            Op::Update(_, k, v) => cl.update(k, v).await?,
+        };
+
+        tracing::trace!("finished load");
+    }
+
+    // now, measure the accesses.
+    let st = resolver.call(addr).await.map_err(|e| e.into())?;
+    let srv = tower_buffer::Buffer::new(kvstore::client(st), 2_000);
+
+    // make all the futures at once, tower_buffer will deal with the rest.
+    use futures_util::stream::{FuturesUnordered, TryStreamExt};
+    let reqs: FuturesUnordered<_> = accesses
+        .into_iter()
+        .map(|o| {
+            let mut cl = kvstore::Client::from(srv.clone());
+            async move {
+                tracing::trace!("starting access");
+                let then = tokio::time::Instant::now();
+                match o {
+                    Op::Get(_, k) => cl.get(k).await?,
+                    Op::Update(_, k, v) => cl.update(k, v).await?,
+                };
+
+                tracing::trace!("finished access");
+                Ok::<_, StdError>(then.elapsed())
+            }
+        })
+        .collect();
+
+    // do the accesses.
+    let access_start = tokio::time::Instant::now();
+    let durs: Vec<_> = reqs.try_collect().await?;
+    let access_end = access_start.elapsed();
+    Ok((durs, access_end))
+
+    //// now, measure the accesses.
+    //let st = resolver.call(addr).await.map_err(|e| e.into())?;
+
+    // accesses group_by client
+    //let mut access_by_client: HashMap<usize, Vec<Op>> = Default::default();
+    //for o in accesses {
+    //    let k = o.client_id();
+    //    access_by_client.entry(k).or_default().push(o);
+    //}
+
+    //let srv = tower_buffer::Buffer::new(kvstore::client(st), access_by_client.len());
+
+    //// each client issues its requests closed-loop. So we get one future per client, resolving to a
+    //// Result<Vec<durations, _>>.
+    //use futures_util::stream::{FuturesUnordered, TryStreamExt};
+    //let reqs: FuturesUnordered<_> = access_by_client
+    //    .into_iter()
+    //    .map(|(_, ops)| {
+    //        let mut cl = kvstore::Client::from(srv.clone());
+    //        let mut durs = vec![];
+    //        async move {
+    //            for o in ops {
+    //                tracing::trace!("starting access");
+    //                let then = tokio::time::Instant::now();
+    //                match o {
+    //                    Op::Get(_, k) => cl.get(k).await?,
+    //                    Op::Update(_, k, v) => cl.update(k, v).await?,
+    //                };
+
+    //                tracing::trace!("finished access");
+    //                durs.push(then.elapsed())
+    //            }
+
+    //            Ok::<_, StdError>(durs)
+    //        }
+    //    })
+    //    .collect();
+
+    //// do the accesses.
+    //let access_start = tokio::time::Instant::now();
+    //let durs: Vec<Vec<_>> = reqs.try_collect().await?;
+    //let access_end = access_start.elapsed();
+    //let durs = durs.into_iter().flat_map(|x| x.into_iter()).collect();
+    //Ok((durs, access_end))
 }
