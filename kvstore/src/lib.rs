@@ -139,6 +139,7 @@ where
                             // but the compiler is unhappy about error types in that case.
                             st.send(resp).await.unwrap();
                         }
+                        else => break,
                     };
                 }
             }
