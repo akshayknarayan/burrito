@@ -1,4 +1,6 @@
+use kvstore_ycsb::{ops, Op};
 use slog::info;
+use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 use structopt::StructOpt;
@@ -17,6 +19,9 @@ struct Opt {
     #[structopt(long)]
     addr: String,
 
+    #[structopt(short, long)]
+    concurrency: usize,
+
     #[structopt(long)]
     loads: std::path::PathBuf,
     #[structopt(long)]
@@ -24,34 +29,6 @@ struct Opt {
 
     #[structopt(short, long)]
     out_file: Option<std::path::PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-enum Op {
-    Get(usize, String),
-    Update(usize, String, String),
-}
-
-impl std::str::FromStr for Op {
-    type Err = StdError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let sp: Vec<&str> = s.split_whitespace().collect();
-        Ok(if sp.len() == 3 && sp[1] == "GET" {
-            Op::Get(sp[0].parse()?, sp[2].into())
-        } else if sp.len() == 4 && sp[1] == "UPDATE" {
-            Op::Update(sp[0].parse()?, sp[1].into(), sp[2].into())
-        } else {
-            Err(format!("Invalid line: {:?}", s))?
-        })
-    }
-}
-
-fn ops(f: std::path::PathBuf) -> Result<Vec<Op>, StdError> {
-    use std::io::BufRead;
-    let f = std::fs::File::open(f)?;
-    let f = std::io::BufReader::new(f);
-    Ok(f.lines().filter_map(|l| l.ok()?.parse().ok()).collect())
 }
 
 #[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
@@ -69,8 +46,8 @@ where
     futures_util::future::poll_fn(|cx| resolver.poll_ready(cx))
         .await
         .map_err(|e| e.into())?;
-    let st = resolver.call(addr).await.map_err(|e| e.into())?;
-    let mut cl = kvstore::Client::from(st);
+    let st = resolver.call(addr.clone()).await.map_err(|e| e.into())?;
+    let mut cl = kvstore::Client::from_stream(st);
 
     // don't need to time the loads.
     for o in loads {
@@ -84,26 +61,51 @@ where
     }
 
     // now, measure the accesses.
-    let mut durs = vec![];
     let num = accesses.len();
-    let access_start = tokio::time::Instant::now();
-    for o in accesses {
-        tracing::trace!("starting access");
-        let then = tokio::time::Instant::now();
-        match o {
-            Op::Get(_, k) => cl.get(k).await?,
-            Op::Update(_, k, v) => cl.update(k, v).await?,
-        };
 
-        durs.push(then.elapsed());
-        tracing::trace!("finished access");
+    let st = resolver.call(addr).await.map_err(|e| e.into())?;
+    let srv = tower_buffer::Buffer::new(kvstore::client(st), 100);
+
+    // accesses group_by client
+    let mut access_by_client: HashMap<usize, Vec<Op>> = Default::default();
+    for o in accesses {
+        let k = o.client_id();
+        access_by_client.entry(k).or_default().push(o);
     }
 
-    tracing::info!(
-        "finished {:?} accesses in {:?}",
-        num,
-        access_start.elapsed()
-    );
+    // each client issues its requests closed-loop. So we get one future per client, resolving to a
+    // Result<Vec<durations, _>>.
+    use futures_util::stream::{FuturesUnordered, TryStreamExt};
+    let reqs: FuturesUnordered<_> = access_by_client
+        .into_iter()
+        .map(|(_, ops)| {
+            let mut cl = kvstore::Client::from(srv.clone());
+            let mut durs = vec![];
+            async move {
+                for o in ops {
+                    tracing::trace!("starting access");
+                    let then = tokio::time::Instant::now();
+                    match o {
+                        Op::Get(_, k) => cl.get(k).await?,
+                        Op::Update(_, k, v) => cl.update(k, v).await?,
+                    };
+
+                    tracing::trace!("finished access");
+                    durs.push(then.elapsed())
+                }
+
+                Ok::<_, StdError>(durs)
+            }
+        })
+        .collect();
+
+    // do the accesses.
+    let access_start = tokio::time::Instant::now();
+    let durs: Vec<Vec<_>> = reqs.try_collect().await?;
+    let access_end = access_start.elapsed();
+
+    let durs = durs.into_iter().flat_map(|x| x.into_iter()).collect();
+    tracing::info!("finished {:?} accesses in {:?}", num, access_end,);
     Ok(durs)
 }
 

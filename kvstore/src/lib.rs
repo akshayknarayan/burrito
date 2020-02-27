@@ -148,10 +148,17 @@ where
     Ok(())
 }
 
+type ClientService<C> = pipeline::Client<
+    AsyncBincodeStream<C, msg::Msg, msg::Msg, async_bincode::AsyncDestination>,
+    StdError,
+    msg::Msg,
+>;
+
 /// Get a client service.
-pub fn client(
-    st: impl AsyncWrite + AsyncRead + Unpin + Send + 'static,
-) -> impl tower_service::Service<msg::Msg, Response = msg::Msg, Error = StdError> {
+pub fn client<C>(st: C) -> ClientService<C>
+where
+    C: AsyncWrite + AsyncRead + Unpin + Send + 'static,
+{
     let st: AsyncBincodeStream<_, msg::Msg, _, _> = AsyncBincodeStream::from(st).for_async();
     pipeline::Client::<_, StdError, _>::new(st)
 }
@@ -159,21 +166,12 @@ pub fn client(
 /// Connect to a Kv service.
 pub struct Client<S>(S);
 
-impl<C> From<C>
-    for Client<
-        pipeline::Client<
-            AsyncBincodeStream<C, msg::Msg, msg::Msg, async_bincode::AsyncDestination>,
-            StdError,
-            msg::Msg,
-        >,
-    >
+impl<C> Client<ClientService<C>>
 where
     C: AsyncWrite + AsyncRead + Unpin + Send + 'static,
 {
-    fn from(st: C) -> Self {
-        Self(pipeline::Client::new(
-            AsyncBincodeStream::from(st).for_async(),
-        ))
+    pub fn from_stream(st: C) -> Client<ClientService<C>> {
+        Self(client::<C>(st))
     }
 }
 
@@ -211,6 +209,21 @@ where
             .await?;
         tracing::trace!("finished get");
         Ok(resp.into_kv().1)
+    }
+}
+
+impl<S> From<S> for Client<S>
+where
+    S: tower_service::Service<msg::Msg, Response = msg::Msg, Error = StdError>,
+{
+    fn from(s: S) -> Client<S> {
+        Client(s)
+    }
+}
+
+impl<T: Clone> Clone for Client<T> {
+    fn clone(&self) -> Client<T> {
+        Client(self.0.clone())
     }
 }
 

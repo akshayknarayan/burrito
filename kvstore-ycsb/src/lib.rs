@@ -24,6 +24,15 @@ pub enum Op {
     Update(usize, String, String),
 }
 
+impl Op {
+    pub fn client_id(&self) -> usize {
+        match self {
+            Op::Get(i, _) => *i,
+            Op::Update(i, _, _) => *i,
+        }
+    }
+}
+
 impl std::str::FromStr for Op {
     type Err = StdError;
 

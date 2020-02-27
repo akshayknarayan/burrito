@@ -33,7 +33,7 @@ fn ycsb_wrkb_ser_tcp(c: &mut Criterion) {
                 .await
                 .unwrap();
             let st = resolver.call(addr).await.expect("resolver");
-            let mut cl = kvstore::Client::from(st);
+            let mut cl = kvstore::Client::from_stream(st);
 
             // don't need to time the loads.
             for o in
@@ -94,7 +94,7 @@ fn ycsb_wrkb_ser_unix(c: &mut Criterion) {
                 .await
                 .unwrap();
             let st = resolver.call(addr).await.expect("resolver");
-            let mut cl = kvstore::Client::from(st);
+            let mut cl = kvstore::Client::from_stream(st);
 
             // don't need to time the loads.
             for o in
@@ -296,7 +296,7 @@ fn ycsb_wrkb_scaling(num_shards: usize, c: &mut Criterion) {
                 .await
                 .unwrap();
             let st = resolver.call(addr).await.expect("resolver");
-            let mut cl = kvstore::Client::from(st);
+            let mut cl = kvstore::Client::from_stream(st);
 
             // don't need to time the loads.
             for o in
