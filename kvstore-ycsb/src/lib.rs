@@ -31,6 +31,13 @@ impl Op {
             Op::Update(i, _, _) => *i,
         }
     }
+
+    pub fn key(&self) -> &str {
+        match self {
+            Op::Get(_, k) => k,
+            Op::Update(_, k, _) => k,
+        }
+    }
 }
 
 impl std::str::FromStr for Op {
