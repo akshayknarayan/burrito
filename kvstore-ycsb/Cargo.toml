@@ -28,6 +28,7 @@ tracing-timing  = "0.3"
 [dev-dependencies]
 criterion = "0.3"
 ahash = "0.3"
+bincode = "1"
 
 [[bench]]
 name = "ycsb"

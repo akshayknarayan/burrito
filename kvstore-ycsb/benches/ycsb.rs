@@ -128,6 +128,74 @@ fn ycsb_wrkb_ser_unix(c: &mut Criterion) {
     });
 }
 
+async fn serve_ser_chan(
+    inc: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    out: tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    let st = kvstore::Store::default();
+    inc.fold(st, |mut st, m| {
+        let mut o = out.clone();
+        async move {
+            futures_util::future::poll_fn(|cx| st.poll_ready(cx))
+                .await
+                .unwrap();
+            let m: kvstore::Msg = bincode::deserialize(&m).unwrap();
+            let resp = st.call(m).await.expect("serv");
+            let resp: Vec<u8> = bincode::serialize(&resp).unwrap();
+            o.send(resp).await.expect("snd");
+            st
+        }
+    })
+    .await;
+}
+
+fn ycsb_wrkb_ser_chan(c: &mut Criterion) {
+    c.bench_function("ycsb_wrkloadb_ser_chan", |b| {
+        let mut rt = tokio::runtime::Runtime::new().unwrap();
+        let (mut s1, r1) = tokio::sync::mpsc::channel(10);
+        let (s2, mut r2) = tokio::sync::mpsc::channel(10);
+
+        rt.block_on(async {
+            // start server
+            tokio::spawn(serve_ser_chan(r1, s2));
+
+            for o in
+                ops(std::path::PathBuf::from("./ycsbc-mock/wrkloadb5000-1.load")).expect("loads")
+            {
+                let req = match o {
+                    Op::Get(_, k) => kvstore::Msg::get_req(k),
+                    Op::Update(_, k, v) => kvstore::Msg::put_req(k, v),
+                };
+
+                let req: Vec<u8> = bincode::serialize(&req).unwrap();
+                s1.send(req).await.unwrap();
+                r2.recv().await.unwrap(); // meh, toss the response
+            }
+        });
+
+        let mut accesses = ops(std::path::PathBuf::from(
+            "./ycsbc-mock/wrkloadb5000-1.access",
+        ))
+        .expect("accesses")
+        .into_iter()
+        .cycle();
+
+        b.iter(|| {
+            rt.block_on(async {
+                let o = accesses.next().unwrap();
+                let req = match o {
+                    Op::Get(_, k) => kvstore::Msg::get_req(k),
+                    Op::Update(_, k, v) => kvstore::Msg::put_req(k, v),
+                };
+
+                let req: Vec<u8> = bincode::serialize(&req).unwrap();
+                s1.send(req).await.unwrap();
+                r2.recv().await.unwrap(); // meh, toss the response
+            });
+        });
+    });
+}
+
 async fn serve_chan(
     inc: tokio::sync::mpsc::Receiver<kvstore::Msg>,
     out: tokio::sync::mpsc::Sender<kvstore::Msg>,
@@ -360,6 +428,7 @@ criterion_group!(
     benches,
     ycsb_wrkb_ser_tcp,
     ycsb_wrkb_ser_unix,
+    ycsb_wrkb_ser_chan,
     ycsb_wrkb_chan,
     ycsb_wrkb_msgkv,
     ycsb_wrkb_kv,
