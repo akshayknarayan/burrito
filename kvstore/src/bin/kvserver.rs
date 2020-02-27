@@ -44,7 +44,10 @@ fn tcp_shard_addrs(num_shards: usize, base_port: u16) -> Vec<String> {
 async fn main() -> Result<(), StdError> {
     let log = burrito_ctl::logger();
     let opt = Opt::from_args();
-    let num_shards = opt.num_shards.unwrap_or(0);
+    let num_shards = match opt.num_shards {
+        None | Some(1) => 0, // having 1 shard is pointless, same as 0, might as well avoid the extra channel sends.
+        Some(x) => x,
+    };
     let shard_fn = move |m: &kvstore::Msg| {
         use std::hash::{Hash, Hasher};
         let mut hasher = ahash::AHasher::default();

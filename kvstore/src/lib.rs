@@ -132,6 +132,12 @@ where
                         Some(Ok(req)) = st.next() => {
                             // call the right shard and push the future onto the out-queue
                             let srv = &mut shards[shard_fn(&req)];
+
+                            // maybe don't await this in the sharder loop
+                            if let Err(_) = futures_util::future::poll_fn(|cx| srv.poll_ready(cx)).await {
+                                break;
+                            }
+
                             resps.push(srv.call(req));
                         }
                         Some(Ok(resp)) = resps.next() => {
