@@ -23,7 +23,7 @@ tower-service = "0.3"
 tracing = "0.1"
 tracing-futures = "0.2"
 tracing-subscriber = "0.2"
-tracing-timing  = "0.4"
+tracing-timing  = "=0.3.0"
 ahash = "0.3"
 
 [dev-dependencies]

@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 use structopt::StructOpt;
-use tracing_timing::{Builder, Histogram};
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -56,16 +55,8 @@ async fn main() -> Result<(), StdError> {
     let log = burrito_ctl::logger();
     let opt = Opt::from_args();
 
-    let subscriber = Builder::default()
-        .no_span_recursion()
-        .build(|| Histogram::new_with_max(10_000_000, 2).unwrap());
-    let sid = subscriber.downcaster();
-    let d = tracing::Dispatch::new(subscriber);
-
     if let None = opt.out_file {
         tracing_subscriber::fmt::init();
-    } else {
-        tracing::dispatcher::set_global_default(d.clone()).expect("set tracing global default");
     }
 
     let loads = ops(opt.accesses.with_extension("load"))?;
@@ -161,41 +152,6 @@ async fn main() -> Result<(), StdError> {
     info!(&log, "Did accesses"; "num" => ?&durs.len(), "elapsed" => ?time,
         "min" => ?durs[0], "p25" => ?quantiles[0], "p50" => ?quantiles[1], "p75" => ?quantiles[2], "p95" => ?quantiles[3], "max" => ?durs[durs.len() - 1],
     );
-
-    sid.downcast(&d).unwrap().force_synchronize();
-
-    if let Some(ref path) = opt.out_file {
-        use std::io::Write;
-        let path = path.with_extension("trace");
-        let mut f = std::fs::File::create(path)?;
-        sid.downcast(&d).unwrap().with_histograms(|hs| {
-            for (span_group, hs) in hs {
-                for (event_group, h) in hs {
-                    write!(
-                        &mut f,
-                        "{}:{}: {} {} {} {} {}\n",
-                        span_group,
-                        event_group,
-                        h.min(),
-                        h.value_at_quantile(0.25),
-                        h.value_at_quantile(0.5),
-                        h.value_at_quantile(0.75),
-                        h.max(),
-                    )
-                    .expect("write to trace file");
-                }
-            }
-        });
-    }
-
-    if let Some(path) = opt.out_file {
-        use std::io::Write;
-        let mut f = std::fs::File::create(path)?;
-        write!(&mut f, "Latency_us\n")?;
-        for d in durs {
-            write!(&mut f, "{}\n", d.as_micros())?;
-        }
-    }
 
     Ok(())
 }
