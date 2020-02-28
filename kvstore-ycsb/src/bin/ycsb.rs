@@ -200,7 +200,12 @@ async fn main() -> Result<(), StdError> {
     Ok(())
 }
 
-#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
+// Uncommenting the following causes:
+// error: reached the type-length limit while instantiating
+//     `std::pin::Pin::<&mut std::future...}[1]::poll[0]::{{closure}}[0])]>`
+//     |
+//     = note: consider adding a `#![type_length_limit="1606073"]` attribute to your crate
+//#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
 async fn server_side_sharding<R, E, C>(
     mut resolver: R,
     addr: hyper::Uri,
