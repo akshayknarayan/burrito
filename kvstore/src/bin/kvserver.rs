@@ -27,6 +27,9 @@ struct Opt {
 
     #[structopt(long, default_value = "flatbuf")]
     burrito_proto: String,
+
+    #[structopt(short, long)]
+    log: bool,
 }
 
 fn shard_addrs(num_shards: usize, base_addr: &str) -> Vec<String> {
@@ -44,8 +47,11 @@ fn tcp_shard_addrs(num_shards: usize, base_port: u16) -> Vec<String> {
 #[tokio::main]
 async fn main() -> Result<(), StdError> {
     let log = burrito_ctl::logger();
-    write_tracing(&log);
     let opt = Opt::from_args();
+    if opt.log {
+        write_tracing(&log);
+    }
+
     let num_shards = match opt.num_shards {
         None | Some(1) => 0, // having 1 shard is pointless, same as 0, might as well avoid the extra channel sends.
         Some(x) => x,
