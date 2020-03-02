@@ -92,7 +92,7 @@ where
     // start the shards
     let shards: Vec<_> = shard_listeners
         .map(move |listener| {
-            let srv = tower_buffer::Buffer::new(Store::default(), 100);
+            let srv = tower_buffer::Buffer::new(Store::default(), 100_000);
             let shard_srv = srv.clone();
 
             // serve srv on listener
