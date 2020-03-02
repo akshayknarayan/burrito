@@ -92,6 +92,7 @@ where
     // start the shards
     let shards: Vec<_> = shard_listeners
         .map(move |listener| {
+            // The channel size passed to new() should be >= the maximum num. of concurrent requests.
             let srv = tower_buffer::Buffer::new(Store::default(), 100_000);
             let shard_srv = srv.clone();
 
@@ -109,7 +110,7 @@ where
     // if shards.len() == 0, then there can only be one shard: sharder_listen. So, we just serve directly and
     // ignore `shard_fn`.
     if shards.is_empty() {
-        let srv = tower_buffer::Buffer::new(Store::default(), 100);
+        let srv = tower_buffer::Buffer::new(Store::default(), 100_000);
         sharder_listen
             .for_each_concurrent(None, move |st| serve(st.unwrap(), srv.clone()))
             .await;
