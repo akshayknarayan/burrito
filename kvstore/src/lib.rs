@@ -195,35 +195,17 @@ impl<S> Client<S>
 where
     S: tower_service::Service<msg::Msg, Response = msg::Msg, Error = StdError>,
 {
-    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn update(&mut self, key: String, val: String) -> Result<Option<String>, StdError> {
-        tracing::trace!("starting update");
-        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx))
-            .instrument(span!(Level::DEBUG, "update:poll_ready"))
-            .await?;
+        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx)).await?;
         let req = msg::Msg::put_req(key, val);
-        let resp = self
-            .0
-            .call(req)
-            .instrument(span!(Level::DEBUG, "update:call"))
-            .await?;
-        tracing::trace!("finished update");
+        let resp = self.0.call(req).await?;
         Ok(resp.into_kv().1)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn get(&mut self, key: String) -> Result<Option<String>, StdError> {
-        tracing::trace!("starting get");
-        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx))
-            .instrument(span!(Level::DEBUG, "get:poll_ready"))
-            .await?;
+        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx)).await?;
         let req = msg::Msg::get_req(key);
-        let resp = self
-            .0
-            .call(req)
-            .instrument(span!(Level::DEBUG, "get:call"))
-            .await?;
-        tracing::trace!("finished get");
+        let resp = self.0.call(req).await?;
         Ok(resp.into_kv().1)
     }
 }

@@ -241,6 +241,8 @@ where
         })
         .collect();
 
+    tracing::info!("starting");
+
     // do the accesses.
     let access_start = tokio::time::Instant::now();
     let durs: Vec<Vec<_>> = reqs.try_collect().await?;
@@ -303,8 +305,8 @@ where
     let (durs, access_end) = if !connections_per_client {
         // one connection per shard
         let mut cls = vec![];
-        for a in addrs {
-            let st = resolver.call(a).await.map_err(|e| e.into())?;
+        for a in &addrs[1..] {
+            let st = resolver.call(a.clone()).await.map_err(|e| e.into())?;
             let srv = tower_buffer::Buffer::new(kvstore::client(st), 100_000);
             cls.push(kvstore::Client::from(srv));
         }
@@ -328,8 +330,7 @@ where
                     for o in ops {
                         tracing::trace!("starting access");
                         let then = tokio::time::Instant::now();
-                        // +1 because the first address is the sharder
-                        let shard = shard_fn(&o) + 1;
+                        let shard = shard_fn(&o);
                         let cl = &mut cls[shard];
                         match o {
                             Op::Get(_, k) => cl.get(k).await?,
@@ -359,8 +360,8 @@ where
             let k = o.client_id();
             if !access_by_client.contains_key(&k) {
                 let mut cls = vec![];
-                for a in addrs.clone() {
-                    let st = resolver.call(a).await.map_err(|e| e.into())?;
+                for a in &addrs[1..] {
+                    let st = resolver.call(a.clone()).await.map_err(|e| e.into())?;
                     cls.push(kvstore::Client::from_stream(st));
                 }
 
@@ -376,23 +377,25 @@ where
         use futures_util::stream::{FuturesUnordered, TryStreamExt};
         let reqs: FuturesUnordered<_> = access_by_client
             .into_iter()
-            .map(|(_, (mut cls, ops))| {
+            .map(|(k, (mut cls, ops))| {
                 let mut durs = vec![];
                 async move {
+                    tracing::info!(id = k, num_ops = ops.len(), "starting client");
                     for o in ops {
-                        tracing::trace!("starting access");
+                        tracing::trace!(id = k, "starting access");
                         let then = tokio::time::Instant::now();
-                        // +1 because the first address is the sharder
-                        let shard = shard_fn(&o) + 1;
+                        let shard = shard_fn(&o);
                         let cl = &mut cls[shard];
                         match o {
                             Op::Get(_, k) => cl.get(k).await?,
                             Op::Update(_, k, v) => cl.update(k, v).await?,
                         };
 
-                        tracing::trace!("finished access");
+                        tracing::trace!(id = k, "finished access");
                         durs.push(then.elapsed())
                     }
+
+                    tracing::info!(id = k, "finished client");
 
                     Ok::<_, StdError>(durs)
                 }
