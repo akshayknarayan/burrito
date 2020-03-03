@@ -11,7 +11,7 @@ use std::error::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tower::pipeline;
 use tower_service::Service;
-use tracing::{span, trace, Level};
+use tracing::{span, info, trace, Level};
 use tracing_futures::Instrument;
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
@@ -125,6 +125,7 @@ where
         .for_each_concurrent(None, |st| {
             let mut shards = shards.clone();
             let shard_fn = shard_fn.clone();
+            let mut concurrent_history = vec![];
             async move {
                 let mut resps = futures_util::stream::FuturesOrdered::new();
                 let mut st: AsyncBincodeStream<C, msg::Msg, msg::Msg, _> =
@@ -157,7 +158,27 @@ where
                     };
 
                     trace!(queue = resps.len(), "loop end");
+                    concurrent_history.push(resps.len());
                 }
+
+                concurrent_history.sort();
+                let len = concurrent_history.len() as f64;
+                let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
+                let quantiles: Vec<_> = quantile_idxs
+                    .iter()
+                    .map(|q| (len * q) as usize)
+                    .map(|i| concurrent_history[i])
+                    .collect();
+                info!( 
+                    num = concurrent_history.len(),
+                    min = concurrent_history[0], 
+                    p25 = quantiles[0], 
+                    p50 = quantiles[1], 
+                    p75 = quantiles[2], 
+                    p95 = quantiles[3], 
+                    max = concurrent_history[concurrent_history.len() - 1],
+                    "Finished connection",
+                );
             }
             .instrument(span!(Level::TRACE, "sharder"))
         })
