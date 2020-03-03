@@ -169,18 +169,11 @@ async fn main() -> Result<(), StdError> {
     Ok(())
 }
 
-// Uncommenting the following causes:
-// error: reached the type-length limit while instantiating
-//     `std::pin::Pin::<&mut std::future...}[1]::poll[0]::{{closure}}[0])]>`
-//     |
-//     = note: consider adding a `#![type_length_limit="1606073"]` attribute to your crate
-//#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
-async fn server_side_sharding<R, E, C>(
-    mut resolver: R,
+async fn do_loads<R, E, C>(
+    resolver: &mut R,
     addr: hyper::Uri,
     loads: Vec<Op>,
-    accesses: Vec<Op>,
-) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
+) -> Result<(), StdError>
 where
     R: tower_service::Service<hyper::Uri, Response = C, Error = E>,
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -202,6 +195,28 @@ where
 
         tracing::trace!("finished load");
     }
+
+    Ok(())
+}
+
+// Uncommenting the following causes:
+// error: reached the type-length limit while instantiating
+//     `std::pin::Pin::<&mut std::future...}[1]::poll[0]::{{closure}}[0])]>`
+//     |
+//     = note: consider adding a `#![type_length_limit="1606073"]` attribute to your crate
+//#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
+async fn server_side_sharding<R, E, C>(
+    mut resolver: R,
+    addr: hyper::Uri,
+    loads: Vec<Op>,
+    accesses: Vec<Op>,
+) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
+where
+    R: tower_service::Service<hyper::Uri, Response = C, Error = E>,
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    E: Into<StdError>,
+{
+    do_loads(&mut resolver, addr.clone(), loads).await?;
 
     // now, measure the accesses.
     let st = resolver.call(addr).await.map_err(|e| e.into())?;
@@ -273,25 +288,7 @@ where
         return server_side_sharding(resolver, addrs.pop().unwrap(), loads, accesses).await;
     };
 
-    futures_util::future::poll_fn(|cx| resolver.poll_ready(cx))
-        .await
-        .map_err(|e| e.into())?;
-    let st = resolver
-        .call(addrs[0].clone())
-        .await
-        .map_err(|e| e.into())?;
-    let mut cl = kvstore::Client::from_stream(st);
-
-    // don't need to time the loads.
-    for o in loads {
-        tracing::trace!("starting load");
-        match o {
-            Op::Get(_, k) => cl.get(k).await?,
-            Op::Update(_, k, v) => cl.update(k, v).await?,
-        };
-
-        tracing::trace!("finished load");
-    }
+    do_loads(&mut resolver, addrs[0].clone(), loads).await?;
 
     // now, measure the accesses.
     let num_shards = addrs.len() - 1;
@@ -377,12 +374,12 @@ where
         use futures_util::stream::{FuturesUnordered, TryStreamExt};
         let reqs: FuturesUnordered<_> = access_by_client
             .into_iter()
-            .map(|(k, (mut cls, ops))| {
+            .map(|(client_id, (mut cls, ops))| {
                 let mut durs = vec![];
                 async move {
-                    tracing::info!(id = k, num_ops = ops.len(), "starting client");
+                    tracing::trace!(id = client_id, num_ops = ops.len(), "starting client");
                     for o in ops {
-                        tracing::trace!(id = k, "starting access");
+                        tracing::trace!(id = client_id, "starting access");
                         let then = tokio::time::Instant::now();
                         let shard = shard_fn(&o);
                         let cl = &mut cls[shard];
@@ -391,11 +388,11 @@ where
                             Op::Update(_, k, v) => cl.update(k, v).await?,
                         };
 
-                        tracing::trace!(id = k, "finished access");
+                        tracing::trace!(id = client_id, "finished access");
                         durs.push(then.elapsed())
                     }
 
-                    tracing::info!(id = k, "finished client");
+                    tracing::trace!(id = client_id, "finished client");
 
                     Ok::<_, StdError>(durs)
                 }
