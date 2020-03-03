@@ -67,7 +67,7 @@ pub async fn serve(
     pipeline::Server::new(st, srv)
         .await
         .map_err(|_| ()) // argh, bincode::Error is not Debug
-        .expect("shard crashed")
+        .unwrap_or_else(|_| ());
 }
 
 /// Serve multiple Store shards on `shard_listeners`.
