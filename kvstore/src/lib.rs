@@ -1,4 +1,5 @@
 use async_bincode::AsyncBincodeStream;
+use std::pin::Pin;
 use core::task::{Context, Poll};
 use futures_util::{
     future::Ready,
@@ -195,19 +196,36 @@ where
 impl<S> Client<S>
 where
     S: tower_service::Service<msg::Msg, Response = msg::Msg, Error = StdError>,
+    S::Future: 'static,
 {
-    pub async fn update(&mut self, key: String, val: String) -> Result<Option<String>, StdError> {
-        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx)).await?;
+    fn do_req(&mut self, req: Msg) -> Pin<Box<dyn std::future::Future<Output=Result<Option<String>, StdError>>>> {
+        let fut = self.0.call(req);
+        Box::pin(async move {
+            Ok(fut.await?.into_kv().1) })
+    }
+
+    pub fn update_fut(&mut self, key: String, val: String) -> Pin<Box<dyn std::future::Future<Output=Result<Option<String>, StdError>>>> {
         let req = msg::Msg::put_req(key, val);
-        let resp = self.0.call(req).await?;
-        Ok(resp.into_kv().1)
+        self.do_req(req)
+    }
+
+    pub async fn update(&mut self , key: String, val: String) -> Result<Option<String>, StdError> {
+        futures_util::future::poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.update_fut(key, val).await
+    }
+
+    pub fn get_fut(&mut self, key: String) -> Pin<Box<dyn std::future::Future<Output=Result<Option<String>, StdError>>>> {
+        let req = msg::Msg::get_req(key);
+        self.do_req(req)
     }
 
     pub async fn get(&mut self, key: String) -> Result<Option<String>, StdError> {
-        futures_util::future::poll_fn(|cx| self.0.poll_ready(cx)).await?;
-        let req = msg::Msg::get_req(key);
-        let resp = self.0.call(req).await?;
-        Ok(resp.into_kv().1)
+        futures_util::future::poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.get_fut(key).await
+    }
+
+    pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), StdError>> {
+        self.0.poll_ready(cx)
     }
 }
 
