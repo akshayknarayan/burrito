@@ -1,3 +1,4 @@
+use async_timer as hrtimer;
 use kvstore_ycsb::{ops, Op};
 use slog::info;
 use std::collections::HashMap;
@@ -286,7 +287,9 @@ where
             let mut durs = vec![];
             let expected_len = ops.len();
             async move {
-                let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
+                //let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
+                let tkr = hrtimer::interval(std::time::Duration::from_micros(interarrival_micros as u64));
+                let mut ops = tkr
                     .zip(futures_util::stream::iter(ops));
 
                 let mut ready = false;
@@ -303,7 +306,6 @@ where
                                 Op::Update(_, k, v) => cl.update_fut(k, v),
                             };
 
-                            tracing::trace!(id = client_id, inflight = inflight.len(), "new request");
                             inflight.push(async move {
                                 tracing::trace!(id = client_id, "starting access");
                                 let then = tokio::time::Instant::now();
@@ -311,9 +313,10 @@ where
                                 tracing::trace!(id = client_id, "finished access");
                                 Ok::<_, StdError>(then.elapsed())
                             });
+                            tracing::trace!(id = client_id, inflight = inflight.len(), "new request");
                         }
                         Some(Ok(d)) = inflight.next() => {
-                            tracing::trace!(id = client_id, inflight = inflight.len(), "request done");
+                            tracing::debug!(id = client_id, inflight = inflight.len(), "request done");
                             durs.push(d);
                         }
                         else => break,
