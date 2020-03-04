@@ -280,7 +280,7 @@ where
     // Result<Vec<durations, _>>.
     // terminate once the first client finishes, since the load characteristics would change
     // otherwise.
-    let (done_tx, done_rx) = tokio::sync::watch::channel::<Option<()>>(None);
+    let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
     use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
     let mut reqs: FuturesUnordered<_> = access_by_client
         .into_iter()
@@ -288,7 +288,7 @@ where
             let mut cl = kvstore::Client::from(srv.clone());
             let mut inflight = FuturesOrdered::new();
             let mut durs = vec![];
-            let mut done = done_rx.clone();
+            let done = done_rx.clone();
             assert!(!ops.is_empty());
             async move {
                 //let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
@@ -297,11 +297,9 @@ where
                     .zip(futures_util::stream::iter(ops));
 
                 let mut ready = false;
+                tracing::info!(id = client_id, "starting");
                 loop {
                     tokio::select! (
-                        Some(Some(_)) = done.recv() => {
-                            break; // the first client finished. stop.
-                        }
                         _ = futures_util::future::poll_fn(|cx| cl.poll_ready(cx)), if !ready => {
                             ready = true;
                         }
@@ -323,11 +321,21 @@ where
                             tracing::trace!(id = client_id, inflight = inflight.len(), "new request");
                         }
                         Some(Ok(d)) = inflight.next() => {
-                            tracing::debug!(id = client_id, inflight = inflight.len(), "request done");
+                            tracing::trace!(id = client_id, inflight = inflight.len(), "request done");
                             durs.push(d);
                         }
-                        else => break,
+                        else => {
+                            tracing::debug!(id = client_id, completed = durs.len(), "finished requests");
+                            break;
+                        }
                     );
+
+                    // This can't be inside the select because then else would never be
+                    // triggered.
+                    if *done.borrow() {
+                        tracing::debug!(id = client_id, completed = durs.len(), "stopping");
+                        break; // the first client finished. stop.
+                    }
                 }
 
                 Ok::<_, StdError>(durs)
@@ -335,17 +343,18 @@ where
         })
         .collect();
 
-    tracing::info!("starting");
-
     let access_start = tokio::time::Instant::now();
     // do the accesses until the first client is done.
     let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
     assert!(!durs.is_empty());
     let access_end = access_start.elapsed();
-    done_tx.broadcast(Some(()))?;
+    tracing::debug!("broadcasting done");
+    done_tx.broadcast(true)?;
+
     // collect all the requests that have completed.
     let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
     assert!(!rest_durs.is_empty());
+    tracing::debug!("all clients reported");
     durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
     Ok((durs, access_end))
 }
