@@ -278,14 +278,17 @@ where
 
     // each client issues its requests open-loop. So we get one future per client, resolving to a
     // Result<Vec<durations, _>>.
+    // terminate once the first client finishes, since the load characteristics would change
+    // otherwise.
+    let (done_tx, done_rx) = tokio::sync::watch::channel::<Option<()>>(None);
     use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
-    let reqs: FuturesUnordered<_> = access_by_client
+    let mut reqs: FuturesUnordered<_> = access_by_client
         .into_iter()
         .map(|(client_id, ops)| {
             let mut cl = kvstore::Client::from(srv.clone());
             let mut inflight = FuturesOrdered::new();
             let mut durs = vec![];
-            let expected_len = ops.len();
+            let mut done = done_rx.clone();
             async move {
                 //let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
                 let tkr = hrtimer::interval(std::time::Duration::from_micros(interarrival_micros as u64));
@@ -295,6 +298,9 @@ where
                 let mut ready = false;
                 loop {
                     tokio::select! (
+                        Some(_) = done.recv() => {
+                            break; // the first client finished. stop.
+                        }
                         _ = futures_util::future::poll_fn(|cx| cl.poll_ready(cx)), if !ready => {
                             ready = true;
                         }
@@ -323,7 +329,6 @@ where
                     );
                 }
 
-                assert_eq!(expected_len, durs.len());
                 Ok::<_, StdError>(durs)
             }
         })
@@ -331,11 +336,14 @@ where
 
     tracing::info!("starting");
 
-    // do the accesses.
     let access_start = tokio::time::Instant::now();
-    let durs: Vec<Vec<_>> = reqs.try_collect().await?;
+    // do the accesses until the first client is done.
+    let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
     let access_end = access_start.elapsed();
-    let durs = durs.into_iter().flat_map(|x| x.into_iter()).collect();
+    done_tx.broadcast(Some(()))?;
+    // collect all the requests that have completed.
+    let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
+    durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
     Ok((durs, access_end))
 }
 
