@@ -289,6 +289,7 @@ where
             let mut inflight = FuturesOrdered::new();
             let mut durs = vec![];
             let mut done = done_rx.clone();
+            assert!(!ops.is_empty());
             async move {
                 //let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
                 let tkr = hrtimer::interval(std::time::Duration::from_micros(interarrival_micros as u64));
@@ -298,7 +299,7 @@ where
                 let mut ready = false;
                 loop {
                     tokio::select! (
-                        Some(_) = done.recv() => {
+                        Some(Some(_)) = done.recv() => {
                             break; // the first client finished. stop.
                         }
                         _ = futures_util::future::poll_fn(|cx| cl.poll_ready(cx)), if !ready => {
@@ -339,10 +340,12 @@ where
     let access_start = tokio::time::Instant::now();
     // do the accesses until the first client is done.
     let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
+    assert!(!durs.is_empty());
     let access_end = access_start.elapsed();
     done_tx.broadcast(Some(()))?;
     // collect all the requests that have completed.
     let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
+    assert!(!rest_durs.is_empty());
     durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
     Ok((durs, access_end))
 }
