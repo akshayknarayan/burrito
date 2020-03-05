@@ -211,6 +211,24 @@ async fn main() -> Result<(), StdError> {
         "min" => ?durs[0], "p25" => ?quantiles[0], "p50" => ?quantiles[1], "p75" => ?quantiles[2], "p95" => ?quantiles[3], "max" => ?durs[durs.len() - 1],
     );
 
+    if let Some(f) = opt.out_file {
+        let mut f = std::fs::File::create(f).expect("Open out file");
+        use std::io::Write;
+        write!(&mut f, "Interarrival_us NumOps Completion_ms Latency_us\n").expect("write");
+        let len = durs.len();
+        for d in durs {
+            write!(
+                &mut f,
+                "{} {} {} {}\n",
+                opt.interarrival_client_micros,
+                len,
+                time.as_millis(),
+                d.as_micros()
+            )
+            .expect("write");
+        }
+    }
+
     Ok(())
 }
 
