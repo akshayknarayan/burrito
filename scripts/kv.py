@@ -243,8 +243,9 @@ def do_exp(outdir, machines, ops_per_sec):
     start_server(machines[0], f"{outdir}/{ops_per_sec}-kvserver")
 
     # others are clients
+    outf = f"{outdir}/{ops_per_sec}-ycsb"
     agenda.task(f"starting clients, server = {server_addr}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}")
-    clients = [threading.Thread(target=run_client, args=(m, server_addr, interarrival_us, f"{outdir}/{ops_per_sec}-ycsb")) for m in machines[1:]]
+    clients = [threading.Thread(target=run_client, args=(m, server_addr, interarrival_us, outf)) for m in machines[1:]]
     [t.start() for t in clients]
     [t.join() for t in clients]
     agenda.task("done")
@@ -252,21 +253,17 @@ def do_exp(outdir, machines, ops_per_sec):
     # kill the server
     machines[0].run("sudo pkill -9 kvserver")
 
-    machines[0].get(f"burrito/{outdir}/kvserver.out", local=f"{outdir}/kvserver.out", preserve_mode=False)
-    machines[0].get(f"burrito/{outdir}/kvserver.err", local=f"{outdir}/kvserver.err", preserve_mode=False)
+    machines[0].get(f"burrito/{outdir}/{ops_per_sec}-kvserver.out", local=f"{outdir}/{ops_per_sec}-kvserver.out", preserve_mode=False)
+    machines[0].get(f"burrito/{outdir}/{ops_per_sec}-kvserver.err", local=f"{outdir}/{ops_per_sec}-kvserver.err", preserve_mode=False)
     for c in machines[1:]:
         if c.addr in ['127.0.0.1', '::1', 'localhost']:
             continue
-        c.get(f"burrito/{outdir}/ycsb.err", local=f"{outdir}/{c.addr}-ycsb.err", preserve_mode=False)
-        c.get(f"burrito/{outdir}/ycsb2.err", local=f"{outdir}/{c.addr}-ycsb2.err", preserve_mode=False)
-        c.get(f"burrito/{outdir}/ycsb.out", local=f"{outdir}/{c.addr}-ycsb.out", preserve_mode=False)
-        c.get(f"burrito/{outdir}/ycsb2.out", local=f"{outdir}/{c.addr}-ycsb2.out", preserve_mode=False)
-        c.get(f"burrito/{outdir}/ycsb.data", local=f"{outdir}/{c.addr}-ycsb.data", preserve_mode=False)
-        c.get(f"burrito/{outdir}/ycsb2.data", local=f"{outdir}/{c.addr}-ycsb2.data", preserve_mode=False)
-
-    import subprocess
-    subprocess.run(f"tail ./{outdir}/*ycsb*err >> {outdir}/exp.log", shell=True)
-    subprocess.run(f"tail ./{outdir}/*ycsb*.data >> {outdir}/exp.data", shell=True)
+        c.get(f"burrito/{outf}.err", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb.err", preserve_mode=False)
+        c.get(f"burrito/{outf}2.err", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb2.err", preserve_mode=False)
+        c.get(f"burrito/{outf}.out", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb.out", preserve_mode=False)
+        c.get(f"burrito/{outf}2.out", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb2.out", preserve_mode=False)
+        c.get(f"burrito/{outf}.data", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb.data", preserve_mode=False)
+        c.get(f"burrito/{outf}2.data", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb2.data", preserve_mode=False)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--outdir', type=str, required=True)
@@ -300,3 +297,9 @@ if __name__ == '__main__':
 
     for o in ops_per_sec:
         do_exp(outdir, machines, o)
+        time.sleep(5)
+
+    import subprocess
+    subprocess.run(f"tail ./{outdir}/*ycsb*err >> {outdir}/exp.log", shell=True)
+    subprocess.run(f"cat ./{outdir}/*ycsb*.data | awk '{{if (!hdr) {{hdr=$0; print $0;}} else if (hdr != $0) {{print $0}};}}' > {outdir}/exp.data", shell=True)
+    subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)
