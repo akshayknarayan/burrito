@@ -4,6 +4,7 @@ from fabric import Connection
 import agenda
 import argparse
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -166,19 +167,23 @@ def check_machine(ip):
 def setup(conn, outdir):
     ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
     check(ok, "mk outdir", conn.addr)
-    ok = conn.run("cset shield --userset=kv --reset", sudo=True)
-    check(ok, "reset cpuset", conn.addr, allowed = [2])
     agenda.subtask(f"building burrito on {conn.addr}")
     ok = conn.run("~/.cargo/bin/cargo build --release", wd = "~/burrito")
     check(ok, "build", conn.addr)
-    agenda.subtask(f"make cpu shield kv for cpus 0-3 on {conn.addr}")
-    ok = conn.run("cset shield --userset=kv --cpu=0-3 --kthread=on", sudo=True)
-    check(ok, "make cpuset", conn.addr)
     return conn
 
-def start_server(conn, outf):
+def start_server(conn, outf, shards=0):
     conn.run("sudo pkill -9 kvserver")
-    ok = conn.run("cset shield --userset=kv --exec ./target/release/kvserver -- -p 4242",
+
+    ok = conn.run("cset shield --userset=kv --reset", sudo=True)
+    check(ok, "reset cpuset", conn.addr, allowed = [2])
+    cpus = max(3, shards + 1)
+    agenda.subtask(f"make cpu shield kv for cpus 0-{cpus} on {conn.addr}")
+    ok = conn.run(f"cset shield --userset=kv --cpu=0-{cpus} --kthread=on", sudo=True)
+    check(ok, "make cpuset", conn.addr)
+
+    shard_arg = f"-n {shards}" if shards > 0 else ""
+    ok = conn.run(f"cset shield --userset=kv --exec ./target/release/kvserver -- -p 4242 {shard_arg}",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -190,7 +195,7 @@ def start_server(conn, outf):
     conn.check_proc("kvserver", f"{outf}.err")
 
 # one machine can handle 2 client processes
-def run_client(conn, server, interarrival, outf):
+def run_client(conn, server, interarrival, outf, clientsharding=0):
     if not conn.file_exists("~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb-100.access"):
         agenda.failure(f"No ycsb trace on {ip}")
         sys.exit(1)
@@ -198,10 +203,23 @@ def run_client(conn, server, interarrival, outf):
         agenda.failure(f"No ycsb trace on {ip}")
         sys.exit(1)
 
+    if clientsharding > 4:
+        agenda.failure(f"Not enough cores for 2x {clientsharding} client shards")
+
+    ok = conn.run("cset shield --userset=kv --reset", sudo=True)
+    check(ok, "reset cpuset", conn.addr, allowed = [2])
+    cpus = max(3, clientsharding + 1)
+    agenda.subtask(f"make cpu shield kv for cpus 0-{cpus} on {conn.addr}")
+    ok = conn.run(f"cset shield --userset=kv --cpu=0-{cpus} --kthread=on", sudo=True)
+    check(ok, "make cpuset", conn.addr)
+
+    shard_arg = f"-n {clientsharding}" if clientsharding > 0 else ""
+
     conn.run(f"cset shield --userset=kv --exec ./target/release/ycsb -- \
             --addr \"http://{server}:4242\" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb-100.access \
             -o {outf}.data \
+            {shard_arg} \
             -i {interarrival}",
             wd = "~/burrito",
             sudo = True,
@@ -213,6 +231,7 @@ def run_client(conn, server, interarrival, outf):
             --addr \"http://{server}:4242\" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb2-100.access \
             -o {outf}2.data \
+            {shard_arg} \
             -i {interarrival}",
             wd = "~/burrito",
             stdout=f"{outf}2.out",
@@ -231,21 +250,32 @@ def run_client(conn, server, interarrival, outf):
     conn.run("sudo chmod 644 {outf}.out")
     conn.run("sudo chmod 644 {outf}.err")
 
-def do_exp(outdir, machines, ops_per_sec):
+def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
+    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-kvserver"
+    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-ycsb"
+
+    if os.path.exists(f"{outf}-{machines[1].addr}.data"):
+        agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
+        return
+
     # load = 100 (client threads / proc) * 2 (procs/machine) * {len(machines) - 1} (machines) / {interarrival} (per client thread)
     # interarrival = 100 * 2 * {len(machines) - 1} / load
     interarrival_secs = 200 * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
 
-    # first one is the server, start the server
     server_addr = machines[0].addr
-    agenda.task("starting server")
-    start_server(machines[0], f"{outdir}/{ops_per_sec}-kvserver")
+    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}")
+
+    # first one is the server, start the server
+    agenda.subtask("starting server")
+    start_server(machines[0], server_prefix, shards=num_shards)
 
     # others are clients
-    outf = f"{outdir}/{ops_per_sec}-ycsb"
-    agenda.task(f"starting clients, server = {server_addr}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}")
-    clients = [threading.Thread(target=run_client, args=(m, server_addr, interarrival_us, outf)) for m in machines[1:]]
+    agenda.subtask("starting clients")
+    if shardtype == "client":
+        clients = [threading.Thread(target=run_client, args=(m, server_addr, interarrival_us, outf), kwargs={'clientsharding':num_shards}) for m in machines[1:]]
+    else:
+        clients = [threading.Thread(target=run_client, args=(m, server_addr, interarrival_us, outf)) for m in machines[1:]]
     [t.start() for t in clients]
     [t.join() for t in clients]
     agenda.task("done")
@@ -253,23 +283,39 @@ def do_exp(outdir, machines, ops_per_sec):
     # kill the server
     machines[0].run("sudo pkill -9 kvserver")
 
-    machines[0].get(f"burrito/{outdir}/{ops_per_sec}-kvserver.out", local=f"{outdir}/{ops_per_sec}-kvserver.out", preserve_mode=False)
-    machines[0].get(f"burrito/{outdir}/{ops_per_sec}-kvserver.err", local=f"{outdir}/{ops_per_sec}-kvserver.err", preserve_mode=False)
+    machines[0].get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
+    machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
     for c in machines[1:]:
         if c.addr in ['127.0.0.1', '::1', 'localhost']:
+            c.run(f"mv burrito/{outf}.data burrito/{outf}-{c.addr}.data2")
+            c.run(f"mv burrito/{outf}2.data burrito/{outf}2-{c.addr}.data2")
             continue
-        c.get(f"burrito/{outf}.err", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb.err", preserve_mode=False)
-        c.get(f"burrito/{outf}2.err", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb2.err", preserve_mode=False)
-        c.get(f"burrito/{outf}.out", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb.out", preserve_mode=False)
-        c.get(f"burrito/{outf}2.out", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb2.out", preserve_mode=False)
-        c.get(f"burrito/{outf}.data", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb.data", preserve_mode=False)
-        c.get(f"burrito/{outf}2.data", local=f"{outdir}/{ops_per_sec}-{c.addr}-ycsb2.data", preserve_mode=False)
+        c.get(f"burrito/{outf}.err", local=f"{outf}-{c.addr}.err", preserve_mode=False)
+        c.get(f"burrito/{outf}2.err", local=f"{outf}2-{c.addr}.err", preserve_mode=False)
+        c.get(f"burrito/{outf}.out", local=f"{outf}-{c.addr}.out", preserve_mode=False)
+        c.get(f"burrito/{outf}2.out", local=f"{outf}2-{c.addr}.out", preserve_mode=False)
+        c.get(f"burrito/{outf}.data", local=f"{outf}-{c.addr}.data2", preserve_mode=False)
+        c.get(f"burrito/{outf}2.data", local=f"{outf}2-{c.addr}.data2", preserve_mode=False)
+
+    # add numshards column
+    for c in machines[1:]:
+        agenda.subtask(f"adding NumShards column for {c.addr}")
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"NumShards \"$0;}} else {{print \"{num_shards}shards \"$0}} }}' {outf}-{c.addr}.data2 > {outf}-{c.addr}.data1", shell=True)
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"NumShards \"$0;}} else {{print \"{num_shards}shards \"$0}} }}' {outf}2-{c.addr}.data2 > {outf}2-{c.addr}.data1", shell=True)
+
+    # add shardtype column
+    for c in machines[1:]:
+        agenda.subtask(f"adding ShardType column for {c.addr}")
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType \"$0;}} else {{print \"{shardtype}shard \"$0}} }}' {outf}-{c.addr}.data1 > {outf}-{c.addr}.data", shell=True)
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType \"$0;}} else {{print \"{shardtype}shard \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--outdir', type=str, required=True)
 parser.add_argument('--load', type=int, action='append', required=True)
 parser.add_argument('--server', type=str, required=True)
 parser.add_argument('--client', type=str, action='append', required=True)
+parser.add_argument('--shards', type=int, action='append')
+parser.add_argument('--shardtype', type=str, action='append')
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -280,6 +326,16 @@ if __name__ == '__main__':
     if len(args.client) < 2:
         agenda.failure("Need more machines")
         sys.exit(1)
+
+    if args.shards is None:
+        args.shards = [1]
+
+    if args.shardtype is None:
+        args.shardtype = ['server']
+    for t in args.shardtype:
+        if t not in ['client', 'server']:
+            agenda.failure(f"Unknown shardtype {t}")
+            sys.exit(1)
 
     agenda.task(f"connecting to {ips}")
     machines, commits = zip(*[check_machine(ip) for ip in ips])
@@ -295,11 +351,16 @@ if __name__ == '__main__':
     [t.join() for t in setups]
     agenda.task("...done building burrito")
 
-    for o in ops_per_sec:
-        do_exp(outdir, machines, o)
-        time.sleep(5)
+    for s in args.shards:
+        for t in args.shardtype:
+            for o in ops_per_sec:
+                do_exp(outdir, machines, s, t, o)
+                time.sleep(5)
 
-    import subprocess
+    agenda.task("done")
+    #subprocess.run(f"rm -f {outdir}/*.data1", shell=True)
+    #subprocess.run(f"rm -f {outdir}/*.data2", shell=True)
     subprocess.run(f"tail ./{outdir}/*ycsb*err >> {outdir}/exp.log", shell=True)
     subprocess.run(f"cat ./{outdir}/*ycsb*.data | awk '{{if (!hdr) {{hdr=$0; print $0;}} else if (hdr != $0) {{print $0}};}}' > {outdir}/exp.data", shell=True)
+    agenda.task("plotting")
     subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)
