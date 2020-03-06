@@ -14,6 +14,7 @@ hyper-unix-connector = "0.1.4"
 hyper = {version = "0.13", features = ["stream"]}
 incoming = "0.1"
 kvstore = {path = "../kvstore"}
+pin-project = "0.4"
 slog = "2"
 slog-term = "2"
 structopt = "0.3"

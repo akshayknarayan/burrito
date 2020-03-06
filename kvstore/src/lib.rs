@@ -1,5 +1,4 @@
 use async_bincode::AsyncBincodeStream;
-use std::pin::Pin;
 use core::task::{Context, Poll};
 use futures_util::{
     future::Ready,
@@ -8,10 +7,11 @@ use futures_util::{
     stream::{Stream, StreamExt},
 };
 use std::error::Error;
+use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tower::pipeline;
 use tower_service::Service;
-use tracing::{span, info, trace, Level};
+use tracing::{info, span, trace, Level};
 use tracing_futures::Instrument;
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
@@ -143,7 +143,7 @@ where
                             if let Err(_) = futures_util::future::poll_fn(|cx| srv.poll_ready(cx)).await {
                                 break;
                             }
-                            
+
                             trace!("ready, pushing call future");
                             resps.push(srv.call(req));
                         }
@@ -169,16 +169,7 @@ where
                     .map(|q| (len * q) as usize)
                     .map(|i| concurrent_history[i])
                     .collect();
-                info!( 
-                    num = concurrent_history.len(),
-                    min = concurrent_history[0], 
-                    p25 = quantiles[0], 
-                    p50 = quantiles[1], 
-                    p75 = quantiles[2], 
-                    p95 = quantiles[3], 
-                    max = concurrent_history[concurrent_history.len() - 1],
-                    "Finished connection",
-                );
+                info!( num = concurrent_history.len(), min = concurrent_history[0], p25 = quantiles[0], p50 = quantiles[1], p75 = quantiles[2], p95 = quantiles[3], max = concurrent_history[concurrent_history.len() - 1], "Finished connection");
             }
             .instrument(span!(Level::TRACE, "sharder"))
         })
@@ -219,23 +210,32 @@ where
     S: tower_service::Service<msg::Msg, Response = msg::Msg, Error = StdError>,
     S::Future: 'static,
 {
-    fn do_req(&mut self, req: Msg) -> Pin<Box<dyn std::future::Future<Output=Result<Option<String>, StdError>>>> {
+    fn do_req(
+        &mut self,
+        req: Msg,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<String>, StdError>>>> {
         let fut = self.0.call(req);
-        Box::pin(async move {
-            Ok(fut.await?.into_kv().1) })
+        Box::pin(async move { Ok(fut.await?.into_kv().1) })
     }
 
-    pub fn update_fut(&mut self, key: String, val: String) -> Pin<Box<dyn std::future::Future<Output=Result<Option<String>, StdError>>>> {
+    pub fn update_fut(
+        &mut self,
+        key: String,
+        val: String,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<String>, StdError>>>> {
         let req = msg::Msg::put_req(key, val);
         self.do_req(req)
     }
 
-    pub async fn update(&mut self , key: String, val: String) -> Result<Option<String>, StdError> {
+    pub async fn update(&mut self, key: String, val: String) -> Result<Option<String>, StdError> {
         futures_util::future::poll_fn(|cx| self.poll_ready(cx)).await?;
         self.update_fut(key, val).await
     }
 
-    pub fn get_fut(&mut self, key: String) -> Pin<Box<dyn std::future::Future<Output=Result<Option<String>, StdError>>>> {
+    pub fn get_fut(
+        &mut self,
+        key: String,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<String>, StdError>>>> {
         let req = msg::Msg::get_req(key);
         self.do_req(req)
     }

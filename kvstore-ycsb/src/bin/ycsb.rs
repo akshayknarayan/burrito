@@ -1,8 +1,10 @@
 use async_timer as hrtimer;
+use core::task::{Context, Poll};
 use kvstore_ycsb::{ops, Op};
 use slog::info;
 use std::collections::HashMap;
 use std::error::Error;
+use std::pin::Pin;
 use std::str::FromStr;
 use structopt::StructOpt;
 
@@ -262,6 +264,27 @@ where
     Ok(())
 }
 
+// accesses group_by client
+fn group_by_client(accesses: Vec<Op>) -> HashMap<usize, Vec<Op>> {
+    let mut access_by_client: HashMap<usize, Vec<Op>> = Default::default();
+    for o in accesses {
+        let k = o.client_id();
+        access_by_client.entry(k).or_default().push(o);
+    }
+
+    access_by_client
+}
+
+fn paced_ops_stream(
+    ops: Vec<Op>,
+    interarrival_micros: u64,
+) -> impl futures_util::stream::Stream<Item = ((), Op)> {
+    use futures_util::stream::StreamExt;
+    //let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
+    let tkr = hrtimer::interval(std::time::Duration::from_micros(interarrival_micros as u64));
+    tkr.zip(futures_util::stream::iter(ops))
+}
+
 // Uncommenting the following causes:
 // error: reached the type-length limit while instantiating
 //     `std::pin::Pin::<&mut std::future...}[1]::poll[0]::{{closure}}[0])]>`
@@ -284,97 +307,16 @@ where
 
     // now, measure the accesses.
     let st = resolver.call(addr).await.map_err(|e| e.into())?;
+    let access_by_client = group_by_client(accesses);
+    let num_clients = access_by_client.len();
+    let srv = kvstore::Client::from(tower_buffer::Buffer::new(kvstore::client(st), num_clients));
 
-    // accesses group_by client
-    let mut access_by_client: HashMap<usize, Vec<Op>> = Default::default();
-    for o in accesses {
-        let k = o.client_id();
-        access_by_client.entry(k).or_default().push(o);
-    }
-
-    let srv = tower_buffer::Buffer::new(kvstore::client(st), access_by_client.len());
-
-    // each client issues its requests open-loop. So we get one future per client, resolving to a
-    // Result<Vec<durations, _>>.
-    // terminate once the first client finishes, since the load characteristics would change
-    // otherwise.
-    let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
-    use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
-    let mut reqs: FuturesUnordered<_> = access_by_client
+    let access_by_client = access_by_client
         .into_iter()
-        .map(|(client_id, ops)| {
-            let mut cl = kvstore::Client::from(srv.clone());
-            let mut inflight = FuturesOrdered::new();
-            let mut durs = vec![];
-            let done = done_rx.clone();
-            assert!(!ops.is_empty());
-            async move {
-                //let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
-                let tkr = hrtimer::interval(std::time::Duration::from_micros(interarrival_micros as u64));
-                let mut ops = tkr
-                    .zip(futures_util::stream::iter(ops));
-
-                let mut ready = false;
-                tracing::info!(id = client_id, "starting");
-                loop {
-                    tokio::select! (
-                        _ = futures_util::future::poll_fn(|cx| cl.poll_ready(cx)), if !ready => {
-                            ready = true;
-                        }
-                        Some((_, o)) = ops.next(), if ready => {
-                            ready = false;
-
-                            let fut = match o {
-                                Op::Get(_, k) => cl.get_fut(k),
-                                Op::Update(_, k, v) => cl.update_fut(k, v),
-                            };
-
-                            inflight.push(async move {
-                                tracing::trace!(id = client_id, "starting access");
-                                let then = tokio::time::Instant::now();
-                                fut.await?;
-                                tracing::trace!(id = client_id, "finished access");
-                                Ok::<_, StdError>(then.elapsed())
-                            });
-                            tracing::trace!(id = client_id, inflight = inflight.len(), "new request");
-                        }
-                        Some(Ok(d)) = inflight.next() => {
-                            tracing::trace!(id = client_id, inflight = inflight.len(), "request done");
-                            durs.push(d);
-                        }
-                        else => {
-                            tracing::debug!(id = client_id, completed = durs.len(), "finished requests");
-                            break;
-                        }
-                    );
-
-                    // This can't be inside the select because then else would never be
-                    // triggered.
-                    if *done.borrow() {
-                        tracing::debug!(id = client_id, completed = durs.len(), "stopping");
-                        break; // the first client finished. stop.
-                    }
-                }
-
-                Ok::<_, StdError>(durs)
-            }
-        })
+        .map(move |(id, ops)| (id, (vec![srv.clone()], ops)))
         .collect();
 
-    let access_start = tokio::time::Instant::now();
-    // do the accesses until the first client is done.
-    let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
-    assert!(!durs.is_empty());
-    let access_end = access_start.elapsed();
-    tracing::debug!("broadcasting done");
-    done_tx.broadcast(true)?;
-
-    // collect all the requests that have completed.
-    let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
-    assert!(!rest_durs.is_empty());
-    tracing::debug!("all clients reported");
-    durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
-    Ok((durs, access_end))
+    do_requests(access_by_client, interarrival_micros as u64, |_| 0).await
 }
 
 //#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
@@ -418,7 +360,7 @@ where
         hasher.finish() as usize % num_shards
     };
 
-    let (durs, access_end) = if !connections_per_client {
+    if !connections_per_client {
         // one connection per shard
         let mut cls = vec![];
         for a in &addrs[1..] {
@@ -427,46 +369,11 @@ where
             cls.push(kvstore::Client::from(srv));
         }
 
-        // accesses group_by client
-        let mut access_by_client: HashMap<usize, Vec<Op>> = Default::default();
-        for o in accesses {
-            let k = o.client_id();
-            access_by_client.entry(k).or_default().push(o);
-        }
-
-        // each client issues its requests closed-loop. So we get one future per client, resolving to a
-        // Result<Vec<durations, _>>.
-        use futures_util::stream::{FuturesUnordered, TryStreamExt};
-        let reqs: FuturesUnordered<_> = access_by_client
+        let access_by_client = group_by_client(accesses)
             .into_iter()
-            .map(|(_, ops)| {
-                let mut cls = cls.clone();
-                let mut durs = vec![];
-                async move {
-                    for o in ops {
-                        tracing::trace!("starting access");
-                        let then = tokio::time::Instant::now();
-                        let shard = shard_fn(&o);
-                        let cl = &mut cls[shard];
-                        match o {
-                            Op::Get(_, k) => cl.get(k).await?,
-                            Op::Update(_, k, v) => cl.update(k, v).await?,
-                        };
-
-                        tracing::trace!("finished access");
-                        durs.push(then.elapsed())
-                    }
-
-                    Ok::<_, StdError>(durs)
-                }
-            })
+            .map(|(id, ops)| (id, (cls.clone(), ops)))
             .collect();
-
-        // do the accesses.
-        let access_start = tokio::time::Instant::now();
-        let durs: Vec<Vec<_>> = reqs.try_collect().await?;
-        let access_end = access_start.elapsed();
-        (durs, access_end)
+        do_requests(access_by_client, interarrival_micros as u64, shard_fn).await
     } else {
         // one conenction per shard per client
         // accesses group_by client
@@ -488,43 +395,194 @@ where
             }
         }
 
-        // each client issues its requests closed-loop. So we get one future per client, resolving to a
-        // Result<Vec<durations, _>>.
-        use futures_util::stream::{FuturesUnordered, TryStreamExt};
-        let reqs: FuturesUnordered<_> = access_by_client
-            .into_iter()
-            .map(|(client_id, (mut cls, ops))| {
-                let mut durs = vec![];
-                async move {
-                    tracing::trace!(id = client_id, num_ops = ops.len(), "starting client");
-                    for o in ops {
-                        tracing::trace!(id = client_id, "starting access");
-                        let then = tokio::time::Instant::now();
-                        let shard = shard_fn(&o);
-                        let cl = &mut cls[shard];
-                        match o {
-                            Op::Get(_, k) => cl.get(k).await?,
-                            Op::Update(_, k, v) => cl.update(k, v).await?,
-                        };
+        do_requests(access_by_client, interarrival_micros as u64, shard_fn).await
+    }
+}
 
-                        tracing::trace!(id = client_id, "finished access");
-                        durs.push(then.elapsed())
-                    }
+use std::collections::VecDeque;
 
-                    tracing::trace!(id = client_id, "finished client");
+/// As clients become ready, send return futures which will make requests on them.
+///
+/// Have to poll only the clients with pending requests. Otherwise, we could
+/// end up repeatedly calling poll_ready on a client with no requests.
+#[pin_project::pin_project]
+struct PendingServices<S> {
+    cls: Vec<kvstore::Client<S>>,
+    pending: Vec<VecDeque<(tokio::time::Instant, Op)>>,
+    pending_now: Vec<usize>,
+}
 
-                    Ok::<_, StdError>(durs)
+impl<S> PendingServices<S>
+where
+    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>,
+    S::Future: 'static,
+{
+    fn new(cls: Vec<kvstore::Client<S>>) -> Self {
+        let pending = cls.iter().map(|_| Default::default()).collect();
+        Self {
+            cls,
+            pending,
+            pending_now: vec![],
+        }
+    }
+
+    fn push(&mut self, idx: usize, o: Op) {
+        if self.pending[idx].is_empty() {
+            self.pending_now.push(idx);
+        }
+
+        self.pending[idx].push_back((tokio::time::Instant::now(), o));
+    }
+
+    fn len(&self, idx: usize) -> usize {
+        self.pending[idx].len()
+    }
+}
+
+impl<S> futures_util::stream::Stream for PendingServices<S>
+where
+    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>,
+    S::Future: 'static,
+{
+    type Item = Result<
+        (
+            tokio::time::Instant,
+            Pin<Box<dyn std::future::Future<Output = Result<Option<String>, StdError>>>>,
+        ),
+        StdError,
+    >;
+
+    #[pin_project::project]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        // project to split the borrow
+        let mut this = self.project();
+        let pending: &mut _ = &mut this.pending;
+        let pending_now: &mut _ = &mut this.pending_now;
+        let cls: &mut _ = &mut this.cls;
+
+        if pending_now.is_empty() {
+            return Poll::Pending;
+        }
+
+        // rotate for poll fairness
+        pending_now.rotate_left(1);
+        // see if any of them are ready
+        let mut ready_now: Option<usize> = None;
+        let mut ready_now_idx = 0;
+        for i in 0..pending_now.len() {
+            let idx = pending_now[i];
+            match cls[idx].poll_ready(cx) {
+                Poll::Pending => continue,
+                Poll::Ready(Ok(())) => {
+                    ready_now.replace(idx);
+                    ready_now_idx = i;
+                    break;
                 }
-            })
-            .collect();
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+            }
+        }
 
-        // do the accesses.
-        let access_start = tokio::time::Instant::now();
-        let durs: Vec<Vec<_>> = reqs.try_collect().await?;
-        let access_end = access_start.elapsed();
-        (durs, access_end)
-    };
+        match ready_now {
+            None => return Poll::Pending, // there are waiting requests, but none of the clients are ready.
+            Some(idx) => {
+                // cls[idx] is ready.
+                let cl = &mut cls[idx];
+                let (then, o) = pending[idx].pop_front().expect("only polled active conns");
+                let fut = match o {
+                    Op::Get(_, k) => cl.get_fut(k),
+                    Op::Update(_, k, v) => cl.update_fut(k, v),
+                };
 
-    let durs = durs.into_iter().flat_map(|x| x.into_iter()).collect();
+                if pending[idx].is_empty() {
+                    // no more messages, yank from pending_now
+                    pending_now.remove(ready_now_idx);
+                }
+
+                Poll::Ready(Some(Ok((then, fut))))
+            }
+        }
+    }
+}
+
+/// Issue a workload of requests, divided by client worker.
+///
+/// Each client issues its requests open-loop. So we get one future per client, resolving to a
+/// Result<Vec<durations, _>>.
+/// Terminate once the first client finishes, since the load characteristics would change
+/// otherwise.
+///
+/// Have to measure from the time the request leaves the queue.
+async fn do_requests<S>(
+    access_by_client: HashMap<usize, (Vec<kvstore::Client<S>>, Vec<Op>)>,
+    interarrival_micros: u64,
+    shard_fn: impl Fn(&Op) -> usize,
+) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
+where
+    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError> + Unpin,
+    S::Future: 'static + Unpin,
+{
+    use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
+    let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
+    let mut reqs: FuturesUnordered<_> = access_by_client
+        .into_iter()
+        .map(|(client_id, (cls, ops))| {
+            let mut inflight = FuturesOrdered::new();
+            let mut durs = vec![];
+            let done = done_rx.clone();
+            assert!(!ops.is_empty());
+            let mut ops = paced_ops_stream(ops, interarrival_micros);
+            let mut pending = PendingServices::new(cls);
+            let shard_fn = &shard_fn;
+            async move {
+                tracing::info!(id = client_id, "starting");
+                loop {
+                    tokio::select!(
+                        Some((_, o)) = ops.next() => {
+                            let shard = shard_fn(&o);
+                            pending.push(shard, o);
+                            tracing::trace!(id = client_id, inflight = inflight.len(), shard_id = shard, pending = pending.len(shard), "new request");
+                        }
+                        Some(Ok((then, fut))) = pending.next() => {
+                            inflight.push(async move {
+                                fut.await?;
+                                Ok::<_, StdError>(then.elapsed())
+                            });
+                        }
+                        Some(Ok(d)) = inflight.next() => {
+                            tracing::trace!(id = client_id, inflight = inflight.len(), "request done");
+                            durs.push(d);
+                        }
+                        else => {
+                            tracing::debug!(id = client_id, completed = durs.len(), "finished requests");
+                            break;
+                        }
+                    );
+
+                    // This can't be inside the select because then else would never be
+                    // triggered.
+                    if *done.borrow() {
+                        tracing::debug!(id = client_id, completed = durs.len(), "stopping");
+                        break; // the first client finished. stop.
+                    }
+                }
+
+                Ok::<_, StdError>(durs)
+            }
+        })
+        .collect();
+
+    let access_start = tokio::time::Instant::now();
+    // do the accesses until the first client is done.
+    let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
+    assert!(!durs.is_empty());
+    let access_end = access_start.elapsed();
+    tracing::debug!("broadcasting done");
+    done_tx.broadcast(true)?;
+
+    // collect all the requests that have completed.
+    let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
+    assert!(!rest_durs.is_empty());
+    tracing::debug!("all clients reported");
+    durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
     Ok((durs, access_end))
 }
