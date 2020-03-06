@@ -461,7 +461,7 @@ where
         let cls: &mut _ = &mut this.cls;
 
         if pending_now.is_empty() {
-            return Poll::Pending;
+            return Poll::Ready(None);
         }
 
         // rotate for poll fairness
@@ -483,7 +483,7 @@ where
         }
 
         match ready_now {
-            None => return Poll::Pending, // there are waiting requests, but none of the clients are ready.
+            None => return Poll::Pending, // there are waiting requests, but all of the clients are pending.
             Some(idx) => {
                 // cls[idx] is ready.
                 let cl = &mut cls[idx];
