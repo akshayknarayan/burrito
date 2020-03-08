@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Which operation to perform
+// bincode represents this as a u32
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Op {
-    Get,
-    Put,
+    Get, // = 0
+    Put, // = 1
 }
 
 /// Both the request type and response type.
@@ -15,6 +16,14 @@ pub enum Op {
 /// Put:
 /// - requests will have val = Some() (or None for deletion)
 /// - responses, val = Some if update and rest copied.
+// bincode serialization:
+// bytes 0-8 : id (u64)
+// bytes 9-12: op (u32)
+// bytes 12-18: key length (u64)
+// bytes 18-?: key
+// byte n: 1 = Some, 0 = None
+// bytes n-(n+8) (if Some): val length
+// bytes (n+8)-m: val
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Msg {
     pub(crate) id: usize,
@@ -74,4 +83,35 @@ fn get_id() -> usize {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     rng.gen()
+}
+
+#[cfg(test)]
+mod test {
+    use super::Msg;
+
+    #[test]
+    fn bincode_test() {
+        // make sure bincode's memory layout hasn't changed :)
+        let m = Msg {
+            id: 0xffff_ffff_ffff_ffff,
+            op: super::Op::Get,
+            key: String::from("a"),
+            val: Some(String::from("b")),
+        };
+
+        let buf = bincode::serialize(&m).unwrap();
+
+        assert_eq!(
+            &buf,
+            &[
+                255, 255, 255, 255, 255, 255, 255, 255, // id usize
+                0, 0, 0, 0, // op
+                1, 0, 0, 0, 0, 0, 0, 0,  // le, u64 len
+                97, // 'a'
+                1,  // Some
+                1, 0, 0, 0, 0, 0, 0, 0,  // le, u64 len
+                98  // 'b'
+            ],
+        );
+    }
 }

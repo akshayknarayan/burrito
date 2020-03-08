@@ -75,12 +75,12 @@ pub async fn serve(
 /// Each shard will listen on the provided listener. In addition, we use `shard_fn` to steer
 /// requests from the first provided listener to the correct shard.
 #[tracing::instrument(level = "debug", skip(shard_listeners, shard_fn))]
-pub async fn shard_server<S, C, E>(
-    shard_listeners: impl IntoIterator<Item = S>,
+pub async fn shard_server<A, C, E>(
+    shard_listeners: impl IntoIterator<Item = A>,
     shard_fn: impl Fn(&Msg) -> usize + 'static,
 ) -> Result<(), StdError>
 where
-    S: Stream<Item = Result<C, E>> + Send + 'static,
+    A: Stream<Item = Result<C, E>> + Send + 'static,
     C: AsyncRead + AsyncWrite + Unpin + Send,
     E: Into<Box<dyn Error + Sync + Send + 'static>> + std::fmt::Debug + Unpin + Send,
 {
