@@ -66,6 +66,18 @@ fn main() {
         .write_to_file(out_path.join("if_xdp.rs"))
         .expect("Unable to write bindings");
 
+    let xdp_prog_types_bindings = bindgen::Builder::default()
+        .header("./src/xdp_port.h")
+        .derive_default(true)
+        .blacklist_type(r#"u\d+"#)
+        .whitelist_type(r#"datarec"#)
+        .whitelist_type(r#"available_shards"#)
+        .generate()
+        .expect("Unable to generate bindings");
+    xdp_prog_types_bindings
+        .write_to_file(out_path.join("xdp_shared.rs"))
+        .expect("Unable to write bindings");
+
     let clang_include = std::process::Command::new("clang")
         .arg("-print-file-name=include")
         .output()
@@ -84,6 +96,8 @@ fn main() {
             "-D__KERNEL__",
             "-D__ASM_SYSREG_H",
             "-I/usr/include",
+            "-Werror",
+            "-Wall",
             "-O2",
             "-emit-llvm",
             "-c",

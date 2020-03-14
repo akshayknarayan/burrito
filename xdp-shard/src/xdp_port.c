@@ -1,8 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0
- * Copyright (c) 2017 Jesper Dangaard Brouer, Red Hat Inc.
- *
- *  Example howto extract XDP RX-queue info
- */
 #include <asm/byteorder.h>
 #include <linux/stddef.h>
 #include <linux/if_ether.h>
@@ -15,7 +10,8 @@
 #include <linux/udp.h>
 #include <linux/bpf.h>
 #include "bpf_helpers.h"
-
+#include "fnv.h"
+#include "xdp_port.h"
 
 typedef __u8 u8;
 typedef __u16 u16;
@@ -33,14 +29,6 @@ struct bpf_map_def SEC("maps") ifindex_map = {
 	.max_entries	= 1,
 };
 
-#define NUM_PORTS 16
-
-/* Common stats data record (shared with userspace) */
-struct datarec {
-    u16 ports[NUM_PORTS];
-    u32 counts[NUM_PORTS + 1];
-};
-
 #define MAX_RXQs 64
 
 /* Stats per port, per rx_queue_index, per CPU */
@@ -50,6 +38,73 @@ struct bpf_map_def SEC("maps") rx_queue_index_map = {
 	.value_size	= sizeof(struct datarec),
 	.max_entries	= MAX_RXQs + 1,
 };
+
+struct bpf_map_def SEC("maps") available_shards_map = {
+	.type		= BPF_MAP_TYPE_ARRAY,
+	.key_size	= sizeof(__u32),
+	.value_size	= sizeof(struct available_shards),
+	.max_entries	= 1,
+};
+
+// async-bincode length in front of this?
+// bincode serialization:
+// bytes 0-8 : id (u64)
+// bytes 9-12: op (u32)
+// bytes 12-18: key length (u64)
+// bytes 18-?: key
+// byte n: 1 = Some, 0 = None
+// bytes n-(n+8) (if Some): val length
+// bytes (n+8)-m: val
+struct bincode_msg {
+    u32 len;
+    u64 id;
+    u32 op;
+    u64 keylen;
+    void *key; // key data follows this, so void *key is a pointer to it.
+};
+
+// decide which port to send this to.
+// the possible options are in available_shards_map
+static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
+    struct bincode_msg *m;
+    u32 msg_len;
+    u64 hash = 0;
+    u8 keylen;
+    u32 key = 0;
+    struct available_shards *shards;
+
+	shards = bpf_map_lookup_elem(&available_shards_map, &key);
+    if (!shards) {
+        bpf_printk("Could not get shards map\n");
+        return XDP_PASS;
+    }
+
+    if (shards->num < 1) {
+        // sharding disabled
+        return XDP_PASS;
+    }
+
+    if (sizeof(struct bincode_msg) + app_data > data_end) {
+        bpf_printk("Packet not large enough for bincode msg\n");
+        return XDP_ABORTED;
+    }
+
+    m = (struct bincode_msg*) app_data;
+    msg_len = ntohs(m->len); // only len is networkendian, rest is littleendian
+
+    if (msg_len + app_data > data_end) {
+        // assumes the whole message is here - i.e. it won't do TCP stream reassembly
+        bpf_printk("Packet not large enough for stated bincode msg len\n");
+        return XDP_ABORTED;
+    }
+
+    // only take the first 32 bytes of the key
+    keylen = m->keylen > 32 ? 32 : m->keylen;
+    hash = fnv_64_buf((void*) &m->key, keylen, FNV1_64_INIT);
+
+    *port = shards->ports[hash % shards->num];
+    return XDP_PASS;
+}
 
 static inline int record_port(u16 port, u32 rxq)
 {
@@ -85,7 +140,7 @@ static inline int record_port(u16 port, u32 rxq)
     return XDP_PASS;
 }
 
-static inline record_icmp(u32 rxq)
+static inline int record_icmp(u32 rxq)
 {
     struct datarec *rxq_rec;
 	rxq_rec = bpf_map_lookup_elem(&rx_queue_index_map, &rxq);
@@ -96,36 +151,47 @@ static inline record_icmp(u32 rxq)
 
     // no port, stick it in the leftover bin.
     rxq_rec->counts[NUM_PORTS]++;
+    return XDP_PASS;
 }
 
 static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
 {
     struct tcphdr *th;
     u16 port;
+    u8 data_offset;
+    void *payload;
+    int res;
+
     th = (struct tcphdr *)tcp_data;
     if ((th + 1) > (struct tcphdr*) data_end)
         return XDP_ABORTED;
+    data_offset = th->doff;
+    payload = tcp_data + data_offset * sizeof(u32);
+
     port = ntohs(th->dest);
-    return record_port(port, rxq);
+    res = record_port(port, rxq);
+    if (res == XDP_ABORTED) { return res; }
+    return shard_bincode(payload, data_end, &(th->dest));
 }
 
-static __always_inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
+static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
 {
+    int res;
     struct udphdr *uh;
     u16 port;
     uh = (struct udphdr *)udp_data;
     if ((uh + 1) > (struct udphdr*) data_end)
         return XDP_ABORTED;
+
     port = ntohs(uh->dest);
-    return record_port(port, rxq);
+    res = record_port(port, rxq);
+    if (res == XDP_ABORTED) { return res; }
+    return shard_bincode((void*) uh + 1, data_end, &(uh->dest));
 }
 
 static inline int parse_ipv4(void *data, void *data_end, u32 rxq)
 {
-    u8 ipproto;
-    u16 ip_len;
     void *trans_data;
-
     struct iphdr *iph = data;
     trans_data = iph + 1;
     if (trans_data > data_end)
@@ -170,7 +236,6 @@ static inline int parse_eth(void *data, void *data_end, u32 rxq)
 SEC("xdp_steer_prog")
 int  xdp_steer(struct xdp_md *ctx)
 {
-	struct datarec *rec, *rxq_rec;
 	int *expected_ifindex, ingress_ifindex;
 	__u32 rxq = 0;
     void *data_end = (void *)(long)ctx->data_end;
