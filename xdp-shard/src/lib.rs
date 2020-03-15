@@ -198,6 +198,43 @@ impl BpfHandles {
         Ok(())
     }
 
+    fn shard_ports(&self, ports: &[u16]) -> Result<(), StdError> {
+        if ports.len() > 16 {
+            Err(format!(
+                "Too many ports to shard (max 16): {:?}",
+                ports.len()
+            ))?;
+        }
+
+        let mut av = AvailableShards {
+            num: ports.len() as _,
+            ports: [0u16; 16],
+        };
+
+        av.ports.copy_from_slice(ports);
+
+        // now set it
+        let fd = unsafe { libbpf::bpf_map__fd(self.available_shards_map) };
+        if fd < 0 {
+            Err(format!("available_shards_map returned bad fd: {}", fd))?;
+        }
+
+        let key = 0;
+        let ok = unsafe {
+            bpf::bpf_map_update_elem(
+                fd,
+                &key as *const _ as *const _,
+                &av as *const _ as *const _,
+                0,
+            )
+        };
+        if ok < 0 {
+            Err(format!("available_shards_map update elem failed: {}", ok))?;
+        }
+
+        Ok(())
+    }
+
     fn set_ifindex(&self) -> Result<(), StdError> {
         let ifindex_map = get_map_by_name("ifindex_map\0", self.bpf_obj)?;
 
