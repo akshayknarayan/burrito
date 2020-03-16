@@ -4,10 +4,6 @@ type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub mod bindings;
 use bindings::*;
 
-pub fn get_interface_id(interface_name: &str) -> Result<u32, StdError> {
-    Ok(nix::net::if_::if_nametoindex(interface_name)?)
-}
-
 pub fn diff_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMap<u16, usize>>>) {
     for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
         for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
@@ -114,11 +110,11 @@ impl StatsRecord {
     }
 }
 
-use std::sync::{atomic::AtomicBool, Arc};
-
+/// Collection of handles to BPF objects.
+///
+/// On drop, unloads the XDP program, via [`remove_xdp`].
 #[derive(Debug)]
 pub struct BpfHandles {
-    stop: Arc<AtomicBool>,
     prog_fd: std::os::raw::c_int,
     ifindex: u32,
     bpf_obj: *mut libbpf::bpf_object,
@@ -127,7 +123,13 @@ pub struct BpfHandles {
 }
 
 impl BpfHandles {
-    pub fn load(interface_id: u32) -> Result<Self, StdError> {
+    /// Load xdp_port XDP program onto the given interface.
+    pub fn load_on_interface_name(interface_name: &str) -> Result<Self, StdError> {
+        BpfHandles::load_on_interface_id(get_interface_id(interface_name)?)
+    }
+
+    /// Load xdp_port XDP program onto the given interface id.
+    pub fn load_on_interface_id(interface_id: u32) -> Result<Self, StdError> {
         let bpf_filename = concat!(env!("OUT_DIR"), "/xdp_port.o\0");
 
         let bpf_filename_cstr = std::ffi::CStr::from_bytes_with_nul(bpf_filename.as_bytes())?;
@@ -162,19 +164,10 @@ impl BpfHandles {
             Err(format!("bpf_prog_load_xattr returned bad fd: {}", prog_fd))?;
         }
 
-        let stop: Arc<std::sync::atomic::AtomicBool> = Arc::new(false.into());
-        let s = stop.clone();
-        ctrlc::set_handler(move || {
-            tracing::warn!("stopping, removing XDP program");
-            s.store(true, std::sync::atomic::Ordering::SeqCst);
-        })
-        .unwrap();
-
         let rx_queue_index_map = get_map_by_name("rx_queue_index_map\0", bpf_obj)?;
         let available_shards_map = get_map_by_name("available_shards_map\0", bpf_obj)?;
 
         let this = BpfHandles {
-            stop,
             prog_fd,
             ifindex: interface_id,
             bpf_obj,
@@ -188,6 +181,10 @@ impl BpfHandles {
         Ok(this)
     }
 
+    /// Define the set of sharding ports.
+    ///
+    /// By default, the shards map is empty and xdp_port will not rewrite port numbers, only log.
+    /// Setting this will define a set of ports that xdp_port will shard between.
     pub fn shard_ports(&self, ports: &[u16]) -> Result<(), StdError> {
         if ports.len() > 16 {
             Err(format!(
@@ -225,11 +222,25 @@ impl BpfHandles {
         Ok(())
     }
 
+    /// Consume self and  every interval, dump (via handler()) cpu-rxq-port records.
+    ///
+    /// Adds a signal handler that stops the loop gracefully, so that drop() can happen.
+    /// As a result, drop() will happen at the end of this method, but any calls after this will
+    /// also execute after the signal is handled (for possible additional cleanup).
     pub fn dump_loop(
         self,
         interval: std::time::Duration,
-        use_res: impl Fn(&StatsRecord, &StatsRecord) -> (),
+        handler: impl Fn(&StatsRecord, &StatsRecord) -> (),
     ) -> Result<(), StdError> {
+        use std::sync::{atomic::AtomicBool, Arc};
+        let stop: Arc<AtomicBool> = Arc::new(false.into());
+        let s = stop.clone();
+        ctrlc::set_handler(move || {
+            tracing::warn!("stopping, removing XDP program");
+            s.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap();
+
         let num_rxqs = unsafe {
             let ptr = libbpf::bpf_map__def(self.rx_queue_index_map);
             if ptr.is_null() {
@@ -246,12 +257,12 @@ impl BpfHandles {
 
         record.update(&self)?;
 
-        while !self.stop.load(std::sync::atomic::Ordering::SeqCst) {
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(interval);
             std::mem::swap(&mut prev_record, &mut record);
             record = StatsRecord::empty(record.rxqs.len());
             record.update(&self)?;
-            use_res(&record, &prev_record);
+            handler(&record, &prev_record);
         }
 
         Ok(())
@@ -302,6 +313,7 @@ impl Drop for BpfHandles {
     }
 }
 
+/// Remove any XDP program on the interface.
 pub unsafe fn remove_xdp(interface_id: u32) {
     let xdp_flags = if_link::XDP_FLAGS_SKB_MODE | if_link::XDP_FLAGS_UPDATE_IF_NOEXIST;
     libbpf::bpf_set_link_xdp_fd(interface_id as _, -1, xdp_flags);
@@ -319,4 +331,8 @@ fn get_map_by_name(
     }
 
     Ok(map)
+}
+
+fn get_interface_id(interface_name: &str) -> Result<u32, StdError> {
+    Ok(nix::net::if_::if_nametoindex(interface_name)?)
 }
