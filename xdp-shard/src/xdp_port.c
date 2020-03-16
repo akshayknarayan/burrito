@@ -10,7 +10,7 @@
 #include <linux/udp.h>
 #include <linux/bpf.h>
 #include "bpf_helpers.h"
-#include "fnv.h"
+//#include "fnv.h"
 #include "xdp_port.h"
 
 typedef __u8 u8;
@@ -91,16 +91,24 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
 
     m = (struct bincode_msg*) app_data;
     msg_len = ntohs(m->len); // only len is networkendian, rest is littleendian
+    if (msg_len > sizeof(struct bincode_msg) + 32) {
+        msg_len = sizeof(struct bincode_msg) + 32;
+    }
 
-    if (msg_len + app_data > data_end) {
+    if ((void*) (msg_len + ((char*) app_data)) > data_end) {
         // assumes the whole message is here - i.e. it won't do TCP stream reassembly
         bpf_printk("Packet not large enough for stated bincode msg len\n");
         return XDP_ABORTED;
     }
 
     // only take the first 32 bytes of the key
-    keylen = m->keylen > 32 ? 32 : m->keylen;
-    hash = fnv_64_buf((void*) &m->key, keylen, FNV1_64_INIT);
+    if (m->keylen > 32) {
+        keylen = 32;
+    } else {
+        keylen = m->keylen;
+    }
+
+    //hash = fnv_64_buf((void*) &m->key, keylen, FNV1_64_INIT);
 
     *port = shards->ports[hash % shards->num];
     return XDP_PASS;
@@ -147,32 +155,41 @@ static inline int record_icmp(u32 rxq)
 	if (!rxq_rec)
 		return XDP_ABORTED;
 
-    bpf_printk("icmp pcket: %d: %u", rxq, rxq_rec->counts[NUM_PORTS]);
-
     // no port, stick it in the leftover bin.
     rxq_rec->counts[NUM_PORTS]++;
     return XDP_PASS;
 }
 
+/*
 static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
 {
     struct tcphdr *th;
     u16 port;
+    int res;
     u8 data_offset;
     void *payload;
-    int res;
 
     th = (struct tcphdr *)tcp_data;
+    // check the TCP header itself
     if ((th + 1) > (struct tcphdr*) data_end)
         return XDP_ABORTED;
-    data_offset = th->doff;
-    payload = tcp_data + data_offset * sizeof(u32);
+    data_offset = ntohs(th->doff);
+    if (data_offset > 0xf) {
+        return XDP_ABORTED; // 4-bit bitfield
+    }
+
+    payload = ((char*)tcp_data) + data_offset * sizeof(u32);
+    // check stated payload location
+    if (payload > data_end) {
+        return XDP_ABORTED;
+    }
 
     port = ntohs(th->dest);
     res = record_port(port, rxq);
     if (res == XDP_ABORTED) { return res; }
     return shard_bincode(payload, data_end, &(th->dest));
 }
+*/
 
 static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
 {
@@ -186,7 +203,7 @@ static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
     port = ntohs(uh->dest);
     res = record_port(port, rxq);
     if (res == XDP_ABORTED) { return res; }
-    return shard_bincode((void*) uh + 1, data_end, &(uh->dest));
+    return shard_bincode((void*) (uh + 1), data_end, &(uh->dest));
 }
 
 static inline int parse_ipv4(void *data, void *data_end, u32 rxq)
@@ -198,7 +215,8 @@ static inline int parse_ipv4(void *data, void *data_end, u32 rxq)
         return XDP_ABORTED;
 
     if (iph->protocol == IPPROTO_TCP) {
-        return parse_tcp(trans_data, data_end, rxq);
+        //return parse_tcp(trans_data, data_end, rxq);
+        return XDP_PASS;
     } else if (iph->protocol ==IPPROTO_UDP) {
         return parse_udp(trans_data, data_end, rxq);
     } else if (iph->protocol == IPPROTO_ICMP) {
@@ -227,7 +245,7 @@ static inline int parse_eth(void *data, void *data_end, u32 rxq)
     }
     
     if (h_proto == htons(ETH_P_IP)) {
-        return parse_ipv4(data + nh_off, data_end, rxq);
+        return parse_ipv4(((char*)data) + nh_off, data_end, rxq);
     }
 
     return XDP_PASS;
@@ -256,8 +274,10 @@ int  xdp_steer(struct xdp_md *ctx)
 	 * is larger than stats map can contain info for.
 	 */
 	rxq = ctx->rx_queue_index;
-	if (rxq >= MAX_RXQs)
+	if (rxq >= MAX_RXQs) {
 		rxq = MAX_RXQs;
+    }
+
     return parse_eth(data, data_end, rxq);
 }
 

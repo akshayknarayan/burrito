@@ -98,6 +98,7 @@ fn main() {
             "-I/usr/include",
             "-Werror",
             "-Wall",
+            "-gdwarf",
             "-O2",
             "-emit-llvm",
             "-c",
