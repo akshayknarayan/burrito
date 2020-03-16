@@ -188,7 +188,7 @@ impl BpfHandles {
     ///
     /// Note: It is not safe to call this concurrently, so it takes `&mut` self even though it would
     /// compile (unsafely) taking `&self`.
-    pub fn shard_ports(&mut self, ports: &[u16]) -> Result<(), StdError> {
+    pub fn shard_ports(&mut self, orig_port: u16, ports: &[u16]) -> Result<(), StdError> {
         if ports.len() > 16 {
             Err(format!(
                 "Too many ports to shard (max 16): {:?}",
@@ -209,11 +209,10 @@ impl BpfHandles {
             Err(format!("available_shards_map returned bad fd: {}", fd))?;
         }
 
-        let key = 0;
         let ok = unsafe {
             bpf::bpf_map_update_elem(
                 fd,
-                &key as *const _ as *const _,
+                &orig_port as *const _ as *const _,
                 &av as *const _ as *const _,
                 0,
             )
