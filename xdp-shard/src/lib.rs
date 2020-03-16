@@ -188,17 +188,7 @@ impl BpfHandles {
         Ok(this)
     }
 
-    fn activate(&self) -> Result<(), StdError> {
-        let xdp_flags = if_link::XDP_FLAGS_SKB_MODE | if_link::XDP_FLAGS_UPDATE_IF_NOEXIST;
-        let ok = unsafe { libbpf::bpf_set_link_xdp_fd(self.ifindex as _, self.prog_fd, xdp_flags) };
-        if ok < 0 {
-            Err(format!("bpf_set_link_xdp_fd failed: {}", ok))?;
-        }
-
-        Ok(())
-    }
-
-    fn shard_ports(&self, ports: &[u16]) -> Result<(), StdError> {
+    pub fn shard_ports(&self, ports: &[u16]) -> Result<(), StdError> {
         if ports.len() > 16 {
             Err(format!(
                 "Too many ports to shard (max 16): {:?}",
@@ -235,6 +225,38 @@ impl BpfHandles {
         Ok(())
     }
 
+    pub fn dump_loop(
+        self,
+        interval: std::time::Duration,
+        use_res: impl Fn(&StatsRecord, &StatsRecord) -> (),
+    ) -> Result<(), StdError> {
+        let num_rxqs = unsafe {
+            let ptr = libbpf::bpf_map__def(self.rx_queue_index_map);
+            if ptr.is_null() {
+                Err(String::from(
+                    "Could not get bpf_map_def for rx_queue_index_map",
+                ))?;
+            }
+
+            (*ptr).max_entries
+        };
+
+        let mut record = StatsRecord::empty(num_rxqs as _);
+        let mut prev_record = StatsRecord::empty(num_rxqs as _);
+
+        record.update(&self)?;
+
+        while !self.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(interval);
+            std::mem::swap(&mut prev_record, &mut record);
+            record = StatsRecord::empty(record.rxqs.len());
+            record.update(&self)?;
+            use_res(&record, &prev_record);
+        }
+
+        Ok(())
+    }
+
     fn set_ifindex(&self) -> Result<(), StdError> {
         let ifindex_map = get_map_by_name("ifindex_map\0", self.bpf_obj)?;
 
@@ -263,33 +285,11 @@ impl BpfHandles {
         Ok(())
     }
 
-    pub fn dump_loop(
-        self,
-        interval: std::time::Duration,
-        use_res: impl Fn(&StatsRecord, &StatsRecord) -> (),
-    ) -> Result<(), StdError> {
-        let num_rxqs = unsafe {
-            let ptr = libbpf::bpf_map__def(self.rx_queue_index_map);
-            if ptr.is_null() {
-                Err(String::from(
-                    "Could not get bpf_map_def for rx_queue_index_map",
-                ))?;
-            }
-
-            (*ptr).max_entries
-        };
-
-        let mut record = StatsRecord::empty(num_rxqs as _);
-        let mut prev_record = StatsRecord::empty(num_rxqs as _);
-
-        record.update(&self)?;
-
-        while !self.stop.load(std::sync::atomic::Ordering::SeqCst) {
-            std::thread::sleep(interval);
-            std::mem::swap(&mut prev_record, &mut record);
-            record = StatsRecord::empty(record.rxqs.len());
-            record.update(&self)?;
-            use_res(&record, &prev_record);
+    fn activate(&self) -> Result<(), StdError> {
+        let xdp_flags = if_link::XDP_FLAGS_SKB_MODE | if_link::XDP_FLAGS_UPDATE_IF_NOEXIST;
+        let ok = unsafe { libbpf::bpf_set_link_xdp_fd(self.ifindex as _, self.prog_fd, xdp_flags) };
+        if ok < 0 {
+            Err(format!("bpf_set_link_xdp_fd failed: {}", ok))?;
         }
 
         Ok(())
