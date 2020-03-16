@@ -9,7 +9,7 @@ typedef __u64 Fnv64_t;
 /* Given an input [buf; len] and a prior value hval,
  * return the hash value. For the first call, pass hval = FNV1_64_INIT.
  */
-Fnv64_t
+Fnv64_t inline
 fnv_64_buf(void *buf, __u64 len, Fnv64_t hval)
 {
     __u64 i;

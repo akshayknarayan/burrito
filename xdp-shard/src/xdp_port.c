@@ -10,7 +10,7 @@
 #include <linux/udp.h>
 #include <linux/bpf.h>
 #include "bpf_helpers.h"
-//#include "fnv.h"
+#include "fnv.h"
 #include "xdp_port.h"
 
 typedef __u8 u8;
@@ -66,12 +66,13 @@ struct bincode_msg {
 // decide which port to send this to.
 // the possible options are in available_shards_map
 static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
-    struct bincode_msg *m;
-    u32 msg_len;
-    u64 hash = 0;
-    u8 keylen;
     u32 key = 0;
     struct available_shards *shards;
+    struct bincode_msg *m;
+    u32 msg_len;
+    u8 keylen;
+    u64 hash = 0;
+    u8 idx = 0;
 
 	shards = bpf_map_lookup_elem(&available_shards_map, &key);
     if (!shards) {
@@ -79,10 +80,12 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
         return XDP_PASS;
     }
 
-    if (shards->num < 1) {
+    if (shards->num < 1 || shards->num > NUM_PORTS) {
         // sharding disabled
         return XDP_PASS;
     }
+
+    return XDP_PASS;
 
     if (sizeof(struct bincode_msg) + app_data > data_end) {
         bpf_printk("Packet not large enough for bincode msg\n");
@@ -108,9 +111,14 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
         keylen = m->keylen;
     }
 
-    //hash = fnv_64_buf((void*) &m->key, keylen, FNV1_64_INIT);
+    hash = fnv_64_buf((void*) &m->key, keylen, FNV1_64_INIT);
+    idx = hash % shards->num;
 
-    *port = shards->ports[hash % shards->num];
+    if (idx > NUM_PORTS) {
+        return XDP_ABORTED; // appease the verifier
+    }
+
+    *port = shards->ports[idx];
     return XDP_PASS;
 }
 
