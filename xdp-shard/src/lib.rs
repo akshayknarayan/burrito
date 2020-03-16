@@ -167,7 +167,7 @@ impl BpfHandles {
         let rx_queue_index_map = get_map_by_name("rx_queue_index_map\0", bpf_obj)?;
         let available_shards_map = get_map_by_name("available_shards_map\0", bpf_obj)?;
 
-        let this = BpfHandles {
+        let mut this = BpfHandles {
             prog_fd,
             ifindex: interface_id,
             bpf_obj,
@@ -185,7 +185,10 @@ impl BpfHandles {
     ///
     /// By default, the shards map is empty and xdp_port will not rewrite port numbers, only log.
     /// Setting this will define a set of ports that xdp_port will shard between.
-    pub fn shard_ports(&self, ports: &[u16]) -> Result<(), StdError> {
+    ///
+    /// Note: It is not safe to call this concurrently, so it takes `&mut` self even though it would
+    /// compile (unsafely) taking `&self`.
+    pub fn shard_ports(&mut self, ports: &[u16]) -> Result<(), StdError> {
         if ports.len() > 16 {
             Err(format!(
                 "Too many ports to shard (max 16): {:?}",
@@ -268,7 +271,7 @@ impl BpfHandles {
         Ok(())
     }
 
-    fn set_ifindex(&self) -> Result<(), StdError> {
+    fn set_ifindex(&mut self) -> Result<(), StdError> {
         let ifindex_map = get_map_by_name("ifindex_map\0", self.bpf_obj)?;
 
         let ifindex_map_fd = unsafe { libbpf::bpf_map__fd(ifindex_map) };
@@ -296,7 +299,7 @@ impl BpfHandles {
         Ok(())
     }
 
-    fn activate(&self) -> Result<(), StdError> {
+    fn activate(&mut self) -> Result<(), StdError> {
         let xdp_flags = if_link::XDP_FLAGS_SKB_MODE | if_link::XDP_FLAGS_UPDATE_IF_NOEXIST;
         let ok = unsafe { libbpf::bpf_set_link_xdp_fd(self.ifindex as _, self.prog_fd, xdp_flags) };
         if ok < 0 {
