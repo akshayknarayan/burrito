@@ -39,11 +39,12 @@ struct bpf_map_def SEC("maps") rx_queue_index_map = {
 	.max_entries	= MAX_RXQs + 1,
 };
 
+/* Dest. port -> available_shards map for sharding on that port */
 struct bpf_map_def SEC("maps") available_shards_map = {
 	.type		= BPF_MAP_TYPE_ARRAY,
-	.key_size	= sizeof(__u32),
+	.key_size	= sizeof(__u16),
 	.value_size	= sizeof(struct available_shards),
-	.max_entries	= 1,
+	.max_entries	= 4,
 };
 
 // async-bincode length in front of this?
@@ -66,7 +67,7 @@ struct bincode_msg {
 // decide which port to send this to.
 // the possible options are in available_shards_map
 static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
-    u32 key = 0;
+    u32 key;
     struct available_shards *shards;
     struct bincode_msg *m;
     u32 msg_len;
@@ -74,7 +75,7 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
     u64 hash = 0;
     u8 idx = 0;
 
-	shards = bpf_map_lookup_elem(&available_shards_map, &key);
+	shards = bpf_map_lookup_elem(&available_shards_map, port);
     if (!shards) {
         bpf_printk("Could not get shards map\n");
         return XDP_PASS;
@@ -168,7 +169,6 @@ static inline int record_icmp(u32 rxq)
     return XDP_PASS;
 }
 
-/*
 static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
 {
     struct tcphdr *th;
@@ -197,7 +197,6 @@ static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
     if (res == XDP_ABORTED) { return res; }
     return shard_bincode(payload, data_end, &(th->dest));
 }
-*/
 
 static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
 {
@@ -223,8 +222,7 @@ static inline int parse_ipv4(void *data, void *data_end, u32 rxq)
         return XDP_ABORTED;
 
     if (iph->protocol == IPPROTO_TCP) {
-        //return parse_tcp(trans_data, data_end, rxq);
-        return XDP_PASS;
+        return parse_tcp(trans_data, data_end, rxq);
     } else if (iph->protocol ==IPPROTO_UDP) {
         return parse_udp(trans_data, data_end, rxq);
     } else if (iph->protocol == IPPROTO_ICMP) {
