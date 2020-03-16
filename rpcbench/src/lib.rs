@@ -13,8 +13,26 @@ mod ping {
 pub use ping::ping_server::{Ping, PingServer};
 pub use ping::{ping_params::Work, PingParams, Pong};
 
+use std::sync::{atomic::AtomicUsize, Arc};
+
 #[derive(Clone, Debug)]
-pub struct Server;
+pub struct Server {
+    req_cnt: Arc<AtomicUsize>,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            req_cnt: Arc::new(0.into()),
+        }
+    }
+}
+
+impl Server {
+    pub fn get_counter(&self) -> Arc<AtomicUsize> {
+        self.req_cnt.clone()
+    }
+}
 
 #[tonic::async_trait]
 impl Ping for Server {
@@ -35,6 +53,9 @@ impl Ping for Server {
                 format!("Unknown value {} for PingParams.Work", ping_req.work),
             )
         })?;
+
+        self.req_cnt
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let amt = ping_req.amount.try_into().expect("u64 to i64 cast");
 

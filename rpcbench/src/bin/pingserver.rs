@@ -25,11 +25,13 @@ async fn main() -> Result<(), failure::Error> {
     let log = burrito_ctl::logger();
     let opt = Opt::from_args();
 
+    let srv_impl = rpcbench::Server::default();
+
     if let Some(path) = opt.unix_addr {
         info!(&log, "UDS mode"; "addr" => ?&path);
         let l = tokio::net::UnixListener::bind(&path)?;
         let srv = hyper_unix_connector::UnixConnector::from(l);
-        let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
+        let ping_srv = rpcbench::PingServer::new(srv_impl);
         hyper::server::Server::builder(srv)
             .serve(hyper::service::make_service_fn(move |_| {
                 let ps = ping_srv.clone();
@@ -52,7 +54,7 @@ async fn main() -> Result<(), failure::Error> {
                 info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => port);
                 let srv =
                     burrito_addr::tonic::Server::start(&addr, port, &opt.burrito_root).await?;
-                let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
+                let ping_srv = rpcbench::PingServer::new(srv_impl);
                 hyper::server::Server::builder(hyper::server::accept::from_stream(srv))
                     .serve(hyper::service::make_service_fn(move |_| {
                         let ps = ping_srv.clone();
@@ -64,7 +66,7 @@ async fn main() -> Result<(), failure::Error> {
                 info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => port);
                 let srv =
                     burrito_addr::flatbuf::Server::start(&addr, port, &opt.burrito_root).await?;
-                let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
+                let ping_srv = rpcbench::PingServer::new(srv_impl);
                 hyper::server::Server::builder(hyper::server::accept::from_stream(srv))
                     .serve(hyper::service::make_service_fn(move |_| {
                         let ps = ping_srv.clone();
@@ -82,7 +84,7 @@ async fn main() -> Result<(), failure::Error> {
     let addr = format!("0.0.0.0:{}", port).parse()?;
     tonic::transport::Server::builder()
         .tcp_nodelay(true)
-        .add_service(rpcbench::PingServer::new(rpcbench::Server))
+        .add_service(rpcbench::PingServer::new(srv_impl))
         .serve(addr)
         .await?;
 
