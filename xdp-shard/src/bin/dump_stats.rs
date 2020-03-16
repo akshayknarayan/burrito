@@ -13,9 +13,7 @@ fn main() -> Result<(), StdError> {
 
     tracing_subscriber::fmt::init();
 
-    let ifindex = xdp_port::get_interface_id(&opt.interface)?;
-    let prog = xdp_port::BpfHandles::load(ifindex)?;
-
+    let prog = xdp_port::BpfHandles::load_on_interface_name(&opt.interface)?;
     let ifn = opt.interface;
     prog.dump_loop(std::time::Duration::from_secs(1), move |stats, prev| {
         let mut rxqs = stats.get_rxq_cpu_port_count();
