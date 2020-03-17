@@ -73,19 +73,20 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
     u8 keylen;
     u64 hash = 0;
     u8 idx = 0;
+    u16 le_port = ntohs(*port);
+    //u16 out_port;
 
-	shards = bpf_map_lookup_elem(&available_shards_map, port);
+	shards = bpf_map_lookup_elem(&available_shards_map, &le_port);
     if (!shards) {
-        bpf_printk("Could not get shards map for %x\n", port);
+        bpf_printk("Could not get shards map for %u\n", le_port);
         return XDP_PASS;
     }
 
     if (shards->num < 1 || shards->num > NUM_PORTS) {
         // sharding disabled
+        bpf_printk("Sharding disabled for %u: %u\n", le_port, shards->num);
         return XDP_PASS;
     }
-
-    return XDP_PASS;
 
     if (sizeof(struct bincode_msg) + app_data > data_end) {
         bpf_printk("Packet not large enough for bincode msg\n");
@@ -104,9 +105,9 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
         return XDP_ABORTED;
     }
 
-    // only take the first 32 bytes of the key
-    if (m->keylen > 32) {
-        keylen = 32;
+    // only take the first 8 bytes of the key
+    if (m->keylen > 8) {
+        keylen = 8;
     } else {
         keylen = m->keylen;
     }
@@ -118,7 +119,10 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
         return XDP_ABORTED; // appease the verifier
     }
 
-    *port = shards->ports[idx];
+    //out_port = shards->ports[idx];
+    //bpf_printk("Sharding %u -> %u\n", le_port, out_port);
+
+    //*port = htons(out_port);
     return XDP_PASS;
 }
 

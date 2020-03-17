@@ -15,6 +15,7 @@ fnv_64_buf(void *buf, __u64 len, Fnv64_t hval)
     __u64 i;
     __u64 v;
     __u8 *b = (__u8*) buf;
+    #pragma clang loop unroll(full)
     for (i = 0; i < len; i++) {
         v = (__u64) b[i];
         hval = hval ^ v;
