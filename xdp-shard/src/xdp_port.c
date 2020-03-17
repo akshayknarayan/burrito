@@ -10,8 +10,51 @@
 #include <linux/udp.h>
 #include <linux/bpf.h>
 #include "bpf_helpers.h"
-#include "fnv.h"
 #include "xdp_port.h"
+
+typedef __u64 Fnv64_t;
+
+/*
+ * 64 bit magic FNV-0 and FNV-1 prime
+ */
+#define FNV1_64_INIT ((Fnv64_t)0xcbf29ce484222325ULL)
+#define FNV_64_PRIME ((Fnv64_t)0x100000001b3ULL)
+
+/* Given an input [buf; len] and a prior value hval,
+ * return the hash value. For the first call, pass hval = FNV1_64_INIT.
+ */
+//static Fnv64_t inline
+//fnv_64_buf(void *buf, __u64 len, Fnv64_t hval)
+//{
+//    __u64 i;
+//    __u64 v;
+//    __u8 *b = (__u8*) buf;
+//    #pragma clang loop unroll(full)
+//    for (i = 0; i < len; i++) {
+//        v = (__u64) b[i];
+//        hval = hval ^ v;
+//        hval *= FNV_64_PRIME;
+//    }
+//
+//    return hval;
+//}
+
+// 8-byte fixed
+static Fnv64_t inline
+fnv_64_buf_fixed(char *buf, Fnv64_t hval)
+{
+    __u64 i;
+    __u64 v;
+    __u8 *b = (__u8*) buf;
+    #pragma clang loop unroll(full)
+    for (i = 0; i < 8; i++) {
+        v = (__u64) b[i];
+        hval = hval ^ v;
+        hval *= FNV_64_PRIME;
+    }
+
+    return hval;
+}
 
 typedef __u8 u8;
 typedef __u16 u16;
@@ -74,7 +117,10 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
     u64 hash = 0;
     u8 idx = 0;
     u16 le_port = ntohs(*port);
-    //u16 out_port;
+    u8 *k;
+    u8 i;
+    char fixkey[8] = { 0,0,0,0,0,0,0,0 };
+    u16 out_port;
 
 	shards = bpf_map_lookup_elem(&available_shards_map, &le_port);
     if (!shards) {
@@ -101,28 +147,40 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
 
     if ((void*) (msg_len + ((char*) app_data)) > data_end) {
         // assumes the whole message is here - i.e. it won't do TCP stream reassembly
-        bpf_printk("Packet not large enough for stated bincode msg len\n");
+        bpf_printk("Packet not large enough for stated bincode msg len: port %u\n", le_port);
         return XDP_ABORTED;
     }
 
+    k = (u8*) &m->key;
     // only take the first 8 bytes of the key
     if (m->keylen > 8) {
         keylen = 8;
+        #pragma clang loop unroll(full)
+        for (i = 0; i < 8; i++) {
+            fixkey[i] = k[i];
+        }
     } else {
         keylen = m->keylen;
+        #pragma clang loop unroll(full)
+        for (i = 0; i < keylen; i++) {
+            fixkey[i] = k[i];
+        }
     }
 
-    hash = fnv_64_buf((void*) &m->key, keylen, FNV1_64_INIT);
+
+    hash = fnv_64_buf_fixed(fixkey, FNV1_64_INIT);
+    //hash = fnv_64_buf((void*) &m->key, keylen, FNV1_64_INIT);
+
     idx = hash % shards->num;
 
-    if (idx > NUM_PORTS) {
-        return XDP_ABORTED; // appease the verifier
+    if (idx > 12) { // should be 16 but that doesn't verify
+        return XDP_ABORTED;
     }
 
-    //out_port = shards->ports[idx];
-    //bpf_printk("Sharding %u -> %u\n", le_port, out_port);
+    out_port = shards->ports[idx];
+    bpf_printk("Sharding %u -> %u\n", le_port, out_port);
 
-    //*port = htons(out_port);
+    *port = htons(out_port);
     return XDP_PASS;
 }
 

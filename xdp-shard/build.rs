@@ -100,7 +100,7 @@ fn main() {
             "-Werror",
             "-Wall",
             "-gdwarf",
-            "-O2",
+            "-O1",
             "-emit-llvm",
             "-c",
             "xdp_port.c",
