@@ -32,20 +32,14 @@ impl Server {
     pub fn get_counter(&self) -> Arc<AtomicUsize> {
         self.req_cnt.clone()
     }
-}
 
-#[tonic::async_trait]
-impl Ping for Server {
-    async fn ping(
+    pub async fn do_ping(
         &self,
-        req: tonic::Request<PingParams>,
-    ) -> Result<tonic::Response<Pong>, tonic::Status> {
-        let span = span!(Level::DEBUG, "ping()", req = ?req);
+        ping_req: PingParams,
+    ) -> Result<Pong, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        let span = span!(Level::DEBUG, "ping()", req = ?ping_req);
         let _span = span.enter();
         let then = std::time::Instant::now();
-        let ping_req = req.into_inner();
-
-        use ping::ping_params::Work;
 
         let w: Work = Work::from_i32(ping_req.work).ok_or_else(|| {
             tonic::Status::new(
@@ -85,13 +79,28 @@ impl Ping for Server {
             }
         }
 
-        Ok(tonic::Response::new(Pong {
+        Ok(Pong {
             duration_us: then
                 .elapsed()
                 .as_micros()
                 .try_into()
                 .expect("u128 to i64 cast"),
-        }))
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl Ping for Server {
+    async fn ping(
+        &self,
+        req: tonic::Request<PingParams>,
+    ) -> Result<tonic::Response<Pong>, tonic::Status> {
+        let ping_req = req.into_inner();
+        let pong = self
+            .do_ping(ping_req)
+            .await
+            .map_err(|e| tonic::Status::invalid_argument(format!("{:?}", e)))?;
+        Ok(tonic::Response::new(pong))
     }
 }
 
