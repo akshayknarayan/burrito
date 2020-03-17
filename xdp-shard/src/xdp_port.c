@@ -41,7 +41,7 @@ struct bpf_map_def SEC("maps") rx_queue_index_map = {
 
 /* Dest. port -> available_shards map for sharding on that port */
 struct bpf_map_def SEC("maps") available_shards_map = {
-	.type		= BPF_MAP_TYPE_ARRAY,
+	.type		= BPF_MAP_TYPE_HASH,
 	.key_size	= sizeof(__u16),
 	.value_size	= sizeof(struct available_shards),
 	.max_entries	= 4,
@@ -67,7 +67,6 @@ struct bincode_msg {
 // decide which port to send this to.
 // the possible options are in available_shards_map
 static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
-    u32 key;
     struct available_shards *shards;
     struct bincode_msg *m;
     u32 msg_len;
@@ -77,7 +76,7 @@ static inline int shard_bincode(void *app_data, void *data_end, u16 *port) {
 
 	shards = bpf_map_lookup_elem(&available_shards_map, port);
     if (!shards) {
-        bpf_printk("Could not get shards map\n");
+        bpf_printk("Could not get shards map for %x\n", port);
         return XDP_PASS;
     }
 

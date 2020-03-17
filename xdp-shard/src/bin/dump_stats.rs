@@ -1,3 +1,7 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use structopt::StructOpt;
 
 type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -13,9 +17,20 @@ fn main() -> Result<(), StdError> {
 
     tracing_subscriber::fmt::init();
 
-    let prog = xdp_port::BpfHandles::load_on_interface_name(&opt.interface)?;
+    let mut prog = xdp_port::BpfHandles::load_on_interface_name(&opt.interface)?;
     let ifn = opt.interface;
-    prog.dump_loop(std::time::Duration::from_secs(1), move |stats, prev| {
+    let stop: Arc<AtomicBool> = Arc::new(false.into());
+    let s = stop.clone();
+    ctrlc::set_handler(move || {
+        tracing::warn!("stopping");
+        s.store(true, Ordering::SeqCst);
+    })
+    .unwrap();
+
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        std::time::Duration::from_secs(1);
+        let (stats, prev) = prog.get_stats()?;
+
         let mut rxqs = stats.get_rxq_cpu_port_count();
         let prev_rxqs = prev.get_rxq_cpu_port_count();
         xdp_port::diff_maps(&mut rxqs, &prev_rxqs);
@@ -28,5 +43,7 @@ fn main() -> Result<(), StdError> {
                 }
             }
         }
-    })
+    }
+
+    Ok(())
 }

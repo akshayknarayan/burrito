@@ -93,12 +93,12 @@ impl StatsRecord {
         }
     }
 
-    fn update(&mut self, maps: &BpfHandles) -> Result<(), StdError> {
-        let fd = unsafe { libbpf::bpf_map__fd(maps.rx_queue_index_map) };
+    fn update(&mut self, rx_queue_index_map: *mut libbpf::bpf_map) -> Result<(), StdError> {
+        let fd = unsafe { libbpf::bpf_map__fd(rx_queue_index_map) };
         assert!(fd > 0);
 
         for (i, rxq) in self.rxqs.iter_mut().enumerate() {
-            rxq.update(i, maps.rx_queue_index_map)?;
+            rxq.update(i, rx_queue_index_map)?;
         }
 
         Ok(())
@@ -120,6 +120,9 @@ pub struct BpfHandles {
     bpf_obj: *mut libbpf::bpf_object,
     rx_queue_index_map: *mut libbpf::bpf_map,
     available_shards_map: *mut libbpf::bpf_map,
+    num_rxqs: usize,
+    curr_record: StatsRecord,
+    prev_record: StatsRecord,
 }
 
 impl BpfHandles {
@@ -165,6 +168,17 @@ impl BpfHandles {
         }
 
         let rx_queue_index_map = get_map_by_name("rx_queue_index_map\0", bpf_obj)?;
+        let num_rxqs = unsafe {
+            let ptr = libbpf::bpf_map__def(rx_queue_index_map);
+            if ptr.is_null() {
+                Err(String::from(
+                    "Could not get bpf_map_def for rx_queue_index_map",
+                ))?;
+            }
+
+            (*ptr).max_entries
+        };
+
         let available_shards_map = get_map_by_name("available_shards_map\0", bpf_obj)?;
 
         let mut this = BpfHandles {
@@ -173,11 +187,15 @@ impl BpfHandles {
             bpf_obj,
             rx_queue_index_map,
             available_shards_map,
+            num_rxqs: num_rxqs as _,
+            curr_record: StatsRecord::empty(num_rxqs as _),
+            prev_record: StatsRecord::empty(num_rxqs as _),
         };
 
         this.set_ifindex()?;
         this.activate()?;
 
+        this.curr_record.update(rx_queue_index_map)?;
         Ok(this)
     }
 
@@ -201,7 +219,7 @@ impl BpfHandles {
             ports: [0u16; 16],
         };
 
-        av.ports.copy_from_slice(ports);
+        av.ports[0..ports.len()].copy_from_slice(ports);
 
         // now set it
         let fd = unsafe { libbpf::bpf_map__fd(self.available_shards_map) };
@@ -218,56 +236,25 @@ impl BpfHandles {
             )
         };
         if ok < 0 {
-            Err(format!("available_shards_map update elem failed: {}", ok))?;
+            let errno = nix::errno::Errno::last();
+            Err(format!(
+                "available_shards_map update elem failed: {}",
+                errno
+            ))?;
         }
 
         Ok(())
     }
 
-    /// Consume self and  every interval, dump (via handler()) cpu-rxq-port records.
+    /// Query cpu-rxq-port records.
     ///
-    /// Adds a signal handler that stops the loop gracefully, so that drop() can happen.
-    /// As a result, drop() will happen at the end of this method, but any calls after this will
-    /// also execute after the signal is handled (for possible additional cleanup).
-    pub fn dump_loop(
-        self,
-        interval: std::time::Duration,
-        handler: impl Fn(&StatsRecord, &StatsRecord) -> (),
-    ) -> Result<(), StdError> {
-        use std::sync::{atomic::AtomicBool, Arc};
-        let stop: Arc<AtomicBool> = Arc::new(false.into());
-        let s = stop.clone();
-        ctrlc::set_handler(move || {
-            tracing::warn!("stopping, removing XDP program");
-            s.store(true, std::sync::atomic::Ordering::SeqCst);
-        })
-        .unwrap();
-
-        let num_rxqs = unsafe {
-            let ptr = libbpf::bpf_map__def(self.rx_queue_index_map);
-            if ptr.is_null() {
-                Err(String::from(
-                    "Could not get bpf_map_def for rx_queue_index_map",
-                ))?;
-            }
-
-            (*ptr).max_entries
-        };
-
-        let mut record = StatsRecord::empty(num_rxqs as _);
-        let mut prev_record = StatsRecord::empty(num_rxqs as _);
-
-        record.update(&self)?;
-
-        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-            std::thread::sleep(interval);
-            std::mem::swap(&mut prev_record, &mut record);
-            record = StatsRecord::empty(record.rxqs.len());
-            record.update(&self)?;
-            handler(&record, &prev_record);
-        }
-
-        Ok(())
+    /// Returns (curr_record, prev_record) tuple. prev_record is equal to the previous call's
+    /// curr_record.
+    pub fn get_stats(&mut self) -> Result<(&StatsRecord, &StatsRecord), StdError> {
+        std::mem::swap(&mut self.prev_record, &mut self.curr_record);
+        self.curr_record = StatsRecord::empty(self.num_rxqs);
+        self.curr_record.update(self.rx_queue_index_map)?;
+        Ok((&self.curr_record, &self.prev_record))
     }
 
     fn set_ifindex(&mut self) -> Result<(), StdError> {
@@ -311,6 +298,7 @@ impl BpfHandles {
 
 impl Drop for BpfHandles {
     fn drop(&mut self) {
+        tracing::warn!("removing xdp program");
         unsafe { remove_xdp(self.ifindex) }
     }
 }

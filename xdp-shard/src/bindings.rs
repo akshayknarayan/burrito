@@ -29,7 +29,7 @@ pub mod if_link {
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 pub mod xdp_shared {
-    include!(concat!(env!("OUT_DIR"), "/xdp_port.rs"));
+    include!(concat!(env!("OUT_DIR"), "/xdp_shared.rs"));
 
     pub type AvailableShards = available_shards;
     pub type Datarec = datarec;
