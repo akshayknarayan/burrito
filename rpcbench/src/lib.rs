@@ -2,6 +2,7 @@
 //! or to a local pipe depending on what burrito-ctl says
 
 use failure::Error;
+use serde::{Deserialize, Serialize};
 use std::convert::TryInto;
 use tracing::{span, trace, Level};
 use tracing_futures::Instrument;
@@ -12,6 +13,51 @@ mod ping {
 
 pub use ping::ping_server::{Ping, PingServer};
 pub use ping::{ping_params::Work, PingParams, Pong};
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct SPingParams {
+    pub work: i32,
+    pub amount: i64,
+}
+
+impl From<PingParams> for SPingParams {
+    fn from(p: PingParams) -> Self {
+        Self {
+            work: p.work,
+            amount: p.amount,
+        }
+    }
+}
+
+impl Into<PingParams> for SPingParams {
+    fn into(self) -> PingParams {
+        PingParams {
+            work: self.work,
+            amount: self.amount,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct SPong {
+    pub duration_us: i64,
+}
+
+impl From<Pong> for SPong {
+    fn from(p: Pong) -> Self {
+        Self {
+            duration_us: p.duration_us,
+        }
+    }
+}
+
+impl Into<Pong> for SPong {
+    fn into(self) -> Pong {
+        Pong {
+            duration_us: self.duration_us,
+        }
+    }
+}
 
 use std::sync::{atomic::AtomicUsize, Arc};
 
