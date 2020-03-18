@@ -47,28 +47,39 @@ fn dump_ctrs(
     }
 }
 
+async fn serve_udp(srv: rpcbench::Server, port: u16) -> Result<(), StdError> {
+    // udp server
+    let mut buf = [0u8; 1024];
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+    let mut sk = tokio::net::UdpSocket::bind::<std::net::SocketAddr>(addr)
+        .await
+        .unwrap();
+    loop {
+        let (len, from_addr) = sk.recv_from(&mut buf).await?;
+        let msg = &buf[..len];
+        // deserialize
+        let msg: rpcbench::SPingParams = bincode::deserialize(msg)?;
+        let resp: rpcbench::SPong = srv.do_ping(msg.into()).await?.into();
+        let msg = bincode::serialize(&resp)?;
+        sk.send_to(&msg, from_addr).await?;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), StdError> {
     let opt = Opt::from_args();
 
     tracing_subscriber::fmt::init();
 
-    // listen on 3 ports
+    // listen on ports
     let ctrs: Vec<(u16, Arc<AtomicUsize>)> = opt
         .ports
         .clone()
         .into_iter()
         .map(|port| {
-            let addr = format!("0.0.0.0:{}", port).parse().unwrap();
             let srv = rpcbench::Server::default();
             let ctr = srv.get_counter();
-            tokio::spawn(
-                tonic::transport::Server::builder()
-                    .tcp_nodelay(true)
-                    .add_service(rpcbench::PingServer::new(srv))
-                    .serve(addr),
-            );
-
+            tokio::spawn(serve_udp(srv, port));
             (port, ctr)
         })
         .collect();
