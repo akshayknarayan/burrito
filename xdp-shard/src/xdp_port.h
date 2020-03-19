@@ -8,8 +8,8 @@ struct datarec {
 };
 
 struct shard_rules {
-    __u32 msg_offset; // where in the message does the key start? (fixed location)
-    __u8 field_size; // if static - easy mode
+    __u8 msg_offset; // where in the message does the key start? (fixed location)
+    __u8 field_size; // if static - easy mode TODO ignored (verifier)
 };
 
 struct available_shards {

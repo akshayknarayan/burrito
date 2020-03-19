@@ -210,7 +210,7 @@ impl BpfHandles {
         &mut self,
         orig_port: u16,
         ports: &[u16],
-        msg_offset: u32,
+        msg_offset: u8,
         field_size: u8,
     ) -> Result<(), StdError> {
         if ports.len() > 16 {
