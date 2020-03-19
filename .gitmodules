@@ -1,3 +1,7 @@
 [submodule "ycsbc-mock"]
 	path = kvstore-ycsb/ycsbc-mock
-	url = git@github.com:apanda/ycsbc-mock.git
+    url = git@github.com:apanda/ycsbc-mock.git
+
+[submodule "src/libbpf"]
+	path = xdp-shard/src/libbpf
+	url = https://github.com/libbpf/libbpf

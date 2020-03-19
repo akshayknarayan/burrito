@@ -9,6 +9,7 @@ members = [
     "kvstore-ycsb",
     "rpcbench",
     "static-test",
+    "xdp-shard",
 ]
 
 [profile.release]

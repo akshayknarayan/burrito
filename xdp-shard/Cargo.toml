@@ -1,0 +1,21 @@
+[package]
+name = "xdp-shard"
+version = "0.1.0"
+authors = ["Akshay Narayan <akshayn@mit.edu>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bincode = "1"
+ctrlc = "3"
+nix = "0.17"
+structopt = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.2"
+tokio = { version = "0.2", features = ["rt-threaded", "macros", "sync"] }
+rpcbench = { path = "../burrito/rpcbench" }
+tonic = "0.1" 
+
+[build-dependencies]
+bindgen = "0.53"
