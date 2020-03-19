@@ -59,7 +59,7 @@ static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
     struct available_shards *shards;
     u16 le_port = ntohs(*port);
     u16 out_port;
-    u32 max_offset;
+    //u32 max_offset;
     u8 *pkt_val;
     u64 hash = FNV1_64_INIT;
     u8 idx = 0;
@@ -79,20 +79,33 @@ static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
     }
 
     // ok, we have to do work. first, check that the max offset we might have to read is valid
-    max_offset = shards->rules.msg_offset + shards->rules.field_size;;
+    //max_offset = shards->rules.msg_offset + shards->rules.field_size;
 
-    if (((void*) (max_offset + ((char*) app_data))) > data_end) {
-        bpf_printk("Packet not large enough for msg: %u < %u\n", max_offset, (data_end - app_data));
+    //if (((void*) (max_offset + ((char*) app_data))) > data_end) {
+    //    bpf_printk("Packet not large enough for msg: %u < %u\n", max_offset, (data_end - app_data));
+    //    return XDP_ABORTED;
+    //}
+    
+    if (((void*) (shards->rules.msg_offset + 12 + ((char*) app_data))) > data_end) {
+        bpf_printk("Packet not large enough for msg: %u\n", (data_end - app_data));
         return XDP_ABORTED;
     }
 
     // get the value
     pkt_val = ((u8*) app_data) + shards->rules.msg_offset;
     // compute FNV hash
-    #pragma clang loop unroll(full)
-    for (i = 0; i < shards->rules.field_size; i++) {
-        hash = hash ^ ((u64) pkt_val[i]);
-        hash *= FNV_64_PRIME;
+    if (shards->rules.field_size > 8) {
+        #pragma clang loop unroll(full)
+        for (i = 0; i < 8; i++) {
+            hash = hash ^ ((u64) pkt_val[i]);
+            hash *= FNV_64_PRIME;
+        }
+    } else {
+        #pragma clang loop unroll(full)
+        for (i = 0; i < shards->rules.field_size; i++) {
+            hash = hash ^ ((u64) pkt_val[i]);
+            hash *= FNV_64_PRIME;
+        }
     }
 
     // map to a shard and assign to that port.
