@@ -220,6 +220,12 @@ impl BpfHandles {
             ))?;
         }
 
+        if field_size != 4 {
+            Err(format!(
+                "field_size != 4 currently doesn't pass the bpf verifier :("
+            ))?;
+        }
+
         let mut av = AvailableShards {
             num: ports.len() as _,
             ports: [0u16; 16],
