@@ -28,8 +28,8 @@ pub mod if_link {
 
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
-pub mod xdp_shared {
-    include!(concat!(env!("OUT_DIR"), "/xdp_shared.rs"));
+pub mod xdp_shard {
+    include!(concat!(env!("OUT_DIR"), "/xdp_shard.rs"));
 
     pub type AvailableShards = available_shards;
     pub type ShardRules = shard_rules;

@@ -95,7 +95,7 @@ async fn main() -> Result<(), StdError> {
         start_sharding_tx.send(()).unwrap();
     });
 
-    let mut prog = xdp_port::BpfHandles::load_on_interface_name(&opt.interface)?;
+    let mut prog = xdp_shard::BpfHandles::load_on_interface_name(&opt.interface)?;
     let ifn = opt.interface;
 
     let stop: Arc<AtomicBool> = Arc::new(false.into());
@@ -120,7 +120,7 @@ async fn main() -> Result<(), StdError> {
 
         let mut rxqs = stats.get_rxq_cpu_port_count();
         let prev_rxqs = prev.get_rxq_cpu_port_count();
-        xdp_port::diff_maps(&mut rxqs, &prev_rxqs);
+        xdp_shard::diff_maps(&mut rxqs, &prev_rxqs);
         for (rxq, cpus) in rxqs.iter().enumerate() {
             for (cpu, portcounts) in cpus.iter().enumerate() {
                 for (port, count) in portcounts.iter() {

@@ -16,7 +16,7 @@ pub fn diff_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMa
     }
 }
 
-use xdp_shared::{AvailableShards, Datarec, ShardRules};
+use xdp_shard::{AvailableShards, Datarec, ShardRules};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -133,7 +133,7 @@ impl BpfHandles {
 
     /// Load xdp_port XDP program onto the given interface id.
     pub fn load_on_interface_id(interface_id: u32) -> Result<Self, StdError> {
-        let bpf_filename = concat!(env!("OUT_DIR"), "/xdp_port.o\0");
+        let bpf_filename = concat!(env!("OUT_DIR"), "/xdp_shard.o\0");
 
         let bpf_filename_cstr = std::ffi::CStr::from_bytes_with_nul(bpf_filename.as_bytes())?;
         let attr = libbpf::bpf_prog_load_attr {

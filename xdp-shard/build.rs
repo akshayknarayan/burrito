@@ -67,7 +67,7 @@ fn main() {
         .expect("Unable to write bindings");
 
     let xdp_prog_types_bindings = bindgen::Builder::default()
-        .header("./src/xdp_port.h")
+        .header("./src/xdp_shard.h")
         .derive_default(true)
         .blacklist_type(r#"u\d+"#)
         .whitelist_type(r#"datarec"#)
@@ -75,7 +75,7 @@ fn main() {
         .generate()
         .expect("Unable to generate bindings");
     xdp_prog_types_bindings
-        .write_to_file(out_path.join("xdp_shared.rs"))
+        .write_to_file(out_path.join("xdp_shard.rs"))
         .expect("Unable to write bindings");
 
     let clang_include = std::process::Command::new("clang")
@@ -86,8 +86,8 @@ fn main() {
 
     let clang_include = std::string::String::from_utf8(clang_include).unwrap();
 
-    println!("cargo:rerun-if-changed=./src/xdp_port.c");
-    println!("cargo:rerun-if-changed=./src/xdp_port.h");
+    println!("cargo:rerun-if-changed=./src/xdp_shard.c");
+    println!("cargo:rerun-if-changed=./src/xdp_shard.h");
     if !std::process::Command::new("clang")
         .current_dir("./src")
         .args(&[
@@ -103,14 +103,14 @@ fn main() {
             "-O1",
             "-emit-llvm",
             "-c",
-            "xdp_port.c",
+            "xdp_shard.c",
             "-o",
-            "xdp_port.d",
+            "xdp_shard.d",
         ])
         .spawn()
-        .expect("clang xdp_port.c")
+        .expect("clang xdp_shard.c")
         .wait()
-        .expect("clang xdp_port.c")
+        .expect("clang xdp_shard.c")
         .success()
     {
         panic!("clang errored");
@@ -122,13 +122,13 @@ fn main() {
             "-march=bpf",
             "-filetype=obj",
             "-o",
-            "xdp_port.o",
-            "xdp_port.d",
+            "xdp_shard.o",
+            "xdp_shard.d",
         ])
         .spawn()
-        .expect("llc xdp_port.d")
+        .expect("llc xdp_shard.d")
         .wait()
-        .expect("llc xdp_port.d")
+        .expect("llc xdp_shard.d")
         .success()
     {
         panic!("llc errored");
@@ -136,17 +136,17 @@ fn main() {
 
     std::process::Command::new("rm")
         .current_dir("./src")
-        .args(&["-f", "xdp_port.d"])
+        .args(&["-f", "xdp_shard.d"])
         .spawn()
         .unwrap()
         .wait()
         .unwrap();
 
-    eprintln!("{:?}", out_path.join("xdp_port.o"));
+    eprintln!("{:?}", out_path.join("xdp_shard.o"));
 
     if !std::process::Command::new("mv")
-        .arg("src/xdp_port.o")
-        .arg(out_path.join("xdp_port.o"))
+        .arg("src/xdp_shard.o")
+        .arg(out_path.join("xdp_shard.o"))
         .spawn()
         .expect("kernel ebpf program move to outdir")
         .wait()
