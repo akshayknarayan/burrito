@@ -16,7 +16,7 @@ pub fn diff_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMa
     }
 }
 
-use xdp_shared::{AvailableShards, Datarec};
+use xdp_shared::{AvailableShards, Datarec, ShardRules};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -206,7 +206,13 @@ impl BpfHandles {
     ///
     /// Note: It is not safe to call this concurrently, so it takes `&mut` self even though it would
     /// compile (unsafely) taking `&self`.
-    pub fn shard_ports(&mut self, orig_port: u16, ports: &[u16]) -> Result<(), StdError> {
+    pub fn shard_ports(
+        &mut self,
+        orig_port: u16,
+        ports: &[u16],
+        msg_offset: u32,
+        field_size: u8,
+    ) -> Result<(), StdError> {
         if ports.len() > 16 {
             Err(format!(
                 "Too many ports to shard (max 16): {:?}",
@@ -217,6 +223,10 @@ impl BpfHandles {
         let mut av = AvailableShards {
             num: ports.len() as _,
             ports: [0u16; 16],
+            rules: ShardRules {
+                msg_offset,
+                field_size,
+            },
         };
 
         av.ports[0..ports.len()].copy_from_slice(ports);

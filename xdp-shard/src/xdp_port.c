@@ -55,111 +55,17 @@ struct bpf_map_def SEC("maps") available_shards_map = {
 	.max_entries	= 4,
 };
 
-// bincode serialization:
-// bytes 0-8 : id (u64)
-// bytes 9-12: op (u32)
-// bytes 12-18: key length (u64)
-// bytes 18-?: key
-// byte n: 1 = Some, 0 = None
-// bytes n-(n+8) (if Some): val length
-// bytes (n+8)-m: val
-//struct kv_msg {
-//    u32 len;
-//    u64 id;
-//    u32 op;
-//    u64 keylen;
-//    void *key; // key data follows this, so &key is a pointer to it.
-//} __attribute__((packed, aligned(4)));
-
-// decide which port to send this to.
-// the possible options are in available_shards_map
-//static inline int shard_kv(void *app_data, void *data_end, u16 *port) {
-//    struct available_shards *shards;
-//    u16 le_port = ntohs(*port);
-//    u16 out_port;
-//    struct kv_msg *m;
-//    u32 msg_len;
-//    u64 hash = 0;
-//    u8 idx = 0;
-//    u8 *k;
-//    u8 i;
-//
-//	shards = bpf_map_lookup_elem(&available_shards_map, &le_port);
-//    if (!shards) {
-//        bpf_printk("Could not get shards map for %u\n", le_port);
-//        return XDP_PASS;
-//    }
-//
-//    if (shards->num < 1 || shards->num > NUM_PORTS) {
-//        // sharding disabled
-//        bpf_printk("Sharding disabled for %u: %u\n", le_port, shards->num);
-//        return XDP_PASS;
-//    }
-//
-//    if (((void*) (sizeof(struct kv_msg) + ((char*) app_data))) > data_end) {
-//        bpf_printk("Packet not large enough for bincode msg: %u < %u\n", sizeof(struct kv_msg), (data_end - app_data));
-//        return XDP_ABORTED;
-//    }
-//
-//    m = (struct kv_msg*) app_data;
-//    msg_len = ntohs(m->len); // only len is networkendian, rest is littleendian
-//    if (msg_len > sizeof(struct kv_msg) + 32) {
-//        msg_len = sizeof(struct kv_msg) + 32;
-//    }
-//
-//    if ((void*) (msg_len + ((char*) app_data)) > data_end) {
-//        // assumes the whole message is here - i.e. it won't do TCP stream reassembly
-//        bpf_printk("Packet not large enough for stated bincode msg len: port %u\n", le_port);
-//        return XDP_ABORTED;
-//    }
-//
-//    k = (u8*) &m->key;
-//    hash = FNV1_64_INIT;
-//    // only take the first 8 bytes of the key
-//    if (m->keylen > 8) {
-//        #pragma clang loop unroll(full)
-//        for (i = 0; i < 8; i++) {
-//            hash = hash ^ ((u64) k[i]);
-//            hash *= FNV_64_PRIME;
-//        }
-//    } else {
-//        #pragma clang loop unroll(full)
-//        for (i = 0; i < m->keylen; i++) {
-//            hash = hash ^ ((u64) k[i]);
-//            hash *= FNV_64_PRIME;
-//        }
-//    }
-//
-//    idx = hash % shards->num;
-//
-//    if (idx > 14) {
-//        return XDP_ABORTED;
-//    }
-//
-//    out_port = shards->ports[idx];
-//    bpf_printk("Sharding %u -> %u\n", le_port, out_port);
-//
-//    *port = htons(out_port);
-//    return XDP_PASS;
-//}
-
-struct ping_msg {
-   __s32 worktype;
-   __s64 amount;
-} __attribute__((packed, aligned(4)));
-
-// decide which port to send this to.
-// the possible options are in available_shards_map
-static inline int shard_ping(void *app_data, void *data_end, u16 *port) {
+static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
     struct available_shards *shards;
     u16 le_port = ntohs(*port);
     u16 out_port;
-    struct ping_msg *m;
-    u64 hash = 0;
+    u32 max_offset;
+    u8 *pkt_val;
+    u64 hash = FNV1_64_INIT;
     u8 idx = 0;
-    u8 *k;
     u8 i;
 
+    // lookup in the map of ports we have to do work for.
 	shards = bpf_map_lookup_elem(&available_shards_map, &le_port);
     if (!shards) {
         bpf_printk("Could not get shards map for %u\n", le_port);
@@ -172,21 +78,24 @@ static inline int shard_ping(void *app_data, void *data_end, u16 *port) {
         return XDP_PASS;
     }
 
-    if (((void*) (sizeof(struct ping_msg) + ((char*) app_data))) > data_end) {
-        bpf_printk("Packet not large enough for msg: %u < %u\n", sizeof(struct ping_msg), (data_end - app_data));
+    // ok, we have to do work. first, check that the max offset we might have to read is valid
+    max_offset = shards->rules.msg_offset + shards->rules.field_size;;
+
+    if (((void*) (max_offset + ((char*) app_data))) > data_end) {
+        bpf_printk("Packet not large enough for msg: %u < %u\n", max_offset, (data_end - app_data));
         return XDP_ABORTED;
     }
 
-    m = (struct ping_msg*) app_data;
-
-    k = (u8*) &m->worktype;
-    hash = FNV1_64_INIT;
+    // get the value
+    pkt_val = ((u8*) app_data) + shards->rules.msg_offset;
+    // compute FNV hash
     #pragma clang loop unroll(full)
-    for (i = 0; i < 8; i++) {
-        hash = hash ^ ((u64) k[i]);
+    for (i = 0; i < shards->rules.field_size; i++) {
+        hash = hash ^ ((u64) pkt_val[i]);
         hash *= FNV_64_PRIME;
     }
 
+    // map to a shard and assign to that port.
     idx = hash % shards->num;
 
     if (idx > 14) {
@@ -272,7 +181,7 @@ static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
     port = ntohs(th->dest);
     res = record_port(port, rxq);
     if (res == XDP_ABORTED) { return res; }
-    return shard_ping(payload, data_end, &(th->dest));
+    return shard_generic(payload, data_end, &(th->dest));
 }
 
 static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
@@ -287,7 +196,7 @@ static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
     port = ntohs(uh->dest);
     res = record_port(port, rxq);
     if (res == XDP_ABORTED) { return res; }
-    return shard_ping((void*) (uh + 1), data_end, &(uh->dest));
+    return shard_generic((void*) (uh + 1), data_end, &(uh->dest));
 }
 
 static inline int parse_ipv4(void *data, void *data_end, u32 rxq)

@@ -110,7 +110,9 @@ async fn main() -> Result<(), StdError> {
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         std::time::Duration::from_secs(1);
         if let Ok(_) = start_sharding_rx.try_recv() {
-            prog.shard_ports(opt.ports[0], &opt.ports[1..])?;
+            // PingParams is { i32, i64 } and we want to shard on the first value.
+            // so offset = 0, length = 4.
+            prog.shard_ports(opt.ports[0], &opt.ports[1..], 0, 4)?;
             tracing::info!(interface = ?&ifn, from = opt.ports[0], to = ?&opt.ports[1..], "sharding activated");
         }
 

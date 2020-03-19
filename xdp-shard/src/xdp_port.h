@@ -7,7 +7,13 @@ struct datarec {
     __u32 counts[NUM_PORTS + 1];
 };
 
+struct shard_rules {
+    __u32 msg_offset; // where in the message does the key start? (fixed location)
+    __u8 field_size; // if static - easy mode
+};
+
 struct available_shards {
     __u8 num;
     __u16 ports[16]; // max 16 shards
+    struct shard_rules rules;
 };

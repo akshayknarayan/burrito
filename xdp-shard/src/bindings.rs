@@ -32,5 +32,6 @@ pub mod xdp_shared {
     include!(concat!(env!("OUT_DIR"), "/xdp_shared.rs"));
 
     pub type AvailableShards = available_shards;
+    pub type ShardRules = shard_rules;
     pub type Datarec = datarec;
 }

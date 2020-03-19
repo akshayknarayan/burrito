@@ -87,7 +87,7 @@ fn main() {
     let clang_include = std::string::String::from_utf8(clang_include).unwrap();
 
     println!("cargo:rerun-if-changed=./src/xdp_port.c");
-    println!("cargo:rerun-if-changed=./src/fnv.h");
+    println!("cargo:rerun-if-changed=./src/xdp_port.h");
     if !std::process::Command::new("clang")
         .current_dir("./src")
         .args(&[
