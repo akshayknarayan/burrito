@@ -1,5 +1,5 @@
 use burrito_addr::bincode::*;
-use burrito_ctl::StaticResolver;
+use burrito_route_ctl::StaticResolver;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::cell::RefCell;
 use std::ops::DerefMut;

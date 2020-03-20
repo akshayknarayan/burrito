@@ -8,7 +8,8 @@ edition = "2018"
 
 [dependencies]
 burrito-addr = {path = "../burrito-addr"}
-burrito-ctl = {path = "../burrito-ctl"}
+burrito-route-ctl = {path = "../burrito-route-ctl"}
+burrito-util = {path = "../burrito-util"}
 futures-util = "0.3"
 hyper-unix-connector = "0.1.4"
 hyper = {version = "0.13", features = ["stream"]}

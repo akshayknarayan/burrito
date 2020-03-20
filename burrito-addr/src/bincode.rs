@@ -1,6 +1,7 @@
 use super::uri::Uri;
 use super::{Addr, Conn};
-use burrito_ctl::SRMsg;
+use burrito_route_ctl as burrito_ctl;
+use burrito_route_ctl::SRMsg;
 use core::{
     future::Future,
     pin::Pin,
@@ -118,7 +119,7 @@ impl hyper::service::Service<hyper::Uri> for StaticClient {
 #[cfg(test)]
 mod test {
     use super::*;
-    use burrito_ctl::static_net::*;
+    use burrito_route_ctl::static_net::*;
 
     #[test]
     fn static_unix_ping() {

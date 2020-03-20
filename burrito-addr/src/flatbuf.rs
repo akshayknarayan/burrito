@@ -4,6 +4,7 @@
 //! Currently this is done manually.
 
 use burrito_flatbuf::{ListenReply, ListenRequest, OpenReply, OpenRequest};
+use burrito_route_ctl as burrito_ctl;
 use core::{
     future::Future,
     pin::Pin,

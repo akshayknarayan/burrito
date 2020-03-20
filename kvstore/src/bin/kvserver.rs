@@ -46,7 +46,7 @@ fn tcp_shard_addrs(num_shards: usize, base_port: u16) -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> Result<(), StdError> {
-    let log = burrito_ctl::logger();
+    let log = burrito_util::logger();
     let opt = Opt::from_args();
     if opt.log {
         write_tracing(&log);

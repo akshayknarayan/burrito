@@ -1,3 +1,4 @@
+use burrito_route_ctl as burrito_ctl;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -13,7 +14,7 @@ struct Opt {
 #[tokio::main]
 async fn main() -> Result<(), failure::Error> {
     let opt = Opt::from_args();
-    let log = burrito_ctl::logger();
+    let log = burrito_util::logger();
 
     let out_addr = opt.out_addr.clone();
 

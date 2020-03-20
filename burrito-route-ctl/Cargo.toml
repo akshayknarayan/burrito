@@ -1,5 +1,5 @@
 [package]
-name = "burrito-ctl"
+name = "burrito-route-ctl"
 version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
@@ -26,8 +26,6 @@ regex = "1"
 serde_json = "1"
 serde  = { version = "1", features = ["derive"]}
 slog = "2"
-slog-async = "2"
-slog-term = "2"
 structopt = "0.3"
 tokio = {version = "0.2.11", features = ["full"]}
 tonic = "0.1"

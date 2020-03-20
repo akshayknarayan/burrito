@@ -9,7 +9,7 @@ edition = "2018"
 [dependencies]
 bincode = "1"
 burrito-addr = {path = "../burrito-addr"}
-burrito-ctl = {path = "../burrito-ctl"}
+burrito-route-ctl = {path = "../burrito-route-ctl"}
 criterion-stats = "=0.3.0"
 failure = "0.1"
 hyper = {version = "0.13", features = ["stream"]}

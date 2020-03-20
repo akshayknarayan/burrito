@@ -25,7 +25,7 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> Result<(), failure::Error> {
-    let log = burrito_ctl::logger();
+    let log = burrito_util::logger();
     let opt = Opt::from_args();
 
     let pp = rpcbench::PingParams {

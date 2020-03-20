@@ -2,6 +2,14 @@
 //!
 //! Will wrap the buffer with its length.
 
+pub fn logger() -> slog::Logger {
+    use slog::Drain;
+    let decorator = slog_term::TermDecorator::new().build();
+    let drain = slog_term::FullFormat::new(decorator).build().fuse();
+    let drain = slog_async::Async::new(drain).build().fuse();
+    slog::Logger::root(drain, slog::o!())
+}
+
 use byteorder::{ByteOrder, LittleEndian};
 use tracing::{instrument, trace};
 

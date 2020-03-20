@@ -1,3 +1,4 @@
+use burrito_route_ctl as burrito_ctl;
 use structopt::StructOpt;
 use tracing_timing::{Builder, Histogram};
 
@@ -16,46 +17,24 @@ struct Opt {
     #[structopt(short, long)]
     burrito_coordinator_addr: Option<std::path::PathBuf>,
 
-    #[structopt(short, long)]
-    redis_addr: String,
-
-    #[structopt(short, long = "net-addr")]
-    net_addrs: Option<Vec<std::net::IpAddr>>,
+    #[structopt(long)]
+    resolve_to: std::net::SocketAddr,
 
     #[structopt(long)]
     tracing_file: Option<std::path::PathBuf>,
-
-    #[structopt(long, default_value = "flatbuf")]
-    burrito_proto: String,
-}
-
-fn get_net_addrs() -> Result<Vec<std::net::IpAddr>, failure::Error> {
-    let hostname_ret = std::process::Command::new("hostname")
-        .arg("-I")
-        .output()
-        .expect("failed to exec hostname")
-        .stdout;
-
-    let ips = String::from_utf8(hostname_ret)?;
-    ips.split_whitespace()
-        .map(|s| s.parse().map_err(failure::Error::from))
-        .collect()
 }
 
 #[tokio::main]
 async fn main() -> Result<(), failure::Error> {
     let opt = Opt::from_args();
-    let log = burrito_ctl::logger();
+    let log = burrito_util::logger();
 
     let out_addr_docker = opt.out_addr_docker.clone();
 
     if let Some(ref p) = opt.tracing_file {
         write_tracing(p.clone(), &log);
-    } else {
-        tracing_subscriber::fmt::init();
     }
 
-    // get docker-proxy serving future
     std::fs::remove_file(&opt.in_addr_docker).unwrap_or_default(); // ignore error if file was not present
     use hyper_unix_connector::UnixConnector;
     let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr_docker).map_err(|e| {
@@ -69,20 +48,11 @@ async fn main() -> Result<(), failure::Error> {
     let docker_proxy_server = hyper::server::Server::builder(uc).serve(make_service);
     slog::info!(log, "docker proxy starting"; "listening at" => ?&opt.in_addr_docker, "proxying to" => ?&opt.out_addr_docker);
 
-    // get burrito-ctl serving future
-    let net_addrs = if let None = opt.net_addrs {
-        get_net_addrs()?
-    } else {
-        opt.net_addrs.unwrap()
-    };
-
-    let burrito = burrito_ctl::BurritoNet::new(
+    let burrito = burrito_ctl::StaticResolver::new(
         opt.burrito_coordinator_addr,
-        net_addrs.into_iter().map(|a| a.to_string()),
-        &opt.redis_addr,
-        log.new(slog::o!("server" => "burrito_net")),
-    )
-    .await?;
+        &format!("{}", opt.resolve_to),
+        "tcp".into(),
+    );
     let burrito_addr = burrito.listen_path();
 
     // if force_burrito, then we are ok with hijacking /controller, potentially from another
@@ -98,27 +68,11 @@ async fn main() -> Result<(), failure::Error> {
         std::process::exit(0);
     })?;
 
-    slog::info!(log, "burrito net starting"; "proto" => &opt.burrito_proto, "listening at" => ?&burrito_addr);
-    let both_servers = match &opt.burrito_proto {
-        x if x == "tonic" => {
-            let uc: UnixConnector = tokio::net::UnixListener::bind(&burrito_addr).map_err(|e| {
-                slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
-                e
-            })?.into();
-            futures_util::future::join(docker_proxy_server, burrito.serve_tonic_on(uc)).await
-        }
-        x if x == "flatbuf" => {
-            let mut uc = tokio::net::UnixListener::bind(&burrito_addr).map_err(|e| {
-                slog::error!(log, "Could not bind to burrito controller address"; "addr" => ?&burrito_addr, "err" => ?e);
-                e
-            })?;
-            futures_util::future::join(docker_proxy_server, burrito.serve_flatbuf_on(uc.incoming()))
-                .await
-        }
-        x => failure::bail!("Unknown burrito protocol {:?}", &x),
-    };
+    let burrito_service = burrito.start();
+    slog::info!(log, "burrito net starting"; "listening at" => ?&burrito_addr);
 
-    match both_servers {
+    let both_servers = futures_util::future::join(docker_proxy_server, burrito_service);
+    match both_servers.await {
         (Err(e1), Err(e2)) => {
             slog::crit!(log, "crash"; "docker_proxy" => ?e1, "burrito_rpc" => ?e2);
         }
@@ -135,7 +89,7 @@ async fn main() -> Result<(), failure::Error> {
 }
 
 // write tracing quantiles to file once a second
-fn write_tracing(p: std::path::PathBuf, log: &slog::Logger) {
+fn write_tracing(p: std::path::PathBuf, _log: &slog::Logger) {
     let subscriber = Builder::default()
         .no_span_recursion()
         .build(|| Histogram::new_with_max(10_000_000, 2).unwrap());
@@ -144,7 +98,6 @@ fn write_tracing(p: std::path::PathBuf, log: &slog::Logger) {
 
     tracing::dispatcher::set_global_default(d.clone()).expect("set tracing global default");
 
-    let log = log.clone();
     std::thread::spawn(move || loop {
         use std::io::Write;
 
@@ -157,28 +110,12 @@ fn write_tracing(p: std::path::PathBuf, log: &slog::Logger) {
             Err(_) => return,
         };
 
-        // force_synchronize in theory drops events, but
-        // the refresh() way appears to not work...
         sid.downcast(&d).unwrap().force_synchronize();
-        sid.downcast(&d).unwrap().with_histograms(|hs| {
-            //for (_, hs) in hs.iter_mut() {
-            //    for (_, h) in hs {
-            //        h.refresh();
-            //    }
-            //}
 
+        sid.downcast(&d).unwrap().with_histograms(|hs| {
             for (span_group, hs) in hs {
                 for (event_group, h) in hs {
                     let tag = format!("{}:{}", span_group, event_group);
-                    slog::debug!(&log, "tracing"; "event" => &tag,
-                        "min" => h.min(),
-                        "p25" => h.value_at_quantile(0.25),
-                        "p50" => h.value_at_quantile(0.5),
-                        "p75" => h.value_at_quantile(0.75),
-                        "max" => h.max(),
-                        "cnt" => h.len(),
-                    );
-
                     write!(
                         &mut f,
                         "{}: {} {} {} {} {}\n",
