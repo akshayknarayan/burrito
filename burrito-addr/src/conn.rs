@@ -2,30 +2,51 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
-use failure::Error;
 use pin_project::{pin_project, project};
 use tracing::trace;
+
+pub enum AddrError {
+    Udp(String),
+    Connect(failure::Error),
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> From<E> for AddrError {
+    fn from(e: E) -> Self {
+        AddrError::Connect(failure::Error::from(e))
+    }
+}
+
+impl Into<failure::Error> for AddrError {
+    fn into(self) -> failure::Error {
+        match self {
+            AddrError::Connect(e) => e,
+            AddrError::Udp(a) => failure::format_err!("Could not use UDP address: {}", a),
+        }
+    }
+}
 
 pub enum Addr {
     Unix(String),
     Tcp(String),
+    Udp(String),
 }
 
 impl Addr {
-    pub async fn connect(self) -> Result<Conn, Error> {
-        Ok(match self {
+    pub async fn connect(self) -> Result<Conn, AddrError> {
+        match self {
             Self::Unix(addr) => {
                 let st = tokio::net::UnixStream::connect(&addr).await?;
                 trace!("burrito-addr::Conn Connected");
-                Conn::Unix(st)
+                Ok(Conn::Unix(st))
             }
             Self::Tcp(addr) => {
                 let st = tokio::net::TcpStream::connect(&addr).await?;
                 st.set_nodelay(true)?;
                 trace!("burrito-addr::Conn Connected");
-                Conn::Tcp(st)
+                Ok(Conn::Tcp(st))
             }
-        })
+            Self::Udp(addr) => Err(AddrError::Udp(addr)),
+        }
     }
 }
 

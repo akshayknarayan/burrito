@@ -10,6 +10,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
+use failure::bail;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -84,6 +85,7 @@ impl Client {
                     .expect("OS string as valid string"),
             ),
             OpenReply::Tcp(addr) => crate::Addr::Tcp(addr),
+            OpenReply::Udp(addr) => crate::Addr::Tcp(addr),
         })
     }
 }
@@ -99,7 +101,8 @@ impl hyper::service::Service<hyper::Uri> for Client {
 
     fn call(&mut self, dst: hyper::Uri) -> Self::Future {
         let mut cl = self.clone();
-        Box::pin(async move { cl.resolve(dst).await?.connect().await })
+        // this will error on UDP remotes
+        Box::pin(async move { cl.resolve(dst).await?.connect().await.map_err(|e| e.into()) })
     }
 }
 
@@ -112,7 +115,7 @@ impl Server {
     #[tracing::instrument(level = "debug", skip(burrito_root))]
     pub async fn start(
         service_addr: &str,
-        port: u16,
+        addr: (&str, u16),
         burrito_root: impl AsRef<Path>,
     ) -> Result<Self, failure::Error> {
         let burrito_root = burrito_root.as_ref();
@@ -123,11 +126,19 @@ impl Server {
         let mut st = tokio::net::UnixStream::connect(burrito_ctl_addr).await?;
         trace!("Connected to burrito-ctl");
 
+        let (addr_type, port) = addr;
+        let addr_type = match addr_type.to_lowercase().as_str() {
+            "tcp" => burrito_flatbuf::AddrType::Tcp,
+            "udp" => burrito_flatbuf::AddrType::Udp,
+            a => bail!("Unknown addr type {}", a),
+        };
+
         // do listen() rpc
         let mut buf = burrito_flatbuf::FlatBufferBuilder::new_with_capacity(512);
         let msg = ListenRequest {
             service_addr: service_addr.to_string(),
             port,
+            addr_type,
         };
 
         msg.onto(&mut buf);

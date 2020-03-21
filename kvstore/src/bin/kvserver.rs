@@ -89,22 +89,11 @@ async fn main() -> Result<(), StdError> {
             .zip((0..num_shards + 1).map(|x| port + (x as u16)))
             .zip(std::iter::repeat(opt.burrito_root));
         match opt.burrito_proto {
-            x if x == "tonic" => {
-                info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&root, "addr" => ?&addr, "tcp port" => port);
-                let ls: Result<Vec<_>, StdError> =
-                    futures_util::future::join_all(addrs.map(|((a, p), root)| async move {
-                        Ok(burrito_addr::tonic::Server::start(&a, p, &root).await?)
-                    }))
-                    .await
-                    .into_iter()
-                    .collect();
-                kvstore::shard_server(ls?, shard_fn).await?;
-            }
             x if x == "flatbuf" => {
                 info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&root, "addr" => ?&addr, "tcp port" => port);
                 let ls: Result<Vec<_>, StdError> =
                     futures_util::future::join_all(addrs.map(|((a, p), root)| async move {
-                        Ok(burrito_addr::flatbuf::Server::start(&a, p, &root).await?)
+                        Ok(burrito_addr::flatbuf::Server::start(&a, ("tcp", p), &root).await?)
                     }))
                     .await
                     .into_iter()

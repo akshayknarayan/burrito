@@ -112,7 +112,8 @@ impl hyper::service::Service<hyper::Uri> for StaticClient {
 
     fn call(&mut self, dst: hyper::Uri) -> Self::Future {
         let mut cl = self.clone();
-        Box::pin(async move { cl.resolve(dst).await?.connect().await })
+        // this will error on UDP remotes
+        Box::pin(async move { cl.resolve(dst).await?.connect().await.map_err(|e| e.into()) })
     }
 }
 

@@ -1,10 +1,10 @@
-pub use flatbuffers::FlatBufferBuilder;
-
 #[allow(unused_imports, unused)]
 mod serialize {
     include!(concat!(env!("OUT_DIR"), "/burrito_generated.rs"));
 }
 
+pub use flatbuffers::FlatBufferBuilder;
+pub use serialize::AddrType;
 burrito_util::assign_const_vals!(LISTEN_REPLY, LISTEN_REQUEST, OPEN_REPLY, OPEN_REQUEST);
 
 #[derive(Debug, Clone)]
@@ -39,6 +39,7 @@ impl From<&'_ [u8]> for ListenReply {
 pub struct ListenRequest {
     pub service_addr: String,
     pub port: u16,
+    pub addr_type: AddrType,
 }
 
 impl ListenRequest {
@@ -49,6 +50,7 @@ impl ListenRequest {
             &serialize::ListenRequestArgs {
                 service_addr: Some(service_addr_field),
                 listen_port: self.port,
+                addr_type: self.addr_type,
             },
         );
 
@@ -62,6 +64,7 @@ impl From<&'_ [u8]> for ListenRequest {
         Self {
             service_addr: m.service_addr().unwrap().to_string(),
             port: m.listen_port(),
+            addr_type: m.addr_type(),
         }
     }
 }
@@ -70,12 +73,13 @@ impl From<&'_ [u8]> for ListenRequest {
 pub enum OpenReply {
     Unix(String),
     Tcp(String),
+    Udp(String),
 }
 
 impl OpenReply {
     pub fn onto(&self, msg: &mut flatbuffers::FlatBufferBuilder) {
         let addr_field = match self {
-            OpenReply::Unix(s) | OpenReply::Tcp(s) => msg.create_string(s),
+            OpenReply::Unix(s) | OpenReply::Tcp(s) | OpenReply::Udp(s) => msg.create_string(s),
         };
 
         let req = serialize::OpenReply::create(
@@ -83,8 +87,9 @@ impl OpenReply {
             &serialize::OpenReplyArgs {
                 send_addr: Some(addr_field),
                 addr_type: match self {
-                    OpenReply::Unix(_) => serialize::AddrType::Unix,
-                    OpenReply::Tcp(_) => serialize::AddrType::Tcp,
+                    OpenReply::Unix(_) => AddrType::Unix,
+                    OpenReply::Tcp(_) => AddrType::Tcp,
+                    OpenReply::Udp(_) => AddrType::Udp,
                 },
             },
         );
