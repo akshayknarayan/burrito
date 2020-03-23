@@ -255,6 +255,9 @@ impl BurritoNet {
             .map(|ref a| format!("{}:{}", a, &listen_port))
             .collect();
 
+        let listen_addr = get_addr();
+        self.route_table_insert(&service_addr, &listen_addr).await?;
+
         tokio::spawn(redis_insert(
             self.redis_listen_connection.clone(),
             service_addr.to_string(),
@@ -262,9 +265,6 @@ impl BurritoNet {
             listen_port,
             self.log.clone(),
         ));
-
-        let listen_addr = get_addr();
-        self.route_table_insert(&service_addr, &listen_addr).await?;
         trace!("listen() done");
 
         slog::info!(self.log, "New service listening";
@@ -299,7 +299,7 @@ impl BurritoNet {
 
     async fn poll_updates(&self, con: &mut redis::aio::Connection) -> Result<(), Error> {
         use redis::AsyncCommands;
-        let srvs: Vec<String> = con.smembers("services").await?;
+        let srvs: Vec<String> = con.smembers("route-services").await?;
 
         let mut tbl = self.route_table.write().await;
         for srv in srvs {
@@ -308,7 +308,10 @@ impl BurritoNet {
                     .smembers::<_, Vec<String>>(&srv)
                     .await?
                     .into_iter()
-                    .map(|a| (srv.clone(), (a, rpc::open_reply::AddrType::Tcp)));
+                    .map(|a| {
+                        let s = srv.trim_start_matches("route:").to_string();
+                        (s, (a, rpc::open_reply::AddrType::Tcp))
+                    });
                 tbl.extend(addrs);
             }
         }
@@ -372,10 +375,15 @@ async fn redis_insert(
     log: slog::Logger,
 ) {
     trace!("redis insert start");
+    let name = format!("route:{}", sa);
     let mut r = redis::pipe();
-    r.atomic().cmd("SADD").arg("services").arg(&sa).ignore();
+    r.atomic()
+        .cmd("SADD")
+        .arg("route-services")
+        .arg(&name)
+        .ignore();
     for net_addr in net_addrs {
-        r.cmd("SADD").arg(&sa).arg(&net_addr);
+        r.cmd("SADD").arg(&name).arg(&net_addr);
     }
 
     let r: redis::RedisResult<()> = r.query_async(&mut *conn.lock().await).await;
