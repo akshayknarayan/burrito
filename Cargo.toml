@@ -3,6 +3,7 @@
 members = [
     "burrito-addr",
     "burrito-route-ctl",
+    "burrito-shard-ctl",
     "burrito-flatbuf",
     "burrito-util",
     "kvstore",
