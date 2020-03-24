@@ -23,7 +23,7 @@ pub struct StaticClient {
 }
 
 impl StaticClient {
-    pub async fn new(burrito_root: std::path::PathBuf) -> Self {
+    pub async fn new(burrito_root: PathBuf) -> Self {
         let controller_addr = burrito_root.join(burrito_ctl::burrito_net::CONTROLLER_ADDRESS);
         let uc = Arc::new(Mutex::new(
             tokio::net::UnixStream::connect(controller_addr)
