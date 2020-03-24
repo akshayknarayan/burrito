@@ -37,9 +37,13 @@ fn shard_addrs(num_shards: usize, base_addr: &str) -> Vec<String> {
     addrs
 }
 
-fn sk_shard_addrs(num_shards: usize, base_port: u16) -> Vec<String> {
+fn sk_shard_addrs(num_shards: usize, base_port: u16) -> Vec<std::net::SocketAddr> {
     (0..num_shards + 1)
-        .map(|i| format!("0.0.0.0:{}", base_port + (i as u16)))
+        .map(|i| {
+            format!("0.0.0.0:{}", base_port + (i as u16))
+                .parse()
+                .expect("valid socket addr")
+        })
         .collect()
 }
 
@@ -90,6 +94,7 @@ async fn main() -> Result<(), StdError> {
         match opt.burrito_proto {
             x if x == "flatbuf" => {
                 info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&root, "addr" => ?&addr, "tcp port" => port);
+                // register the addrs
                 let ls: Result<Vec<_>, StdError> =
                     futures_util::future::join_all(addrs.map(|((a, p), root)| async move {
                         Ok(burrito_addr::flatbuf::Server::start(&a, ("tcp", p), &root).await?)
@@ -97,7 +102,9 @@ async fn main() -> Result<(), StdError> {
                     .await
                     .into_iter()
                     .collect();
-                kvstore::shard_server(ls?, shard_fn).await?;
+                let ls = ls?;
+
+                kvstore::shard_server(ls, shard_fn).await?;
             }
             x => Err(format!("Unknown burrito protocol {:?}", &x))?,
         };
@@ -105,10 +112,31 @@ async fn main() -> Result<(), StdError> {
         return Ok(());
     }
 
+    let addrs = sk_shard_addrs(num_shards, port);
+
+    use burrito_shard_ctl::{
+        proto::{self, ShardInfo},
+        ShardCtlClient,
+    };
+
+    let si = ShardInfo {
+        service_name: "kv".into(),
+        canonical_addr: proto::Addr::Udp(addrs[0]),
+        shard_addrs: addrs[1..].iter().map(|a| proto::Addr::Udp(*a)).collect(),
+        shard_info: proto::SimpleShardPolicy {
+            packet_data_offset: 18,
+            packet_data_length: 4,
+        },
+    };
+
+    // register the shards
+    let mut shardctl = ShardCtlClient::new(&opt.burrito_root).await?;
+    shardctl.register(si).await?;
+
     info!(&log, "UDP mode"; "port" => port);
 
     let ls: Result<Vec<_>, _> = futures_util::future::join_all(
-        sk_shard_addrs(num_shards, port)
+        addrs
             .into_iter()
             .map(|addr| async move { tokio::net::UdpSocket::bind(addr).await }),
     )
