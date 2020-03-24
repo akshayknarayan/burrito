@@ -11,7 +11,7 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tower::pipeline;
 use tower_service::Service;
-use tracing::{info, span, trace, Level};
+use tracing::{info, span, trace, warn, Level};
 use tracing_futures::Instrument;
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
@@ -68,6 +68,110 @@ pub async fn serve(
         .await
         .map_err(|_| ()) // argh, bincode::Error is not Debug
         .unwrap_or_else(|_| ());
+}
+
+/// Serve Store shards on `shard_listeners`.
+///
+/// The first shard_listener is the sharder, which uses shard_fn to steer requests to the correct
+/// shard.
+pub async fn shard_server_udp(
+    shard_listeners: impl IntoIterator<Item = tokio::net::UdpSocket>,
+    shard_fn: impl Fn(&Msg) -> usize + 'static,
+) -> Result<(), StdError> {
+    let mut shard_listeners = shard_listeners.into_iter();
+    // the first shard_listener is the sharder
+    let sharder_listen = shard_listeners
+        .next()
+        .ok_or_else(|| String::from("must provide at least one listener"))?;
+
+    async fn serve_one_udp<S>(
+        sk: &mut tokio::net::UdpSocket,
+        srv: &mut S,
+        mut buf: &mut [u8],
+    ) -> Result<(), StdError>
+    where
+        S: tower_service::Service<msg::Msg, Response = msg::Msg>,
+        S::Error: std::fmt::Debug,
+    {
+        let (len, from_addr) = sk.recv_from(&mut buf).await?;
+        if len > buf.len() {
+            Err(format!("Message too big: {} > {}", len, buf.len()))?;
+        }
+
+        let msg = &buf[..len];
+        // deserialize
+        let msg: msg::Msg = bincode::deserialize(msg)?;
+
+        futures_util::future::poll_fn(|cx| srv.poll_ready(cx))
+            .await
+            .map_err(|e| format!("Poll service err: {:?}", e))?;
+        let resp = srv
+            .call(msg)
+            .await
+            .map_err(|e| format!("Call service err: {:?}", e))?;
+
+        let msg = bincode::serialize(&resp)?;
+        sk.send_to(&msg, from_addr).await?;
+        Ok(())
+    }
+
+    // start the shards
+    let shards: Vec<_> = shard_listeners
+        .map(move |mut sk| {
+            // The channel size passed to new() should be >= the maximum num. of concurrent requests.
+            let mut srv = tower_buffer::Buffer::new(Store::default(), 100_000);
+            let shard_srv = srv.clone();
+
+            // serve srv on listener
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    if let Err(e) = serve_one_udp(&mut sk, &mut srv, &mut buf[..]).await {
+                        warn!(err = ?e, "Error serving request");
+                    }
+                }
+            });
+
+            shard_srv
+        })
+        .collect();
+
+    let mut sk = sharder_listen;
+    let mut buf = [0u8; 1024];
+    // if shards.len() == 0, then there can only be one shard: sharder_listen. So, we just serve directly and
+    // ignore `shard_fn`.
+    if shards.is_empty() {
+        let mut srv = Store::default();
+        loop {
+            if let Err(e) = serve_one_udp(&mut sk, &mut srv, &mut buf[..]).await {
+                warn!(err = ?e, "Error serving request");
+            }
+        }
+    }
+
+    let mut shards = shards;
+    loop {
+        let (len, from_addr) = sk.recv_from(&mut buf).await?;
+        if len > buf.len() {
+            Err(format!("Message too big: {} > {}", len, buf.len()))?;
+        }
+
+        let msg = &buf[..len];
+        // deserialize
+        let msg: msg::Msg = bincode::deserialize(msg)?;
+
+        let srv = &mut shards[shard_fn(&msg)];
+        futures_util::future::poll_fn(|cx| srv.poll_ready(cx))
+            .await
+            .map_err(|e| format!("Poll service err: {:?}", e))?;
+        let resp = srv
+            .call(msg)
+            .await
+            .map_err(|e| format!("Call service err: {:?}", e))?;
+
+        let msg = bincode::serialize(&resp)?;
+        sk.send_to(&msg, from_addr).await?;
+    }
 }
 
 /// Serve multiple Store shards on `shard_listeners`.

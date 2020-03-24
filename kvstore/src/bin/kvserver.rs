@@ -1,4 +1,3 @@
-use futures_util::stream::TryStreamExt;
 use incoming::IntoIncoming;
 use slog::{info, warn};
 use std::error::Error;
@@ -38,7 +37,7 @@ fn shard_addrs(num_shards: usize, base_addr: &str) -> Vec<String> {
     addrs
 }
 
-fn tcp_shard_addrs(num_shards: usize, base_port: u16) -> Vec<String> {
+fn sk_shard_addrs(num_shards: usize, base_port: u16) -> Vec<String> {
     (0..num_shards + 1)
         .map(|i| format!("0.0.0.0:{}", base_port + (i as u16)))
         .collect()
@@ -106,23 +105,18 @@ async fn main() -> Result<(), StdError> {
         return Ok(());
     }
 
-    info!(&log, "TCP mode"; "port" => port);
+    info!(&log, "UDP mode"; "port" => port);
 
-    let ls: Result<Vec<_>, _> =
-        futures_util::future::join_all(tcp_shard_addrs(num_shards, port).into_iter().map(
-            |addr| async move {
-                let l = tokio::net::TcpListener::bind(addr).await?;
-                Ok::<_, StdError>(l.into_incoming().map_ok(|st| {
-                    st.set_nodelay(true).unwrap();
-                    st
-                }))
-            },
-        ))
-        .await
-        .into_iter()
-        .collect();
+    let ls: Result<Vec<_>, _> = futures_util::future::join_all(
+        sk_shard_addrs(num_shards, port)
+            .into_iter()
+            .map(|addr| async move { tokio::net::UdpSocket::bind(addr).await }),
+    )
+    .await
+    .into_iter()
+    .collect();
 
-    kvstore::shard_server(ls?, shard_fn).await?;
+    kvstore::shard_server_udp(ls?, shard_fn).await?;
     Ok(())
 }
 
