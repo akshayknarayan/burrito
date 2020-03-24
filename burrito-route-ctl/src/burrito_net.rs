@@ -10,7 +10,7 @@ pub mod rpc {
     tonic::include_proto!("burrito");
 }
 
-pub const CONTROLLER_ADDRESS: &str = "controller";
+pub const CONTROLLER_ADDRESS: &str = "route-controller";
 
 /// Manages the inter-container network.
 ///
