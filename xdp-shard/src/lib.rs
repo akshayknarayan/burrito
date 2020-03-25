@@ -16,7 +16,7 @@ pub fn diff_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMa
     }
 }
 
-use xdp_shard::{AvailableShards, Datarec, ShardRules};
+use xdp_shard_prog::{AvailableShards, Datarec, ShardRules};
 
 #[repr(C)]
 #[derive(Debug)]
