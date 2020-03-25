@@ -29,7 +29,7 @@ fn main() {
         .write_to_file(out_path.join("libbpf.rs"))
         .expect("Unable to write bindings");
 
-    println!("cargo:rustc-link-search=./src/libbpf/src/");
+    println!("cargo:rustc-link-search=./xdp-shard/src/libbpf/src/");
     println!("cargo:rustc-link-lib=static=bpf");
     println!("cargo:rustc-link-lib=z");
     println!("cargo:rustc-link-lib=elf");
