@@ -5,7 +5,6 @@ use slog::info;
 use std::collections::HashMap;
 use std::error::Error;
 use std::pin::Pin;
-use std::str::FromStr;
 use structopt::StructOpt;
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
@@ -37,25 +36,14 @@ struct Opt {
     interarrival_client_micros: usize,
 }
 
-fn shard_addrs(
-    num_shards: usize,
-    base_addr: &str,
-    to_uri: impl Fn(&str) -> hyper::Uri,
-) -> Vec<hyper::Uri> {
-    let mut addrs = vec![base_addr.to_owned()];
-    addrs.extend((1..num_shards + 1).map(|i| format!("{}-shard{}", base_addr, i)));
-    addrs.into_iter().map(|s| to_uri(&s)).collect()
-}
-
-fn tcp_shard_addrs(num_shards: usize, base_addr: String) -> Vec<hyper::Uri> {
-    // strip off http://
-    let base = &base_addr[7..];
-    let parts: Vec<&str> = base.split(":").collect();
+fn sk_shard_addrs(num_shards: usize, base_addr: String) -> Vec<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let parts: Vec<&str> = base_addr.split(":").collect();
     assert_eq!(parts.len(), 2);
     let base_port: u16 = parts[1].parse().expect("invalid port number");
     (0..num_shards + 1)
-        .map(|i| format!("http://{}:{}", parts[0], base_port + (i as u16)))
-        .map(|s| hyper::Uri::from_str(&s).expect("valid uri"))
+        .map(|i| format!("{}:{}", parts[0], base_port + (i as u16)))
+        .map(|s| s.to_socket_addrs().expect("valid sockaddr").next().unwrap())
         .collect()
 }
 
@@ -76,129 +64,59 @@ async fn main() -> Result<(), StdError> {
         Some(x) => x,
     };
 
-    let (mut durs, time) = if let Some(root) = opt.burrito_root {
-        // burrito mode
-        if num_shards < 2 {
-            let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
-            info!(&log, "burrito mode"; "sharding" => "server", "proto" => &opt.burrito_proto, "burrito_root" => ?root, "addr" => ?&opt.addr);
-            match opt.burrito_proto {
-                x if x == "tonic" => {
-                    let cl = burrito_addr::tonic::Client::new(root).await?;
-                    server_side_sharding(cl, addr, opt.interarrival_client_micros, loads, accesses)
-                        .await?
-                }
-                x if x == "bincode" => {
-                    let cl =
-                        burrito_addr::bincode::StaticClient::new(std::path::PathBuf::from(root))
-                            .await;
-                    server_side_sharding(cl, addr, opt.interarrival_client_micros, loads, accesses)
-                        .await?
-                }
-                x if x == "flatbuf" => {
-                    let cl =
-                        burrito_addr::flatbuf::Client::new(std::path::PathBuf::from(root)).await?;
-                    server_side_sharding(cl, addr, opt.interarrival_client_micros, loads, accesses)
-                        .await?
-                }
-                x => Err(format!("Unknown burrito protocol {:?}", &x))?,
-            }
-        } else {
-            let addrs = shard_addrs(num_shards, &opt.addr, |a| burrito_addr::Uri::new(a).into());
-            info!(&log, "burrito mode"; "sharding" => "client", "proto" => &opt.burrito_proto, "burrito_root" => ?root, "addr" => ?&addrs);
-            match opt.burrito_proto {
-                x if x == "tonic" => {
-                    let cl = burrito_addr::tonic::Client::new(root).await?;
-                    client_side_sharding(
-                        cl,
-                        addrs,
-                        opt.connections_per_client,
-                        opt.interarrival_client_micros,
-                        loads,
-                        accesses,
-                    )
-                    .await?
-                }
-                x if x == "bincode" => {
-                    let cl =
-                        burrito_addr::bincode::StaticClient::new(std::path::PathBuf::from(root))
-                            .await;
-                    client_side_sharding(
-                        cl,
-                        addrs,
-                        opt.connections_per_client,
-                        opt.interarrival_client_micros,
-                        loads,
-                        accesses,
-                    )
-                    .await?
-                }
-                x if x == "flatbuf" => {
-                    let cl =
-                        burrito_addr::flatbuf::Client::new(std::path::PathBuf::from(root)).await?;
-                    client_side_sharding(
-                        cl,
-                        addrs,
-                        opt.connections_per_client,
-                        opt.interarrival_client_micros,
-                        loads,
-                        accesses,
-                    )
-                    .await?
-                }
-                x => Err(format!("Unknown burrito protocol {:?}", &x))?,
-            }
+    let cls = if let Some(root) = opt.burrito_root {
+        // first query shard-ctl
+        let mut shardctl = burrito_shard_ctl::ShardCtlClient::new(root).await?;
+        let mut si = shardctl.query("kv").await?;
+
+        // TODO assume for now that shard_info doesn't contain burrito addresses to be resolved
+
+        // decide managed_sharding or not.
+        if num_shards > 1 {
+            // we are going to manage the sharding ourselves.
+            si.shard_addrs.clear();
         }
-    } else if opt.addr.starts_with("http") {
-        // raw tcp mode
-        let mut http = hyper::client::connect::HttpConnector::new();
-        http.set_nodelay(true);
-        if num_shards < 2 {
-            info!(&log, "TCP mode"; "addr" => ?&opt.addr, "sharding" => "server");
-            let addr: hyper::Uri = hyper::Uri::from_str(&opt.addr)?;
-            server_side_sharding(http, addr, opt.interarrival_client_micros, loads, accesses)
-                .await?
-        } else {
-            let addrs = tcp_shard_addrs(num_shards, opt.addr);
-            info!(&log, "TCP mode"; "addr" => ?&addrs, "sharding" => "client");
-            client_side_sharding(
-                http,
-                addrs,
-                opt.connections_per_client,
-                opt.interarrival_client_micros,
-                loads,
-                accesses,
-            )
-            .await?
-        }
-    } else {
-        // raw unix mode
-        if num_shards < 2 {
-            info!(&log, "UDP mode"; "addr" => ?&opt.addr, "sharding" => "server");
-            let addr: hyper::Uri = hyper_unix_connector::Uri::new(opt.addr, "/").into();
-            server_side_sharding(
-                hyper_unix_connector::UnixClient,
-                addr,
-                opt.interarrival_client_micros,
-                loads,
-                accesses,
-            )
-            .await?
-        } else {
-            let addrs = shard_addrs(num_shards, &opt.addr, |a| {
-                hyper_unix_connector::Uri::new(a, "/").into()
+
+        let mut addrs = vec![si.canonical_addr];
+        addrs.extend(si.shard_addrs.into_iter());
+
+        // make clients
+        let mut cls = Vec::with_capacity(addrs.len());
+        for a in addrs {
+            cls.push(match a {
+                burrito_shard_ctl::proto::Addr::Udp(sa) => {
+                    let sk = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+                    kvstore::Client::from(kvstore::UdpClientService::new(sk, sa).await?)
+                }
+                _ => unimplemented!(),
             });
-            info!(&log, "UDP mode"; "addr" => ?&addrs, "sharding" => "client");
-            client_side_sharding(
-                hyper_unix_connector::UnixClient,
-                addrs,
-                opt.connections_per_client,
-                opt.interarrival_client_micros,
-                loads,
-                accesses,
-            )
-            .await?
         }
+
+        cls
+    } else {
+        // there is no shardctl
+        // "guess" that the ports are sequential
+        let addrs = sk_shard_addrs(num_shards, opt.addr);
+        // make clients
+        let mut cls = Vec::with_capacity(addrs.len());
+        for sa in addrs {
+            cls.push(kvstore::Client::from({
+                let sk = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+                kvstore::UdpClientService::new(sk, sa).await?
+            }));
+        }
+
+        cls
     };
+
+    let (mut durs, time) = do_exp(
+        cls,
+        opt.connections_per_client,
+        opt.interarrival_client_micros,
+        loads,
+        accesses,
+    )
+    .await?;
 
     // done
     durs.sort();
@@ -234,22 +152,11 @@ async fn main() -> Result<(), StdError> {
     Ok(())
 }
 
-async fn do_loads<R, E, C>(
-    resolver: &mut R,
-    addr: hyper::Uri,
-    loads: Vec<Op>,
-) -> Result<(), StdError>
+async fn do_loads<S>(cl: &mut kvstore::Client<S>, loads: Vec<Op>) -> Result<(), StdError>
 where
-    R: tower_service::Service<hyper::Uri, Response = C, Error = E>,
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    E: Into<StdError>,
+    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>,
+    S::Future: 'static,
 {
-    futures_util::future::poll_fn(|cx| resolver.poll_ready(cx))
-        .await
-        .map_err(|e| e.into())?;
-    let st = resolver.call(addr.clone()).await.map_err(|e| e.into())?;
-    let mut cl = kvstore::Client::from_stream(st);
-
     // don't need to time the loads.
     for o in loads {
         tracing::trace!("starting load");
@@ -291,68 +198,54 @@ fn paced_ops_stream(
 //     |
 //     = note: consider adding a `#![type_length_limit="1606073"]` attribute to your crate
 //#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
-async fn server_side_sharding<R, E, C>(
-    mut resolver: R,
-    addr: hyper::Uri,
+async fn managed_sharding<S>(
+    mut cl: kvstore::Client<S>,
     interarrival_micros: usize,
     loads: Vec<Op>,
     accesses: Vec<Op>,
 ) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
 where
-    R: tower_service::Service<hyper::Uri, Response = C, Error = E>,
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    E: Into<StdError>,
+    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>
+        + Clone
+        + Unpin,
+    S::Future: 'static + Unpin,
 {
-    do_loads(&mut resolver, addr.clone(), loads).await?;
+    do_loads(&mut cl, loads).await?;
 
     // now, measure the accesses.
-    let st = resolver.call(addr).await.map_err(|e| e.into())?;
-    let access_by_client = group_by_client(accesses);
-    let num_clients = access_by_client.len();
-    let srv = kvstore::Client::from(tower_buffer::Buffer::new(kvstore::client(st), num_clients));
-
-    let access_by_client = access_by_client
+    let access_by_client = group_by_client(accesses)
         .into_iter()
-        .map(move |(id, ops)| (id, (vec![srv.clone()], ops)))
+        .map(move |(id, ops)| (id, (vec![cl.clone()], ops)))
         .collect();
-
     do_requests(access_by_client, interarrival_micros as u64, |_| 0).await
 }
 
 //#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
-async fn client_side_sharding<R, E, C>(
-    mut resolver: R,
-    addrs: Vec<hyper::Uri>,
+async fn do_exp<S>(
+    mut cls: Vec<kvstore::Client<S>>,
     connections_per_client: bool,
     interarrival_micros: usize,
     loads: Vec<Op>,
     accesses: Vec<Op>,
 ) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
 where
-    R: tower_service::Service<hyper::Uri, Response = C, Error = E>,
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    E: Into<StdError>,
+    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>
+        + Clone
+        + Unpin,
+    S::Future: 'static + Unpin,
 {
-    if addrs.len() == 0 {
-        Err(String::from("Need at least one address."))?;
-    } else if addrs.len() < 3 {
+    if cls.is_empty() {
+        Err(String::from("Need at least one client."))?;
+    } else if cls.len() < 3 {
         // passing only one address means no sharding, which is equivalent to server sharding.
         // two addresses is a sharder and one shard, which is the same thing.
-        let mut addrs = addrs;
-        return server_side_sharding(
-            resolver,
-            addrs.pop().unwrap(),
-            interarrival_micros,
-            loads,
-            accesses,
-        )
-        .await;
+        return managed_sharding(cls.swap_remove(0), interarrival_micros, loads, accesses).await;
     };
 
-    do_loads(&mut resolver, addrs[0].clone(), loads).await?;
+    do_loads(&mut cls[0], loads).await?;
 
     // now, measure the accesses.
-    let num_shards = addrs.len() - 1;
+    let num_shards = cls.len() - 1;
     let shard_fn = move |o: &Op| {
         use std::hash::{Hash, Hasher};
         let mut hasher = ahash::AHasher::default();
@@ -362,13 +255,6 @@ where
 
     if !connections_per_client {
         // one connection per shard
-        let mut cls = vec![];
-        for a in &addrs[1..] {
-            let st = resolver.call(a.clone()).await.map_err(|e| e.into())?;
-            let srv = tower_buffer::Buffer::new(kvstore::client(st), 100_000);
-            cls.push(kvstore::Client::from(srv));
-        }
-
         let access_by_client = group_by_client(accesses)
             .into_iter()
             .map(|(id, ops)| (id, (cls.clone(), ops)))
@@ -382,13 +268,7 @@ where
         for o in accesses {
             let k = o.client_id();
             if !access_by_client.contains_key(&k) {
-                let mut cls = vec![];
-                for a in &addrs[1..] {
-                    let st = resolver.call(a.clone()).await.map_err(|e| e.into())?;
-                    cls.push(kvstore::Client::from_stream(st));
-                }
-
-                access_by_client.insert(k, (cls, vec![o]));
+                access_by_client.insert(k, (cls.clone(), vec![o]));
             } else {
                 let v = access_by_client.get_mut(&k).unwrap();
                 v.1.push(o);
