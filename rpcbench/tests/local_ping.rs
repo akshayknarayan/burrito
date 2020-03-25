@@ -2,9 +2,9 @@ use failure::Error;
 use slog::{debug, error, trace};
 
 #[test]
-// The sleeps are unfortunate, but there's not really a way to tell when
-// a server has started serving :(
 fn local_tonic_ping() -> Result<(), Error> {
+    // The sleeps are unfortunate, but there's not really a way to tell when
+    // a server has started serving :(
     let log = test_logger();
     let mut rt = tokio::runtime::Runtime::new()?;
 
@@ -93,8 +93,9 @@ async fn start_rpcbench_flatbuf_server_burrito(log: &slog::Logger) -> Result<(),
 
     // get serving address
     let srv =
-        burrito_addr::flatbuf::Server::start("test-rpcbench", 42426, "./tmp-flatbuf-bn").await?;
-    let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
+        burrito_addr::flatbuf::Server::start("test-rpcbench", ("tcp", 42426), "./tmp-flatbuf-bn")
+            .await?;
+    let ping_srv = rpcbench::PingServer::new(rpcbench::Server::default());
 
     trace!(l2, "spawning test-rpcbench");
 
@@ -114,7 +115,7 @@ pub async fn start_flatbuf_burrito_ctl(redis_addr: &str, log: &slog::Logger) -> 
     trace!(&log, "creating"; "dir" => "./tmp-flatbuf-bn/");
     std::fs::create_dir_all("./tmp-flatbuf-bn/")?;
 
-    let bn = burrito_ctl::BurritoNet::new(
+    let bn = burrito_route_ctl::BurritoNet::new(
         Some(std::path::PathBuf::from("./tmp-flatbuf-bn/")),
         vec!["127.0.0.1".to_string()],
         redis_addr,
@@ -142,7 +143,7 @@ async fn start_rpcbench_tonic_server_burrito(log: &slog::Logger) -> Result<(), E
 
     // get serving address
     let srv = burrito_addr::tonic::Server::start("test-rpcbench", 42425, "./tmp-tonic-bn").await?;
-    let ping_srv = rpcbench::PingServer::new(rpcbench::Server);
+    let ping_srv = rpcbench::PingServer::new(rpcbench::Server::default());
 
     trace!(l2, "spawning test-rpcbench");
 
@@ -162,7 +163,7 @@ pub async fn start_tonic_burrito_ctl(redis_addr: &str, log: &slog::Logger) -> Re
     trace!(&log, "creating"; "dir" => "./tmp-tonic-bn/");
     std::fs::create_dir_all("./tmp-tonic-bn/")?;
 
-    let bn = burrito_ctl::BurritoNet::new(
+    let bn = burrito_route_ctl::BurritoNet::new(
         Some(std::path::PathBuf::from("./tmp-tonic-bn/")),
         vec!["127.0.0.1".to_string()],
         redis_addr,
