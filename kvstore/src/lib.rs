@@ -6,9 +6,13 @@ use futures_util::{
     sink::SinkExt,
     stream::{Stream, StreamExt},
 };
+use std::collections::HashMap;
 use std::error::Error;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{oneshot, Mutex};
 use tokio_tower::pipeline;
 use tower_service::Service;
 use tracing::{info, span, trace, warn, Level};
@@ -152,10 +156,6 @@ pub async fn shard_server_udp(
     let mut shards = shards;
     loop {
         let (len, from_addr) = sk.recv_from(&mut buf).await?;
-        if len > buf.len() {
-            Err(format!("Message too big: {} > {}", len, buf.len()))?;
-        }
-
         let msg = &buf[..len];
         // deserialize
         let msg: msg::Msg = bincode::deserialize(msg)?;
@@ -366,6 +366,76 @@ where
 impl<T: Clone> Clone for Client<T> {
     fn clone(&self) -> Client<T> {
         Client(self.0.clone())
+    }
+}
+
+/// A [`Service`] implementation for UdpSocket-backed connections.
+///
+/// Necessarily also includes `tower-buffer`-like functionality since UDP does not guarantee
+/// ordering.
+#[derive(Debug, Clone)]
+pub struct UdpClientService {
+    sk_write: Arc<Mutex<tokio::net::udp::SendHalf>>,
+    pending: Arc<Mutex<HashMap<usize, oneshot::Sender<msg::Msg>>>>,
+}
+
+impl UdpClientService {
+    pub async fn new(
+        sk: tokio::net::UdpSocket,
+        dest: std::net::SocketAddr,
+    ) -> Result<Self, StdError> {
+        sk.connect(dest).await?;
+        let (mut sk_read, sk_write) = sk.split();
+        let pending: Arc<Mutex<HashMap<usize, oneshot::Sender<msg::Msg>>>> = Default::default();
+        let inflight = pending.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                tokio::select!(
+                    Ok(len) = sk_read.recv(&mut buf) => {
+                        let msg = &buf[..len];
+                        let msg: msg::Msg = bincode::deserialize(msg)?;
+
+                        let mut inf = inflight.lock().await;
+                        if let Some(ch) = inf.remove(&msg.id) {
+                            ch.send(msg).unwrap();
+                        }
+                    }
+                    else => {
+                        break;
+                    }
+                )
+            }
+
+            Ok::<_, StdError>(())
+        });
+
+        Ok(Self {
+            sk_write: Arc::new(Mutex::new(sk_write)),
+            pending: Default::default(),
+        })
+    }
+}
+
+impl tower_service::Service<msg::Msg> for UdpClientService {
+    type Response = msg::Msg;
+    type Error = StdError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: msg::Msg) -> Self::Future {
+        let sk = self.sk_write.clone();
+        let pnd = self.pending.clone();
+        Box::pin(async move {
+            let msg = bincode::serialize(&req)?;
+            sk.lock().await.send(&msg).await?;
+            let (s, r) = oneshot::channel();
+            pnd.lock().await.insert(req.id, s);
+            Ok(r.await?)
+        })
     }
 }
 
