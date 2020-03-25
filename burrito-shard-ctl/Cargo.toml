@@ -16,3 +16,4 @@ redis = "0.15"
 tower-service = "0.3"
 tokio = { version = "0.2", features = ["sync", "rt-core"] }
 tracing = "0.1"
+xdp-shard = { path = "../xdp-shard" }

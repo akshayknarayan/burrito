@@ -14,6 +14,7 @@ pub mod proto;
 #[derive(Clone)]
 pub struct ShardCtl {
     shard_table: Arc<RwLock<HashMap<String, proto::ShardInfo>>>,
+    handles: Arc<Mutex<HashMap<String, Option<Vec<xdp_shard::BpfHandles>>>>>,
     redis_client: redis::Client,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
 }
@@ -28,6 +29,7 @@ impl ShardCtl {
             redis_client,
             redis_listen_connection,
             shard_table: Default::default(),
+            handles: Default::default(),
         };
 
         Ok(s)
@@ -100,17 +102,67 @@ impl ShardCtl {
             ));
         }
 
+        let r = req.clone();
         tokio::spawn(async move {
-            let r = req.clone();
             if let Err(e) = redis_insert(redis_conn, &r).await {
                 warn!(req = ?&r, err = ?e, "Could not do redis insert");
             }
         });
 
+        let shard_ports: Result<Vec<u16>, String> = req
+            .shard_addrs
+            .iter()
+            .map(|a| match a {
+                proto::Addr::Tcp(s) | proto::Addr::Udp(s) => Ok(s.port()),
+                x => Err(format!("Addr must be tcp or udp for sharding: {:?}", x)),
+            })
+            .collect();
+        let shard_ports = match shard_ports {
+            Ok(s) => s,
+            Err(s) => return proto::RegisterShardReply::Err(s),
+        };
+
+        if let proto::Addr::Udp(sk) = req.canonical_addr {
+            let handles = xdp_shard::BpfHandles::load_on_address(sk);
+            let mut handles = match handles {
+                Ok(s) => s,
+                Err(e) => {
+                    return proto::RegisterShardReply::Err(format!(
+                        "Error loading xdp-shard on address: {:?}",
+                        e
+                    ))
+                }
+            };
+
+            for h in handles.iter_mut() {
+                let ok = h.shard_ports(
+                    sk.port(),
+                    &shard_ports[..],
+                    req.shard_info.packet_data_offset,
+                    req.shard_info.packet_data_length,
+                );
+                match ok {
+                    Ok(_) => (),
+                    Err(e) => {
+                        return proto::RegisterShardReply::Err(format!(
+                            "Error writing xdp-shard ports: {:?}",
+                            e
+                        ))
+                    }
+                }
+            }
+
+            // can't drop handles or the program will get removed
+            let mut map = self.handles.lock().await;
+            let x = map.get_mut(&req.service_name).unwrap();
+            *x = Some(handles);
+        }
+
         proto::RegisterShardReply::Ok
     }
 
     pub async fn query(&self, req: proto::QueryShardRequest) -> proto::QueryShardReply {
+        // TODO if necessary, install client-side xdp program
         if let Some(s) = self.shard_table.read().await.get(&req.service_name) {
             proto::QueryShardReply::Ok(s.clone())
         } else {

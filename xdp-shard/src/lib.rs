@@ -126,12 +126,12 @@ pub struct BpfHandles {
 }
 
 impl BpfHandles {
-    /// Load xdp_port XDP program onto the given interface.
+    /// Load xdp_shard XDP program onto the given interface.
     pub fn load_on_interface_name(interface_name: &str) -> Result<Self, StdError> {
         BpfHandles::load_on_interface_id(get_interface_id(interface_name)?)
     }
 
-    /// Load xdp_port XDP program onto the given interface id.
+    /// Load xdp_shard XDP program onto the given interface id.
     pub fn load_on_interface_id(interface_id: u32) -> Result<Self, StdError> {
         let bpf_filename = concat!(env!("OUT_DIR"), "/xdp_shard.o\0");
 
@@ -199,10 +199,36 @@ impl BpfHandles {
         Ok(this)
     }
 
+    /// Load xdp_shard XDP program onto all the interfaces matching the given socket address.
+    ///
+    /// Returns a list of BpfHandles, one per matching interface.
+    pub fn load_on_address(serv_addr: std::net::SocketAddr) -> Result<Vec<Self>, StdError> {
+        use nix::ifaddrs;
+        let ifaddrs = ifaddrs::getifaddrs()?
+            .filter_map(|a| match a {
+                ifaddrs::InterfaceAddress {
+                    interface_name,
+                    address: Some(nix::sys::socket::SockAddr::Inet(if_addr)),
+                    ..
+                } if if_addr.port() == serv_addr.port()
+                    && (serv_addr.ip().is_unspecified()
+                        || serv_addr.ip() == if_addr.ip().to_std()) =>
+                {
+                    Some(interface_name)
+                }
+                _ => None,
+            })
+            .map(|if_name| Self::load_on_interface_name(&if_name))
+            .collect();
+
+        ifaddrs
+    }
+
     /// Define the set of sharding ports.
     ///
     /// By default, the shards map is empty and xdp_port will not rewrite port numbers, only log.
     /// Setting this will define a set of ports that xdp_port will shard between.
+    /// Both the TCP and UDP `orig_port`s will be sharded to the respective ports.
     ///
     /// Note: It is not safe to call this concurrently, so it takes `&mut` self even though it would
     /// compile (unsafely) taking `&self`.
