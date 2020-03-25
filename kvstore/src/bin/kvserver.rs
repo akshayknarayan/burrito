@@ -1,5 +1,5 @@
 use incoming::IntoIncoming;
-use slog::{info, warn};
+use slog::{debug, info, warn};
 use std::error::Error;
 use structopt::StructOpt;
 use tracing_timing::{Builder, Histogram};
@@ -54,6 +54,8 @@ async fn main() -> Result<(), StdError> {
     if opt.log {
         write_tracing(&log);
     }
+
+    tracing_subscriber::fmt::init();
 
     let num_shards = match opt.num_shards {
         None | Some(1) => 0, // having 1 shard is pointless, same as 0, might as well avoid the extra channel sends.
@@ -129,11 +131,15 @@ async fn main() -> Result<(), StdError> {
         },
     };
 
-    // register the shards
-    let mut shardctl = ShardCtlClient::new(&opt.burrito_root).await?;
-    shardctl.register(si).await?;
+    debug!(&log, "Registering shard"; "si" => ?&si);
 
-    info!(&log, "UDP mode"; "port" => port);
+    // register the shards
+    {
+        let mut shardctl = ShardCtlClient::new(&opt.burrito_root).await?;
+        shardctl.register(si).await?;
+    } // drop shardctl connection
+
+    info!(&log, "Listening on UDP"; "port" => port);
 
     let ls: Result<Vec<_>, _> = futures_util::future::join_all(
         addrs

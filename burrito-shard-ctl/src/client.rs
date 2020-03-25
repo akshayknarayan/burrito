@@ -1,6 +1,7 @@
 use anyhow::Error;
 use std::path::Path;
 use std::pin::Pin;
+use tracing::trace;
 
 use crate::{proto, CONTROLLER_ADDRESS};
 
@@ -42,6 +43,8 @@ impl ShardCtlClient {
         })
         .await?;
 
+        trace!("wait for response");
+
         // now wait for the response
         match self.uc.next().await {
             Some(Ok(proto::Reply::Register(proto::RegisterShardReply::Ok))) => Ok(()),
@@ -56,6 +59,8 @@ impl ShardCtlClient {
 
     pub async fn query(&mut self, req: &str) -> Result<proto::ShardInfo, Error> {
         use futures_util::{sink::Sink, stream::StreamExt};
+
+        trace!("poll_ready");
         futures_util::future::poll_fn(|cx| {
             let pst = Pin::new(&mut self.uc);
             pst.poll_ready(cx)
@@ -63,10 +68,12 @@ impl ShardCtlClient {
         .await?;
 
         let pst = Pin::new(&mut self.uc);
+        trace!("start_send");
         pst.start_send(proto::Request::Query(proto::QueryShardRequest {
             service_name: req.into(),
         }))?;
 
+        trace!("poll_flush");
         futures_util::future::poll_fn(|cx| {
             let pst = Pin::new(&mut self.uc);
             pst.poll_flush(cx)
@@ -74,6 +81,7 @@ impl ShardCtlClient {
         .await?;
 
         // now wait for the response
+        trace!("wait for response");
         match self.uc.next().await {
             Some(Ok(proto::Reply::Query(proto::QueryShardReply::Ok(si)))) => Ok(si),
             Some(Ok(proto::Reply::Query(proto::QueryShardReply::Err(e)))) => {

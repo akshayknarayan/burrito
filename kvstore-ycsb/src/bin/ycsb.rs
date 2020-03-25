@@ -1,11 +1,11 @@
 use async_timer as hrtimer;
 use core::task::{Context, Poll};
 use kvstore_ycsb::{ops, Op};
-use slog::info;
 use std::collections::HashMap;
 use std::error::Error;
 use std::pin::Pin;
 use structopt::StructOpt;
+use tracing::{debug, info, trace};
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -49,15 +49,14 @@ fn sk_shard_addrs(num_shards: usize, base_addr: String) -> Vec<std::net::SocketA
 
 #[tokio::main]
 async fn main() -> Result<(), StdError> {
-    let log = burrito_util::logger();
     let opt = Opt::from_args();
 
-    if let None = opt.out_file {
-        tracing_subscriber::fmt::init();
-    }
+    tracing_subscriber::fmt::init();
 
+    trace!("reading workload");
     let loads = ops(opt.accesses.with_extension("load"))?;
     let accesses = ops(opt.accesses)?;
+    debug!(num_ops = ?accesses.len(), "done reading workload");
 
     let num_shards = match opt.num_shards {
         None | Some(1) => 0, // having 1 shard is pointless, same as 0, might as well avoid the extra channel sends.
@@ -65,9 +64,11 @@ async fn main() -> Result<(), StdError> {
     };
 
     let cls = if let Some(root) = opt.burrito_root {
+        debug!(root = ?&root, "Burrito mode");
         // first query shard-ctl
         let mut shardctl = burrito_shard_ctl::ShardCtlClient::new(root).await?;
-        let mut si = shardctl.query("kv").await?;
+        debug!(service_addr = ?&opt.addr, "Querying");
+        let mut si = shardctl.query(&opt.addr).await?;
 
         // TODO assume for now that shard_info doesn't contain burrito addresses to be resolved
 
@@ -79,6 +80,8 @@ async fn main() -> Result<(), StdError> {
 
         let mut addrs = vec![si.canonical_addr];
         addrs.extend(si.shard_addrs.into_iter());
+
+        debug!(addrs = ?&addrs, "Queried shard");
 
         // make clients
         let mut cls = Vec::with_capacity(addrs.len());
@@ -127,8 +130,11 @@ async fn main() -> Result<(), StdError> {
         .map(|q| (len * q) as usize)
         .map(|i| durs[i])
         .collect();
-    info!(&log, "Did accesses"; "num" => ?&durs.len(), "elapsed" => ?time,
-        "min" => ?durs[0], "p25" => ?quantiles[0], "p50" => ?quantiles[1], "p75" => ?quantiles[2], "p95" => ?quantiles[3], "max" => ?durs[durs.len() - 1],
+    info!(
+        num = ?&durs.len(), elapsed = ?time, min = ?durs[0],
+        p25 = ?quantiles[0], p50 = ?quantiles[1], p75 = ?quantiles[2],
+        p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
+        "Did accesses"
     );
 
     if let Some(f) = opt.out_file {
@@ -159,13 +165,13 @@ where
 {
     // don't need to time the loads.
     for o in loads {
-        tracing::trace!("starting load");
+        trace!("starting load");
         match o {
             Op::Get(_, k) => cl.get(k).await?,
             Op::Update(_, k, v) => cl.update(k, v).await?,
         };
 
-        tracing::trace!("finished load");
+        trace!("finished load");
     }
 
     Ok(())
@@ -414,13 +420,13 @@ where
             let mut pending = PendingServices::new(cls);
             let shard_fn = &shard_fn;
             async move {
-                tracing::info!(id = client_id, "starting");
+                debug!(id = client_id, "starting");
                 loop {
                     tokio::select!(
                         Some((_, o)) = ops.next() => {
                             let shard = shard_fn(&o);
                             pending.push(shard, o);
-                            tracing::trace!(id = client_id, inflight = inflight.len(), shard_id = shard, pending = pending.len(shard), "new request");
+                            trace!(id = client_id, inflight = inflight.len(), shard_id = shard, pending = pending.len(shard), "new request");
                         }
                         Some(Ok((then, fut))) = pending.next() => {
                             inflight.push(async move {
@@ -429,11 +435,11 @@ where
                             });
                         }
                         Some(Ok(d)) = inflight.next() => {
-                            tracing::trace!(id = client_id, inflight = inflight.len(), "request done");
+                            trace!(id = client_id, inflight = inflight.len(), "request done");
                             durs.push(d);
                         }
                         else => {
-                            tracing::debug!(id = client_id, completed = durs.len(), "finished requests");
+                            info!(id = client_id, completed = durs.len(), "finished requests");
                             break;
                         }
                     );
@@ -441,7 +447,7 @@ where
                     // This can't be inside the select because then else would never be
                     // triggered.
                     if *done.borrow() {
-                        tracing::debug!(id = client_id, completed = durs.len(), "stopping");
+                        debug!(id = client_id, completed = durs.len(), "stopping");
                         break; // the first client finished. stop.
                     }
                 }
@@ -456,13 +462,13 @@ where
     let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
     assert!(!durs.is_empty());
     let access_end = access_start.elapsed();
-    tracing::debug!("broadcasting done");
+    info!("broadcasting done");
     done_tx.broadcast(true)?;
 
     // collect all the requests that have completed.
     let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
     assert!(!rest_durs.is_empty());
-    tracing::debug!("all clients reported");
+    info!("all clients reported");
     durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
     Ok((durs, access_end))
 }

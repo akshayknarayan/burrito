@@ -10,15 +10,12 @@ edition = "2018"
 burrito-addr = {path = "../burrito-addr"}
 burrito-route-ctl = {path = "../burrito-route-ctl"}
 burrito-shard-ctl = {path = "../burrito-shard-ctl"}
-burrito-util = {path = "../burrito-util"}
 futures-util = "0.3"
 hyper-unix-connector = "0.1.4"
 hyper = {version = "0.13", features = ["stream"]}
 incoming = "0.1"
 kvstore = {path = "../kvstore"}
 pin-project = "0.4"
-slog = "2"
-slog-term = "2"
 structopt = "0.3"
 tokio = {version = "0.2.11", features = ["full"]}
 async-timer = { version = "0.7", features = ["stream", "tokio_on"] }

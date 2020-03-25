@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{oneshot, Mutex};
 use tokio_tower::pipeline;
 use tower_service::Service;
-use tracing::{info, span, trace, warn, Level};
+use tracing::{debug, error, info, span, trace, warn, Level};
 use tracing_futures::Instrument;
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
@@ -106,6 +106,8 @@ pub async fn shard_server_udp(
         // deserialize
         let msg: msg::Msg = bincode::deserialize(msg)?;
 
+        trace!(req = ?&msg.id, "serviceing request");
+
         futures_util::future::poll_fn(|cx| srv.poll_ready(cx))
             .await
             .map_err(|e| format!("Poll service err: {:?}", e))?;
@@ -146,6 +148,7 @@ pub async fn shard_server_udp(
     // ignore `shard_fn`.
     if shards.is_empty() {
         let mut srv = Store::default();
+        info!("Serving one shard");
         loop {
             if let Err(e) = serve_one_udp(&mut sk, &mut srv, &mut buf[..]).await {
                 warn!(err = ?e, "Error serving request");
@@ -395,13 +398,23 @@ impl UdpClientService {
                     Ok(len) = sk_read.recv(&mut buf) => {
                         let msg = &buf[..len];
                         let msg: msg::Msg = bincode::deserialize(msg)?;
+                        trace!(msg = ?&msg, "got response");
 
                         let mut inf = inflight.lock().await;
                         if let Some(ch) = inf.remove(&msg.id) {
-                            ch.send(msg).unwrap();
+                            let id = msg.id;
+                            // it's possible for the receiver to have hung up, if the service was
+                            // dropped. In this case ignore.
+                            if let Err(_) = ch.send(msg) {
+                                trace!(id, "Msg send failed");
+                            }
+                        } else {
+                            // we got a response to a message we don't remember sending.
+                            trace!(id = msg.id, table = ?&inf, "no match");
                         }
                     }
                     else => {
+                        debug!("UdpClientService loop exiting");
                         break;
                     }
                 )
@@ -412,7 +425,7 @@ impl UdpClientService {
 
         Ok(Self {
             sk_write: Arc::new(Mutex::new(sk_write)),
-            pending: Default::default(),
+            pending,
         })
     }
 }
@@ -430,11 +443,22 @@ impl tower_service::Service<msg::Msg> for UdpClientService {
         let sk = self.sk_write.clone();
         let pnd = self.pending.clone();
         Box::pin(async move {
+            trace!(id = req.id, "sending request");
             let msg = bincode::serialize(&req)?;
             sk.lock().await.send(&msg).await?;
             let (s, r) = oneshot::channel();
             pnd.lock().await.insert(req.id, s);
-            Ok(r.await?)
+            match tokio::time::timeout(std::time::Duration::from_secs(10), r).await {
+                Err(_) => {
+                    error!(
+                        id = req.id,
+                        pending = ?*pnd.lock().await,
+                        "Request timed out. Dropped?"
+                    );
+                    panic!("Request timed out.");
+                }
+                Ok(x) => Ok(x?),
+            }
         })
     }
 }

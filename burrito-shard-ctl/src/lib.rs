@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{trace, warn};
+use tracing::{debug, info, trace, warn};
 
 pub const CONTROLLER_ADDRESS: &str = "shard-controller";
 mod client;
@@ -49,27 +49,40 @@ impl ShardCtl {
         tokio::spawn(listen_updates(self.shard_table.clone(), con));
 
         sk.for_each_concurrent(None, |st| async {
+            let st = st.expect("accept failed");
+            let peer = st.peer_addr();
             let st: async_bincode::AsyncBincodeStream<_, proto::Request, proto::Reply, _> =
-                st.expect("accept failed").into();
+                st.into();
             let mut st = st.for_async();
             loop {
                 let req = st.next().await;
+                match req {
+                    Some(Err(e)) => {
+                        warn!(err = ?e, "Error processing message");
+                        break;
+                    }
+                    None => {
+                        trace!("st.next() gave None");
+                        break;
+                    }
+                    _ => (),
+                }
+
                 let rep = async {
                     match req {
                         Some(Ok(proto::Request::Register(si))) => {
                             let rep = self.register(si).await;
-                            Ok(proto::Reply::Register(rep))
+                            proto::Reply::Register(rep)
                         }
                         Some(Ok(proto::Request::Query(sa))) => {
                             let rep = self.query(sa).await;
-                            Ok(proto::Reply::Query(rep))
+                            proto::Reply::Query(rep)
                         }
-                        Some(Err(e)) => Err(anyhow::Error::from(e)),
-                        None => Err(anyhow::anyhow!("Stream done")),
+                        _ => unreachable!(),
                     }
                 };
 
-                let (rep, rdy): (Result<proto::Reply, Error>, _) = futures_util::future::join(
+                let (rep, rdy): (proto::Reply, _) = futures_util::future::join(
                     rep,
                     futures_util::future::poll_fn(|cx| {
                         let pst = Pin::new(&mut st);
@@ -77,15 +90,22 @@ impl ShardCtl {
                     }),
                 )
                 .await;
-                rdy.unwrap();
+                rdy.expect("poll_ready");
 
-                if let Err(_) = rep {
-                    break;
-                }
-
+                trace!(response = ?&rep, "start_send");
                 let pst = Pin::new(&mut st);
-                pst.start_send(rep.unwrap()).unwrap();
+                pst.start_send(rep).expect("start_send");
+
+                trace!("poll_flush");
+                futures_util::future::poll_fn(|cx| {
+                    let pst = Pin::new(&mut st);
+                    pst.poll_flush(cx)
+                })
+                .await
+                .expect("poll_flush");
             }
+
+            debug!(client = ?peer, "Stream done");
         })
         .await;
         Ok(())
@@ -102,12 +122,18 @@ impl ShardCtl {
             ));
         }
 
+        debug!(req = ?&req, "Registered shard");
+
         let r = req.clone();
         tokio::spawn(async move {
             if let Err(e) = redis_insert(redis_conn, &r).await {
                 warn!(req = ?&r, err = ?e, "Could not do redis insert");
             }
         });
+
+        if req.shard_addrs.is_empty() {
+            return proto::RegisterShardReply::Ok;
+        }
 
         let shard_ports: Result<Vec<u16>, String> = req
             .shard_addrs
@@ -134,6 +160,8 @@ impl ShardCtl {
                 }
             };
 
+            info!(service = ?req.canonical_addr, "Loaded XDP program");
+
             for h in handles.iter_mut() {
                 let ok = h.shard_ports(
                     sk.port(),
@@ -152,10 +180,11 @@ impl ShardCtl {
                 }
             }
 
+            info!(service = ?req.canonical_addr, "Registered sharding with XDP program");
+
             // can't drop handles or the program will get removed
             let mut map = self.handles.lock().await;
-            let x = map.get_mut(&req.service_name).unwrap();
-            *x = Some(handles);
+            map.insert(req.service_name, Some(handles));
         }
 
         proto::RegisterShardReply::Ok
