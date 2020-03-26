@@ -19,6 +19,9 @@ struct Opt {
     port: Option<u16>,
 
     #[structopt(short, long)]
+    ip_addr: Option<std::net::IpAddr>,
+
+    #[structopt(short, long)]
     num_shards: Option<usize>,
 
     #[structopt(long, default_value = "/tmp/burrito")]
@@ -37,13 +40,14 @@ fn shard_addrs(num_shards: usize, base_addr: &str) -> Vec<String> {
     addrs
 }
 
-fn sk_shard_addrs(num_shards: usize, base_port: u16) -> Vec<std::net::SocketAddr> {
+fn sk_shard_addrs(
+    ip_addr: Option<std::net::IpAddr>,
+    num_shards: usize,
+    base_port: u16,
+) -> Vec<std::net::SocketAddr> {
+    let ip_addr = ip_addr.unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     (0..num_shards + 1)
-        .map(|i| {
-            format!("0.0.0.0:{}", base_port + (i as u16))
-                .parse()
-                .expect("valid socket addr")
-        })
+        .map(|i| std::net::SocketAddr::new(ip_addr, base_port + i as u16))
         .collect()
 }
 
@@ -114,7 +118,7 @@ async fn main() -> Result<(), StdError> {
         return Ok(());
     }
 
-    let addrs = sk_shard_addrs(num_shards, port);
+    let addrs = sk_shard_addrs(opt.ip_addr, num_shards, port);
 
     use burrito_shard_ctl::{
         proto::{self, ShardInfo},
