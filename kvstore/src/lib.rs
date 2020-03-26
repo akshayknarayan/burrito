@@ -379,10 +379,10 @@ impl<T: Clone> Clone for Client<T> {
 #[derive(Debug, Clone)]
 pub struct UdpClientService {
     sk_write: Arc<Mutex<tokio::net::udp::SendHalf>>,
-    pending: Arc<Mutex<HashMap<usize, oneshot::Sender<msg::Msg>>>>,
+    pending_msg: tokio::sync::mpsc::Sender<(usize, oneshot::Sender<msg::Msg>)>,
 }
 
-// Alternate way to do this without a Mutex<HashMap>: send all received messages on a broadcast channel.
+// Way with just one channel: send all received messages on a broadcast channel.
 // Each request future has a listener on the broadcast channel, and discards any message that
 // doesn't correspond to its request. Disadvantage is the response message will get cloned once per receiver.
 impl UdpClientService {
@@ -392,33 +392,41 @@ impl UdpClientService {
     ) -> Result<Self, StdError> {
         sk.connect(dest).await?;
         let (mut sk_read, sk_write) = sk.split();
-        let pending: Arc<Mutex<HashMap<usize, oneshot::Sender<msg::Msg>>>> = Default::default();
-        let inflight = pending.clone();
+        let (pending_msg, mut new_req) =
+            tokio::sync::mpsc::channel::<(usize, oneshot::Sender<msg::Msg>)>(1_000);
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            let mut recvd = vec![];
+            // if new_req.recv() happened first, store the oneshot here.
+            let mut inflight: HashMap<usize, oneshot::Sender<msg::Msg>> = Default::default();
+            // if sk_read.recv() happened first, store the message here.
+            let mut recvd: HashMap<usize, msg::Msg> = Default::default();
             loop {
                 tokio::select!(
                     Ok(len) = sk_read.recv(&mut buf) => {
                         let msg = &buf[..len];
                         let msg: msg::Msg = bincode::deserialize(msg)?;
                         trace!(msg = ?&msg, "got response");
-                        recvd.push(msg);
-                    }
-                    inf = inflight.lock(), if !recvd.is_empty() => {
-                        let mut inf = inf;
-                        for msg in recvd.drain(..) {
-                            if let Some(ch) = inf.remove(&msg.id) {
-                                let id = msg.id;
-                                // it's possible for the receiver to have hung up, if the service was
-                                // dropped. In this case ignore.
-                                if let Err(_) = ch.send(msg) {
-                                    trace!(id, "Msg send failed");
-                                }
-                            } else {
-                                // we got a response to a message we don't remember sending.
-                                trace!(id = msg.id, table = ?&inf, "no match");
+                        if let Some(ch) = inflight.remove(&msg.id) {
+                            let id = msg.id;
+                            // it's possible for the receiver to have hung up, if the service was
+                            // dropped. In this case ignore.
+                            if let Err(_) = ch.send(msg) {
+                                trace!(id, "Msg send failed");
                             }
+                        } else {
+                            // put it in recvd.
+                            recvd.insert(msg.id, msg);
+                        }
+                    }
+                    Some((id, ch)) = new_req.recv() => {
+                        if let Some(msg) = recvd.remove(&id) {
+                            // it's possible for the receiver to have hung up, if the service was
+                            // dropped. In this case ignore.
+                            if let Err(_) = ch.send(msg) {
+                                trace!(id, "Msg send failed");
+                            }
+                        } else {
+                            inflight.insert(id, ch);
                         }
                     }
                     else => {
@@ -433,7 +441,7 @@ impl UdpClientService {
 
         Ok(Self {
             sk_write: Arc::new(Mutex::new(sk_write)),
-            pending,
+            pending_msg,
         })
     }
 }
@@ -449,20 +457,16 @@ impl tower_service::Service<msg::Msg> for UdpClientService {
 
     fn call(&mut self, req: msg::Msg) -> Self::Future {
         let sk = self.sk_write.clone();
-        let pnd = self.pending.clone();
+        let mut pnd = self.pending_msg.clone();
         Box::pin(async move {
             trace!(id = req.id, "sending request");
             let msg = bincode::serialize(&req)?;
             sk.lock().await.send(&msg).await?;
             let (s, r) = oneshot::channel();
-            pnd.lock().await.insert(req.id, s);
+            pnd.send((req.id, s)).await?;
             match tokio::time::timeout(std::time::Duration::from_secs(10), r).await {
                 Err(_) => {
-                    error!(
-                        id = req.id,
-                        pending = ?*pnd.lock().await,
-                        "Request timed out. Dropped?"
-                    );
+                    error!(id = req.id, "Request timed out. Dropped?");
                     panic!("Request timed out.");
                 }
                 Ok(x) => Ok(x?),
