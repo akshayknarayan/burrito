@@ -183,7 +183,7 @@ def start_server(conn, outf, shards=0):
     check(ok, "make cpuset", conn.addr)
 
     shard_arg = f"-n {shards}" if shards > 0 else ""
-    ok = conn.run(f"cset shield --userset=kv --exec ./target/release/kvserver -- -p 4242 {shard_arg}",
+    ok = conn.run(f"cset shield --userset=kv --exec ./target/release/kvserver -- -i {conn.addr} -p 4242 {shard_arg}",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -216,7 +216,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
     shard_arg = f"-n {clientsharding}" if clientsharding > 0 else ""
 
     conn.run(f"cset shield --userset=kv --exec ./target/release/ycsb -- \
-            --addr \"http://{server}:4242\" \
+            --addr \"kv\" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb-100.access \
             -o {outf}.data \
             {shard_arg} \
@@ -228,7 +228,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
             stderr=f"{outf}.err",
             )
     ok = conn.run(f"./target/release/ycsb \
-            --addr \"http://{server}:4242\" \
+            --addr \"kv\" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb2-100.access \
             -o {outf}2.data \
             {shard_arg} \
