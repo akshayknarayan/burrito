@@ -1,5 +1,4 @@
-use incoming::IntoIncoming;
-use slog::{debug, info, warn};
+use slog::{debug, info};
 use std::error::Error;
 use structopt::StructOpt;
 use tracing_timing::{Builder, Histogram};
@@ -10,13 +9,7 @@ type StdError = Box<dyn Error + Send + Sync + 'static>;
 #[structopt(name = "kvserver")]
 struct Opt {
     #[structopt(short, long)]
-    unix_addr: Option<std::path::PathBuf>,
-
-    #[structopt(long)]
-    burrito_addr: Option<String>,
-
-    #[structopt(short, long)]
-    port: Option<u16>,
+    port: u16,
 
     #[structopt(short, long)]
     ip_addr: Option<std::net::IpAddr>,
@@ -24,20 +17,17 @@ struct Opt {
     #[structopt(short, long)]
     num_shards: Option<usize>,
 
-    #[structopt(long, default_value = "/tmp/burrito")]
-    burrito_root: String,
+    #[structopt(long)]
+    burrito_root: Option<std::path::PathBuf>,
+
+    #[structopt(long)]
+    burrito_addr: Option<String>,
 
     #[structopt(long, default_value = "flatbuf")]
     burrito_proto: String,
 
     #[structopt(short, long)]
     log: bool,
-}
-
-fn shard_addrs(num_shards: usize, base_addr: &str) -> Vec<String> {
-    let mut addrs = vec![base_addr.to_owned()];
-    addrs.extend((1..num_shards + 1).map(|i| format!("{}-shard{}", base_addr, i)));
-    addrs
 }
 
 fn sk_shard_addrs(
@@ -66,6 +56,7 @@ async fn main() -> Result<(), StdError> {
         Some(x) => x,
     };
     let shard_fn = move |m: &kvstore::Msg| {
+        // TODO update to match FNV function in xdp program
         use std::hash::{Hash, Hasher};
         let mut hasher = ahash::AHasher::default();
         m.key().hash(&mut hasher);
@@ -74,74 +65,35 @@ async fn main() -> Result<(), StdError> {
 
     info!(&log, "KV Server");
 
-    if let Some(path) = opt.unix_addr {
-        info!(&log, "UDS mode"; "addr" => ?&path);
-        let ls: Result<Vec<_>, StdError> = shard_addrs(num_shards, path.to_str().unwrap())
-            .into_iter()
-            .map(|path| Ok(tokio::net::UnixListener::bind(&path)?.into_incoming()))
-            .collect();
-        kvstore::shard_server(ls?, shard_fn).await?;
-        return Ok(());
-    }
-
-    if opt.port.is_none() {
-        warn!(&log, "Must specify port if not using unix address");
-        Err(format!("Must specify port if not using unix address"))?
-    }
-
-    let port = opt.port.unwrap();
-
-    if let Some(addr) = opt.burrito_addr {
-        let root = opt.burrito_root.clone();
-        let addrs = shard_addrs(num_shards, &addr)
-            .into_iter()
-            .zip((0..num_shards + 1).map(|x| port + (x as u16)))
-            .zip(std::iter::repeat(opt.burrito_root));
-        match opt.burrito_proto {
-            x if x == "flatbuf" => {
-                info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&root, "addr" => ?&addr, "tcp port" => port);
-                // register the addrs
-                let ls: Result<Vec<_>, StdError> =
-                    futures_util::future::join_all(addrs.map(|((a, p), root)| async move {
-                        Ok(burrito_addr::flatbuf::Server::start(&a, ("tcp", p), &root).await?)
-                    }))
-                    .await
-                    .into_iter()
-                    .collect();
-                let ls = ls?;
-
-                kvstore::shard_server(ls, shard_fn).await?;
-            }
-            x => Err(format!("Unknown burrito protocol {:?}", &x))?,
-        };
-
-        return Ok(());
-    }
-
+    let port = opt.port;
     let addrs = sk_shard_addrs(opt.ip_addr, num_shards, port);
 
-    use burrito_shard_ctl::{
-        proto::{self, ShardInfo},
-        ShardCtlClient,
-    };
+    if let Some(burrito_root) = opt.burrito_root {
+        use burrito_shard_ctl::{
+            proto::{self, ShardInfo},
+            ShardCtlClient,
+        };
 
-    let si = ShardInfo {
-        service_name: "kv".into(),
-        canonical_addr: proto::Addr::Udp(addrs[0]),
-        shard_addrs: addrs[1..].iter().map(|a| proto::Addr::Udp(*a)).collect(),
-        shard_info: proto::SimpleShardPolicy {
-            packet_data_offset: 18,
-            packet_data_length: 4,
-        },
-    };
+        let si = ShardInfo {
+            service_name: "kv".into(),
+            canonical_addr: proto::Addr::Udp(addrs[0]),
+            shard_addrs: addrs[1..].iter().map(|a| proto::Addr::Udp(*a)).collect(),
+            shard_info: proto::SimpleShardPolicy {
+                packet_data_offset: 18,
+                packet_data_length: 4,
+            },
+        };
 
-    debug!(&log, "Registering shard"; "si" => ?&si);
+        debug!(&log, "Registering shard"; "si" => ?&si);
 
-    // register the shards
-    {
-        let mut shardctl = ShardCtlClient::new(&opt.burrito_root).await?;
-        shardctl.register(si).await?;
-    } // drop shardctl connection
+        // register the shards
+        {
+            let mut shardctl = ShardCtlClient::new(&burrito_root).await?;
+            shardctl.register(si).await?;
+        } // drop shardctl connection
+
+        info!(&log, "Registered shard-server"; "canonical_addr" => ?addrs[0], "shard_addrs" => ?&addrs[1..]);
+    }
 
     info!(&log, "Listening on UDP"; "port" => port);
 
