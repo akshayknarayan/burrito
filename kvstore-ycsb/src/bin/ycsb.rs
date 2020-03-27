@@ -73,7 +73,7 @@ async fn main() -> Result<(), StdError> {
         // TODO assume for now that shard_info doesn't contain burrito addresses to be resolved
 
         // decide managed_sharding or not.
-        if num_shards > 1 {
+        if num_shards < 1 {
             // we are going to manage the sharding ourselves.
             si.shard_addrs.clear();
         }
@@ -81,7 +81,7 @@ async fn main() -> Result<(), StdError> {
         let mut addrs = vec![si.canonical_addr];
         addrs.extend(si.shard_addrs.into_iter());
 
-        debug!(addrs = ?&addrs, "Queried shard");
+        debug!(addrs = ?&addrs, num_shards, "Queried shard");
 
         // make clients
         let mut cls = Vec::with_capacity(addrs.len());
