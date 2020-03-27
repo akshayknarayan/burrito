@@ -172,7 +172,7 @@ def setup(conn, outdir):
     check(ok, "build", conn.addr)
     return conn
 
-def start_server(conn, outf, shards=0):
+def start_server(conn, outf, shards=0, use_burrito_shard=True):
     conn.run("sudo pkill -9 kvserver")
 
     #ok = conn.run("cset shield --userset=kv --reset", sudo=True)
@@ -183,7 +183,8 @@ def start_server(conn, outf, shards=0):
     #check(ok, "make cpuset", conn.addr)
 
     shard_arg = f"-n {shards}" if shards > 0 else ""
-    ok = conn.run(f"./target/release/kvserver -i {conn.addr} -p 4242 {shard_arg}",
+    burrito_shard_arg = f"" if use_burrito_shard else "--no-shard-ctl"
+    ok = conn.run(f"./target/release/kvserver -i {conn.addr} -p 4242 {shard_arg} {burrito_shard_arg}",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -225,7 +226,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
     conn.run(f"cset shield --userset=kv --exec ./target/release/ycsb -- \
             --burrito-root=/tmp/burrito \
             --addr \"kv\" \
-            --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb-100.access \
+            --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access \
             -o {outf}.data \
             {shard_arg} \
             -i {interarrival}",
@@ -316,14 +317,22 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    start_server(machines[0], server_prefix, shards=num_shards)
+    if shardtype == "xdpserver":
+        start_server(machines[0], server_prefix, shards=num_shards)
+    elif shardtype == "client" or shardtype == "server":
+        start_server(machines[0], server_prefix, shards=num_shards, use_burrito_shard=False)
+    else:
+        assert(False)
 
     # others are clients
     agenda.subtask("starting clients")
     if shardtype == "client":
         clients = [threading.Thread(target=run_client, args=(m, server_addr, interarrival_us, outf), kwargs={'clientsharding':num_shards}) for m in machines[1:]]
-    else:
+    elif shardtype == "xdpserver" or shardtype == "server":
         clients = [threading.Thread(target=run_client, args=(m, server_addr, interarrival_us, outf)) for m in machines[1:]]
+    else:
+        assert(False)
+
     [t.start() for t in clients]
     [t.join() for t in clients]
     agenda.task("done")
@@ -381,7 +390,7 @@ if __name__ == '__main__':
     if args.shardtype is None:
         args.shardtype = ['server']
     for t in args.shardtype:
-        if t not in ['client', 'server']:
+        if t not in ['client', 'server', 'xdpserver']:
             agenda.failure(f"Unknown shardtype {t}")
             sys.exit(1)
 
