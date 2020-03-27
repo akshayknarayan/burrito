@@ -204,7 +204,7 @@ def start_server(conn, outf, shards=0, use_burrito_shard=True):
 
 # one machine can handle 2 client processes
 def run_client(conn, server, interarrival, outf, clientsharding=0):
-    if not conn.file_exists("~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb-100.access"):
+    if not conn.file_exists("~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access"):
         agenda.failure(f"No ycsb trace on {conn.addr}")
         sys.exit(1)
     if not conn.file_exists("~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb2-100.access"):
@@ -344,27 +344,29 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
     for c in machines[1:]:
         if c.addr in ['127.0.0.1', '::1', 'localhost']:
-            c.run(f"mv burrito/{outf}.data burrito/{outf}-{c.addr}.data2")
-            c.run(f"mv burrito/{outf}2.data burrito/{outf}2-{c.addr}.data2")
+            c.run(f"mv burrito/{outf}.data burrito/{outf}-{c.addr}.data1")
+            c.run(f"mv burrito/{outf}2.data burrito/{outf}2-{c.addr}.data1")
             continue
         c.get(f"burrito/{outf}.err", local=f"{outf}-{c.addr}.err", preserve_mode=False)
         c.get(f"burrito/{outf}2.err", local=f"{outf}2-{c.addr}.err", preserve_mode=False)
         c.get(f"burrito/{outf}.out", local=f"{outf}-{c.addr}.out", preserve_mode=False)
         c.get(f"burrito/{outf}2.out", local=f"{outf}2-{c.addr}.out", preserve_mode=False)
-        c.get(f"burrito/{outf}.data", local=f"{outf}-{c.addr}.data2", preserve_mode=False)
-        c.get(f"burrito/{outf}2.data", local=f"{outf}2-{c.addr}.data2", preserve_mode=False)
+        c.get(f"burrito/{outf}.data", local=f"{outf}-{c.addr}.data1", preserve_mode=False)
+        c.get(f"burrito/{outf}2.data", local=f"{outf}2-{c.addr}.data1", preserve_mode=False)
 
-    # add numshards column
-    for c in machines[1:]:
-        agenda.subtask(f"adding NumShards column for {c.addr}")
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"NumShards \"$0;}} else {{print \"{num_shards}shards \"$0}} }}' {outf}-{c.addr}.data2 > {outf}-{c.addr}.data1", shell=True)
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"NumShards \"$0;}} else {{print \"{num_shards}shards \"$0}} }}' {outf}2-{c.addr}.data2 > {outf}2-{c.addr}.data1", shell=True)
+    # make sure *.data1 is there
+    ok = subprocess.run(f"ls {outf}-{c.addr}.data1")
+    if not ok.returncode == 0:
+        agenda.failure(f"Could not get ycsb output {outf}-{c.addr}.data1")
+    ok = subprocess.run(f"ls {outf}2-{c.addr}.data1")
+    if not ok.returncode == 0:
+        agenda.failure(f"Could not get ycsb output {outf}2-{c.addr}.data1")
 
-    # add shardtype column
     for c in machines[1:]:
-        agenda.subtask(f"adding ShardType column for {c.addr}")
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType \"$0;}} else {{print \"{shardtype}shard \"$0}} }}' {outf}-{c.addr}.data1 > {outf}-{c.addr}.data", shell=True)
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType \"$0;}} else {{print \"{shardtype}shard \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
+        agenda.subtask(f"adding experiment info for {c.addr}")
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards \"$0;}} else {{print \"{shardtype}shard {num_shards}shards \"$0}} }}' {outf}-{c.addr}.data1 > {outf}-{c.addr}.data", shell=True)
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"NumShards \"$0;}} else {{print \"{shardtype}shard {num_shards}shards \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--outdir', type=str, required=True)
