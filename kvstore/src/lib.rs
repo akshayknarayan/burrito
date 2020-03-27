@@ -126,7 +126,17 @@ pub async fn shard_server_udp(
         let msg = &buf[..len];
         // deserialize
         let msg: msg::Msg = bincode::deserialize(msg)?;
-        out.send((from_addr, msg)).await?;
+        match out.try_send((from_addr, msg)) {
+            Err(mpsc::error::TrySendError::Full(m)) => {
+                warn!(id = ?m.1.id, "Awaiting on channel send");
+                out.send(m).await?;
+            }
+            e @ Err(_) => {
+                return Ok(e?);
+            }
+            Ok(_) => (),
+        }
+
         Ok(())
     }
 
