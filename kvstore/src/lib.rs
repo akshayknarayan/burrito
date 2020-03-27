@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tower::pipeline;
 use tower_service::Service;
 use tracing::{debug, error, info, span, trace, warn, Level};
@@ -98,15 +98,11 @@ pub async fn shard_server_udp(
         S::Error: std::fmt::Debug,
     {
         let (len, from_addr) = sk.recv_from(&mut buf).await?;
-        if len > buf.len() {
-            Err(format!("Message too big: {} > {}", len, buf.len()))?;
-        }
-
         let msg = &buf[..len];
         // deserialize
         let msg: msg::Msg = bincode::deserialize(msg)?;
 
-        trace!(req = ?&msg.id, "serviceing request");
+        trace!(req = ?&msg.id, "servicing request");
 
         futures_util::future::poll_fn(|cx| srv.poll_ready(cx))
             .await
@@ -121,6 +117,51 @@ pub async fn shard_server_udp(
         Ok(())
     }
 
+    async fn serve_one_recv_half(
+        sk: &mut tokio::net::udp::RecvHalf,
+        mut buf: &mut [u8],
+        out: &mut mpsc::Sender<(std::net::SocketAddr, msg::Msg)>,
+    ) -> Result<(), StdError> {
+        let (len, from_addr) = sk.recv_from(&mut buf).await?;
+        let msg = &buf[..len];
+        // deserialize
+        let msg: msg::Msg = bincode::deserialize(msg)?;
+        out.send((from_addr, msg)).await?;
+        Ok(())
+    }
+
+    async fn serve_send_half<S>(
+        mut sk: tokio::net::udp::SendHalf,
+        mut srv: S,
+        mut incoming: mpsc::Receiver<(std::net::SocketAddr, msg::Msg)>,
+    ) -> Result<(), StdError>
+    where
+        S: tower_service::Service<msg::Msg, Response = msg::Msg>,
+        S::Error: std::fmt::Debug,
+    {
+        loop {
+            let (from_addr, msg) = match incoming.next().await {
+                Some(x) => x,
+                None => break,
+            };
+
+            trace!(req = ?&msg.id, "servicing request");
+
+            futures_util::future::poll_fn(|cx| srv.poll_ready(cx))
+                .await
+                .map_err(|e| format!("Poll service err: {:?}", e))?;
+            let resp = srv
+                .call(msg)
+                .await
+                .map_err(|e| format!("Call service err: {:?}", e))?;
+
+            let msg = bincode::serialize(&resp)?;
+            sk.send_to(&msg, &from_addr).await?;
+        }
+
+        Ok(())
+    }
+
     // start the shards
     let shards: Vec<_> = shard_listeners
         .map(move |mut sk| {
@@ -130,6 +171,7 @@ pub async fn shard_server_udp(
 
             // serve srv on listener
             tokio::spawn(async move {
+                info!(port = sk.local_addr().unwrap().port(), "Serving shard");
                 let mut buf = [0u8; 1024];
                 loop {
                     if let Err(e) = serve_one_udp(&mut sk, &mut srv, &mut buf[..]).await {
@@ -147,15 +189,24 @@ pub async fn shard_server_udp(
     // if shards.len() == 0, then there can only be one shard: sharder_listen. So, we just serve directly and
     // ignore `shard_fn`.
     if shards.is_empty() {
-        let mut srv = Store::default();
-        info!("Serving one shard");
+        let srv = Store::default();
+        info!(port = sk.local_addr().unwrap().port(), "Serving one shard");
+        let (mut recv, send) = sk.split();
+        let (mut s, r) = mpsc::channel(1_000);
+        tokio::spawn(serve_send_half(send, srv, r));
         loop {
-            if let Err(e) = serve_one_udp(&mut sk, &mut srv, &mut buf[..]).await {
-                warn!(err = ?e, "Error serving request");
+            if let Err(e) = serve_one_recv_half(&mut recv, &mut buf[..], &mut s).await {
+                warn!(err = ?e, "Error reading request");
             }
         }
+        //loop {
+        //    if let Err(e) = serve_one_udp(&mut sk, &mut srv, &mut buf[..]).await {
+        //        warn!(err = ?e, "Error serving request");
+        //    }
+        //}
     }
 
+    info!(port = sk.local_addr().unwrap().port(), "Serving sharder");
     let mut shards = shards;
     loop {
         let (len, from_addr) = sk.recv_from(&mut buf).await?;
@@ -379,7 +430,7 @@ impl<T: Clone> Clone for Client<T> {
 #[derive(Debug, Clone)]
 pub struct UdpClientService {
     sk_write: Arc<Mutex<tokio::net::udp::SendHalf>>,
-    pending_msg: tokio::sync::mpsc::Sender<(usize, oneshot::Sender<msg::Msg>)>,
+    pending_msg: mpsc::Sender<(usize, oneshot::Sender<msg::Msg>)>,
 }
 
 // Way with just one channel: send all received messages on a broadcast channel.
@@ -392,8 +443,7 @@ impl UdpClientService {
     ) -> Result<Self, StdError> {
         sk.connect(dest).await?;
         let (mut sk_read, sk_write) = sk.split();
-        let (pending_msg, mut new_req) =
-            tokio::sync::mpsc::channel::<(usize, oneshot::Sender<msg::Msg>)>(1_000);
+        let (pending_msg, mut new_req) = mpsc::channel::<(usize, oneshot::Sender<msg::Msg>)>(1_000);
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             // if new_req.recv() happened first, store the oneshot here.
