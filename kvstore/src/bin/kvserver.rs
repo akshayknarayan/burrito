@@ -17,14 +17,11 @@ struct Opt {
     #[structopt(short, long)]
     num_shards: Option<usize>,
 
-    #[structopt(long)]
-    burrito_root: Option<std::path::PathBuf>,
+    #[structopt(long, default_value = "/tmp/burrito")]
+    burrito_root: std::path::PathBuf,
 
     #[structopt(long)]
-    burrito_addr: Option<String>,
-
-    #[structopt(long, default_value = "flatbuf")]
-    burrito_proto: String,
+    no_shard_ctl: bool,
 
     #[structopt(short, long)]
     log: bool,
@@ -68,34 +65,34 @@ async fn main() -> Result<(), StdError> {
     let port = opt.port;
     let addrs = sk_shard_addrs(opt.ip_addr, num_shards, port);
 
-    if let Some(burrito_root) = opt.burrito_root {
-        use burrito_shard_ctl::{
-            proto::{self, ShardInfo},
-            ShardCtlClient,
-        };
+    use burrito_shard_ctl::{
+        proto::{self, ShardInfo},
+        ShardCtlClient,
+    };
 
-        let si = ShardInfo {
-            service_name: "kv".into(),
-            canonical_addr: proto::Addr::Udp(addrs[0]),
-            shard_addrs: addrs[1..].iter().map(|a| proto::Addr::Udp(*a)).collect(),
-            shard_info: proto::SimpleShardPolicy {
-                packet_data_offset: 18,
-                packet_data_length: 4,
-            },
-        };
+    let si = ShardInfo {
+        service_name: "kv".into(),
+        canonical_addr: proto::Addr::Udp(addrs[0]),
+        shard_addrs: if opt.no_shard_ctl {
+            vec![]
+        } else {
+            addrs[1..].iter().map(|a| proto::Addr::Udp(*a)).collect()
+        },
+        shard_info: proto::SimpleShardPolicy {
+            packet_data_offset: 18,
+            packet_data_length: 4,
+        },
+    };
 
-        debug!(&log, "Registering shard"; "si" => ?&si);
+    debug!(&log, "Registering shard"; "si" => ?&si);
 
-        // register the shards
-        {
-            let mut shardctl = ShardCtlClient::new(&burrito_root).await?;
-            shardctl.register(si).await?;
-        } // drop shardctl connection
+    // register the shards
+    {
+        let mut shardctl = ShardCtlClient::new(&opt.burrito_root).await?;
+        shardctl.register(si).await?;
+    } // drop shardctl connection
 
-        info!(&log, "Registered shard-server"; "canonical_addr" => ?addrs[0], "shard_addrs" => ?&addrs[1..]);
-    }
-
-    info!(&log, "Listening on UDP"; "port" => port);
+    info!(&log, "Registered shard-server"; "canonical_addr" => ?addrs[0], "shard_addrs" => ?&addrs[1..]);
 
     let ls: Result<Vec<_>, _> = futures_util::future::join_all(
         addrs

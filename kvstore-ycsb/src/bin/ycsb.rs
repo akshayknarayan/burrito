@@ -74,7 +74,7 @@ async fn main() -> Result<(), StdError> {
 
         // decide managed_sharding or not.
         if num_shards < 1 {
-            // we are going to manage the sharding ourselves.
+            // xdp or the server will manage the sharding for us.
             si.shard_addrs.clear();
         }
 
