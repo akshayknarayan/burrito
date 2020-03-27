@@ -175,21 +175,28 @@ def setup(conn, outdir):
 def start_server(conn, outf, shards=0):
     conn.run("sudo pkill -9 kvserver")
 
-    ok = conn.run("cset shield --userset=kv --reset", sudo=True)
-    check(ok, "reset cpuset", conn.addr, allowed = [2])
-    cpus = max(3, shards + 1)
-    agenda.subtask(f"make cpu shield kv for cpus 0-{cpus} on {conn.addr}")
-    ok = conn.run(f"cset shield --userset=kv --cpu=0-{cpus} --kthread=on", sudo=True)
-    check(ok, "make cpuset", conn.addr)
+    #ok = conn.run("cset shield --userset=kv --reset", sudo=True)
+    #check(ok, "reset cpuset", conn.addr, allowed = [2])
+    #cpus = max(3, shards + 1)
+    #agenda.subtask(f"make cpu shield kv for cpus 0-{cpus} on {conn.addr}")
+    #ok = conn.run(f"cset shield --userset=kv --cpu=0-{cpus} --kthread=on", sudo=True)
+    #check(ok, "make cpuset", conn.addr)
 
     shard_arg = f"-n {shards}" if shards > 0 else ""
-    ok = conn.run(f"cset shield --userset=kv --exec ./target/release/kvserver -- -i {conn.addr} -p 4242 {shard_arg}",
+    ok = conn.run(f"./target/release/kvserver -i {conn.addr} -p 4242 {shard_arg}",
             wd="~/burrito",
             sudo=True,
             background=True,
             stdout=f"{outf}.out",
             stderr=f"{outf}.err",
             )
+    #ok = conn.run(f"cset shield --userset=kv --exec ./target/release/kvserver -- -i {conn.addr} -p 4242 {shard_arg}",
+    #        wd="~/burrito",
+    #        sudo=True,
+    #        background=True,
+    #        stdout=f"{outf}.out",
+    #        stderr=f"{outf}.err",
+    #        )
     check(ok, "spawn server", conn.addr)
     time.sleep(2)
     conn.check_proc("kvserver", f"{outf}.err")
@@ -197,10 +204,10 @@ def start_server(conn, outf, shards=0):
 # one machine can handle 2 client processes
 def run_client(conn, server, interarrival, outf, clientsharding=0):
     if not conn.file_exists("~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb-100.access"):
-        agenda.failure(f"No ycsb trace on {ip}")
+        agenda.failure(f"No ycsb trace on {conn.addr}")
         sys.exit(1)
     if not conn.file_exists("~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb2-100.access"):
-        agenda.failure(f"No ycsb trace on {ip}")
+        agenda.failure(f"No ycsb trace on {conn.addr}")
         sys.exit(1)
 
     if clientsharding > 4:
@@ -216,6 +223,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
     shard_arg = f"-n {clientsharding}" if clientsharding > 0 else ""
 
     conn.run(f"cset shield --userset=kv --exec ./target/release/ycsb -- \
+            --burrito-root=/tmp/burrito \
             --addr \"kv\" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb-100.access \
             -o {outf}.data \
@@ -228,6 +236,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
             stderr=f"{outf}.err",
             )
     ok = conn.run(f"./target/release/ycsb \
+            --burrito-root=/tmp/burrito \
             --addr \"kv\" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb2-100.access \
             -o {outf}2.data \
@@ -250,9 +259,46 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
     conn.run("sudo chmod 644 {outf}.out")
     conn.run("sudo chmod 644 {outf}.err")
 
+def start_burrito_shard_ctl(machines, outdir):
+    for m in machines:
+        m.run("sudo pkill -INT burrito-shard")
+        m.run("rm -rf /tmp/burrito/*", sudo=True)
+    machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f burrito-shard-redis", sudo=True)
+
+    agenda.task("Starting burrito-shard-ctl")
+    # redis runs on first machine
+    ok = machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock \
+            docker run \
+            --name burrito-shard-redis \
+            -d -p 6379:6379 redis:5",
+            sudo=True,
+            stdout=f"{outdir}-docker-redis.out",
+            stderr=f"{outdir}-docker-redis.err",
+            wd="~/burrito")
+    check(ok, "start redis", machines[0].addr)
+    ok = machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock docker ps | grep burrito-shard-redis", sudo=True)
+    check(ok, "start redis", machines[0].addr)
+
+    agenda.subtask(f"Started redis on {machines[1].addr}")
+
+    machines[0].run(
+        "./target/release/burrito-shard -r redis://localhost:6379",
+        wd="~/burrito", background=True, stderr=f"{outdir}-{machines[0].addr}.err")
+    agenda.subtask(f"Started burrito-shard-ctl on {machines[0].addr}")
+    redis_addr = machines[0].addr
+
+    # burrito-shard-ctl runs on all
+    for m in machines[1:]:
+        m.run(f"./target/release/burrito-shard -r redis://{redis_addr}:6379",
+            wd="~/burrito", background=True, stderr=f"{outdir}-{m.addr}.err")
+        agenda.subtask(f"Started burrito-shard-ctl on {m.addr}")
+
 def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-kvserver"
     outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-ycsb"
+
+    for m in machines:
+        m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
     if os.path.exists(f"{outf}-{machines[1].addr}.data"):
         agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
@@ -262,6 +308,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     # interarrival = 100 * 2 * {len(machines) - 1} / load
     interarrival_secs = 200 * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
+
+    start_burrito_shard_ctl(machines, f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-burrito-shard")
 
     server_addr = machines[0].addr
     agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}")
@@ -323,7 +371,7 @@ if __name__ == '__main__':
     ops_per_sec = args.load
     ips = [args.server] + args.client
 
-    if len(args.client) < 2:
+    if len(args.client) < 1:
         agenda.failure("Need more machines")
         sys.exit(1)
 
