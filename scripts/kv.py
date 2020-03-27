@@ -260,29 +260,45 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
     conn.run("sudo chmod 644 {outf}.err")
 
 def start_burrito_shard_ctl(machines, outdir):
+    for m in machines:
+        m.run("sudo pkill -INT burrito-shard")
+        m.run("rm -rf /tmp/burrito/*", sudo=True)
+    machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f burrito-shard-redis", sudo=True)
+
     agenda.task("Starting burrito-shard-ctl")
     # redis runs on first machine
-    machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock \
+    ok = machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock \
             docker run \
             --name burrito-shard-redis \
-            -d -p 6379:6379 redis:5", sudo=True)
-    agenda.subtask(f"Started redis on {machines[0].addr}")
+            -d -p 6379:6379 redis:5",
+            sudo=True,
+            stdout=f"{outdir}-docker-redis.out",
+            stderr=f"{outdir}-docker-redis.err",
+            wd="~/burrito")
+    check(ok, "start redis", machines[0].addr)
+    ok = machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock docker ps | grep burrito-shard-redis", sudo=True)
+    check(ok, "start redis", machines[0].addr)
+
+    agenda.subtask(f"Started redis on {machines[1].addr}")
 
     machines[0].run(
         "./target/release/burrito-shard -r redis://localhost:6379",
-        wd="~/burrito", background=True, stderr=f"{outdir}/burrito-shard.err")
+        wd="~/burrito", background=True, stderr=f"{outdir}-{machines[0].addr}.err")
     agenda.subtask(f"Started burrito-shard-ctl on {machines[0].addr}")
     redis_addr = machines[0].addr
 
     # burrito-shard-ctl runs on all
     for m in machines[1:]:
         m.run(f"./target/release/burrito-shard -r redis://{redis_addr}:6379",
-            wd="~/burrito", background=True, stderr=f"{outdir}/burrito-shard.err")
+            wd="~/burrito", background=True, stderr=f"{outdir}-{m.addr}.err")
         agenda.subtask(f"Started burrito-shard-ctl on {m.addr}")
 
 def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-kvserver"
     outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-ycsb"
+
+    for m in machines:
+        m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
     if os.path.exists(f"{outf}-{machines[1].addr}.data"):
         agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
@@ -292,6 +308,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     # interarrival = 100 * 2 * {len(machines) - 1} / load
     interarrival_secs = 200 * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
+
+    start_burrito_shard_ctl(machines, f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-burrito-shard")
 
     server_addr = machines[0].addr
     agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}")
@@ -310,11 +328,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     [t.join() for t in clients]
     agenda.task("done")
 
-    # kill the server + burrito-shard + redis
+    # kill the server
     machines[0].run("sudo pkill -9 kvserver")
-    for m  in machines:
-        m.run("sudo pkill -INT burrito-shard")
-    machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f burrito-shard-redis", sudo=True)
 
     machines[0].get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
     machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
@@ -383,8 +398,6 @@ if __name__ == '__main__':
     [t.start() for t in setups]
     [t.join() for t in setups]
     agenda.task("...done building burrito")
-
-    start_burrito_shard_ctl(machines, outdir)
 
     for s in args.shards:
         for t in args.shardtype:
