@@ -253,6 +253,7 @@ where
     // now, measure the accesses.
     let num_shards = cls.len() - 1;
     let shard_fn = move |o: &Op| {
+        // TODO update to match FNV function in xdp program
         use std::hash::{Hash, Hasher};
         let mut hasher = ahash::AHasher::default();
         o.key().hash(&mut hasher);
