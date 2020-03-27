@@ -212,10 +212,7 @@ impl BpfHandles {
                     interface_name,
                     address: Some(nix::sys::socket::SockAddr::Inet(if_addr)),
                     ..
-                } if if_addr.port() == serv_addr.port()
-                    && (serv_addr.ip().is_unspecified()
-                        || serv_addr.ip() == if_addr.ip().to_std()) =>
-                {
+                } if serv_addr.ip().is_unspecified() || serv_addr.ip() == if_addr.ip().to_std() => {
                     debug!(
                         ifname = ?&interface_name,
                         given_ip = ?&serv_addr.ip(),
@@ -223,6 +220,19 @@ impl BpfHandles {
                         "Loading XDP on interface"
                     );
                     Some(interface_name)
+                }
+                ifaddrs::InterfaceAddress {
+                    interface_name,
+                    address: Some(nix::sys::socket::SockAddr::Inet(if_addr)),
+                    ..
+                } => {
+                    trace!(
+                        ifname = ?&interface_name,
+                        given_ip = ?&serv_addr.ip(),
+                        if_ip = ?&if_addr.ip().to_std(),
+                        "Interface does not match, skipping"
+                    );
+                    None
                 }
                 _ => None,
             })
