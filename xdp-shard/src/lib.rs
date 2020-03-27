@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace};
 
 type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -361,6 +361,30 @@ impl Drop for BpfHandles {
         tracing::warn!("removing xdp program");
         unsafe { remove_xdp(self.ifindex) }
     }
+}
+
+pub fn remove_xdp_on_address(serv_addr: std::net::SocketAddr) -> Result<(), StdError> {
+    use nix::ifaddrs;
+    for interface_name in ifaddrs::getifaddrs()?.filter_map(|a| match a {
+        ifaddrs::InterfaceAddress {
+            interface_name,
+            address: Some(nix::sys::socket::SockAddr::Inet(if_addr)),
+            ..
+        } if serv_addr.ip().is_unspecified() || serv_addr.ip() == if_addr.ip().to_std() => {
+            Some(interface_name)
+        }
+        _ => None,
+    }) {
+        let if_id = get_interface_id(&interface_name)?;
+        debug!(
+            ifname = ?&interface_name,
+            ifid = if_id,
+            "Removing XDP from interface"
+        );
+        unsafe { remove_xdp(if_id) };
+    }
+
+    Ok(())
 }
 
 /// Remove any XDP program on the interface.

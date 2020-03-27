@@ -132,6 +132,16 @@ impl ShardCtl {
         });
 
         if req.shard_addrs.is_empty() {
+            // clear out any xdp programs
+            match req.canonical_addr {
+                proto::Addr::Tcp(s) | proto::Addr::Udp(s) => {
+                    if let Err(e) = xdp_shard::remove_xdp_on_address(s) {
+                        warn!(err = ?&e, addr = ?&s, "Failure removing xdp programs on address");
+                    }
+                }
+                _ => (),
+            }
+
             return proto::RegisterShardReply::Ok;
         }
 

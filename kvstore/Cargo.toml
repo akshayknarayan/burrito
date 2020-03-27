@@ -8,6 +8,7 @@ edition = "2018"
 
 [dependencies]
 bincode = "1"
+ctrlc = "3"
 serde  = { version = "1", features = ["derive"]}
 rand = "0.7"
 async-bincode = "0.5"
