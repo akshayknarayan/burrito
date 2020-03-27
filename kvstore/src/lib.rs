@@ -379,6 +379,7 @@ impl<T: Clone> Clone for Client<T> {
 #[derive(Debug, Clone)]
 pub struct UdpClientService {
     sk_write: Arc<Mutex<tokio::net::udp::SendHalf>>,
+    dest: std::net::SocketAddr,
     pending_msg: tokio::sync::mpsc::Sender<(usize, oneshot::Sender<msg::Msg>)>,
 }
 
@@ -390,7 +391,6 @@ impl UdpClientService {
         sk: tokio::net::UdpSocket,
         dest: std::net::SocketAddr,
     ) -> Result<Self, StdError> {
-        sk.connect(dest).await?;
         let (mut sk_read, sk_write) = sk.split();
         let (pending_msg, mut new_req) =
             tokio::sync::mpsc::channel::<(usize, oneshot::Sender<msg::Msg>)>(1_000);
@@ -402,7 +402,7 @@ impl UdpClientService {
             let mut recvd: HashMap<usize, msg::Msg> = Default::default();
             loop {
                 tokio::select!(
-                    Ok(len) = sk_read.recv(&mut buf) => {
+                    Ok((len, _)) = sk_read.recv_from(&mut buf) => {
                         let msg = &buf[..len];
                         let msg: msg::Msg = bincode::deserialize(msg)?;
                         trace!(msg = ?&msg, "got response");
@@ -441,6 +441,7 @@ impl UdpClientService {
 
         Ok(Self {
             sk_write: Arc::new(Mutex::new(sk_write)),
+            dest,
             pending_msg,
         })
     }
@@ -458,10 +459,11 @@ impl tower_service::Service<msg::Msg> for UdpClientService {
     fn call(&mut self, req: msg::Msg) -> Self::Future {
         let sk = self.sk_write.clone();
         let mut pnd = self.pending_msg.clone();
+        let dest = self.dest.clone();
         Box::pin(async move {
             trace!(id = req.id, "sending request");
             let msg = bincode::serialize(&req)?;
-            sk.lock().await.send(&msg).await?;
+            sk.lock().await.send_to(&msg, &dest).await?;
             let (s, r) = oneshot::channel();
             pnd.send((req.id, s)).await?;
             match tokio::time::timeout(std::time::Duration::from_secs(10), r).await {
