@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use tracing::{debug, info, trace, warn};
+
 type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub mod bindings;
@@ -214,6 +216,12 @@ impl BpfHandles {
                     && (serv_addr.ip().is_unspecified()
                         || serv_addr.ip() == if_addr.ip().to_std()) =>
                 {
+                    debug!(
+                        ifname = ?&interface_name,
+                        given_ip = ?&serv_addr.ip(),
+                        if_ip = ?&if_addr.ip().to_std(),
+                        "Loading XDP on interface"
+                    );
                     Some(interface_name)
                 }
                 _ => None,
