@@ -130,6 +130,7 @@ pub async fn shard_server_udp(
             Err(mpsc::error::TrySendError::Full(m)) => {
                 warn!(id = ?m.1.id, "Awaiting on channel send");
                 out.send(m).await?;
+                panic!("blocked on channel");
             }
             e @ Err(_) => {
                 return Ok(e?);
