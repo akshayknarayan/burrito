@@ -37,6 +37,7 @@ fn main() {
     let bpf_bindings = bindgen::Builder::default()
         .header("./src/libbpf/src/bpf.h")
         .whitelist_function("bpf_map_update_elem")
+        .whitelist_function("bpf_map_delete_elem")
         .whitelist_function("bpf_map_lookup_elem")
         .whitelist_function("bpf_get_map_by_name")
         .blacklist_type(r#"u\d+"#)

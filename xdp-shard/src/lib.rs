@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use tracing::{debug, trace};
+use tracing::debug;
 
 type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -29,11 +29,8 @@ pub struct Record {
 
 impl Record {
     // map_key is the rxq
-    fn update(&mut self, map_key: usize, map: *mut libbpf::bpf_map) -> Result<(), StdError> {
+    fn update(&mut self, map_key: usize, fd: std::os::raw::c_int) -> Result<(), StdError> {
         // collect stats.
-        let fd = unsafe { libbpf::bpf_map__fd(map) };
-        assert!(fd > 0); // already checked before
-
         let stats_percpu_values = &mut self.cpu;
         let stats_percpu_values_ptr = stats_percpu_values.as_mut_ptr();
 
@@ -95,10 +92,7 @@ impl StatsRecord {
         }
     }
 
-    fn update(&mut self, rx_queue_index_map: *mut libbpf::bpf_map) -> Result<(), StdError> {
-        let fd = unsafe { libbpf::bpf_map__fd(rx_queue_index_map) };
-        assert!(fd > 0);
-
+    fn update(&mut self, rx_queue_index_map: std::os::raw::c_int) -> Result<(), StdError> {
         for (i, rxq) in self.rxqs.iter_mut().enumerate() {
             rxq.update(i, rx_queue_index_map)?;
         }
@@ -119,9 +113,9 @@ impl StatsRecord {
 pub struct BpfHandles {
     prog_fd: std::os::raw::c_int,
     ifindex: u32,
-    bpf_obj: *mut libbpf::bpf_object,
-    rx_queue_index_map: *mut libbpf::bpf_map,
-    available_shards_map: *mut libbpf::bpf_map,
+    ifindex_map: std::os::raw::c_int,
+    rx_queue_index_map: std::os::raw::c_int,
+    available_shards_map: std::os::raw::c_int,
     num_rxqs: usize,
     curr_record: StatsRecord,
     prev_record: StatsRecord,
@@ -148,6 +142,7 @@ impl BpfHandles {
         };
 
         let mut bpf_obj: *mut libbpf::bpf_object = std::ptr::null_mut();
+
         let mut prog_fd = 0;
 
         let ok = unsafe {
@@ -181,12 +176,33 @@ impl BpfHandles {
             (*ptr).max_entries
         };
 
+        let rx_queue_index_map = unsafe { libbpf::bpf_map__fd(rx_queue_index_map) };
+        if rx_queue_index_map < 0 {
+            Err(format!(
+                "rx_queue_index_map returned bad fd: {}",
+                rx_queue_index_map
+            ))?;
+        }
+
         let available_shards_map = get_map_by_name("available_shards_map\0", bpf_obj)?;
+        let available_shards_map = unsafe { libbpf::bpf_map__fd(available_shards_map) };
+        if available_shards_map < 0 {
+            Err(format!(
+                "available_shards_map returned bad fd: {}",
+                available_shards_map
+            ))?;
+        }
+
+        let ifindex_map = get_map_by_name("ifindex_map\0", bpf_obj)?;
+        let ifindex_map = unsafe { libbpf::bpf_map__fd(ifindex_map) };
+        if ifindex_map < 0 {
+            Err(format!("ifindex_map_fd returned bad fd: {}", ifindex_map))?;
+        }
 
         let mut this = BpfHandles {
             prog_fd,
             ifindex: interface_id,
-            bpf_obj,
+            ifindex_map,
             rx_queue_index_map,
             available_shards_map,
             num_rxqs: num_rxqs as _,
@@ -204,42 +220,11 @@ impl BpfHandles {
     /// Load xdp_shard XDP program onto all the interfaces matching the given socket address.
     ///
     /// Returns a list of BpfHandles, one per matching interface.
-    pub fn load_on_address(serv_addr: std::net::SocketAddr) -> Result<Vec<Self>, StdError> {
-        use nix::ifaddrs;
-        let ifaddrs = ifaddrs::getifaddrs()?
-            .filter_map(|a| match a {
-                ifaddrs::InterfaceAddress {
-                    interface_name,
-                    address: Some(nix::sys::socket::SockAddr::Inet(if_addr)),
-                    ..
-                } if serv_addr.ip().is_unspecified() || serv_addr.ip() == if_addr.ip().to_std() => {
-                    debug!(
-                        ifname = ?&interface_name,
-                        given_ip = ?&serv_addr.ip(),
-                        if_ip = ?&if_addr.ip().to_std(),
-                        "Loading XDP on interface"
-                    );
-                    Some(interface_name)
-                }
-                ifaddrs::InterfaceAddress {
-                    interface_name,
-                    address: Some(nix::sys::socket::SockAddr::Inet(if_addr)),
-                    ..
-                } => {
-                    trace!(
-                        ifname = ?&interface_name,
-                        given_ip = ?&serv_addr.ip(),
-                        if_ip = ?&if_addr.ip().to_std(),
-                        "Interface does not match, skipping"
-                    );
-                    None
-                }
-                _ => None,
-            })
+    pub fn load_on_address(serv_addr: std::net::IpAddr) -> Result<Vec<Self>, StdError> {
+        get_interface_name(serv_addr)?
+            .into_iter()
             .map(|if_name| Self::load_on_interface_name(&if_name))
-            .collect();
-
-        ifaddrs
+            .collect()
     }
 
     /// Define the set of sharding ports.
@@ -282,14 +267,9 @@ impl BpfHandles {
         av.ports[0..ports.len()].copy_from_slice(ports);
 
         // now set it
-        let fd = unsafe { libbpf::bpf_map__fd(self.available_shards_map) };
-        if fd < 0 {
-            Err(format!("available_shards_map returned bad fd: {}", fd))?;
-        }
-
         let ok = unsafe {
             bpf::bpf_map_update_elem(
-                fd,
+                self.available_shards_map,
                 &orig_port as *const _ as *const _,
                 &av as *const _ as *const _,
                 0,
@@ -299,6 +279,22 @@ impl BpfHandles {
             let errno = nix::errno::Errno::last();
             Err(format!(
                 "available_shards_map update elem failed: {}",
+                errno
+            ))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn clear_port(&mut self, port: u16) -> Result<(), StdError> {
+        // now set it
+        let ok = unsafe {
+            bpf::bpf_map_delete_elem(self.available_shards_map, &port as *const _ as *const _)
+        };
+        if ok < 0 {
+            let errno = nix::errno::Errno::last();
+            Err(format!(
+                "available_shards_map delete elem failed: {}",
                 errno
             ))?;
         }
@@ -318,15 +314,7 @@ impl BpfHandles {
     }
 
     fn set_ifindex(&mut self) -> Result<(), StdError> {
-        let ifindex_map = get_map_by_name("ifindex_map\0", self.bpf_obj)?;
-
-        let ifindex_map_fd = unsafe { libbpf::bpf_map__fd(ifindex_map) };
-        if ifindex_map_fd < 0 {
-            Err(format!(
-                "ifindex_map_fd returned bad fd: {}",
-                ifindex_map_fd
-            ))?;
-        }
+        let ifindex_map_fd = self.ifindex_map;
 
         let key = 0;
         let ifindex = self.ifindex as i32;
@@ -364,17 +352,7 @@ impl Drop for BpfHandles {
 }
 
 pub fn remove_xdp_on_address(serv_addr: std::net::IpAddr) -> Result<(), StdError> {
-    use nix::ifaddrs;
-    for interface_name in ifaddrs::getifaddrs()?.filter_map(|a| match a {
-        ifaddrs::InterfaceAddress {
-            interface_name,
-            address: Some(nix::sys::socket::SockAddr::Inet(if_addr)),
-            ..
-        } if serv_addr.is_unspecified() || serv_addr == if_addr.ip().to_std() => {
-            Some(interface_name)
-        }
-        _ => None,
-    }) {
+    for interface_name in get_interface_name(serv_addr)? {
         let if_id = get_interface_id(&interface_name)?;
         debug!(
             ifname = ?&interface_name,
@@ -413,6 +391,24 @@ fn get_map_by_name(
     Ok(map)
 }
 
-fn get_interface_id(interface_name: &str) -> Result<u32, StdError> {
+/// Wraps `getifaddrs`.
+pub fn get_interface_name(addr: std::net::IpAddr) -> Result<Vec<String>, StdError> {
+    use nix::ifaddrs;
+    let ifaddrs = ifaddrs::getifaddrs()?
+        .filter_map(|a| match a {
+            ifaddrs::InterfaceAddress {
+                interface_name,
+                address: Some(nix::sys::socket::SockAddr::Inet(if_addr)),
+                ..
+            } if addr.is_unspecified() || addr == if_addr.ip().to_std() => Some(interface_name),
+            _ => None,
+        })
+        .collect();
+
+    Ok(ifaddrs)
+}
+
+/// Wraps `if_nametoindex`.
+pub fn get_interface_id(interface_name: &str) -> Result<u32, StdError> {
     Ok(nix::net::if_::if_nametoindex(interface_name)?)
 }

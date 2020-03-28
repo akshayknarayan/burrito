@@ -289,7 +289,9 @@ def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
 
     machines[0].run(
         "./target/release/burrito-shard -r redis://localhost:6379",
-        wd="~/burrito", sudo=use_sudo, background=True, stderr=f"{outdir}-{machines[0].addr}.err")
+        wd="~/burrito", sudo=use_sudo, background=True,
+        stdout=f"{outdir}-{machines[0].addr}.out",
+        stderr=f"{outdir}-{machines[0].addr}.err")
     agenda.subtask(f"Started burrito-shard-ctl on {machines[0].addr}")
     redis_addr = machines[0].addr
 
