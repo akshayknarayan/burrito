@@ -181,9 +181,9 @@ static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
     }
 
     port = ntohs(th->dest);
-    res = record_port(port, rxq);
+    res = shard_generic(payload, data_end, &(th->dest));
     if (res == XDP_ABORTED) { return res; }
-    return shard_generic(payload, data_end, &(th->dest));
+    return record_port(port, rxq);
 }
 
 static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
@@ -196,9 +196,9 @@ static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
         return XDP_ABORTED;
 
     port = ntohs(uh->dest);
-    res = record_port(port, rxq);
+    res = shard_generic((void*) (uh + 1), data_end, &(uh->dest));
     if (res == XDP_ABORTED) { return res; }
-    return shard_generic((void*) (uh + 1), data_end, &(uh->dest));
+    return record_port(port, rxq);
 }
 
 static inline int parse_ipv4(void *data, void *data_end, u32 rxq)

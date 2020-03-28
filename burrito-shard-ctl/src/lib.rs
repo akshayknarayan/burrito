@@ -14,7 +14,8 @@ pub mod proto;
 #[derive(Clone)]
 pub struct ShardCtl {
     shard_table: Arc<RwLock<HashMap<String, proto::ShardInfo>>>,
-    handles: Arc<Mutex<HashMap<String, Option<Vec<xdp_shard::BpfHandles>>>>>,
+    // Interface name -> handles
+    handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles>>>,
     redis_client: redis::Client,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
 }
@@ -47,6 +48,7 @@ impl ShardCtl {
             .await
             .expect("get redis connection");
         tokio::spawn(listen_updates(self.shard_table.clone(), con));
+        tokio::spawn(read_shard_stats(self.handles.clone()));
 
         sk.for_each_concurrent(None, |st| async {
             let st = st.expect("accept failed");
@@ -132,14 +134,25 @@ impl ShardCtl {
         });
 
         if req.shard_addrs.is_empty() {
-            // clear out any xdp programs
-            match req.canonical_addr {
-                proto::Addr::Tcp(s) | proto::Addr::Udp(s) => {
-                    if let Err(e) = xdp_shard::remove_xdp_on_address(s.ip()) {
-                        warn!(err = ?&e, addr = ?&s, "Failure removing xdp programs on address");
+            if let proto::Addr::Udp(sk) = req.canonical_addr {
+                let ifnames = match xdp_shard::get_interface_name(sk.ip()) {
+                    Ok(ifnames) => ifnames,
+                    Err(e) => {
+                        return proto::RegisterShardReply::Err(format!(
+                            "Error loading xdp-shard on address: {:?}",
+                            e
+                        ))
+                    }
+                };
+
+                let mut map = self.handles.lock().await;
+                for ifn in ifnames {
+                    if let Some(h) = map.get_mut(&ifn) {
+                        if let Err(e) = h.clear_port(sk.port()) {
+                            warn!(err = ?e, sock = ?sk, "Failed to clear port map");
+                        }
                     }
                 }
-                _ => (),
             }
 
             return proto::RegisterShardReply::Ok;
@@ -159,9 +172,9 @@ impl ShardCtl {
         };
 
         if let proto::Addr::Udp(sk) = req.canonical_addr {
-            let handles = xdp_shard::BpfHandles::load_on_address(sk);
-            let mut handles = match handles {
-                Ok(s) => s,
+            // see if handles are there already
+            let ifnames = match xdp_shard::get_interface_name(sk.ip()) {
+                Ok(ifnames) => ifnames,
                 Err(e) => {
                     return proto::RegisterShardReply::Err(format!(
                         "Error loading xdp-shard on address: {:?}",
@@ -170,9 +183,25 @@ impl ShardCtl {
                 }
             };
 
-            info!(service = ?req.canonical_addr, "Loaded XDP program");
+            let mut map = self.handles.lock().await;
+            for ifn in ifnames {
+                if !map.contains_key(&ifn) {
+                    let handle = match xdp_shard::BpfHandles::load_on_interface_name(&ifn) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return proto::RegisterShardReply::Err(format!(
+                                "Error loading xdp-shard on address: {:?}",
+                                e
+                            ))
+                        }
+                    };
 
-            for h in handles.iter_mut() {
+                    info!(service = ?req.canonical_addr, "Loaded XDP program");
+
+                    map.insert(ifn.clone(), handle);
+                }
+
+                let h = map.get_mut(&ifn).unwrap();
                 let ok = h.shard_ports(
                     sk.port(),
                     &shard_ports[..],
@@ -188,13 +217,13 @@ impl ShardCtl {
                         ))
                     }
                 }
+
+                info!(
+                    service = ?req.canonical_addr,
+                    interface = ?&ifn,
+                    "Registered sharding with XDP program"
+                );
             }
-
-            info!(service = ?req.canonical_addr, "Registered sharding with XDP program");
-
-            // can't drop handles or the program will get removed
-            let mut map = self.handles.lock().await;
-            map.insert(req.service_name, Some(handles));
         }
 
         proto::RegisterShardReply::Ok
@@ -222,6 +251,42 @@ impl ShardCtl {
         Ok(())
     }
 }
+
+async fn read_shard_stats(
+    handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles>>>,
+) -> Result<(), Error> {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        for (inf, handle) in handles.lock().await.iter_mut() {
+            match handle.get_stats() {
+                Ok((c, p)) => {
+                    let mut c = c.get_rxq_cpu_port_count();
+                    xdp_shard::diff_maps(&mut c, &p.get_rxq_cpu_port_count());
+                    // c: rxq_id -> cpu_id -> port -> count
+                    for (rxq_id, cpu_map) in c.iter().enumerate() {
+                        for (cpu_id, port_map) in cpu_map.iter().enumerate() {
+                            for (port, count) in port_map.iter() {
+                                info!(
+                                    interface = ?inf,
+                                    rxq = ?rxq_id,
+                                    cpu = ?cpu_id,
+                                    port = ?port,
+                                    count = ?count,
+                                    "XDP stats"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(err = ?e, "Could not get rxq stats");
+                }
+            }
+        }
+    }
+}
+
 async fn listen_updates(
     shard_table: Arc<RwLock<HashMap<String, proto::ShardInfo>>>,
     mut con: redis::aio::Connection,
