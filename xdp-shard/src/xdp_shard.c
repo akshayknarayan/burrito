@@ -39,7 +39,7 @@ struct bpf_map_def SEC("maps") ifindex_map = {
 
 #define MAX_RXQs 64
 
-/* Stats per port, per rx_queue_index, per CPU */
+/* Stats per rx_queue_index, per port, per CPU */
 struct bpf_map_def SEC("maps") rx_queue_index_map = {
 	.type		= BPF_MAP_TYPE_PERCPU_ARRAY,
 	.key_size	= sizeof(__u32),
@@ -68,11 +68,13 @@ static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
     // lookup in the map of ports we have to do work for.
 	shards = bpf_map_lookup_elem(&available_shards_map, &le_port);
     if (!shards) {
+        bpf_printk("port not found %u\n", le_port);
         return XDP_PASS;
     }
 
     if (shards->num < 1 || shards->num > NUM_PORTS) {
         // sharding disabled
+        bpf_printk("sharding disabled on %u\n", le_port);
         return XDP_PASS;
     }
 
@@ -107,6 +109,7 @@ static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
     }
 
     out_port = shards->ports[idx];
+    bpf_printk("Sharding %u -> %u\n", le_port, out_port);
     *port = htons(out_port);
     return XDP_PASS;
 }
@@ -145,6 +148,28 @@ static inline int record_port(u16 port, u32 rxq)
     return XDP_PASS;
 }
 
+/*
+static inline void dump_stats() {
+    struct datarec *rxq_rec;
+    u32 i = 0;
+    u8 j;
+    u16 *ports;
+    u32 *counts;
+
+    rxq_rec = bpf_map_lookup_elem(&rx_queue_index_map, &i);
+    if (!rxq_rec)
+        return;
+
+    ports = rxq_rec->ports;
+    counts = rxq_rec->counts;
+
+    #pragma clang loop unroll(full)
+    for (j = 0; j < NUM_PORTS; j++) {
+        bpf_printk("rxq %u -> port %u: %u\n", i, ports[j], counts[j]);
+    }
+}
+*/
+
 static inline int record_icmp(u32 rxq)
 {
     struct datarec *rxq_rec;
@@ -154,13 +179,13 @@ static inline int record_icmp(u32 rxq)
 
     // no port, stick it in the leftover bin.
     rxq_rec->counts[NUM_PORTS]++;
+    bpf_printk("rxq %u -> icmp: %u (counts[%u])\n", rxq, rxq_rec->counts[NUM_PORTS], NUM_PORTS);
     return XDP_PASS;
 }
 
 static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
 {
     struct tcphdr *th;
-    u16 port;
     int res;
     u8 data_offset;
     void *payload;
@@ -180,25 +205,24 @@ static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
         return XDP_ABORTED;
     }
 
-    port = ntohs(th->dest);
     res = shard_generic(payload, data_end, &(th->dest));
     if (res == XDP_ABORTED) { return res; }
-    return record_port(port, rxq);
+    return record_port(ntohs(th->dest), rxq);
 }
 
 static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
 {
     int res;
     struct udphdr *uh;
-    u16 port;
     uh = (struct udphdr *)udp_data;
     if ((uh + 1) > (struct udphdr*) data_end)
         return XDP_ABORTED;
 
-    port = ntohs(uh->dest);
     res = shard_generic((void*) (uh + 1), data_end, &(uh->dest));
     if (res == XDP_ABORTED) { return res; }
-    return record_port(port, rxq);
+    return record_port(ntohs(uh->dest), rxq);
+    //dump_stats();
+    //return res;
 }
 
 static inline int parse_ipv4(void *data, void *data_end, u32 rxq)

@@ -6,6 +6,18 @@ type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub mod bindings;
 use bindings::*;
 
+pub fn sum_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMap<u16, usize>>>) {
+    for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
+        for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
+            for (port, count) in curr.iter_mut() {
+                if prev.contains_key(port) {
+                    *count += prev.get(port).unwrap();
+                }
+            }
+        }
+    }
+}
+
 pub fn diff_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMap<u16, usize>>>) {
     for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
         for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
@@ -22,14 +34,17 @@ use xdp_shard_prog::{AvailableShards, Datarec, ShardRules};
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct Record {
+struct Record {
+    rxq_id: usize,
     timestamp: std::time::Instant,
     cpu: Vec<Datarec>,
 }
 
 impl Record {
     // map_key is the rxq
-    fn update(&mut self, map_key: usize, fd: std::os::raw::c_int) -> Result<(), StdError> {
+    fn update(&mut self, fd: std::os::raw::c_int) -> Result<(), StdError> {
+        let map_key = self.rxq_id;
+
         // collect stats.
         let stats_percpu_values = &mut self.cpu;
         let stats_percpu_values_ptr = stats_percpu_values.as_mut_ptr();
@@ -51,7 +66,19 @@ impl Record {
         Ok(())
     }
 
-    pub fn get_cpu_port_count(&self) -> Vec<HashMap<u16, usize>> {
+    fn clear(&mut self) {
+        for r in self.cpu.iter_mut() {
+            for v in &mut r.ports[..] {
+                *v = 0;
+            }
+
+            for v in &mut r.counts[..] {
+                *v = 0;
+            }
+        }
+    }
+
+    fn get_cpu_port_count(&self) -> Vec<HashMap<u16, usize>> {
         self.cpu
             .iter()
             .map(|d| {
@@ -61,8 +88,9 @@ impl Record {
                     .take_while(|(_, x)| **x != 0)
                     .map(|(idx, port)| (*port, d.counts[idx] as usize))
                     .collect();
-                if d.counts[16] > 0 {
-                    h.insert(0, d.counts[16] as usize);
+
+                if d.counts[xdp_shard_prog::NUM_PORTS as usize] > 0 {
+                    h.insert(0, d.counts[xdp_shard_prog::NUM_PORTS as usize] as usize);
                 }
 
                 h
@@ -84,7 +112,8 @@ impl StatsRecord {
         let num_cpus = unsafe { libbpf::libbpf_num_possible_cpus() } as usize + 2;
         StatsRecord {
             rxqs: (0..num_rxqs)
-                .map(|_| Record {
+                .map(|i| Record {
+                    rxq_id: i,
                     timestamp: std::time::Instant::now(),
                     cpu: (0..num_cpus).map(|_| Default::default()).collect(),
                 })
@@ -92,9 +121,15 @@ impl StatsRecord {
         }
     }
 
+    fn clear(&mut self) {
+        for r in self.rxqs.iter_mut() {
+            r.clear();
+        }
+    }
+
     fn update(&mut self, rx_queue_index_map: std::os::raw::c_int) -> Result<(), StdError> {
-        for (i, rxq) in self.rxqs.iter_mut().enumerate() {
-            rxq.update(i, rx_queue_index_map)?;
+        for rxq in self.rxqs.iter_mut() {
+            rxq.update(rx_queue_index_map)?;
         }
 
         Ok(())
@@ -142,7 +177,6 @@ impl BpfHandles {
         };
 
         let mut bpf_obj: *mut libbpf::bpf_object = std::ptr::null_mut();
-
         let mut prog_fd = 0;
 
         let ok = unsafe {
@@ -308,7 +342,7 @@ impl BpfHandles {
     /// curr_record.
     pub fn get_stats(&mut self) -> Result<(&StatsRecord, &StatsRecord), StdError> {
         std::mem::swap(&mut self.prev_record, &mut self.curr_record);
-        self.curr_record = StatsRecord::empty(self.num_rxqs);
+        self.curr_record.clear();
         self.curr_record.update(self.rx_queue_index_map)?;
         Ok((&self.curr_record, &self.prev_record))
     }

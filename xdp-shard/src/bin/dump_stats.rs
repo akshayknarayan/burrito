@@ -28,8 +28,9 @@ fn main() -> Result<(), StdError> {
     .unwrap();
 
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        std::time::Duration::from_secs(1);
+        std::thread::sleep(std::time::Duration::from_secs(1));
         let (stats, prev) = prog.get_stats()?;
+        tracing::debug!("Checking rxqs");
 
         let mut rxqs = stats.get_rxq_cpu_port_count();
         let prev_rxqs = prev.get_rxq_cpu_port_count();
