@@ -263,6 +263,7 @@ async fn read_shard_stats(
                 Ok((c, p)) => {
                     let mut c = c.get_rxq_cpu_port_count();
                     xdp_shard::diff_maps(&mut c, &p.get_rxq_cpu_port_count());
+                    debug!("logging XDP stats");
                     // c: rxq_id -> cpu_id -> port -> count
                     for (rxq_id, cpu_map) in c.iter().enumerate() {
                         for (cpu_id, port_map) in cpu_map.iter().enumerate() {
