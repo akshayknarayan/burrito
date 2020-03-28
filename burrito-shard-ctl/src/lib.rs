@@ -135,7 +135,7 @@ impl ShardCtl {
             // clear out any xdp programs
             match req.canonical_addr {
                 proto::Addr::Tcp(s) | proto::Addr::Udp(s) => {
-                    if let Err(e) = xdp_shard::remove_xdp_on_address(s) {
+                    if let Err(e) = xdp_shard::remove_xdp_on_address(s.ip()) {
                         warn!(err = ?&e, addr = ?&s, "Failure removing xdp programs on address");
                     }
                 }
