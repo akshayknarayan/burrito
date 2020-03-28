@@ -182,11 +182,14 @@ def start_server(conn, outf, shards=0, use_burrito_shard=True):
     #ok = conn.run(f"cset shield --userset=kv --cpu=0-{cpus} --kthread=on", sudo=True)
     #check(ok, "make cpuset", conn.addr)
 
+    ok = conn.run(f"./target/release/xdp_clear -i {conn.addr}", wd="~/burrito", sudo=True)
+    check(ok, "Clear xdp programs", conn.addr)
+
     shard_arg = f"-n {shards}" if shards > 0 else ""
     burrito_shard_arg = f"" if use_burrito_shard else "--no-shard-ctl"
     ok = conn.run(f"./target/release/kvserver -i {conn.addr} -p 4242 {shard_arg} {burrito_shard_arg}",
             wd="~/burrito",
-            sudo=True,
+            sudo=use_burrito_shard,
             background=True,
             stdout=f"{outf}.out",
             stderr=f"{outf}.err",
@@ -243,6 +246,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
             -o {outf}2.data \
             {shard_arg} \
             -i {interarrival}",
+            sudo=True,
             wd = "~/burrito",
             stdout=f"{outf}2.out",
             stderr=f"{outf}2.err",
@@ -260,10 +264,11 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
     conn.run("sudo chmod 644 {outf}.out")
     conn.run("sudo chmod 644 {outf}.err")
 
-def start_burrito_shard_ctl(machines, outdir):
+def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
     for m in machines:
         m.run("sudo pkill -INT burrito-shard")
         m.run("rm -rf /tmp/burrito/*", sudo=True)
+
     machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f burrito-shard-redis", sudo=True)
 
     agenda.task("Starting burrito-shard-ctl")
@@ -284,14 +289,14 @@ def start_burrito_shard_ctl(machines, outdir):
 
     machines[0].run(
         "./target/release/burrito-shard -r redis://localhost:6379",
-        wd="~/burrito", background=True, stderr=f"{outdir}-{machines[0].addr}.err")
+        wd="~/burrito", sudo=use_sudo, background=True, stderr=f"{outdir}-{machines[0].addr}.err")
     agenda.subtask(f"Started burrito-shard-ctl on {machines[0].addr}")
     redis_addr = machines[0].addr
 
     # burrito-shard-ctl runs on all
     for m in machines[1:]:
         m.run(f"./target/release/burrito-shard -r redis://{redis_addr}:6379",
-            wd="~/burrito", background=True, stderr=f"{outdir}-{m.addr}.err")
+            wd="~/burrito", sudo=use_sudo, background=True, stderr=f"{outdir}-{m.addr}.err")
         agenda.subtask(f"Started burrito-shard-ctl on {m.addr}")
 
 def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
@@ -310,7 +315,7 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     interarrival_secs = 200 * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
 
-    start_burrito_shard_ctl(machines, f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-burrito-shard")
+    start_burrito_shard_ctl(machines, f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-burrito-shard", use_sudo = (shardtype == "xdpserver"))
 
     server_addr = machines[0].addr
     agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}")
@@ -344,8 +349,10 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
     for c in machines[1:]:
         if c.addr in ['127.0.0.1', '::1', 'localhost']:
-            c.run(f"mv burrito/{outf}.data burrito/{outf}-{c.addr}.data1")
-            c.run(f"mv burrito/{outf}2.data burrito/{outf}2-{c.addr}.data1")
+            ok = c.run(f"mv burrito/{outf}.data burrito/{outf}-{c.addr}.data1")
+            #check(ok, f"Get ycsb data: burrito/{outf}-{c.addr}.data1", c.addr)
+            ok = c.run(f"mv burrito/{outf}2.data burrito/{outf}2-{c.addr}.data1")
+            #check(ok, f"Get ycsb data: burrito/{outf}2-{c.addr}.data1", c.addr)
             continue
         c.get(f"burrito/{outf}.err", local=f"{outf}-{c.addr}.err", preserve_mode=False)
         c.get(f"burrito/{outf}2.err", local=f"{outf}2-{c.addr}.err", preserve_mode=False)
@@ -353,14 +360,6 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
         c.get(f"burrito/{outf}2.out", local=f"{outf}2-{c.addr}.out", preserve_mode=False)
         c.get(f"burrito/{outf}.data", local=f"{outf}-{c.addr}.data1", preserve_mode=False)
         c.get(f"burrito/{outf}2.data", local=f"{outf}2-{c.addr}.data1", preserve_mode=False)
-
-    # make sure *.data1 is there
-    ok = subprocess.run(f"ls {outf}-{c.addr}.data1")
-    if not ok.returncode == 0:
-        agenda.failure(f"Could not get ycsb output {outf}-{c.addr}.data1")
-    ok = subprocess.run(f"ls {outf}2-{c.addr}.data1")
-    if not ok.returncode == 0:
-        agenda.failure(f"Could not get ycsb output {outf}2-{c.addr}.data1")
 
     for c in machines[1:]:
         agenda.subtask(f"adding experiment info for {c.addr}")

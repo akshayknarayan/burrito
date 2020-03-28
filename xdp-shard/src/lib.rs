@@ -363,14 +363,14 @@ impl Drop for BpfHandles {
     }
 }
 
-pub fn remove_xdp_on_address(serv_addr: std::net::SocketAddr) -> Result<(), StdError> {
+pub fn remove_xdp_on_address(serv_addr: std::net::IpAddr) -> Result<(), StdError> {
     use nix::ifaddrs;
     for interface_name in ifaddrs::getifaddrs()?.filter_map(|a| match a {
         ifaddrs::InterfaceAddress {
             interface_name,
             address: Some(nix::sys::socket::SockAddr::Inet(if_addr)),
             ..
-        } if serv_addr.ip().is_unspecified() || serv_addr.ip() == if_addr.ip().to_std() => {
+        } if serv_addr.is_unspecified() || serv_addr == if_addr.ip().to_std() => {
             Some(interface_name)
         }
         _ => None,
@@ -384,6 +384,12 @@ pub fn remove_xdp_on_address(serv_addr: std::net::SocketAddr) -> Result<(), StdE
         unsafe { remove_xdp(if_id) };
     }
 
+    Ok(())
+}
+
+pub fn remove_xdp_on_ifname(interface: &str) -> Result<(), StdError> {
+    let id = get_interface_id(interface)?;
+    unsafe { remove_xdp(id) };
     Ok(())
 }
 
