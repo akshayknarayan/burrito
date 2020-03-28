@@ -266,7 +266,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
 
 def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
     for m in machines:
-        m.run("sudo pkill -INT burrito-shard")
+        m.run("sudo pkill -9 burrito-shard")
         m.run("rm -rf /tmp/burrito/*", sudo=True)
 
     machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f burrito-shard-redis", sudo=True)
@@ -364,7 +364,7 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     for c in machines[1:]:
         agenda.subtask(f"adding experiment info for {c.addr}")
         subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards \"$0;}} else {{print \"{shardtype}shard {num_shards}shards \"$0}} }}' {outf}-{c.addr}.data1 > {outf}-{c.addr}.data", shell=True)
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"NumShards \"$0;}} else {{print \"{shardtype}shard {num_shards}shards \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards \"$0;}} else {{print \"{shardtype}shard {num_shards}shards \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
 
 
 parser = argparse.ArgumentParser()
