@@ -68,13 +68,11 @@ static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
     // lookup in the map of ports we have to do work for.
 	shards = bpf_map_lookup_elem(&available_shards_map, &le_port);
     if (!shards) {
-        bpf_printk("Could not get shards map for %u\n", le_port);
         return XDP_PASS;
     }
 
     if (shards->num < 1 || shards->num > NUM_PORTS) {
         // sharding disabled
-        bpf_printk("Sharding disabled for %u: %u\n", le_port, shards->num);
         return XDP_PASS;
     }
 
@@ -109,8 +107,6 @@ static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
     }
 
     out_port = shards->ports[idx];
-    bpf_printk("Sharding %u -> %u\n", le_port, out_port);
-
     *port = htons(out_port);
     return XDP_PASS;
 }
