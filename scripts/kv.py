@@ -206,11 +206,15 @@ def start_server(conn, outf, shards=0, use_burrito_shard=True):
     conn.check_proc("kvserver", f"{outf}.err")
 
 # one machine can handle 2 client processes
-def run_client(conn, server, interarrival, outf, clientsharding=0):
-    if not conn.file_exists("~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access"):
+def run_client(conn, server, interarrival, outf, clientsharding=0, wrkload='zipf'):
+    wrkfile = "~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access"
+    if wrkload == 'uniform':
+        wrkfile = "~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadbunf{}-100.access"
+
+    if not conn.file_exists(wrkfile.format(1)):
         agenda.failure(f"No ycsb trace on {conn.addr}")
         sys.exit(1)
-    if not conn.file_exists("~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb2-100.access"):
+    if not conn.file_exists(wrkfile.format(2)):
         agenda.failure(f"No ycsb trace on {conn.addr}")
         sys.exit(1)
 
@@ -229,7 +233,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
     conn.run(f"cset shield --userset=kv --exec ./target/release/ycsb -- \
             --burrito-root=/tmp/burrito \
             --addr \"kv\" \
-            --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access \
+            --accesses {wrkfile.format(1)} \
             -o {outf}.data \
             {shard_arg} \
             -i {interarrival}",
@@ -242,7 +246,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
     ok = conn.run(f"./target/release/ycsb \
             --burrito-root=/tmp/burrito \
             --addr \"kv\" \
-            --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb2-100.access \
+            --accesses {wrkfile.format(2)} \
             -o {outf}2.data \
             {shard_arg} \
             -i {interarrival}",
@@ -266,7 +270,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0):
 
 def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
     for m in machines:
-        m.run("sudo pkill -INT burrito-shard")
+        m.run("sudo pkill -9 burrito-shard")
         m.run("rm -rf /tmp/burrito/*", sudo=True)
 
     machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock docker rm -f burrito-shard-redis", sudo=True)
@@ -288,10 +292,10 @@ def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
     agenda.subtask(f"Started redis on {machines[1].addr}")
 
     machines[0].run(
-        "./target/release/burrito-shard -r redis://localhost:6379",
+        "RUST_LOG=info ./target/release/burrito-shard -r redis://localhost:6379 -l {outdir}-shardctl-{machines[0].addr}.log",
         wd="~/burrito", sudo=use_sudo, background=True,
-        stdout=f"{outdir}-{machines[0].addr}.out",
-        stderr=f"{outdir}-{machines[0].addr}.err")
+        stdout=f"{outdir}-shardctl-{machines[0].addr}.out",
+        stderr=f"{outdir}-shardctl-{machines[0].addr}.err")
     agenda.subtask(f"Started burrito-shard-ctl on {machines[0].addr}")
     redis_addr = machines[0].addr
 
@@ -301,9 +305,9 @@ def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
             wd="~/burrito", sudo=use_sudo, background=True, stderr=f"{outdir}-{m.addr}.err")
         agenda.subtask(f"Started burrito-shard-ctl on {m.addr}")
 
-def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
-    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-kvserver"
-    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-ycsb"
+def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='zipf'):
+    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-kvserver"
+    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-ycsb"
 
     for m in machines:
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
@@ -317,16 +321,16 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     interarrival_secs = 200 * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
 
-    start_burrito_shard_ctl(machines, f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-burrito-shard", use_sudo = (shardtype == "xdpserver"))
+    start_burrito_shard_ctl(machines, f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-burritoshard", use_sudo = (shardtype == "xdpserver" or shardtype == "client"))
 
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}")
+    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec}, workload = {wrkload}, ops/s -> interarrival_us = {interarrival_us}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    if shardtype == "xdpserver":
+    if shardtype == "client" or shardtype == "xdpserver":
         start_server(machines[0], server_prefix, shards=num_shards)
-    elif shardtype == "client" or shardtype == "server":
+    elif shardtype == "server":
         start_server(machines[0], server_prefix, shards=num_shards, use_burrito_shard=False)
     else:
         assert(False)
@@ -334,9 +338,23 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
     # others are clients
     agenda.subtask("starting clients")
     if shardtype == "client":
-        clients = [threading.Thread(target=run_client, args=(m, server_addr, interarrival_us, outf), kwargs={'clientsharding':num_shards}) for m in machines[1:]]
+        clients = [threading.Thread(target=run_client, args=(
+                m,
+                server_addr,
+                interarrival_us,
+                outf
+            ),
+            kwargs={'clientsharding':num_shards, 'wrkload':wrkload}
+        ) for m in machines[1:]]
     elif shardtype == "xdpserver" or shardtype == "server":
-        clients = [threading.Thread(target=run_client, args=(m, server_addr, interarrival_us, outf)) for m in machines[1:]]
+        clients = [threading.Thread(target=run_client, args=(
+                m,
+                server_addr,
+                interarrival_us,
+                outf,
+            ),
+            kwargs={'wrkload':wrkload}
+        ) for m in machines[1:]]
     else:
         assert(False)
 
@@ -365,8 +383,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec):
 
     for c in machines[1:]:
         agenda.subtask(f"adding experiment info for {c.addr}")
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards \"$0;}} else {{print \"{shardtype}shard {num_shards}shards \"$0}} }}' {outf}-{c.addr}.data1 > {outf}-{c.addr}.data", shell=True)
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"NumShards \"$0;}} else {{print \"{shardtype}shard {num_shards}shards \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards Wrkload \"$0;}} else {{print \"{shardtype}shard {num_shards}shards {wrkload} \"$0}} }}' {outf}-{c.addr}.data1 > {outf}-{c.addr}.data", shell=True)
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards Wrkload \"$0;}} else {{print \"{shardtype}shard {num_shards}shards {wrkload} \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
 
 
 parser = argparse.ArgumentParser()
@@ -376,6 +394,7 @@ parser.add_argument('--server', type=str, required=True)
 parser.add_argument('--client', type=str, action='append', required=True)
 parser.add_argument('--shards', type=int, action='append')
 parser.add_argument('--shardtype', type=str, action='append')
+parser.add_argument('--wrk', type=str, action='append')
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -389,6 +408,13 @@ if __name__ == '__main__':
 
     if args.shards is None:
         args.shards = [1]
+
+    if args.wrk is None:
+        args.wrk = ['zipf']
+    for t in args.wrk:
+        if t not in ['zipf', 'uniform']:
+            agenda.failure(f"Unknown workload {t}")
+            sys.exit(1)
 
     if args.shardtype is None:
         args.shardtype = ['server']
@@ -413,9 +439,10 @@ if __name__ == '__main__':
 
     for s in args.shards:
         for t in args.shardtype:
-            for o in ops_per_sec:
-                do_exp(outdir, machines, s, t, o)
-                time.sleep(5)
+            for w in args.wrk:
+                for o in ops_per_sec:
+                    do_exp(outdir, machines, s, t, o, wrkload=w)
+                    time.sleep(3)
 
     agenda.task("done")
     #subprocess.run(f"rm -f {outdir}/*.data1", shell=True)
