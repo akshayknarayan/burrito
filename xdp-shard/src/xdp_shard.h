@@ -4,7 +4,7 @@
 #define NUM_PORTS 16
 struct datarec {
     __u16 ports[NUM_PORTS];
-    __u32 counts[NUM_PORTS + 1];
+    __u32 counts[NUM_PORTS + 2];
 };
 
 struct shard_rules {

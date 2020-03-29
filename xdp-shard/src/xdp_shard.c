@@ -39,7 +39,7 @@ struct bpf_map_def SEC("maps") ifindex_map = {
 
 #define MAX_RXQs 64
 
-/* Stats per port, per rx_queue_index, per CPU */
+/* Stats per rx_queue_index, per port, per CPU */
 struct bpf_map_def SEC("maps") rx_queue_index_map = {
 	.type		= BPF_MAP_TYPE_PERCPU_ARRAY,
 	.key_size	= sizeof(__u32),
@@ -179,7 +179,7 @@ static inline int record_icmp(u32 rxq)
 
     // no port, stick it in the leftover bin.
     rxq_rec->counts[NUM_PORTS]++;
-    bpf_printk("rxq %u -> icmp: %u\n", rxq, rxq_rec->counts[NUM_PORTS]);
+    bpf_printk("rxq %u -> icmp: %u (counts[%u])\n", rxq, rxq_rec->counts[NUM_PORTS], NUM_PORTS);
     return XDP_PASS;
 }
 
