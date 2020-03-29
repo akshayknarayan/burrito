@@ -72,6 +72,7 @@ fn main() {
         .derive_default(true)
         .blacklist_type(r#"u\d+"#)
         .whitelist_type(r#"datarec"#)
+        .whitelist_var(r#"NUM_PORTS"#)
         .whitelist_type(r#"available_shards"#)
         .generate()
         .expect("Unable to generate bindings");
