@@ -5,6 +5,9 @@ use tracing_timing::{Builder, Histogram};
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
 
+const FNV1_64_INIT: u64 = 0xcbf29ce484222325u64;
+const FNV_64_PRIME: u64 = 0x100000001b3u64;
+
 #[derive(Debug, StructOpt)]
 #[structopt(name = "kvserver")]
 struct Opt {
@@ -52,12 +55,31 @@ async fn main() -> Result<(), StdError> {
         None | Some(1) => 0, // having 1 shard is pointless, same as 0, might as well avoid the extra channel sends.
         Some(x) => x,
     };
+
     let shard_fn = move |m: &kvstore::Msg| {
-        // TODO update to match FNV function in xdp program
-        use std::hash::{Hash, Hasher};
-        let mut hasher = ahash::AHasher::default();
-        m.key().hash(&mut hasher);
-        hasher.finish() as usize % num_shards
+        /* xdp_shard version of FNV: take the first 4 bytes of the key
+        * u64 hash = FNV1_64_INIT;
+        * // ...
+        * // value start
+        * pkt_val = ((u8*) app_data) + offset;
+
+        * // compute FNV hash
+        * #pragma clang loop unroll(full)
+        * for (i = 0; i < 4; i++) {
+        *     hash = hash ^ ((u64) pkt_val[i]);
+        *     hash *= FNV_64_PRIME;
+        * }
+
+        * // map to a shard and assign to that port.
+        * idx = hash % shards->num;
+        */
+        let mut hash = FNV1_64_INIT;
+        for b in m.key().as_bytes()[0..4].iter() {
+            hash = hash ^ (*b as u64);
+            hash = u64::wrapping_mul(hash, FNV_64_PRIME);
+        }
+
+        hash as usize % num_shards
     };
 
     info!(&log, "KV Server");
