@@ -12,6 +12,9 @@ struct Opt {
 
     #[structopt(short, long)]
     redis_addr: String,
+
+    #[structopt(short, long)]
+    log: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -37,8 +40,10 @@ async fn main() -> Result<(), Error> {
         std::process::exit(0);
     })?;
 
+    let log = opt.log.and_then(|p| std::fs::File::create(p).ok());
+
     tracing::info!(addr = ?&burrito_addr, "Starting ShardCtl");
     let ul = tokio::net::UnixListener::bind(burrito_addr)?;
-    burrito.serve_on(ul).await?;
+    burrito.serve_on(ul, log).await?;
     Ok(())
 }
