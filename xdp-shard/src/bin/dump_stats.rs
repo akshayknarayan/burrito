@@ -1,7 +1,3 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use structopt::StructOpt;
 
 type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -13,6 +9,11 @@ struct Opt {
 }
 
 fn main() -> Result<(), StdError> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
     let opt = Opt::from_args();
 
     tracing_subscriber::fmt::init();
