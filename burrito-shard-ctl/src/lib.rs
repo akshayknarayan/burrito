@@ -36,7 +36,7 @@ impl ShardCtl {
         Ok(s)
     }
 
-    pub async fn serve_on<S, E>(self, sk: S) -> Result<(), Error>
+    pub async fn serve_on<S, E>(self, sk: S, stats_log: Option<std::fs::File>) -> Result<(), Error>
     where
         S: tokio::stream::Stream<Item = Result<tokio::net::UnixStream, E>>,
         E: std::error::Error,
@@ -48,7 +48,7 @@ impl ShardCtl {
             .await
             .expect("get redis connection");
         tokio::spawn(listen_updates(self.shard_table.clone(), con));
-        tokio::spawn(read_shard_stats(self.handles.clone()));
+        tokio::spawn(read_shard_stats(self.handles.clone(), stats_log));
 
         sk.for_each_concurrent(None, |st| async {
             let st = st.expect("accept failed");
@@ -254,8 +254,11 @@ impl ShardCtl {
 
 async fn read_shard_stats(
     handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles>>>,
+    mut stats_log: Option<std::fs::File>,
 ) -> Result<(), Error> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut first = true;
+    let start = std::time::Instant::now();
     loop {
         interval.tick().await;
         for (inf, handle) in handles.lock().await.iter_mut() {
@@ -263,7 +266,7 @@ async fn read_shard_stats(
                 Ok((c, p)) => {
                     let mut c = c.get_rxq_cpu_port_count();
                     xdp_shard::diff_maps(&mut c, &p.get_rxq_cpu_port_count());
-                    debug!("logging XDP stats");
+                    trace!("logging XDP stats");
                     // c: rxq_id -> cpu_id -> port -> count
                     for (rxq_id, cpu_map) in c.iter().enumerate() {
                         for (cpu_id, port_map) in cpu_map.iter().enumerate() {
@@ -276,6 +279,30 @@ async fn read_shard_stats(
                                     count = ?count,
                                     "XDP stats"
                                 );
+
+                                if let Some(ref mut f) = stats_log {
+                                    use std::io::Write;
+                                    if first {
+                                        if let Err(e) = write!(f, "Time CPU Rxq Port Count\n") {
+                                            debug!(err = ?e, "Failed writing to stats_log");
+                                            continue;
+                                        }
+
+                                        first = false;
+                                    }
+
+                                    if let Err(e) = write!(
+                                        f,
+                                        "{} {} {} {} {}\n",
+                                        start.elapsed().as_secs_f32(),
+                                        cpu_id,
+                                        rxq_id,
+                                        port,
+                                        count
+                                    ) {
+                                        debug!(err = ?e, "Failed writing to stats_log");
+                                    }
+                                }
                             }
                         }
                     }
