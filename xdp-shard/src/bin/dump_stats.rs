@@ -1,7 +1,3 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use structopt::StructOpt;
 
 type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -12,7 +8,13 @@ struct Opt {
     interface: String,
 }
 
+#[cfg(feature = "ebpf")]
 fn main() -> Result<(), StdError> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
     let opt = Opt::from_args();
 
     tracing_subscriber::fmt::init();
@@ -46,5 +48,10 @@ fn main() -> Result<(), StdError> {
         }
     }
 
+    Ok(())
+}
+
+#[cfg(not(feature = "ebpf"))]
+fn main() -> Result<(), StdError> {
     Ok(())
 }
