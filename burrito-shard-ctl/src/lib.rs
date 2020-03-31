@@ -278,6 +278,8 @@ mod srv {
         handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles>>>,
         mut stats_log: Option<std::fs::File>,
     ) -> Result<(), Error> {
+        use tracing::info;
+
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut first = true;
         let start = std::time::Instant::now();
