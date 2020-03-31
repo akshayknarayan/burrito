@@ -13,7 +13,6 @@ struct Opt {
     interface: Option<String>,
 }
 
-#[cfg(feature = "ebpf")]
 fn main() -> Result<(), StdError> {
     let opt = Opt::from_args();
     tracing_subscriber::fmt::init();
@@ -26,10 +25,5 @@ fn main() -> Result<(), StdError> {
         xdp_shard::remove_xdp_on_ifname(&ifce)?
     }
 
-    Ok(())
-}
-
-#[cfg(not(feature = "ebpf"))]
-fn main() -> Result<(), StdError> {
     Ok(())
 }

@@ -24,3 +24,15 @@ tokio = { version = "0.2", features = ["rt-threaded", "macros", "sync"] }
 
 [build-dependencies]
 bindgen = "0.53"
+
+[[bin]]
+name = "dump_stats"
+required-features = ["ebpf"]
+
+[[bin]]
+name = "xdp_clear"
+required-features = ["ebpf"]
+
+[[example]]
+name = "shard"
+required-features = ["ebpf"]

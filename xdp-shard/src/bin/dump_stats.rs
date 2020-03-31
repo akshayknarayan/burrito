@@ -8,7 +8,6 @@ struct Opt {
     interface: String,
 }
 
-#[cfg(feature = "ebpf")]
 fn main() -> Result<(), StdError> {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -48,10 +47,5 @@ fn main() -> Result<(), StdError> {
         }
     }
 
-    Ok(())
-}
-
-#[cfg(not(feature = "ebpf"))]
-fn main() -> Result<(), StdError> {
     Ok(())
 }
