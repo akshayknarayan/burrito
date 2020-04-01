@@ -56,7 +56,7 @@ async fn main() -> Result<(), StdError> {
 
     tracing_subscriber::fmt::init();
 
-    trace!("reading workload");
+    debug!("reading workload");
     let loads = ops(opt.accesses.with_extension("load"))?;
     let accesses = ops(opt.accesses)?;
     debug!(num_ops = ?accesses.len(), "done reading workload");
@@ -69,7 +69,10 @@ async fn main() -> Result<(), StdError> {
     let cls = if let Some(root) = opt.burrito_root {
         debug!(root = ?&root, "Burrito mode");
         // first query shard-ctl
-        let mut shardctl = burrito_shard_ctl::ShardCtlClient::new(root).await?;
+        let mut shardctl = match burrito_shard_ctl::ShardCtlClient::new(root).await {
+            Ok(s) => s,
+            Err(e) => Err(format!("Could not contact ShardCtl: err = {}", e))?,
+        };
         debug!(service_addr = ?&opt.addr, "Querying");
         let mut si = shardctl.query(&opt.addr).await?;
 

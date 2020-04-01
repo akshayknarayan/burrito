@@ -10,7 +10,10 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{oneshot, Mutex};
 use tokio_tower::pipeline;
@@ -122,11 +125,14 @@ pub async fn shard_server_udp(
     }
 
     // start the shards
-    let shards: Vec<_> = shard_listeners
+    let (shards, ctrs): (Vec<_>, Vec<_>) = shard_listeners
         .map(move |mut sk| {
             // The channel size passed to new() should be >= the maximum num. of concurrent requests.
             let mut srv = tower_buffer::Buffer::new(Store::default(), 100_000);
             let shard_srv = srv.clone();
+            let ctr = Arc::new(AtomicUsize::new(0));
+            let shard_ctr = ctr.clone();
+            let a = sk.local_addr().expect("sk local addr").port();
 
             // serve srv on listener
             tokio::spawn(async move {
@@ -135,12 +141,14 @@ pub async fn shard_server_udp(
                     if let Err(e) = serve_one_udp(&mut sk, &mut srv, &mut buf[..]).await {
                         warn!(err = ?e, "Error serving request");
                     }
+
+                    ctr.fetch_add(1, Ordering::SeqCst);
                 }
             });
 
-            shard_srv
+            (shard_srv, (a, shard_ctr))
         })
-        .collect();
+        .unzip();
 
     let mut sk = sharder_listen;
     let mut buf = [0u8; 1024];
@@ -155,6 +163,17 @@ pub async fn shard_server_udp(
             }
         }
     }
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            for (a, ctr) in ctrs.iter() {
+                let count = ctr.swap(0, Ordering::Relaxed);
+                info!(port = ?a, count, "kvserver stats");
+            }
+        }
+    });
 
     let mut shards = shards;
     loop {
