@@ -363,13 +363,16 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
 
     [t.start() for t in clients]
     [t.join() for t in clients]
-    agenda.task("done")
+
+    agenda.subtask("client returned")
 
     # kill the server
     machines[0].run("sudo pkill -9 kvserver")
     for m in machines:
         m.run("sudo pkill -9 burrito-shard")
         m.run("rm -rf /tmp/burrito/*", sudo=True)
+
+    agenda.subtask("processes killed")
 
     machines[0].get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
     machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
@@ -389,6 +392,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
         c.get(f"burrito/{outf}2.out", local=f"{outf}2-{c.addr}.out", preserve_mode=False)
         c.get(f"burrito/{outf}.data", local=f"{outf}-{c.addr}.data1", preserve_mode=False)
         c.get(f"burrito/{outf}2.data", local=f"{outf}2-{c.addr}.data1", preserve_mode=False)
+
+    agenda.task("done")
 
     for c in machines[1:]:
         agenda.subtask(f"adding experiment info for {c.addr}")
