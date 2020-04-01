@@ -69,7 +69,10 @@ async fn main() -> Result<(), StdError> {
     let cls = if let Some(root) = opt.burrito_root {
         debug!(root = ?&root, "Burrito mode");
         // first query shard-ctl
-        let mut shardctl = burrito_shard_ctl::ShardCtlClient::new(root).await?;
+        let mut shardctl = match burrito_shard_ctl::ShardCtlClient::new(root).await {
+            Ok(s) => s,
+            Err(e) => Err(format!("Could not contact ShardCtl: err = {}", e))?,
+        };
         debug!(service_addr = ?&opt.addr, "Querying");
         let mut si = shardctl.query(&opt.addr).await?;
 

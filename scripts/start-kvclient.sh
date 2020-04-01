@@ -11,7 +11,7 @@ RUST_LOG=info ./target/release/burrito-shard -r "redis://$1:6379" &
 
 sleep 5
 
-sudo RUST_LOG=info cset shield --userset=kv --exec ./target/release/ycsb -- \
+sudo cset shield --userset=kv --exec ./target/release/ycsb -- \
             --burrito-root="/tmp/burrito" \
             --addr "kv" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access \
@@ -19,7 +19,7 @@ sudo RUST_LOG=info cset shield --userset=kv --exec ./target/release/ycsb -- \
 client1=$!
 echo "started client 1"
 
-RUST_LOG=info ./target/release/ycsb \
+./target/release/ycsb \
     --burrito-root="/tmp/burrito" \
     --addr "kv" \
     --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb2-100.access \
