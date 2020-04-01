@@ -14,7 +14,7 @@ sleep 5
 sudo cset shield --userset=kv --exec ./target/release/ycsb -- \
             --burrito-root="/tmp/burrito" \
             --addr "kv" \
-            --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access \
+            --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-100.access \
             -i "$2" -n "$3" &
 client1=$!
 echo "started client 1"
@@ -22,7 +22,7 @@ echo "started client 1"
 ./target/release/ycsb \
     --burrito-root="/tmp/burrito" \
     --addr "kv" \
-    --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadb2-100.access \
+    --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadbunf2-100.access \
     -i "$2" -n "$3" &
 client2=$!
 echo "started client 2"
