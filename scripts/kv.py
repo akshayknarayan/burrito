@@ -206,7 +206,7 @@ def start_server(conn, outf, shards=0, use_burrito_shard=True):
     conn.check_proc("kvserver", f"{outf}.err")
 
 # one machine can handle 2 client processes
-def run_client(conn, server, interarrival, outf, clientsharding=0, wrkload='zipf'):
+def run_client(conn, server, interarrival, outf, clientsharding=0, wrkload='uniform'):
     wrkfile = "~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access"
     if wrkload == 'uniform':
         wrkfile = "~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadbunf{}-100.access"
@@ -303,7 +303,7 @@ def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
             wd="~/burrito", sudo=use_sudo, background=True, stderr=f"{outdir}-{m.addr}.err")
         agenda.subtask(f"Started burrito-shard-ctl on {m.addr}")
 
-def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='zipf'):
+def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='uniform'):
     shardctl_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-burritoshard"
     server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-kvserver"
     outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-ycsb"

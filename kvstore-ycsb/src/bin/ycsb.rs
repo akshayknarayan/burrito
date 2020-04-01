@@ -56,7 +56,7 @@ async fn main() -> Result<(), StdError> {
 
     tracing_subscriber::fmt::init();
 
-    trace!("reading workload");
+    debug!("reading workload");
     let loads = ops(opt.accesses.with_extension("load"))?;
     let accesses = ops(opt.accesses)?;
     debug!(num_ops = ?accesses.len(), "done reading workload");
