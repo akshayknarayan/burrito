@@ -1,4 +1,3 @@
-use async_timer as hrtimer;
 use core::task::{Context, Poll};
 use kvstore_ycsb::{ops, Op};
 use std::collections::HashMap;
@@ -200,7 +199,10 @@ fn paced_ops_stream(
 ) -> impl futures_util::stream::Stream<Item = ((), Op)> {
     use futures_util::stream::StreamExt;
     //let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
-    let tkr = hrtimer::interval(std::time::Duration::from_micros(interarrival_micros as u64));
+    //use async_timer as hrtimer;
+    //let tkr = hrtimer::interval(std::time::Duration::from_micros(interarrival_micros as u64));
+    let tkr =
+        poisson_ticker::Ticker::new(std::time::Duration::from_micros(interarrival_micros as u64));
     tkr.zip(futures_util::stream::iter(ops))
 }
 
