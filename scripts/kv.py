@@ -223,9 +223,8 @@ def run_client(conn, server, interarrival, outf, clientsharding=0, wrkload='unif
 
     ok = conn.run("cset shield --userset=kv --reset", sudo=True)
     check(ok, "reset cpuset", conn.addr, allowed = [2])
-    cpus = max(3, clientsharding + 1)
-    agenda.subtask(f"make cpu shield kv for cpus 0-{cpus} on {conn.addr}")
-    ok = conn.run(f"cset shield --userset=kv --cpu=0-{cpus} --kthread=on", sudo=True)
+    agenda.subtask(f"make cpu shield kv for cpus 0-4 on {conn.addr}")
+    ok = conn.run(f"cset shield --userset=kv --cpu=0-4 --kthread=on", sudo=True)
     check(ok, "make cpuset", conn.addr)
 
     shard_arg = f"-n {clientsharding}" if clientsharding > 0 else ""
@@ -234,7 +233,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0, wrkload='unif
             --burrito-root=/tmp/burrito \
             --addr \"kv\" \
             --accesses {wrkfile.format(1)} \
-            -o {outf}.data \
+            -o {outf}.data1 \
             {shard_arg} \
             -i {interarrival}",
             wd = "~/burrito",
@@ -247,7 +246,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0, wrkload='unif
             --burrito-root=/tmp/burrito \
             --addr \"kv\" \
             --accesses {wrkfile.format(2)} \
-            -o {outf}2.data \
+            -o {outf}2.data1 \
             {shard_arg} \
             -i {interarrival}",
             sudo=True,
@@ -257,14 +256,18 @@ def run_client(conn, server, interarrival, outf, clientsharding=0, wrkload='unif
             )
     check(ok, "ycsb client", conn.addr)
     # wait for the other one
+    wait_start = time.monotonic()
     while True:
         ok = conn.run(f"ls {outf}.data", wd="~/burrito")
         if ok.exited == 0:
+            conn.run("sudo chmod 644 {outf}.data")
             break
         else:
             time.sleep(1)
+            if time.monotonic() - wait_start > 10.:
+                agenda.subfailure("Giving up waiting for ycsb client")
+                break
 
-    conn.run("sudo chmod 644 {outf}.data")
     conn.run("sudo chmod 644 {outf}.out")
     conn.run("sudo chmod 644 {outf}.err")
 
@@ -313,7 +316,7 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
 
     if os.path.exists(f"{outf}-{machines[1].addr}.data"):
         agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
-        return
+        return True
 
     # load = 100 (client threads / proc) * 2 (procs/machine) * {len(machines) - 1} (machines) / {interarrival} (per client thread)
     # interarrival = 100 * 2 * {len(machines) - 1} / load
@@ -374,31 +377,52 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
 
     agenda.subtask("processes killed")
 
-    machines[0].get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
-    machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
-    machines[0].get(f"burrito/{shardctl_prefix}.out", local=f"{shardctl_prefix}.out", preserve_mode=False)
-    machines[0].get(f"burrito/{shardctl_prefix}.err", local=f"{shardctl_prefix}.err", preserve_mode=False)
-    machines[0].get(f"burrito/{shardctl_prefix}.log", local=f"{shardctl_prefix}.log", preserve_mode=False)
-    for c in machines[1:]:
-        if c.addr in ['127.0.0.1', '::1', 'localhost']:
-            ok = c.run(f"mv burrito/{outf}.data burrito/{outf}-{c.addr}.data1")
-            #check(ok, f"Get ycsb data: burrito/{outf}-{c.addr}.data1", c.addr)
-            ok = c.run(f"mv burrito/{outf}2.data burrito/{outf}2-{c.addr}.data1")
-            #check(ok, f"Get ycsb data: burrito/{outf}2-{c.addr}.data1", c.addr)
-            continue
-        c.get(f"burrito/{outf}.err", local=f"{outf}-{c.addr}.err", preserve_mode=False)
-        c.get(f"burrito/{outf}2.err", local=f"{outf}2-{c.addr}.err", preserve_mode=False)
-        c.get(f"burrito/{outf}.out", local=f"{outf}-{c.addr}.out", preserve_mode=False)
-        c.get(f"burrito/{outf}2.out", local=f"{outf}2-{c.addr}.out", preserve_mode=False)
-        c.get(f"burrito/{outf}.data", local=f"{outf}-{c.addr}.data1", preserve_mode=False)
-        c.get(f"burrito/{outf}2.data", local=f"{outf}2-{c.addr}.data1", preserve_mode=False)
+    try:
+        machines[0].get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
+        machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+        machines[0].get(f"burrito/{shardctl_prefix}.out", local=f"{shardctl_prefix}.out", preserve_mode=False)
+        machines[0].get(f"burrito/{shardctl_prefix}.err", local=f"{shardctl_prefix}.err", preserve_mode=False)
+        machines[0].get(f"burrito/{shardctl_prefix}.log", local=f"{shardctl_prefix}.log", preserve_mode=False)
+        for c in machines[1:]:
+            if c.addr in ['127.0.0.1', '::1', 'localhost']:
+                continue
+            c.get(f"burrito/{outf}.err", local=f"{outf}-{c.addr}.err", preserve_mode=False)
+            c.get(f"burrito/{outf}2.err", local=f"{outf}2-{c.addr}.err", preserve_mode=False)
+            c.get(f"burrito/{outf}.out", local=f"{outf}-{c.addr}.out", preserve_mode=False)
+            c.get(f"burrito/{outf}2.out", local=f"{outf}2-{c.addr}.out", preserve_mode=False)
+            c.get(f"burrito/{outf}.data1", local=f"{outf}-{c.addr}.data1", preserve_mode=False)
+            c.get(f"burrito/{outf}2.data1", local=f"{outf}2-{c.addr}.data1", preserve_mode=False)
+    except:
+        agenda.subfailure("At least one file missing")
+        return False
 
     agenda.task("done")
 
     for c in machines[1:]:
         agenda.subtask(f"adding experiment info for {c.addr}")
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards Wrkload \"$0;}} else {{print \"{shardtype}shard {num_shards}shards {wrkload} \"$0}} }}' {outf}-{c.addr}.data1 > {outf}-{c.addr}.data", shell=True)
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards Wrkload \"$0;}} else {{print \"{shardtype}shard {num_shards}shards {wrkload} \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$1; print \"ShardType NumShards Wrkload Ops \"$0;}} else {{print \"{shardtype} {num_shards} {wrkload} {ops_per_sec} \"$0}} }}' {outf}-{c.addr}.data1 > {outf}-{c.addr}.data", shell=True)
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards Wrkload Ops \"$0;}} else {{print \"{shardtype} {num_shards} {wrkload} {ops_per_sec} \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
+
+    return True
+
+def probe_ops(outdir, machines, num_shards, shardtype, low_ops, high_ops=None, wrkload='uniform'):
+    if high_ops is not None and high_ops - low_ops < 20000:
+        agenda.task(f"resolved: num_shards = {num_shards}, shardtype = {shardtype}, workload = {wrkload} => {low_ops} ops/s")
+        return low_ops
+    elif high_ops is not None:
+        ops = (low_ops + high_ops) / 2
+        ok = do_exp(outdir, machines, num_shards, shardtype, ops, wrkload=wrkload)
+        if ok:
+            return probe_ops(outdir, machines, num_shards, shardtype, ops, high_ops=high_ops, wrkload=wrkload)
+        else:
+            return probe_ops(outdir, machines, num_shards, shardtype, low_ops, high_ops=ops, wrkload=wrkload)
+    else:
+        # probe by doubling upwards until it fails
+        ok = do_exp(outdir, machines, num_shards, shardtype, low_ops, wrkload=wrkload)
+        if ok:
+            return probe_ops(outdir, machines, num_shards, shardtype, low_ops*2, high_ops=None, wrkload=wrkload)
+        else:
+            return probe_ops(outdir, machines, num_shards, shardtype, low_ops/2, high_ops=low_ops, wrkload=wrkload)
 
 
 parser = argparse.ArgumentParser()
@@ -409,16 +433,24 @@ parser.add_argument('--client', type=str, action='append', required=True)
 parser.add_argument('--shards', type=int, action='append')
 parser.add_argument('--shardtype', type=str, action='append')
 parser.add_argument('--wrk', type=str, action='append')
+parser.add_argument('--mode', type=str)
 
 if __name__ == '__main__':
     args = parser.parse_args()
     outdir = args.outdir
-    ops_per_sec = args.load
     ips = [args.server] + args.client
 
     if len(args.client) < 1:
         agenda.failure("Need more machines")
         sys.exit(1)
+
+    if args.mode is None:
+        args.mode = 'run'
+
+    if args.mode == 'run':
+        ops_per_sec = args.load
+    else:
+        ops_per_sec = args.load[0]
 
     if args.shards is None:
         args.shards = [1]
@@ -451,17 +483,23 @@ if __name__ == '__main__':
     [t.join() for t in setups]
     agenda.task("...done building burrito")
 
-    for s in args.shards:
+    for w in args.wrk:
         for t in args.shardtype:
-            for w in args.wrk:
-                for o in ops_per_sec:
-                    do_exp(outdir, machines, s, t, o, wrkload=w)
-                    time.sleep(3)
+            for s in args.shards:
+                if args.mode == 'run':
+                    for o in ops_per_sec:
+                        do_exp(outdir, machines, s, t, o, wrkload=w)
+                        time.sleep(3)
+                else: # probe
+                    probe_ops(outdir, machines, s, t, ops_per_sec, wrkload=w)
 
     agenda.task("done")
     #subprocess.run(f"rm -f {outdir}/*.data1", shell=True)
     #subprocess.run(f"rm -f {outdir}/*.data2", shell=True)
     subprocess.run(f"tail ./{outdir}/*ycsb*err >> {outdir}/exp.log", shell=True)
     subprocess.run(f"cat ./{outdir}/*ycsb*.data | awk '{{if (!hdr) {{hdr=$0; print $0;}} else if (hdr != $0) {{print $0}};}}' > {outdir}/exp.data", shell=True)
+    subprocess.run(f"awk '{print $1,$2,$3,$4}' {outdir}/exp.data | uniq > {outdir}/exp-scaling.data1", shell=True)
+    subprocess.run(f"python3 scripts/exp_max.py < {outdir}/exp-scaling.data1 > {outdir}/exp-scaling.data", shell=True)
     agenda.task("plotting")
     subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)
+    subprocess.run(f"./scripts/kv-udp.R {outdir}/exp-scaling.data {outdir}/exp-scaling.pdf", shell=True)
