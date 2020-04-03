@@ -57,7 +57,7 @@ impl ShardCtlClient {
         }
     }
 
-    pub async fn query(&mut self, req: &str) -> Result<proto::ShardInfo, Error> {
+    pub async fn query(&mut self, req: proto::Addr) -> Result<proto::ShardInfo, Error> {
         use futures_util::{sink::Sink, stream::StreamExt};
 
         trace!("poll_ready");
@@ -70,7 +70,7 @@ impl ShardCtlClient {
         let pst = Pin::new(&mut self.uc);
         trace!("start_send");
         pst.start_send(proto::Request::Query(proto::QueryShardRequest {
-            service_name: req.into(),
+            canonical_addr: req,
         }))?;
 
         trace!("poll_flush");

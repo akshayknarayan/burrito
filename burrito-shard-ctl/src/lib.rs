@@ -20,7 +20,8 @@ mod srv {
     /// Keep track of sharded services.
     #[derive(Clone)]
     pub struct ShardCtl {
-        shard_table: Arc<RwLock<HashMap<String, proto::ShardInfo>>>,
+        // canonical addr -> shard info
+        shard_table: Arc<RwLock<HashMap<proto::Addr, proto::ShardInfo>>>,
         // Interface name -> handles
         #[cfg(feature = "ebpf")]
         handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles>>>,
@@ -252,18 +253,18 @@ mod srv {
 
         pub async fn query(&self, req: proto::QueryShardRequest) -> proto::QueryShardReply {
             // TODO if necessary, install client-side xdp program
-            if let Some(s) = self.shard_table.read().await.get(&req.service_name) {
+            if let Some(s) = self.shard_table.read().await.get(&req.canonical_addr) {
                 proto::QueryShardReply::Ok(s.clone())
             } else {
-                proto::QueryShardReply::Err(format!("Could not find {:?}", &req.service_name))
+                proto::QueryShardReply::Err(format!("Could not find {}", &req.canonical_addr))
             }
         }
 
         async fn shard_table_insert(&self, serv: proto::ShardInfo) -> Result<(), Error> {
-            let sn = serv.service_name.clone();
+            let sn = serv.canonical_addr.clone();
             if let Some(s) = self.shard_table.write().await.insert(sn.clone(), serv) {
                 Err(anyhow::anyhow!(
-                    "Shard service address {} already in use at: {:?}",
+                    "Shard service address {} already in use at: {}",
                     sn,
                     s.canonical_addr
                 ))?;
@@ -340,7 +341,7 @@ mod srv {
     }
 
     async fn listen_updates(
-        shard_table: Arc<RwLock<HashMap<String, proto::ShardInfo>>>,
+        shard_table: Arc<RwLock<HashMap<proto::Addr, proto::ShardInfo>>>,
         mut con: redis::aio::Connection,
     ) {
         // usual blah blah warning about polling intervals
@@ -356,7 +357,7 @@ mod srv {
     }
 
     async fn poll_updates(
-        shard_table: &RwLock<HashMap<String, proto::ShardInfo>>,
+        shard_table: &RwLock<HashMap<proto::Addr, proto::ShardInfo>>,
         con: &mut redis::aio::Connection,
     ) -> Result<(), Error> {
         use redis::AsyncCommands;
@@ -366,11 +367,23 @@ mod srv {
 
         let mut tbl = shard_table.write().await;
         for srv in srvs {
-            if !tbl.contains_key(&srv) {
-                let sh_info_blob = con.get::<_, Vec<u8>>(&srv).await?;
-                let sh_info = bincode::deserialize(&sh_info_blob)?;
-                let k = srv.trim_start_matches("shard:");
-                tbl.insert(k.to_owned(), sh_info);
+            let k = srv.trim_start_matches("shard:");
+            if let Ok(s) = k.parse::<proto::Addr>() {
+                if !tbl.contains_key(&s) {
+                    let sh_info_blob = con.get::<_, Vec<u8>>(&srv).await?;
+                    let sh_info: proto::ShardInfo = bincode::deserialize(&sh_info_blob)?;
+                    if s == sh_info.canonical_addr {
+                        tbl.insert(s.to_owned(), sh_info);
+                    } else {
+                        warn!(
+                            redis_addr = ?s,
+                            shardinfo_addr = ?sh_info.canonical_addr,
+                            "Mismatch error with redis key <-> ShardInfo",
+                        );
+                    }
+                }
+            } else {
+                warn!(redis_key = ?srv, addr = ?k, "Parse error with redis key -> Addr");
             }
         }
 
@@ -381,7 +394,7 @@ mod srv {
         conn: Arc<Mutex<redis::aio::Connection>>,
         serv: &proto::ShardInfo,
     ) -> Result<(), Error> {
-        let name = format!("shard:{}", serv.service_name);
+        let name = format!("shard:{}", serv.canonical_addr);
         let mut r = redis::pipe();
         r.atomic()
             .cmd("SADD")

@@ -17,9 +17,6 @@ pub struct SimpleShardPolicy {
 /// Request type for servers registering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardInfo {
-    // TODO service_name should not exist, should index by canonical_addr
-    // otherwise it is not clean as service_name ends up doing the job of route-ctl
-    pub service_name: String,
     pub canonical_addr: Addr,
     pub shard_addrs: Vec<Addr>,
     pub shard_info: SimpleShardPolicy,
@@ -34,7 +31,7 @@ pub enum RegisterShardReply {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryShardRequest {
-    pub service_name: String,
+    pub canonical_addr: Addr,
 }
 
 /// Response type for clients wanting to know where the servers are.

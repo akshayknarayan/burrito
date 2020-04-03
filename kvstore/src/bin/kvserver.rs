@@ -93,7 +93,6 @@ async fn main() -> Result<(), StdError> {
     };
 
     let si = ShardInfo {
-        service_name: "kv".into(),
         canonical_addr: proto::Addr::Udp(addrs[0]),
         shard_addrs: if opt.no_shard_ctl {
             vec![]
