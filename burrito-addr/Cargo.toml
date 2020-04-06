@@ -8,7 +8,8 @@ edition = "2018"
 
 [dependencies]
 bincode = "1"
-burrito-route-ctl = {path = "../burrito-route-ctl"}
+burrito-localname-ctl = {path = "../burrito-localname-ctl"}
+burrito-discovery-ctl = {path = "../burrito-discovery-ctl"}
 burrito-flatbuf = {path = "../burrito-flatbuf"}
 burrito-util = {path = "../burrito-util"}
 bytes = "0.4"
@@ -25,6 +26,3 @@ tonic = "0.1"
 tracing = "0.1"
 tracing-futures = "0.2"
 tracing-attributes = "=0.1.6"
-
-[build-dependencies]
-tonic-build = "0.1"

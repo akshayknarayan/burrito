@@ -15,9 +15,6 @@ struct Opt {
 
     #[structopt(long, default_value = "/tmp/burrito")]
     burrito_root: String,
-
-    #[structopt(long, default_value = "flatbuf")]
-    burrito_proto: String,
 }
 
 #[tokio::main]
@@ -49,22 +46,15 @@ async fn main() -> Result<(), failure::Error> {
     let port = opt.port.unwrap();
 
     if let Some(addr) = opt.burrito_addr {
-        match opt.burrito_proto {
-            x if x == "flatbuf" => {
-                info!(&log, "burrito mode"; "proto" => &x, "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => port);
-                let srv =
-                    burrito_addr::flatbuf::Server::start(&addr, ("tcp", port), &opt.burrito_root)
-                        .await?;
-                let ping_srv = rpcbench::PingServer::new(srv_impl);
-                hyper::server::Server::builder(hyper::server::accept::from_stream(srv))
-                    .serve(hyper::service::make_service_fn(move |_| {
-                        let ps = ping_srv.clone();
-                        async move { Ok::<_, hyper::Error>(ps) }
-                    }))
-                    .await?;
-            }
-            x => failure::bail!("Unknown burrito protocol {:?}", &x),
-        }
+        info!(&log, "burrito mode";  "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => port);
+        let srv = burrito_addr::Server::start(&addr, ("tcp", port), &opt.burrito_root).await?;
+        let ping_srv = rpcbench::PingServer::new(srv_impl);
+        hyper::server::Server::builder(hyper::server::accept::from_stream(srv))
+            .serve(hyper::service::make_service_fn(move |_| {
+                let ps = ping_srv.clone();
+                async move { Ok::<_, hyper::Error>(ps) }
+            }))
+            .await?;
 
         return Ok(());
     }

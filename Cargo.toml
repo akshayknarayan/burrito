@@ -4,14 +4,12 @@ members = [
     "burrito-addr",
     "burrito-discovery-ctl",
     "burrito-localname-ctl",
-    "burrito-route-ctl",
     "burrito-shard-ctl",
     "burrito-flatbuf",
     "burrito-util",
     "kvstore",
     "kvstore-ycsb",
     "rpcbench",
-    "static-test",
     "xdp-shard",
 ]
 

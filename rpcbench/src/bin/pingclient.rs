@@ -19,8 +19,6 @@ struct Opt {
     reqs_per_iter: usize,
     #[structopt(short, long)]
     out_file: Option<std::path::PathBuf>,
-    #[structopt(long, default_value = "flatbuf")]
-    burrito_proto: String,
 }
 
 #[tokio::main]
@@ -62,26 +60,10 @@ async fn main() -> Result<(), failure::Error> {
     let durs = if let Some(root) = opt.burrito_root {
         // burrito mode
         let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
-        info!(&log, "burrito mode"; "proto" => &opt.burrito_proto, "burrito_root" => ?root, "addr" => ?&opt.addr);
-        match opt.burrito_proto {
-            x if x == "tonic" => {
-                let cl = burrito_addr::tonic::Client::new(root).await?;
-                trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
-                rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
-            }
-            x if x == "bincode" => {
-                let cl =
-                    burrito_addr::bincode::StaticClient::new(std::path::PathBuf::from(root)).await;
-                trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
-                rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
-            }
-            x if x == "flatbuf" => {
-                let cl = burrito_addr::flatbuf::Client::new(std::path::PathBuf::from(root)).await?;
-                trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
-                rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
-            }
-            x => failure::bail!("Unknown burrito protocol {:?}", &x),
-        }
+        info!(&log, "burrito mode"; "burrito_root" => ?root, "addr" => ?&opt.addr);
+        let cl = burrito_addr::Client::new(root).await?;
+        trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
+        rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
     } else if opt.addr.starts_with("http") {
         // raw tcp mode
         info!(&log, "TCP mode"; "addr" => ?&opt.addr);

@@ -43,4 +43,9 @@ impl<'a> Uri<'a> {
             .next()
             .ok_or_else(|| format_err!("Could not get socket path for Destination"))
     }
+
+    pub fn burrito_addr(uri: &hyper::Uri) -> Result<burrito_localname_ctl::proto::Addr, Error> {
+        let s = Uri::socket_path(uri)?;
+        Ok(burrito_localname_ctl::proto::Addr::Burrito(s))
+    }
 }

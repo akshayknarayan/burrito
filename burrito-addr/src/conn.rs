@@ -3,10 +3,12 @@ use core::{
     task::{Context, Poll},
 };
 use pin_project::{pin_project, project};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use tracing::trace;
 
 pub enum AddrError {
-    Udp(String),
+    Unknown(String),
     Connect(failure::Error),
 }
 
@@ -20,15 +22,15 @@ impl Into<failure::Error> for AddrError {
     fn into(self) -> failure::Error {
         match self {
             AddrError::Connect(e) => e,
-            AddrError::Udp(a) => failure::format_err!("Could not use UDP address: {}", a),
+            AddrError::Unknown(a) => failure::format_err!("Could not use address: {}", a),
         }
     }
 }
 
 pub enum Addr {
-    Unix(String),
-    Tcp(String),
-    Udp(String),
+    Unix(PathBuf),
+    Tcp(SocketAddr),
+    Other(String),
 }
 
 impl Addr {
@@ -45,7 +47,7 @@ impl Addr {
                 trace!("burrito-addr::Conn Connected");
                 Ok(Conn::Tcp(st))
             }
-            Self::Udp(addr) => Err(AddrError::Udp(addr)),
+            Self::Other(addr) => Err(AddrError::Unknown(addr)),
         }
     }
 }
