@@ -2,6 +2,7 @@
 
 members = [
     "burrito-addr",
+    "burrito-discovery-ctl",
     "burrito-route-ctl",
     "burrito-shard-ctl",
     "burrito-flatbuf",
