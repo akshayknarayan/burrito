@@ -24,7 +24,7 @@ mod srv {
         shard_table: Arc<RwLock<HashMap<proto::Addr, proto::ShardInfo>>>,
         // Interface name -> handles
         #[cfg(feature = "ebpf")]
-        handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles>>>,
+        handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
         redis_client: redis::Client,
         redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
     }
@@ -207,7 +207,7 @@ mod srv {
                     let mut map = self.handles.lock().await;
                     for ifn in ifnames {
                         if !map.contains_key(&ifn) {
-                            let handle = match xdp_shard::BpfHandles::load_on_interface_name(&ifn) {
+                            let handle = match xdp_shard::BpfHandles::<xdp_shard::Ingress>::load_on_interface_name(&ifn) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     return proto::RegisterShardReply::Err(format!(
@@ -276,7 +276,7 @@ mod srv {
 
     #[cfg(feature = "ebpf")]
     async fn read_shard_stats(
-        handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles>>>,
+        handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
         mut stats_log: Option<std::fs::File>,
     ) -> Result<(), Error> {
         use tracing::info;

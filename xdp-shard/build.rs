@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     if cfg!(feature = "ebpf") {
@@ -68,6 +68,7 @@ fn main() {
             .write_to_file(out_path.join("if_xdp.rs"))
             .expect("Unable to write bindings");
 
+        println!("cargo:rerun-if-changed=./src/xdp_shard.h");
         let xdp_prog_types_bindings = bindgen::Builder::default()
             .header("./src/xdp_shard.h")
             .derive_default(true)
@@ -81,82 +82,91 @@ fn main() {
             .write_to_file(out_path.join("xdp_shard.rs"))
             .expect("Unable to write bindings");
 
-        let clang_include = std::process::Command::new("clang")
-            .arg("-print-file-name=include")
-            .output()
-            .expect("clang get include path")
-            .stdout;
+        let p: PathBuf = "./src/xdp_shard_ingress.c".parse().unwrap();
+        compile_ebpf_prog(&p);
+    }
+}
 
-        let clang_include = std::string::String::from_utf8(clang_include).unwrap();
+fn compile_ebpf_prog(name: &Path) {
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    println!(
+        "cargo:rerun-if-changed={}",
+        name.as_os_str().to_str().unwrap()
+    );
+    let clang_include = std::process::Command::new("clang")
+        .arg("-print-file-name=include")
+        .output()
+        .expect("clang get include path")
+        .stdout;
+    let clang_include = std::string::String::from_utf8(clang_include).unwrap();
+    if !std::process::Command::new("clang")
+        .args(&[
+            "-nostdinc",
+            "-isystem",
+            &clang_include,
+            "-D__KERNEL__",
+            "-D__ASM_SYSREG_H",
+            "-I/usr/include",
+            "-Werror",
+            "-Wall",
+            "-gdwarf",
+            "-O1",
+            "-emit-llvm",
+            "-c",
+            name.to_str().unwrap(),
+            "-o",
+            name.with_extension("d").to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("clang .c")
+        .wait()
+        .expect("clang .c")
+        .success()
+    {
+        panic!("clang errored");
+    }
 
-        println!("cargo:rerun-if-changed=./src/xdp_shard.c");
-        println!("cargo:rerun-if-changed=./src/xdp_shard.h");
-        if !std::process::Command::new("clang")
-            .current_dir("./src")
-            .args(&[
-                "-nostdinc",
-                "-isystem",
-                &clang_include,
-                "-D__KERNEL__",
-                "-D__ASM_SYSREG_H",
-                "-I/usr/include",
-                "-Werror",
-                "-Wall",
-                "-gdwarf",
-                "-O1",
-                "-emit-llvm",
-                "-c",
-                "xdp_shard.c",
-                "-o",
-                "xdp_shard.d",
-            ])
-            .spawn()
-            .expect("clang xdp_shard.c")
-            .wait()
-            .expect("clang xdp_shard.c")
-            .success()
-        {
-            panic!("clang errored");
-        }
+    if !std::process::Command::new("llc")
+        .args(&[
+            "-march=bpf",
+            "-filetype=obj",
+            "-o",
+            name.with_extension("o").to_str().unwrap(),
+            name.with_extension("d").to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("llc")
+        .wait()
+        .expect("llc")
+        .success()
+    {
+        panic!("llc errored");
+    }
 
-        if !std::process::Command::new("llc")
-            .current_dir("./src")
-            .args(&[
-                "-march=bpf",
-                "-filetype=obj",
-                "-o",
-                "xdp_shard.o",
-                "xdp_shard.d",
-            ])
-            .spawn()
-            .expect("llc xdp_shard.d")
-            .wait()
-            .expect("llc xdp_shard.d")
-            .success()
-        {
-            panic!("llc errored");
-        }
+    std::process::Command::new("rm")
+        .args(&["-f", name.with_extension("d").to_str().unwrap()])
+        .spawn()
+        .unwrap()
+        .wait()
+        .unwrap();
 
-        std::process::Command::new("rm")
-            .current_dir("./src")
-            .args(&["-f", "xdp_shard.d"])
-            .spawn()
-            .unwrap()
-            .wait()
-            .unwrap();
-
-        eprintln!("{:?}", out_path.join("xdp_shard.o"));
-
-        if !std::process::Command::new("mv")
-            .arg("src/xdp_shard.o")
-            .arg(out_path.join("xdp_shard.o"))
-            .spawn()
-            .expect("kernel ebpf program move to outdir")
-            .wait()
-            .expect("kernel ebpf program move to outdir")
-            .success()
-        {
-            panic!("mv errored");
-        }
+    if !std::process::Command::new("mv")
+        .arg(name.with_extension("o").to_str().unwrap())
+        .arg(
+            out_path.join(
+                name.with_extension("o")
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+            ),
+        )
+        .spawn()
+        .expect("kernel ebpf program move to outdir")
+        .wait()
+        .expect("kernel ebpf program move to outdir")
+        .success()
+    {
+        panic!("mv errored");
     }
 }

@@ -18,7 +18,8 @@ fn main() -> Result<(), StdError> {
 
     tracing_subscriber::fmt::init();
 
-    let mut prog = xdp_shard::BpfHandles::load_on_interface_name(&opt.interface)?;
+    let mut prog =
+        xdp_shard::BpfHandles::<xdp_shard::Ingress>::load_on_interface_name(&opt.interface)?;
     let ifn = opt.interface;
     let stop: Arc<AtomicBool> = Arc::new(false.into());
     let s = stop.clone();
