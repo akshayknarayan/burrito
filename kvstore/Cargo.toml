@@ -20,7 +20,6 @@ slog = "2"
 slog-term = "2"
 structopt = "0.3"
 burrito-addr = {path = "../burrito-addr"}
-burrito-route-ctl = {path = "../burrito-route-ctl"}
 burrito-shard-ctl = {path = "../burrito-shard-ctl"}
 burrito-util = {path = "../burrito-util"}
 tracing = "0.1"

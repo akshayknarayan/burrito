@@ -1,12 +1,5 @@
+pub use burrito_discovery_ctl::proto::Addr;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Addr {
-    Burrito(String),
-    Tcp(SocketAddr),
-    Udp(SocketAddr),
-}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SimpleShardPolicy {
@@ -15,6 +8,9 @@ pub struct SimpleShardPolicy {
 }
 
 /// Request type for servers registering.
+///
+/// `canonical_addr` must be routable. So, if `canonical_addr` is Addr::Burrito, then discovery-ctl
+/// must be reachable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardInfo {
     pub canonical_addr: Addr,

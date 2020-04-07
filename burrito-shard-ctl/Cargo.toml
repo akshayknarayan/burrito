@@ -14,6 +14,7 @@ ebpf-bin = ["bin", "ebpf"]
 
 [dependencies]
 anyhow = "1"
+burrito-discovery-ctl = { path = "../burrito-discovery-ctl" }
 async-bincode = "0.5"
 bincode = "1"
 futures-util = { version = "0.3", features = ["sink"] }
@@ -26,6 +27,13 @@ structopt = { version = "0.3", optional = true }
 tower-service = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
 xdp-shard = { path = "../xdp-shard", optional = true }
+
+[dev-dependencies]
+slog = "2"
+slog-term = "2"
+tokio = { version = "0.2", features = ["sync", "rt-core", "uds", "time", "rt-threaded"] }
+burrito-shard-ctl = { path = ".", features = ["bin"] }
+redis = "0.15"
 
 [[bin]]
 name = "burrito-shard"

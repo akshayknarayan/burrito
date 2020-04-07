@@ -67,15 +67,14 @@ async fn main() -> Result<(), StdError> {
 
     let cls = if let Some(root) = opt.burrito_root {
         debug!(root = ?&root, "Burrito mode");
-        // first query shard-ctl
-        let mut shardctl = match burrito_shard_ctl::ShardCtlClient::new(root).await {
+
+        let mut dcl = burrito_discovery_ctl::client::DiscoveryClient::new(&root).await?;
+        let mut shardctl = match burrito_shard_ctl::ShardCtlClient::new(&root).await {
             Ok(s) => s,
             Err(e) => Err(format!("Could not contact ShardCtl: err = {}", e))?,
         };
-        debug!(service_addr = ?&opt.addr, "Querying");
-        let mut si = shardctl.query(&opt.addr).await?;
 
-        // TODO assume for now that shard_info doesn't contain burrito addresses to be resolved
+        let mut si = shardctl.query_recursive(&mut dcl, &opt.addr).await?;
 
         // decide managed_sharding or not.
         if num_shards < 1 {

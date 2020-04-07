@@ -65,18 +65,6 @@ impl tower_service::Service<msg::Msg> for Store {
     }
 }
 
-/// Serve `srv` on `st`.
-pub async fn serve(
-    st: impl AsyncWrite + AsyncRead + Unpin,
-    srv: impl tower_service::Service<msg::Msg, Response = msg::Msg>,
-) {
-    let st: AsyncBincodeStream<_, msg::Msg, _, _> = AsyncBincodeStream::from(st).for_async();
-    pipeline::Server::new(st, srv)
-        .await
-        .map_err(|_| ()) // argh, bincode::Error is not Debug
-        .unwrap_or_else(|_| ());
-}
-
 /// Serve Store shards on `shard_listeners`.
 ///
 /// The first shard_listener is the sharder, which uses shard_fn to steer requests to the correct
@@ -194,6 +182,18 @@ pub async fn shard_server_udp(
         let msg = bincode::serialize(&resp)?;
         sk.send_to(&msg, from_addr).await?;
     }
+}
+
+/// Serve `srv` on `st`.
+pub async fn serve(
+    st: impl AsyncWrite + AsyncRead + Unpin,
+    srv: impl tower_service::Service<msg::Msg, Response = msg::Msg>,
+) {
+    let st: AsyncBincodeStream<_, msg::Msg, _, _> = AsyncBincodeStream::from(st).for_async();
+    pipeline::Server::new(st, srv)
+        .await
+        .map_err(|_| ()) // argh, bincode::Error is not Debug
+        .unwrap_or_else(|_| ());
 }
 
 /// Serve multiple Store shards on `shard_listeners`.

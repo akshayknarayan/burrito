@@ -2,7 +2,7 @@ mod client;
 pub use client::*;
 pub mod proto;
 
-pub const CONTROLLER_ADDRESS: &str = "shard-controller";
+pub const CONTROLLER_ADDRESS: &str = "shard-ctl";
 
 #[cfg(feature = "bin")]
 pub use srv::*;
