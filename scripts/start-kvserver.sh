@@ -9,4 +9,4 @@ sudo ./target/release/xdp_clear -i "$1"
 sleep 2
 sudo RUST_LOG=debug ./target/release/burrito-shard -b /tmp/burrito -r "redis://localhost:6379" &
 sleep 2
-sudo ./target/release/kvserver -i "$1" -p "$2" -n "$3" "$4"
+sudo ./target/release/kvserver -i "$1" -p "$2" -n "$3" $4
