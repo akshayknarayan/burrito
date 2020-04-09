@@ -82,12 +82,16 @@ impl<T> BpfHandles<T> {
     }
 
     pub fn clear_port(&mut self, port: u16) -> Result<(), StdError> {
-        // now set it
         let ok = unsafe {
             bpf::bpf_map_delete_elem(self.available_shards_map, &port as *const _ as *const _)
         };
         if ok < 0 {
             let errno = nix::errno::Errno::last();
+            if let nix::errno::Errno::ENOENT = errno {
+                // it is ok to clear_port on a value not in the map
+                return Ok(());
+            }
+
             Err(format!(
                 "available_shards_map delete elem failed: {}",
                 errno
