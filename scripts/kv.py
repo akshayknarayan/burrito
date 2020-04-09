@@ -164,12 +164,26 @@ def check_machine(ip):
     agenda.subtask(f"burrito commit {commit} on {ip}")
     return (conn, commit)
 
-def setup(conn, outdir):
+def setup_client(conn, outdir):
     ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
     check(ok, "mk outdir", conn.addr)
-    #agenda.subtask(f"building burrito on {conn.addr}")
-    #ok = conn.run("~/.cargo/bin/cargo build --release", wd = "~/burrito")
-    #check(ok, "build", conn.addr)
+    agenda.subtask(f"building burrito on {conn.addr}")
+    ok = conn.run("~/.cargo/bin/cargo build --release --features=\"bin\"", wd = "~/burrito/burrito-shard-ctl")
+    check(ok, "build", conn.addr)
+    ok = conn.run("~/.cargo/bin/cargo build --release", wd = "~/burrito/kvstore-ycsb")
+    check(ok, "build", conn.addr)
+    return conn
+
+def setup_server(conn, outdir):
+    ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
+    check(ok, "mk outdir", conn.addr)
+    agenda.subtask(f"building burrito on {conn.addr}")
+    ok = conn.run("~/.cargo/bin/cargo build --release --features=\"ebpf-bin\"", wd = "~/burrito/burrito-shard-ctl")
+    check(ok, "build", conn.addr)
+    ok = conn.run("~/.cargo/bin/cargo build --release", wd = "~/burrito/kvstore")
+    check(ok, "build", conn.addr)
+    ok = conn.run("~/.cargo/bin/cargo build --release", wd = "~/burrito/kvstore-ycsb")
+    check(ok, "build", conn.addr)
     return conn
 
 def start_server(conn, outf, shards=0, use_burrito_shard=True):
@@ -218,9 +232,6 @@ def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='u
         agenda.failure(f"No ycsb trace on {conn.addr}")
         sys.exit(1)
 
-    if clientsharding > 4:
-        agenda.failure(f"Not enough cores for 2x {clientsharding} client shards")
-
     ok = conn.run("cset shield --userset=kv --reset", sudo=True)
     check(ok, "reset cpuset", conn.addr, allowed = [2])
     agenda.subtask(f"make cpu shield kv for cpus 0-4 on {conn.addr}")
@@ -231,7 +242,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='u
 
     conn.run(f"cset shield --userset=kv --exec ./target/release/ycsb -- \
             --burrito-root=/tmp/burrito \
-            --addr \"kv\" \
+            --addr \"udp://{server}:4242\" \
             --accesses {wrkfile.format(1)} \
             -o {outf}.data1 \
             {shard_arg} \
@@ -244,7 +255,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='u
             )
     ok = conn.run(f"./target/release/ycsb \
             --burrito-root=/tmp/burrito \
-            --addr \"kv\" \
+            --addr \"udp://{server}:4242\" \
             --accesses {wrkfile.format(2)} \
             -o {outf}2.data1 \
             {shard_arg} \
@@ -258,9 +269,10 @@ def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='u
     # wait for the other one
     wait_start = time.monotonic()
     while True:
-        ok = conn.run(f"ls {outf}.data", wd="~/burrito")
+        agenda.subtask("Checking for background ycsb to finish")
+        ok = conn.run(f"ls {outf}.data1", wd="~/burrito")
         if ok.exited == 0:
-            conn.run("sudo chmod 644 {outf}.data")
+            conn.run("sudo chmod 644 {outf}.data1")
             break
         else:
             time.sleep(1)
@@ -270,6 +282,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='u
 
     conn.run("sudo chmod 644 {outf}.out")
     conn.run("sudo chmod 644 {outf}.err")
+    agenda.subtask("client done")
 
 def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
     for m in machines:
@@ -323,7 +336,7 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
     interarrival_secs = 200 * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
 
-    start_burrito_shard_ctl(machines, shardctl_prefix, use_sudo = (shardtype == "xdpserver" or shardtype == "client"))
+    start_burrito_shard_ctl(machines, shardctl_prefix, use_sudo = (shardtype == "xdpserver" or shardtype == "client" or shardtype == "dyn"))
 
     time.sleep(5)
 
@@ -332,7 +345,7 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    if shardtype == "client" or shardtype == "xdpserver":
+    if shardtype == "client" or shardtype == "xdpserver" or shardtype == "dyn":
         start_server(machines[0], server_prefix, shards=num_shards)
     elif shardtype == "server":
         start_server(machines[0], server_prefix, shards=num_shards, use_burrito_shard=False)
@@ -352,14 +365,14 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
             ),
             kwargs={'clientsharding':0, 'wrkload':wrkload}
         ) for m in machines[1:]]
-    if shardtype == "dyn":
+    elif shardtype == "dyn":
         clients = [threading.Thread(target=run_client, args=(
                 m,
                 server_addr,
                 interarrival_us,
                 outf
             ),
-            kwargs={'clientsharding':6, 'wrkload':wrkload}
+            kwargs={'clientsharding':5, 'wrkload':wrkload}
         ) for m in machines[1:]]
     elif shardtype == "xdpserver" or shardtype == "server":
         clients = [threading.Thread(target=run_client, args=(
@@ -381,7 +394,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
     # kill the server
     machines[0].run("sudo pkill -9 kvserver")
     for m in machines:
-        m.run("sudo pkill -9 burrito-shard")
+        m.run("pkill -9 burrito-shard", sudo=True)
+        m.run("pkill -9 ycsb", sudo=True)
         m.run("rm -rf /tmp/burrito/*", sudo=True)
 
     agenda.subtask("processes killed")
@@ -474,7 +488,7 @@ if __name__ == '__main__':
     if args.shardtype is None:
         args.shardtype = ['server']
     for t in args.shardtype:
-        if t not in ['client', 'server', 'xdpserver']:
+        if t not in ['client', 'server', 'xdpserver', 'dyn']:
             agenda.failure(f"Unknown shardtype {t}")
             sys.exit(1)
 
@@ -487,7 +501,8 @@ if __name__ == '__main__':
 
     # build
     agenda.task("building burrito...")
-    setups = [threading.Thread(target=setup, args=(m,outdir)) for m in machines]
+    setups = [threading.Thread(target=setup_server, args=(machines[0],outdir))] +\
+        [threading.Thread(target=setup_client, args=(m,outdir)) for m in machines[1:]]
     [t.start() for t in setups]
     [t.join() for t in setups]
     agenda.task("...done building burrito")
@@ -507,7 +522,7 @@ if __name__ == '__main__':
     #subprocess.run(f"rm -f {outdir}/*.data2", shell=True)
     subprocess.run(f"tail ./{outdir}/*ycsb*err >> {outdir}/exp.log", shell=True)
     subprocess.run(f"cat ./{outdir}/*ycsb*.data | awk '{{if (!hdr) {{hdr=$0; print $0;}} else if (hdr != $0) {{print $0}};}}' > {outdir}/exp.data", shell=True)
-    subprocess.run(f"awk '{print $1,$2,$3,$4}' {outdir}/exp.data | uniq > {outdir}/exp-scaling.data1", shell=True)
+    subprocess.run(f"awk '{{print $1,$2,$3,$4}}' {outdir}/exp.data | uniq > {outdir}/exp-scaling.data1", shell=True)
     subprocess.run(f"python3 scripts/exp_max.py < {outdir}/exp-scaling.data1 > {outdir}/exp-scaling.data", shell=True)
     agenda.task("plotting")
     subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)

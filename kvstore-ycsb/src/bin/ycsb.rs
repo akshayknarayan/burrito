@@ -127,7 +127,7 @@ async fn main() -> Result<(), StdError> {
     } else {
         // there is no shardctl
         // "guess" that the ports are sequential
-        let addrs = sk_shard_addrs(num_shards, opt.addr);
+        let addrs = sk_shard_addrs(opt.num_shards_thresh.unwrap(), opt.addr);
         // make clients
         let mut cls = Vec::with_capacity(addrs.len());
         for sa in addrs {
