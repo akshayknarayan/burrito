@@ -30,8 +30,9 @@ xdp-shard = { path = "../xdp-shard", optional = true }
 
 [dev-dependencies]
 burrito-shard-ctl = { path = ".", features = ["bin"] }
-slog = "2"
+burrito-discovery-ctl = { path = "../burrito-discovery-ctl", features = ["ctl"] }
 test-util = { path = "../test-util" }
+slog = "2"
 
 [[bin]]
 name = "burrito-shard"

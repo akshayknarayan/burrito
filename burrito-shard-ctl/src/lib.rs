@@ -24,13 +24,17 @@ mod srv {
         shard_table: Arc<RwLock<HashMap<proto::Addr, proto::ShardInfo>>>,
         // Interface name -> handles
         #[cfg(feature = "ebpf")]
-        handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
+        ingress_handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
         redis_client: redis::Client,
         redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
+        disc_cl: Arc<Mutex<Option<burrito_discovery_ctl::client::DiscoveryClient>>>,
     }
 
     impl ShardCtl {
-        pub async fn new(redis_addr: &str) -> Result<Self, Error> {
+        pub async fn new(
+            redis_addr: &str,
+            root: Option<std::path::PathBuf>,
+        ) -> Result<Self, Error> {
             let redis_client = redis::Client::open(redis_addr)?;
             let redis_listen_connection =
                 Arc::new(Mutex::new(redis_client.get_async_connection().await?));
@@ -40,8 +44,34 @@ mod srv {
                 redis_listen_connection,
                 shard_table: Default::default(),
                 #[cfg(feature = "ebpf")]
-                handles: Default::default(),
+                ingress_handles: Default::default(),
+                disc_cl: Default::default(),
             };
+
+            let dcl = s.disc_cl.clone();
+            tokio::spawn(async move {
+                use burrito_discovery_ctl::client::DiscoveryClient;
+                use std::path::Path;
+                use tokio::time;
+
+                let root = root.unwrap_or_else(|| Path::new("/tmp/burrito").to_path_buf());
+
+                let start = time::Instant::now();
+                loop {
+                    time::delay_for(time::Duration::from_millis(100)).await;
+
+                    if start.elapsed() > time::Duration::from_secs(5) {
+                        // time out.
+                        debug!(root = ?&root, "Timed out connecting to discovery-ctl");
+                        return None;
+                    }
+
+                    if let Ok(d) = DiscoveryClient::new(&root).await {
+                        *dcl.lock().await = Some(d);
+                        return Some(());
+                    }
+                }
+            });
 
             Ok(s)
         }
@@ -65,7 +95,7 @@ mod srv {
                 .expect("get redis connection");
             tokio::spawn(listen_updates(self.shard_table.clone(), con));
             #[cfg(feature = "ebpf")]
-            tokio::spawn(read_shard_stats(self.handles.clone(), stats_log));
+            tokio::spawn(read_shard_stats(self.ingress_handles.clone(), stats_log));
 
             sk.for_each_concurrent(None, |st| async {
                 let st = st.expect("accept failed");
@@ -133,6 +163,37 @@ mod srv {
         // Instead of tower_service::call(), do this, which lets us have async fns
         // instead of fn foo() -> Pin<Box<dyn Future<..>>> everywhere
         pub async fn register(&self, req: proto::ShardInfo) -> proto::RegisterShardReply {
+            fn check(si: &proto::ShardInfo) -> Result<(), Error> {
+                for a in si.shard_addrs.iter() {
+                    match a {
+                        proto::Addr::Udp(_) | proto::Addr::Burrito(_) => (),
+                        a => {
+                            return Err(anyhow::anyhow!(
+                                "Must pass either name or Udp address: {}",
+                                a
+                            ));
+                        }
+                    }
+                }
+
+                match &si.canonical_addr {
+                    proto::Addr::Udp(_) | proto::Addr::Burrito(_) => (),
+                    a => {
+                        return Err(anyhow::anyhow!(
+                            "Must pass either name or Udp address: {}",
+                            a
+                        ));
+                    }
+                };
+
+                Ok(())
+            }
+
+            match check(&req) {
+                Ok(_) => (),
+                Err(e) => return proto::RegisterShardReply::Err(format!("{}", e)),
+            }
+
             let redis_conn = self.redis_listen_connection.clone();
             if let Err(e) = self.shard_table_insert(req.clone()).await {
                 return proto::RegisterShardReply::Err(format!(
@@ -152,72 +213,51 @@ mod srv {
 
             #[cfg(feature = "ebpf")]
             {
-                use tracing::info;
+                async fn register_resolved_shardinfo(
+                    handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
+                    si: proto::ShardInfo,
+                ) {
+                    use tracing::info;
 
-                if req.shard_addrs.is_empty() {
-                    if let proto::Addr::Udp(sk) = req.canonical_addr {
-                        let ifnames = match xdp_shard::get_interface_name(sk.ip()) {
-                            Ok(ifnames) => ifnames,
-                            Err(e) => {
-                                return proto::RegisterShardReply::Err(format!(
-                                    "Error loading xdp-shard on address: {:?}",
-                                    e
-                                ))
-                            }
-                        };
+                    let shard_ports: Vec<u16> = si
+                        .shard_addrs
+                        .iter()
+                        .map(|a| match a {
+                            proto::Addr::Udp(s) => s.port(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
 
-                        let mut map = self.handles.lock().await;
-                        for ifn in ifnames {
-                            if let Some(h) = map.get_mut(&ifn) {
-                                if let Err(e) = h.clear_port(sk.port()) {
-                                    warn!(err = ?e, sock = ?sk, "Failed to clear port map");
-                                }
-                            }
-                        }
-                    }
+                    let sk = match si.canonical_addr {
+                        proto::Addr::Udp(sk) => sk,
+                        _ => unreachable!(),
+                    };
 
-                    return proto::RegisterShardReply::Ok;
-                }
-
-                let shard_ports: Result<Vec<u16>, String> = req
-                    .shard_addrs
-                    .iter()
-                    .map(|a| match a {
-                        proto::Addr::Tcp(s) | proto::Addr::Udp(s) => Ok(s.port()),
-                        x => Err(format!("Addr must be tcp or udp for sharding: {:?}", x)),
-                    })
-                    .collect();
-                let shard_ports = match shard_ports {
-                    Ok(s) => s,
-                    Err(s) => return proto::RegisterShardReply::Err(s),
-                };
-
-                if let proto::Addr::Udp(sk) = req.canonical_addr {
                     // see if handles are there already
                     let ifnames = match xdp_shard::get_interface_name(sk.ip()) {
                         Ok(ifnames) => ifnames,
                         Err(e) => {
-                            return proto::RegisterShardReply::Err(format!(
-                                "Error loading xdp-shard on address: {:?}",
-                                e
-                            ))
+                            warn!(err = ?e, sk = ?sk, "Error getting interface");
+                            return;
                         }
                     };
 
-                    let mut map = self.handles.lock().await;
+                    let mut map = handles.lock().await;
                     for ifn in ifnames {
                         if !map.contains_key(&ifn) {
-                            let handle = match xdp_shard::BpfHandles::<xdp_shard::Ingress>::load_on_interface_name(&ifn) {
+                            let l =
+                                xdp_shard::BpfHandles::<xdp_shard::Ingress>::load_on_interface_name(
+                                    &ifn,
+                                );
+                            let handle = match l {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    return proto::RegisterShardReply::Err(format!(
-                                        "Error loading xdp-shard on address: {:?}",
-                                        e
-                                    ))
+                                    warn!(err = ?e, ifn = ?&ifn, "Error loading xdp-shard");
+                                    return;
                                 }
                             };
 
-                            info!(service = ?req.canonical_addr, "Loaded XDP program");
+                            info!(service = ?si.canonical_addr, "Loaded XDP program");
 
                             map.insert(ifn.clone(), handle);
                         }
@@ -226,26 +266,67 @@ mod srv {
                         let ok = h.shard_ports(
                             sk.port(),
                             &shard_ports[..],
-                            req.shard_info.packet_data_offset,
-                            req.shard_info.packet_data_length,
+                            si.shard_info.packet_data_offset,
+                            si.shard_info.packet_data_length,
                         );
                         match ok {
                             Ok(_) => (),
                             Err(e) => {
-                                return proto::RegisterShardReply::Err(format!(
-                                    "Error writing xdp-shard ports: {:?}",
-                                    e
-                                ))
+                                warn!(
+                                    err = ?e,
+                                    ifn = ?&ifn,
+                                    port = ?sk.port(),
+                                    shard_port = ?&shard_ports[..],
+                                    "Error writing xdp-shard ports",
+                                );
+                                return;
                             }
                         }
 
                         info!(
-                            service = ?req.canonical_addr,
+                            service = ?si.canonical_addr,
                             interface = ?&ifn,
                             "Registered sharding with XDP program"
                         );
                     }
                 }
+
+                use crate::{clear_port, resolve_shardinfo};
+
+                if req.shard_addrs.is_empty() {
+                    match &req.canonical_addr {
+                        proto::Addr::Udp(sk) | proto::Addr::Tcp(sk) => {
+                            clear_port(self.ingress_handles.clone(), *sk).await;
+                        }
+                        proto::Addr::Burrito(_) => {
+                            let h = self.ingress_handles.clone();
+                            let dc = self.disc_cl.clone();
+                            tokio::spawn(async move {
+                                let ca = match resolve_shardinfo(dc, req).await? {
+                                    proto::ShardInfo {
+                                        canonical_addr: proto::Addr::Udp(sk),
+                                        ..
+                                    } => sk,
+                                    _ => return None,
+                                };
+
+                                clear_port(h, ca).await;
+                                Some(())
+                            });
+                        }
+                        _ => (),
+                    }
+
+                    return proto::RegisterShardReply::Ok;
+                }
+
+                let h = self.ingress_handles.clone();
+                let dc = self.disc_cl.clone();
+                tokio::spawn(async move {
+                    let si = resolve_shardinfo(dc, req).await?;
+                    register_resolved_shardinfo(h, si).await;
+                    Some(())
+                });
             }
 
             proto::RegisterShardReply::Ok
@@ -407,5 +488,308 @@ mod srv {
 
         r.query_async(&mut *conn.lock().await).await?;
         Ok(())
+    }
+}
+
+use anyhow::Error;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{debug, warn};
+
+#[cfg_attr(not(feature = "ebpf"), allow(unused))]
+use std::collections::HashMap;
+
+#[cfg(feature = "ebpf")]
+async fn clear_port<T>(
+    handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<T>>>>,
+    sk: std::net::SocketAddr,
+) {
+    let mut map = handles.lock().await;
+    for h in map.values_mut() {
+        if let Err(e) = h.clear_port(sk.port()) {
+            debug!(err = ?e, sock = ?sk, "Failed to clear port map");
+        }
+    }
+}
+
+/// Resolve any burrito addresses of a ShardInfo to Udp addresses.
+///
+/// Return `None` if any of the addresses are not Udp, or if some other error occurred.
+pub async fn resolve_shardinfo(
+    dcl: Arc<Mutex<Option<burrito_discovery_ctl::client::DiscoveryClient>>>,
+    mut si: proto::ShardInfo,
+) -> Option<proto::ShardInfo> {
+    async fn try_resolve_once(
+        dcl: &mut burrito_discovery_ctl::client::DiscoveryClient,
+        addr: &mut proto::Addr,
+    ) -> Result<bool, Error> {
+        match addr {
+            proto::Addr::Burrito(name) => {
+                if let Ok(m) = dcl.query(name.clone()).await {
+                    for srv in m.services {
+                        if srv.service == burrito_discovery_ctl::CONTROLLER_ADDRESS {
+                            match srv.address {
+                                a @ proto::Addr::Udp(_) => {
+                                    std::mem::replace(addr, a);
+                                    return Ok(true);
+                                }
+                                // other cases are not possible, so we error
+                                a => {
+                                    return Err(anyhow::anyhow!(
+                                        "Must resolve to Udp address: {} -> {}",
+                                        addr,
+                                        a
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(false);
+            }
+            _ => Ok(true),
+        }
+    }
+
+    use tokio::time;
+    let start = time::Instant::now();
+    loop {
+        time::delay_for(time::Duration::from_millis(100)).await;
+
+        if start.elapsed() > time::Duration::from_secs(5) {
+            // time out.
+            debug!(shard = ?si, "Timed out resolving shardinfo for xdp setup");
+            return None;
+        }
+
+        if let Some(ref mut dcl) = *dcl.lock().await {
+            // 1. first check the canonical_addr
+            if let ref mut ca @ proto::Addr::Burrito(_) = si.canonical_addr {
+                match try_resolve_once(dcl, ca).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        warn!(err = ?e, addr = ?ca, "Error resolving addr");
+                        return None;
+                    }
+                }
+            }
+
+            // 2. next check the shard addrs
+            for mut sa in si.shard_addrs.iter_mut() {
+                if let ref mut sa @ proto::Addr::Burrito(_) = sa {
+                    match try_resolve_once(dcl, sa).await {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            warn!(err = ?e, addr = ?sa, "Error resolving addr");
+                            return None;
+                        }
+                    }
+                }
+            }
+
+            // 3. if we reach here, we are good to go!
+            break;
+        } else {
+            // There is no disc-cl (yet) - just check if we are already done.
+            // 1. first check the canonical_addr
+            if let proto::Addr::Burrito(_) = si.canonical_addr {
+                continue;
+            }
+
+            // 2. next check the shard addrs
+            for sa in si.shard_addrs.iter_mut() {
+                if let proto::Addr::Burrito(_) = sa {
+                    continue;
+                }
+            }
+
+            // 3. if we reach here, we are good to go!
+            break;
+        }
+    }
+
+    Some(si)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::proto;
+    use anyhow::Error;
+    use slog::debug;
+    use std::sync::Arc;
+    use test_util::*;
+    use tokio::sync::Mutex;
+
+    #[test]
+    fn resolve_shardinfo_test() -> Result<(), Error> {
+        let log = test_logger();
+        let root: std::path::PathBuf = "./tmp-bn-resolve_shardinfo_test".parse().unwrap();
+        reset_root_dir(&root, &log);
+
+        let mut rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async move {
+            let l = log.clone();
+            let redis = start_redis(&l, 28174);
+            let redis_addr = redis.get_addr();
+            let ra = redis_addr.clone();
+            let root2 = root.clone();
+            block_for(std::time::Duration::from_millis(400)).await; // wait for redis
+
+            tokio::spawn(async move {
+                burrito_discovery_ctl::ctl::serve_ctl(
+                    Some(root2.clone()),
+                    &ra,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    true,
+                )
+                .await
+            });
+            block_for(std::time::Duration::from_millis(400)).await; // wait for discovery-ctl
+
+            let names: Vec<proto::Addr> = (0..7)
+                .map(|i| format!("burrito://shard-{}", i).parse().unwrap())
+                .collect();
+            let si = proto::ShardInfo {
+                canonical_addr: "burrito://shardtest".parse().unwrap(),
+                shard_addrs: names[0..].into(),
+                shard_info: proto::SimpleShardPolicy {
+                    packet_data_offset: 18,
+                    packet_data_length: 4,
+                },
+            };
+
+            // start server
+            start_disc_server(root.as_path(), &names[..], 12897).await;
+            block_for(std::time::Duration::from_millis(200)).await;
+
+            let adcl = Arc::new(Mutex::new(None));
+
+            let adcl1 = adcl.clone();
+            let l2 = log.clone();
+            tokio::spawn(async move {
+                block_for(std::time::Duration::from_secs(1)).await;
+                debug!(&l2, "connecting to burrito controller"; "burrito_root" => ?&root);
+                let dcl = burrito_discovery_ctl::client::DiscoveryClient::new(&root)
+                    .await
+                    .expect("Connect client discoveryclient");
+                *adcl1.lock().await = Some(dcl);
+            });
+
+            let si = super::resolve_shardinfo(adcl, si).await.unwrap();
+
+            assert!(matches!(
+                si,
+                proto::ShardInfo {
+                    canonical_addr: proto::Addr::Udp(ca),
+                    shard_info: proto::SimpleShardPolicy {
+                        packet_data_offset: 18,
+                        packet_data_length: 4,
+                    },
+                    ..
+                } if ca.ip().is_loopback() && ca.port() == 12897
+            ));
+
+            for (p, r) in si
+                .shard_addrs
+                .iter()
+                .map(|a| match a {
+                    burrito_shard_ctl::proto::Addr::Udp(sa) if sa.ip().is_loopback() => sa.port(),
+                    _ => panic!("shard addresses wrong"),
+                })
+                .zip(12898..12905)
+            {
+                assert_eq!(p, r);
+            }
+
+            Ok(())
+        })
+    }
+
+    async fn start_disc_server(root: &std::path::Path, names: &[proto::Addr], start: u16) {
+        use burrito_shard_ctl::proto;
+        let addrs: Vec<proto::Addr> = (0..8)
+            .map(|i| format!("udp://127.0.0.1:{}", start + i).parse().unwrap())
+            .collect();
+
+        {
+            let mut dcl = burrito_discovery_ctl::client::DiscoveryClient::new(root.clone())
+                .await
+                .expect("Connect client discoveryclient");
+
+            dcl.register(burrito_discovery_ctl::proto::Service {
+                name: "shardtest".to_owned(),
+                scope: burrito_discovery_ctl::proto::Scope::Global,
+                service: burrito_discovery_ctl::CONTROLLER_ADDRESS.to_owned(),
+                address: addrs[0].clone(),
+            })
+            .await
+            .expect("Could not register discovery-ctl");
+
+            // register all the shards
+            for (n, a) in names.iter().zip(addrs[1..].iter()) {
+                let s = match n {
+                    burrito_discovery_ctl::proto::Addr::Burrito(s) => s,
+                    _ => unreachable!(),
+                };
+
+                dcl.register(burrito_discovery_ctl::proto::Service {
+                    name: s.clone(),
+                    scope: burrito_discovery_ctl::proto::Scope::Global,
+                    service: burrito_discovery_ctl::CONTROLLER_ADDRESS.to_owned(),
+                    address: a.clone(),
+                })
+                .await
+                .expect("Could not register discovery-ctl");
+            }
+        }
+    }
+
+    #[test]
+    fn already_done_resolve_shardinfo_test() -> Result<(), Error> {
+        let mut rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async move {
+            let names: Vec<proto::Addr> = (0..7)
+                .map(|i| format!("udp://127.0.0.1:{}", 12315 + i).parse().unwrap())
+                .collect();
+            let si = proto::ShardInfo {
+                canonical_addr: "udp://127.0.0.1:12314".parse().unwrap(),
+                shard_addrs: names[0..].into(),
+                shard_info: proto::SimpleShardPolicy {
+                    packet_data_offset: 18,
+                    packet_data_length: 4,
+                },
+            };
+
+            let adcl = Arc::new(Mutex::new(None));
+            super::resolve_shardinfo(adcl, si).await.unwrap();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn failed_resolve_shardinfo_test() -> Result<(), Error> {
+        let mut rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async move {
+            let names: Vec<proto::Addr> = (0..7)
+                .map(|i| format!("burrito://shard-{}", i).parse().unwrap())
+                .collect();
+            let si = proto::ShardInfo {
+                canonical_addr: "burrito://shardtest".parse().unwrap(),
+                shard_addrs: names[0..].into(),
+                shard_info: proto::SimpleShardPolicy {
+                    packet_data_offset: 18,
+                    packet_data_length: 4,
+                },
+            };
+
+            let adcl = Arc::new(Mutex::new(None));
+            if super::resolve_shardinfo(adcl, si).await.is_some() {
+                panic!("failed");
+            }
+
+            Ok(())
+        })
     }
 }

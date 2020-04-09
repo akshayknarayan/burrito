@@ -22,7 +22,8 @@ async fn main() -> Result<(), Error> {
     let opt = Opt::from_args();
     tracing_subscriber::fmt::init();
 
-    let burrito = burrito_shard_ctl::ShardCtl::new(&opt.redis_addr).await?;
+    let burrito =
+        burrito_shard_ctl::ShardCtl::new(&opt.redis_addr, opt.burrito_root.clone()).await?;
     let burrito_addr = opt
         .burrito_root
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/burrito"))
