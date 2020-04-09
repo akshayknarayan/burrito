@@ -206,7 +206,7 @@ def start_server(conn, outf, shards=0, use_burrito_shard=True):
     conn.check_proc("kvserver", f"{outf}.err")
 
 # one machine can handle 2 client processes
-def run_client(conn, server, interarrival, outf, clientsharding=0, wrkload='uniform'):
+def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='uniform'):
     wrkfile = "~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access"
     if wrkload == 'uniform':
         wrkfile = "~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadbunf{}-100.access"
@@ -227,7 +227,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=0, wrkload='unif
     ok = conn.run(f"cset shield --userset=kv --cpu=0-4 --kthread=on", sudo=True)
     check(ok, "make cpuset", conn.addr)
 
-    shard_arg = f"-n {clientsharding}" if clientsharding > 0 else ""
+    shard_arg = f"-n {clientsharding}" if clientsharding is not None else ""
 
     conn.run(f"cset shield --userset=kv --exec ./target/release/ycsb -- \
             --burrito-root=/tmp/burrito \
@@ -350,7 +350,16 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
                 interarrival_us,
                 outf
             ),
-            kwargs={'clientsharding':num_shards, 'wrkload':wrkload}
+            kwargs={'clientsharding':0, 'wrkload':wrkload}
+        ) for m in machines[1:]]
+    if shardtype == "dyn":
+        clients = [threading.Thread(target=run_client, args=(
+                m,
+                server_addr,
+                interarrival_us,
+                outf
+            ),
+            kwargs={'clientsharding':6, 'wrkload':wrkload}
         ) for m in machines[1:]]
     elif shardtype == "xdpserver" or shardtype == "server":
         clients = [threading.Thread(target=run_client, args=(

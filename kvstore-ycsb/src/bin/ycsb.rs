@@ -23,7 +23,7 @@ struct Opt {
     addr: String,
 
     #[structopt(short, long)]
-    num_shards: Option<usize>,
+    num_shards_thresh: Option<usize>,
 
     #[structopt(short, long)]
     connections_per_client: bool,
@@ -60,11 +60,6 @@ async fn main() -> Result<(), StdError> {
     let accesses = ops(opt.accesses)?;
     debug!(num_ops = ?accesses.len(), "done reading workload");
 
-    let num_shards = match opt.num_shards {
-        None | Some(1) => 0, // having 1 shard is pointless, same as 0, might as well avoid the extra channel sends.
-        Some(x) => x,
-    };
-
     let cls = if let Some(root) = opt.burrito_root {
         debug!(root = ?&root, "Burrito mode");
 
@@ -79,10 +74,10 @@ async fn main() -> Result<(), StdError> {
                     .await?
             } else {
                 debug!("Could not contact discovery-ctl");
-                shardctl
-                    .query_shard(opt.addr.parse()?)
-                    .await?
+                shardctl.query_shard(opt.addr.parse()?).await?
             };
+
+        debug!(info = ?&si, "Queried shard");
 
         use burrito_shard_ctl::Shard;
         let addrs = match si {
@@ -91,24 +86,30 @@ async fn main() -> Result<(), StdError> {
                 let mut addrs = vec![si.canonical_addr];
 
                 // decide managed_sharding or not.
-                if num_shards > 0 {
-                    // we will manage the sharding ourselves
-                    addrs.extend(
-                        si.shard_addrs
-                            .into_iter()
-                            .map(|s| match s {
-                                Shard::Addr(a) => a,
-                                Shard::Sharded(c) => c.canonical_addr,
-                            })
-                            .into_iter(),
-                    );
-                }
+                // Some(0): client-always
+                // Some(x): server until x, after that client
+                // None: server-always
+                match opt.num_shards_thresh {
+                    Some(thresh) if thresh < si.shard_addrs.len() => {
+                        // we will manage the sharding ourselves
+                        addrs.extend(
+                            si.shard_addrs
+                                .into_iter()
+                                .map(|s| match s {
+                                    Shard::Addr(a) => a,
+                                    Shard::Sharded(c) => c.canonical_addr,
+                                })
+                                .into_iter(),
+                        );
+                    }
+                    _ => (),
+                };
 
                 addrs
             }
         };
 
-        debug!(addrs = ?&addrs, num_shards, "Queried shard");
+        debug!(addrs = ?&addrs, "Decided sharding plan");
 
         // make clients
         let mut cls = Vec::with_capacity(addrs.len());
