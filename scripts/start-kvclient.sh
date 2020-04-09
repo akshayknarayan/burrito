@@ -15,7 +15,7 @@ sudo RUST_LOG="$RUST_LOG" cset shield --userset=kv --exec ./target/release/ycsb 
             --burrito-root="/tmp/burrito" \
             --addr "kv" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-100.access \
-            -i "$2" -n "$3" &
+            -i "$2" -n "$3" -t "$4" &
 client1=$!
 echo "started client 1: $client1"
 
@@ -23,7 +23,7 @@ echo "started client 1: $client1"
     --burrito-root="/tmp/burrito" \
     --addr "kv" \
     --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadbunf2-100.access \
-    -i "$2" -n "$3" &
+    -i "$2" -n "$3" -t "$4" &
 client2=$!
 echo "started client 2: $client2"
 

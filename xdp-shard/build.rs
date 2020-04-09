@@ -84,6 +84,8 @@ fn main() {
 
         let p: PathBuf = "./src/xdp_shard_ingress.c".parse().unwrap();
         compile_ebpf_prog(&p);
+        let p: PathBuf = "./src/xdp_shard_egress.c".parse().unwrap();
+        compile_ebpf_prog(&p);
     }
 }
 

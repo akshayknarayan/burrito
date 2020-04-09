@@ -25,6 +25,8 @@ mod srv {
         // Interface name -> handles
         #[cfg(feature = "ebpf")]
         ingress_handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
+        #[cfg(feature = "ebpf")]
+        egress_handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Egress>>>>,
         redis_client: redis::Client,
         redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
         disc_cl: Arc<Mutex<Option<burrito_discovery_ctl::client::DiscoveryClient>>>,
@@ -45,6 +47,8 @@ mod srv {
                 shard_table: Default::default(),
                 #[cfg(feature = "ebpf")]
                 ingress_handles: Default::default(),
+                #[cfg(feature = "ebpf")]
+                egress_handles: Default::default(),
                 disc_cl: Default::default(),
             };
 
@@ -333,8 +337,131 @@ mod srv {
         }
 
         pub async fn query(&self, req: proto::QueryShardRequest) -> proto::QueryShardReply {
-            // TODO if necessary, install client-side xdp program
             if let Some(s) = self.shard_table.read().await.get(&req.canonical_addr) {
+                #[cfg(feature = "ebpf")]
+                {
+                    async fn register_resolved_shardinfo(
+                        handles: Arc<
+                            Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Egress>>>,
+                        >,
+                        si: proto::ShardInfo,
+                    ) {
+                        use tracing::info;
+
+                        let shard_ports: Vec<u16> = si
+                            .shard_addrs
+                            .iter()
+                            .map(|a| match a {
+                                proto::Addr::Udp(s) => s.port(),
+                                _ => unreachable!(),
+                            })
+                            .collect();
+
+                        let sk = match si.canonical_addr {
+                            proto::Addr::Udp(sk) => sk,
+                            _ => unreachable!(),
+                        };
+
+                        // see if handles are there already
+                        let ifn = match xdp_shard::get_outgoing_interface_name(sk.ip()) {
+                            Ok(ifname) => ifname,
+                            Err(e) => {
+                                warn!(err = ?e, sk = ?sk, "Error getting interface");
+                                return;
+                            }
+                        };
+
+                        let mut map = handles.lock().await;
+                        if !map.contains_key(&ifn) {
+                            let l =
+                                xdp_shard::BpfHandles::<xdp_shard::Egress>::load_on_interface_name(
+                                    &ifn,
+                                );
+                            let handle = match l {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(err = ?e, ifn = ?&ifn, "Error loading xdp-shard");
+                                    return;
+                                }
+                            };
+
+                            info!(service = ?si.canonical_addr, "Loaded XDP program");
+
+                            map.insert(ifn.clone(), handle);
+                        }
+
+                        let h = map.get_mut(&ifn).unwrap();
+                        let ok = h.shard_ports(
+                            sk.port(),
+                            &shard_ports[..],
+                            si.shard_info.packet_data_offset,
+                            si.shard_info.packet_data_length,
+                        );
+
+                        match ok {
+                            Ok(_) => (),
+                            Err(e) => {
+                                warn!(
+                                    err = ?e,
+                                    ifn = ?&ifn,
+                                    port = ?sk.port(),
+                                    shard_port = ?&shard_ports[..],
+                                    "Error writing xdp-shard ports",
+                                );
+                                return;
+                            }
+                        }
+
+                        info!(
+                            service = ?si.canonical_addr,
+                            interface = ?&ifn,
+                            "Registered sharding with XDP program"
+                        );
+                    }
+
+                    use crate::{clear_port, resolve_shardinfo};
+
+                    let min_egress_sharding_thresh = req.min_egress_sharding_thresh;
+                    if let Some(_) = min_egress_sharding_thresh {
+                        let si = s.clone();
+                        let dc = self.disc_cl.clone();
+                        let h = self.egress_handles.clone();
+
+                        tokio::spawn(async move {
+                            if si.shard_addrs.is_empty() {
+                                match &req.canonical_addr {
+                                    proto::Addr::Udp(sk) | proto::Addr::Tcp(sk) => {
+                                        debug!(sk = ?sk, "query: clearing xdp on address");
+                                        clear_port(h, *sk).await;
+                                        Some(())
+                                    }
+                                    proto::Addr::Burrito(_) => {
+                                        debug!(sk = ?&si.canonical_addr, "query: resolving to clear xdp on address");
+                                        let ca = match resolve_shardinfo(dc, si).await? {
+                                            proto::ShardInfo {
+                                                canonical_addr: proto::Addr::Udp(sk),
+                                                ..
+                                            } => sk,
+                                            _ => return None,
+                                        };
+
+                                        debug!(sk = ?&ca, "query: resolved; clearing xdp on address");
+                                        clear_port(h, ca).await;
+                                        Some(())
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                debug!(si = ?si, "query: resolving shardinfo");
+                                let si = resolve_shardinfo(dc, si).await?;
+                                debug!(si = ?si, "query: registering shardinfo");
+                                register_resolved_shardinfo(h, si).await;
+                                Some(())
+                            }
+                        });
+                    }
+                }
+
                 proto::QueryShardReply::Ok(s.clone())
             } else {
                 proto::QueryShardReply::Err(format!("Could not find {}", &req.canonical_addr))

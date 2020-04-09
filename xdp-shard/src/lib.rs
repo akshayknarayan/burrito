@@ -37,6 +37,16 @@ pub fn diff_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMa
     }
 }
 
+pub fn get_outgoing_interface_name(dst_addr: std::net::IpAddr) -> Result<String, StdError> {
+    let out = std::process::Command::new("ip")
+        .args(&["-o", "route", "get", &dst_addr.to_string()])
+        .output()?
+        .stdout;
+    let out = String::from_utf8(out)?;
+    let sp: Vec<&str> = out.split_whitespace().take(3).collect();
+    Ok(sp[2].to_owned())
+}
+
 /// Wraps `getifaddrs`.
 pub fn get_interface_name(addr: std::net::IpAddr) -> Result<Vec<String>, StdError> {
     use nix::ifaddrs;

@@ -26,6 +26,9 @@ struct Opt {
     num_shards: Option<usize>,
 
     #[structopt(short, long)]
+    thresh_offload: Option<usize>,
+
+    #[structopt(short, long)]
     connections_per_client: bool,
 
     #[structopt(long)]
@@ -75,12 +78,12 @@ async fn main() -> Result<(), StdError> {
         let si =
             if let Ok(mut dcl) = burrito_discovery_ctl::client::DiscoveryClient::new(&root).await {
                 shardctl
-                    .query_recursive(&mut dcl, opt.addr.parse()?)
+                    .query_recursive(&mut dcl, opt.addr.parse()?, opt.thresh_offload)
                     .await?
             } else {
                 debug!("Could not contact discovery-ctl");
                 shardctl
-                    .query_shard(opt.addr.parse()?)
+                    .query_shard(opt.addr.parse()?, opt.thresh_offload)
                     .await?
             };
 

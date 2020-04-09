@@ -4,6 +4,7 @@ use tracing::debug;
 use xdp_shard_prog::{AvailableShards, ShardRules};
 
 pub struct Ingress;
+pub struct Egress;
 
 /// Collection of handles to BPF objects.
 ///
@@ -247,6 +248,81 @@ impl BpfHandles<Ingress> {
         }
 
         Ok(())
+    }
+}
+
+impl BpfHandles<Egress> {
+    /// Load xdp_shard XDP program onto the given interface.
+    pub fn load_on_interface_name(interface_name: &str) -> Result<Self, StdError> {
+        Self::load_on_interface_id(get_interface_id(interface_name)?)
+    }
+
+    /// Load xdp_shard XDP program onto all the interfaces matching the given socket address.
+    ///
+    /// Returns a list of BpfHandles, one per matching interface.
+    pub fn load_on_address(serv_addr: std::net::IpAddr) -> Result<Vec<Self>, StdError> {
+        let if_name = get_outgoing_interface_name(serv_addr)?;
+        Ok(vec![Self::load_on_interface_name(&if_name)?])
+    }
+
+    pub fn load_on_interface_id(interface_id: u32) -> Result<Self, StdError> {
+        let bpf_filename = concat!(env!("OUT_DIR"), "/xdp_shard_egress.o\0");
+
+        let bpf_filename_cstr = std::ffi::CStr::from_bytes_with_nul(bpf_filename.as_bytes())?;
+        let attr = libbpf::bpf_prog_load_attr {
+            file: bpf_filename_cstr.as_ptr(),
+            prog_type: libbpf::bpf_prog_type_BPF_PROG_TYPE_XDP,
+            prog_flags: 0,
+            expected_attach_type: libbpf::bpf_attach_type_BPF_CGROUP_INET_EGRESS,
+            ifindex: 0,
+            log_level: 0,
+        };
+
+        let mut bpf_obj: *mut libbpf::bpf_object = std::ptr::null_mut();
+        let mut prog_fd = 0;
+
+        let ok = unsafe {
+            libbpf::bpf_prog_load_xattr(
+                &attr,
+                &mut bpf_obj as *mut *mut libbpf::bpf_object,
+                &mut prog_fd as *mut _,
+            )
+        };
+        if ok > 0 {
+            Err(format!("bpf_prog_load_xattr failed: {}", ok))?;
+        }
+
+        if prog_fd == 0 {
+            Err(format!("bpf_prog_load_xattr returned null fd"))?;
+        }
+
+        if prog_fd < 0 {
+            Err(format!("bpf_prog_load_xattr returned bad fd: {}", prog_fd))?;
+        }
+
+        let available_shards_map = get_map_by_name("available_shards_map\0", bpf_obj)?;
+        let available_shards_map = unsafe { libbpf::bpf_map__fd(available_shards_map) };
+        if available_shards_map < 0 {
+            Err(format!(
+                "available_shards_map returned bad fd: {}",
+                available_shards_map
+            ))?;
+        }
+
+        let mut this = Self {
+            prog_fd,
+            ifindex: interface_id,
+            ifindex_map: 0,
+            rx_queue_index_map: 0,
+            available_shards_map,
+            num_rxqs: 0,
+            curr_record: StatsRecord::empty(0 as _),
+            prev_record: StatsRecord::empty(0 as _),
+            _type: std::marker::PhantomData::<Egress>,
+        };
+
+        this.activate()?;
+        Ok(this)
     }
 }
 

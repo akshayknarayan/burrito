@@ -81,7 +81,11 @@ impl ShardCtlClient {
         }
     }
 
-    async fn query(&mut self, req: proto::Addr) -> Result<proto::ShardInfo, Error> {
+    async fn query(
+        &mut self,
+        req: proto::Addr,
+        min_egress_sharding_thresh: Option<usize>,
+    ) -> Result<proto::ShardInfo, Error> {
         use futures_util::{sink::Sink, stream::StreamExt};
 
         trace!("poll_ready");
@@ -95,6 +99,7 @@ impl ShardCtlClient {
         trace!("start_send");
         pst.start_send(proto::Request::Query(proto::QueryShardRequest {
             canonical_addr: req,
+            min_egress_sharding_thresh,
         }))?;
 
         trace!("poll_flush");
@@ -117,11 +122,21 @@ impl ShardCtlClient {
         }
     }
 
+    /// If `min_egress_sharding_thresh` is `None`, the offload will never be installed.
+    /// If it is `Some(0)`, it will always be installed when possible.
+    ///
     /// If any Addr shard-ctl returns would require discovery-ctl to resolve (Addr::Burrito), this will error.
     /// The correct way to handle that error is to call discovery-ctl via `query_recursive`, so
     /// those addresses can be resolved.
-    pub async fn query_shard(&mut self, req: proto::Addr) -> Result<Shard, Error> {
-        let si = self.query(req).await.context("Query shard-ctl failed")?;
+    pub async fn query_shard(
+        &mut self,
+        req: proto::Addr,
+        min_egress_sharding_thresh: Option<usize>,
+    ) -> Result<Shard, Error> {
+        let si = self
+            .query(req, min_egress_sharding_thresh)
+            .await
+            .context("Query shard-ctl failed")?;
 
         fn check(a: &proto::Addr) -> Result<(), Error> {
             match a {
@@ -143,11 +158,13 @@ impl ShardCtlClient {
         &mut self,
         dcl: &mut burrito_discovery_ctl::client::DiscoveryClient,
         addr: proto::Addr,
+        min_egress_sharding_thresh: Option<usize>,
     ) -> Result<Shard, Error> {
         async fn ask(
             scl: &mut ShardCtlClient,
             dcl: &mut burrito_discovery_ctl::client::DiscoveryClient,
             s: Shard,
+            min_egress_sharding_thresh: Option<usize>,
         ) -> Result<Shard, Error> {
             let addr = match s {
                 Shard::Addr(crate::proto::Addr::Burrito(b)) => b,
@@ -183,7 +200,7 @@ impl ShardCtlClient {
                     crate::CONTROLLER_ADDRESS => {
                         debug!(service_addr = ?&address, "Querying ShardCtl");
                         // this will install the correct offloads for this level of the shard-tree
-                        let shards = scl.query(address).await?;
+                        let shards = scl.query(address, min_egress_sharding_thresh).await?;
                         info = match info {
                             None => Some(Shard::Sharded(shards.into())),
                             Some(s) => match s {
@@ -208,15 +225,18 @@ impl ShardCtlClient {
             scl: &'cl mut ShardCtlClient,
             dcl: &'cl mut burrito_discovery_ctl::client::DiscoveryClient,
             s: Shard,
+            min_egress_sharding_thresh: Option<usize>,
         ) -> Pin<Box<dyn Future<Output = Result<Shard, Error>> + 'cl>> {
             Box::pin(async move {
-                Ok(match ask(scl, dcl, s).await? {
+                Ok(match ask(scl, dcl, s, min_egress_sharding_thresh).await? {
                     s @ Shard::Addr(_) => s,
                     Shard::Sharded(mut tsi) => {
                         // canonical_addr is guaranteed to be resolved
                         let mut new = Vec::with_capacity(tsi.shard_addrs.len());
                         for sh in tsi.shard_addrs {
-                            new.push(resolve_shards(scl, dcl, sh).await?);
+                            new.push(
+                                resolve_shards(scl, dcl, sh, min_egress_sharding_thresh).await?,
+                            );
                         }
 
                         tsi.shard_addrs = new;
@@ -226,6 +246,6 @@ impl ShardCtlClient {
             })
         }
 
-        Ok(resolve_shards(self, dcl, Shard::Addr(addr)).await?)
+        Ok(resolve_shards(self, dcl, Shard::Addr(addr), min_egress_sharding_thresh).await?)
     }
 }

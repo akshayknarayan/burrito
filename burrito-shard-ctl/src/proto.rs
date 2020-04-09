@@ -25,9 +25,13 @@ pub enum RegisterShardReply {
     Ok,
 }
 
+/// `canonical_addr`: The address to look up.
+/// `min_egress_sharding_thresh`: If the number of available shards is greater than this, install
+/// xdp sharding locally if available. If None, never install.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryShardRequest {
     pub canonical_addr: Addr,
+    pub min_egress_sharding_thresh: Option<usize>,
 }
 
 /// Response type for clients wanting to know where the servers are.
@@ -38,6 +42,8 @@ pub enum QueryShardReply {
     Ok(ShardInfo),
 }
 
+/// Register: if ShardInfo, once resolved, has a Udp address and Udp shards, install xdp sharding
+/// locally if available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Register(ShardInfo),
