@@ -5,6 +5,30 @@ use tracing::{debug, trace};
 
 use crate::{proto, CONTROLLER_ADDRESS};
 
+#[derive(Debug, Clone)]
+pub enum Shard {
+    Addr(proto::Addr),
+    Sharded(TreeShardInfo),
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeShardInfo {
+    pub canonical_addr: proto::Addr,
+    pub shard_addrs: Vec<Shard>,
+    pub shard_info: proto::SimpleShardPolicy,
+}
+
+impl From<proto::ShardInfo> for TreeShardInfo {
+    fn from(si: proto::ShardInfo) -> Self {
+        TreeShardInfo {
+            canonical_addr: si.canonical_addr,
+            shard_addrs: si.shard_addrs.into_iter().map(|a| Shard::Addr(a)).collect(),
+            shard_info: si.shard_info,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ShardCtlClient {
     uc: async_bincode::AsyncBincodeStream<
         tokio::net::UnixStream,
@@ -57,7 +81,7 @@ impl ShardCtlClient {
         }
     }
 
-    pub async fn query(&mut self, req: proto::Addr) -> Result<proto::ShardInfo, Error> {
+    async fn query(&mut self, req: proto::Addr) -> Result<proto::ShardInfo, Error> {
         use futures_util::{sink::Sink, stream::StreamExt};
 
         trace!("poll_ready");
@@ -93,24 +117,44 @@ impl ShardCtlClient {
         }
     }
 
+    /// If any Addr shard-ctl returns would require discovery-ctl to resolve (Addr::Burrito), this will error.
+    /// The correct way to handle that error is to call discovery-ctl via `query_recursive`, so
+    /// those addresses can be resolved.
+    pub async fn query_shard(&mut self, req: proto::Addr) -> Result<Shard, Error> {
+        let si = self.query(req).await.context("Query shard-ctl failed")?;
+
+        fn check(a: &proto::Addr) -> Result<(), Error> {
+            match a {
+                proto::Addr::Burrito(_) => Err(anyhow::anyhow!("Cannot resolve returned Addr: {}")),
+                _ => Ok(()),
+            }
+        }
+
+        check(&si.canonical_addr)?;
+        for s in &si.shard_addrs {
+            check(s)?;
+        }
+
+        Ok(Shard::Sharded(si.into()))
+    }
+
+    /// Helper function for querying shard-ctl and discovery-ctl recursively together.
     pub async fn query_recursive(
         &mut self,
         dcl: &mut burrito_discovery_ctl::client::DiscoveryClient,
-        name: &str,
-    ) -> Result<proto::ShardInfo, Error> {
-        let addr = name.parse::<proto::Addr>()?;
-
+        addr: proto::Addr,
+    ) -> Result<Shard, Error> {
         async fn ask(
             scl: &mut ShardCtlClient,
             dcl: &mut burrito_discovery_ctl::client::DiscoveryClient,
-            s: crate::proto::Addr,
-        ) -> Result<(Option<crate::proto::Addr>, Option<crate::proto::ShardInfo>), Error> {
-            let ba = s.clone();
+            s: Shard,
+        ) -> Result<Shard, Error> {
             let addr = match s {
-                crate::proto::Addr::Burrito(b) => b,
-                a => return Ok((Some(a), None)),
+                Shard::Addr(crate::proto::Addr::Burrito(b)) => b,
+                a => return Ok(a),
             };
 
+            let ba = addr.clone();
             let rsp = dcl
                 .query(addr)
                 .await
@@ -118,72 +162,70 @@ impl ShardCtlClient {
 
             debug!(services = ?&rsp.services, addr = ?&ba, "got services");
 
-            let mut info: (Option<crate::proto::Addr>, Option<crate::proto::ShardInfo>) =
-                (None, None);
+            let mut info: Option<Shard> = None;
             for srv in rsp.services.into_iter() {
                 let burrito_discovery_ctl::proto::Service {
                     service, address, ..
                 } = srv;
                 match service.as_str() {
                     burrito_discovery_ctl::CONTROLLER_ADDRESS => {
-                        info.0 = info.0.or_else(|| Some(address));
+                        info = match info {
+                            Some(s) => match s {
+                                Shard::Addr(_) => unreachable!(),
+                                Shard::Sharded(mut t) => {
+                                    t.canonical_addr = address;
+                                    Some(Shard::Sharded(t))
+                                }
+                            },
+                            None => Some(Shard::Addr(address)),
+                        };
                     }
                     crate::CONTROLLER_ADDRESS => {
                         debug!(service_addr = ?&address, "Querying ShardCtl");
-                        if let None = info.1 {
-                            let shards = scl.query(address).await?;
-                            info.1 = info.1.or_else(|| Some(shards));
+                        // this will install the correct offloads for this level of the shard-tree
+                        let shards = scl.query(address).await?;
+                        info = match info {
+                            None => Some(Shard::Sharded(shards.into())),
+                            Some(s) => match s {
+                                Shard::Addr(a) => {
+                                    let mut tsi: TreeShardInfo = shards.into();
+                                    tsi.canonical_addr = a;
+                                    Some(Shard::Sharded(tsi))
+                                }
+                                Shard::Sharded(_) => unreachable!(),
+                            },
                         }
                     }
                     _ => (),
                 }
             }
 
-            Ok(info)
+            Ok(info.ok_or_else(|| anyhow::anyhow!("No information found"))?)
         }
 
-        async fn resolve_shards(
-            scl: &mut ShardCtlClient,
-            dcl: &mut burrito_discovery_ctl::client::DiscoveryClient,
-            addr: crate::proto::Addr,
-        ) -> Result<Vec<crate::proto::Addr>, Error> {
-            let ba = addr.clone();
-            let mut remaining = vec![addr];
-            let mut done = vec![];
-            while !remaining.is_empty() {
-                let addr = remaining.pop().unwrap();
-                match ask(scl, dcl, addr).await? {
-                    (Some(ca), None) => done.push(ca),
-                    (_, Some(s)) => {
-                        remaining.extend(s.shard_addrs);
-                    }
-                    (None, None) => Err(anyhow::anyhow!("Could not find addr: {}", ba))?,
-                }
-            }
-
-            Ok(done)
-        }
-
-        let a = addr.clone();
-        let (ca, si) = ask(self, dcl, addr).await?;
-        let ca = ca.ok_or_else(|| anyhow::anyhow!("Could not find addr: {}", a))?;
-        match si {
-            Some(mut si) => {
-                si.canonical_addr = ca;
-                let mut shards = vec![];
-                for s in si.shard_addrs {
-                    match s {
-                        b @ crate::proto::Addr::Burrito(_) => {
-                            shards.extend(resolve_shards(self, dcl, b).await?.into_iter())
+        use std::future::Future;
+        fn resolve_shards<'cl>(
+            scl: &'cl mut ShardCtlClient,
+            dcl: &'cl mut burrito_discovery_ctl::client::DiscoveryClient,
+            s: Shard,
+        ) -> Pin<Box<dyn Future<Output = Result<Shard, Error>> + 'cl>> {
+            Box::pin(async move {
+                Ok(match ask(scl, dcl, s).await? {
+                    s @ Shard::Addr(_) => s,
+                    Shard::Sharded(mut tsi) => {
+                        // canonical_addr is guaranteed to be resolved
+                        let mut new = Vec::with_capacity(tsi.shard_addrs.len());
+                        for sh in tsi.shard_addrs {
+                            new.push(resolve_shards(scl, dcl, sh).await?);
                         }
-                        x => shards.push(x),
-                    }
-                }
 
-                si.shard_addrs = shards;
-                Ok(si)
-            }
-            None => Err(anyhow::anyhow!("No ShardCtl entry found"))?,
+                        tsi.shard_addrs = new;
+                        Shard::Sharded(tsi)
+                    }
+                })
+            })
         }
+
+        Ok(resolve_shards(self, dcl, Shard::Addr(addr)).await?)
     }
 }
