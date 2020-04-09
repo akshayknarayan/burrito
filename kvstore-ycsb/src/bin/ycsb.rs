@@ -68,22 +68,45 @@ async fn main() -> Result<(), StdError> {
     let cls = if let Some(root) = opt.burrito_root {
         debug!(root = ?&root, "Burrito mode");
 
-        let mut dcl = burrito_discovery_ctl::client::DiscoveryClient::new(&root).await?;
         let mut shardctl = match burrito_shard_ctl::ShardCtlClient::new(&root).await {
             Ok(s) => s,
             Err(e) => Err(format!("Could not contact ShardCtl: err = {}", e))?,
         };
+        let si =
+            if let Ok(mut dcl) = burrito_discovery_ctl::client::DiscoveryClient::new(&root).await {
+                shardctl
+                    .query_recursive(&mut dcl, opt.addr.parse()?)
+                    .await?
+            } else {
+                debug!("Could not contact discovery-ctl");
+                shardctl
+                    .query_shard(opt.addr.parse()?)
+                    .await?
+            };
 
-        let mut si = shardctl.query_recursive(&mut dcl, &opt.addr).await?;
+        use burrito_shard_ctl::Shard;
+        let addrs = match si {
+            Shard::Addr(a) => vec![a],
+            Shard::Sharded(si) => {
+                let mut addrs = vec![si.canonical_addr];
 
-        // decide managed_sharding or not.
-        if num_shards < 1 {
-            // xdp or the server will manage the sharding for us.
-            si.shard_addrs.clear();
-        }
+                // decide managed_sharding or not.
+                if num_shards > 0 {
+                    // we will manage the sharding ourselves
+                    addrs.extend(
+                        si.shard_addrs
+                            .into_iter()
+                            .map(|s| match s {
+                                Shard::Addr(a) => a,
+                                Shard::Sharded(c) => c.canonical_addr,
+                            })
+                            .into_iter(),
+                    );
+                }
 
-        let mut addrs = vec![si.canonical_addr];
-        addrs.extend(si.shard_addrs.into_iter());
+                addrs
+            }
+        };
 
         debug!(addrs = ?&addrs, num_shards, "Queried shard");
 

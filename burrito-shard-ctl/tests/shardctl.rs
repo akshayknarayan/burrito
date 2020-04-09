@@ -47,7 +47,7 @@ fn recursive_shardctl_test() -> Result<(), Error> {
         let mut shardctl = burrito_shard_ctl::ShardCtlClient::new(&root).await.unwrap();
 
         let si = shardctl
-            .query_recursive(&mut dcl, "burrito://shardtest".parse().unwrap(), None)
+            .query_recursive(&mut dcl, "burrito://shardtest".parse().unwrap())
             .await
             .context("Could not query shard-ctl")?;
 
@@ -350,7 +350,7 @@ fn shardctl_test() -> Result<(), Error> {
         let mut shardctl = burrito_shard_ctl::ShardCtlClient::new(&root).await.unwrap();
 
         let si = shardctl
-            .query_recursive(&mut dcl, "burrito://shardtest".parse().unwrap(), None)
+            .query_recursive(&mut dcl, "burrito://shardtest".parse().unwrap())
             .await
             .context("Could not query shard-ctl")?;
 
@@ -484,7 +484,7 @@ fn basic_shardctl_test() -> Result<(), Error> {
             .await
             .context("shardctl client")?;
         let a: burrito_shard_ctl::proto::Addr = format!("udp://127.0.0.1:19422").parse().unwrap();
-        let r = cl.query_shard(a, None).await.context("query shardctl")?;
+        let r = cl.query_shard(a).await.context("query shardctl")?;
 
         assert!(matches!(r, burrito_shard_ctl::Shard::Sharded(burrito_shard_ctl::TreeShardInfo {
             canonical_addr: burrito_shard_ctl::proto::Addr::Udp(ca),
