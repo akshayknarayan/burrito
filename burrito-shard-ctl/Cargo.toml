@@ -29,11 +29,9 @@ tracing-subscriber = { version = "0.2", optional = true }
 xdp-shard = { path = "../xdp-shard", optional = true }
 
 [dev-dependencies]
-slog = "2"
-slog-term = "2"
-tokio = { version = "0.2", features = ["sync", "rt-core", "uds", "time", "rt-threaded"] }
 burrito-shard-ctl = { path = ".", features = ["bin"] }
-redis = "0.15"
+slog = "2"
+test-util = { path = "../test-util" }
 
 [[bin]]
 name = "burrito-shard"
