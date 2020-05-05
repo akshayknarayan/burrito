@@ -101,7 +101,7 @@ fn compile_ebpf_prog(name: &Path) {
     let clang_include = std::string::String::from_utf8(clang_include).unwrap();
     if !std::process::Command::new("clang")
         .args(&[
-            "-nostdinc",
+            //"-nostdinc",
             "-isystem",
             &clang_include,
             "-D__KERNEL__",

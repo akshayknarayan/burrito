@@ -19,7 +19,6 @@ tokio = {version = "0.2.11", features = ["full"]}
 slog = "2"
 slog-term = "2"
 structopt = "0.3"
-burrito-addr = {path = "../burrito-addr"}
 burrito-shard-ctl = {path = "../burrito-shard-ctl"}
 burrito-util = {path = "../burrito-util"}
 tracing = "0.1"
@@ -31,4 +30,3 @@ hyper-unix-connector = "0.1"
 hashbrown = "0.7"
 tower-buffer = "0.3"
 incoming = "0.1"
-ahash = "0.3"
