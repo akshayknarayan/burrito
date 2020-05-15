@@ -50,6 +50,7 @@ impl tower_service::Service<msg::Msg> for Store {
     }
 
     fn call(&mut self, req: msg::Msg) -> Self::Future {
+        trace!(req = ?&req.id(), "serviceing request");
         let resp = match req.op() {
             msg::Op::Get => {
                 let val = self.inner.get(req.key()).map(str::to_string);
@@ -190,10 +191,14 @@ pub async fn serve(
     srv: impl tower_service::Service<msg::Msg, Response = msg::Msg>,
 ) {
     let st: AsyncBincodeStream<_, msg::Msg, _, _> = AsyncBincodeStream::from(st).for_async();
-    pipeline::Server::new(st, srv)
-        .await
-        .map_err(|_| ()) // argh, bincode::Error is not Debug
-        .unwrap_or_else(|_| ());
+    match pipeline::Server::new(st, srv).await {
+        Err(_) => {
+            warn!("connection error");
+        }
+        _ => (),
+    }
+
+    trace!("connection done");
 }
 
 /// Serve multiple Store shards on `shard_listeners`.
@@ -201,13 +206,12 @@ pub async fn serve(
 /// Each shard will listen on the provided listener. In addition, we use `shard_fn` to steer
 /// requests from the first provided listener to the correct shard.
 #[tracing::instrument(level = "debug", skip(shard_listeners, shard_fn))]
-pub async fn shard_server<A, C, E>(
+pub async fn shard_server<A, E>(
     shard_listeners: impl IntoIterator<Item = A>,
     shard_fn: impl Fn(&Msg) -> usize + 'static,
 ) -> Result<(), StdError>
 where
-    A: Stream<Item = Result<C, E>> + Send + 'static,
-    C: AsyncRead + AsyncWrite + Unpin + Send,
+    A: Stream<Item = Result<tokio::net::TcpStream, E>> + Send + 'static,
     E: Into<Box<dyn Error + Sync + Send + 'static>> + std::fmt::Debug + Unpin + Send,
 {
     let mut shard_listeners = shard_listeners.into_iter();
@@ -226,7 +230,12 @@ where
             // serve srv on listener
             tokio::spawn(async move {
                 listener
-                    .for_each_concurrent(None, move |st| serve(st.unwrap(), srv.clone()))
+                    .for_each_concurrent(None, move |st| {
+                        debug!(st = ?st, "new connection");
+                        let tcp_st = st.unwrap();
+                        tcp_st.set_nodelay(true).unwrap();
+                        serve(tcp_st, srv.clone())
+                    })
                     .await
             });
 
@@ -237,9 +246,15 @@ where
     // if shards.len() == 0, then there can only be one shard: sharder_listen. So, we just serve directly and
     // ignore `shard_fn`.
     if shards.is_empty() {
+        debug!("one-shard mode");
         let srv = tower_buffer::Buffer::new(Store::default(), 100_000);
         sharder_listen
-            .for_each_concurrent(None, move |st| serve(st.unwrap(), srv.clone()))
+            .for_each_concurrent(None, move |st| {
+                debug!(st = ?st, "new connection");
+                let tcp_st = st.unwrap();
+                tcp_st.set_nodelay(true).unwrap();
+                serve(tcp_st, srv.clone())
+            })
             .await;
         return Ok(());
     }
@@ -249,13 +264,16 @@ where
     // start the sharder
     sharder_listen
         .for_each_concurrent(None, |st| {
+            let st = st.unwrap();
+            st.set_nodelay(true).unwrap();
+            debug!(st = ?st, "starting connection");
             let mut shards = shards.clone();
             let shard_fn = shard_fn.clone();
             let mut concurrent_history = vec![];
             async move {
                 let mut resps = futures_util::stream::FuturesOrdered::new();
-                let mut st: AsyncBincodeStream<C, msg::Msg, msg::Msg, _> =
-                    AsyncBincodeStream::from(st.unwrap()).for_async();
+                let mut st: AsyncBincodeStream<_, msg::Msg, msg::Msg, _> =
+                    AsyncBincodeStream::from(st).for_async();
 
                 loop {
                     trace!(queue = resps.len(), "loop start");

@@ -166,7 +166,7 @@ mod srv {
             fn check(si: &proto::ShardInfo) -> Result<(), Error> {
                 for a in si.shard_addrs.iter() {
                     match a {
-                        proto::Addr::Udp(_) | proto::Addr::Burrito(_) => (),
+                        proto::Addr::Tcp(_) | proto::Addr::Udp(_) | proto::Addr::Burrito(_) => (),
                         a => {
                             return Err(anyhow::anyhow!(
                                 "Must pass either name or Udp address: {}",
@@ -177,7 +177,7 @@ mod srv {
                 }
 
                 match &si.canonical_addr {
-                    proto::Addr::Udp(_) | proto::Addr::Burrito(_) => (),
+                    proto::Addr::Tcp(_) | proto::Addr::Udp(_) | proto::Addr::Burrito(_) => (),
                     a => {
                         return Err(anyhow::anyhow!(
                             "Must pass either name or Udp address: {}",
@@ -318,6 +318,12 @@ mod srv {
                     }
 
                     return proto::RegisterShardReply::Ok;
+                }
+
+                // only Udp or Burrito after this
+                match &req.canonical_addr {
+                    proto::Addr::Udp(_) | proto::Addr::Burrito(_) => (),
+                    _ => return proto::RegisterShardReply::Ok,
                 }
 
                 let h = self.ingress_handles.clone();
