@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{oneshot, Mutex};
 use tokio_tower::pipeline;
 use tower_service::Service;
-use tracing::{debug, error, info, span, trace, warn, Level};
+use tracing::{debug, info, span, trace, warn, Level};
 use tracing_futures::Instrument;
 
 type StdError = Box<dyn Error + Send + Sync + 'static>;
@@ -483,15 +483,20 @@ impl tower_service::Service<msg::Msg> for UdpClientService {
             trace!(id = req.id, "sending request");
             let msg = bincode::serialize(&req)?;
             sk.lock().await.send_to(&msg, &dest).await?;
-            let (s, r) = oneshot::channel();
+            let (s, mut r) = oneshot::channel();
             pnd.send((req.id, s)).await?;
-            match tokio::time::timeout(std::time::Duration::from_secs(10), r).await {
-                Err(_) => {
-                    error!(id = req.id, "Request timed out. Dropped?");
-                    panic!("Request timed out.");
+            let res = loop {
+                // TODO smarter timeout
+                let res = tokio::time::timeout(std::time::Duration::from_secs(1), &mut r).await;
+                if let Err(_) = res {
+                    debug!(id = req.id, "Request timed out. Dropped? Retrying");
+                    continue;
+                } else {
+                    break res.unwrap();
                 }
-                Ok(x) => Ok(x?),
-            }
+            };
+
+            Ok(res?)
         })
     }
 }

@@ -477,6 +477,7 @@ where
             assert!(!ops.is_empty());
             let mut ops = paced_ops_stream(ops, interarrival_micros, client_id);
             let mut pending = PendingServices::new(cls);
+            let mut last_req_time = tokio::time::Instant::now();
             let shard_fn = &shard_fn;
             async move {
                 debug!(id = client_id, "starting");
@@ -485,7 +486,9 @@ where
                         Some((remaining_cnt, o)) = ops.next() => {
                             let shard = shard_fn(&o);
                             pending.push(shard, o);
-                            trace!(id = client_id, remaining_cnt, inflight = inflight.len(), shard_id = shard, pending = pending.len(shard), "new request");
+                            let interval = last_req_time.elapsed();
+                            last_req_time = tokio::time::Instant::now();
+                            trace!(id = client_id, remaining_cnt, inflight = inflight.len(), shard_id = shard, pending = pending.len(shard), interarrival = ?interval, "new request");
                         }
                         Some(Ok((then, fut))) = pending.next() => {
                             inflight.push(async move {
