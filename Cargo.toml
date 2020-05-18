@@ -12,6 +12,7 @@ members = [
     "rpcbench",
     "test-util",
     "xdp-shard",
+    "ycsb-shenango",
 ]
 
 [profile.release]
