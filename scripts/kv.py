@@ -18,6 +18,7 @@ class ConnectionWrapper(Connection):
             port=port,
         )
         self.addr = addr
+        self.conn_addr = addr
 
         # Start the ssh connection
         super().open()
@@ -42,7 +43,7 @@ class ConnectionWrapper(Connection):
         .stdout = stdout string (if not redirected to a file)
         .stderr = stderr string (if not redirected to a file)
     """
-    def run(self, cmd, *args, stdin=None, stdout=None, stderr=None, ignore_out=False, wd=None, sudo=False, background=False, pty=True, **kwargs):
+    def run(self, cmd, *args, stdin=None, stdout=None, stderr=None, ignore_out=False, wd=None, sudo=False, background=False, quiet=False, pty=True, **kwargs):
         self.verbose = True
         # Prepare command string
         pre = ""
@@ -77,7 +78,8 @@ class ConnectionWrapper(Connection):
             pty=False
 
         # Print command if necessary
-        agenda.subtask("[{}]{} {}".format(self.addr.ljust(10), " (bg) " if background else "      ", full_cmd))
+        if not quiet:
+            agenda.subtask("[{}]{} {}".format(self.addr.ljust(10), " (bg) " if background else "      ", full_cmd))
 
         # Finally actually run it
         return super().run(full_cmd, *args, hide=True, warn=True, pty=pty, **kwargs)
@@ -142,6 +144,8 @@ class ConnectionWrapper(Connection):
 
         return super().get(remote_file, local=local, preserve_mode=preserve_mode)
 
+thread_ok = True
+
 def check(ok, msg, addr, allowed=[]):
     # exit code 0 is always ok, allowed is in addition
     if ok.exited != 0 and ok.exited not in allowed:
@@ -150,18 +154,21 @@ def check(ok, msg, addr, allowed=[]):
         print(ok.stdout)
         agenda.subfailure("stderr")
         print(ok.stderr)
+        thread_ok = False # something went wrong.
         sys.exit(1)
 
 def check_machine(ip):
-    conn = ConnectionWrapper(ip)
+    conn = ConnectionWrapper(ip[0])
     if not conn.file_exists("~/burrito"):
-        agenda.failure(f"No burrito on {ip}")
+        agenda.failure(f"No burrito on {ip[0]}")
+        thread_ok = False # something went wrong.
         sys.exit(1)
 
     commit = conn.run("git rev-parse --short HEAD", wd = "~/burrito")
     if commit.exited == 0:
         commit = commit.stdout.strip()
     agenda.subtask(f"burrito commit {commit} on {ip}")
+    conn.addr = ip[1]
     return (conn, commit)
 
 def setup_client(conn, outdir):
@@ -219,69 +226,35 @@ def start_server(conn, outf, shards=0, use_burrito_shard=True):
     time.sleep(2)
     conn.check_proc("kvserver", f"{outf}.err")
 
-# one machine can handle 2 client processes
+# one machine can handle 1 client process
 def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='uniform'):
-    wrkfile = "~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadb1-100.access"
+    wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadb1-4.access"
     if wrkload == 'uniform':
-        wrkfile = "~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadbunf{}-100.access"
+        wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadbunf{}-4.access"
 
-    if not conn.file_exists(wrkfile.format(1)):
-        agenda.failure(f"No ycsb trace on {conn.addr}")
-        sys.exit(1)
-    if not conn.file_exists(wrkfile.format(2)):
-        agenda.failure(f"No ycsb trace on {conn.addr}")
-        sys.exit(1)
+    #if not conn.file_exists(wrkfile.format(1)):
+    #    agenda.failure(f"No ycsb trace on {conn.addr}")
+    #    thread_ok = False # something went wrong.
+    #    sys.exit(1)
 
-    ok = conn.run("cset shield --userset=kv --reset", sudo=True)
-    check(ok, "reset cpuset", conn.addr, allowed = [2])
-    agenda.subtask(f"make cpu shield kv for cpus 0-4 on {conn.addr}")
-    ok = conn.run(f"cset shield --userset=kv --cpu=0-4 --kthread=on", sudo=True)
-    check(ok, "make cpuset", conn.addr)
+    #conn.run("pkill -9 ycsb-sync", sudo=True)
 
     shard_arg = f"-n {clientsharding}" if clientsharding is not None else ""
 
-    conn.run(f"cset shield --userset=kv --exec ./target/release/ycsb -- \
+    ok = conn.run(f"RUST_LOG=info,ycsb=debug ./target/release/ycsb \
             --burrito-root=/tmp/burrito \
             --addr \"udp://{server}:4242\" \
             --accesses {wrkfile.format(1)} \
-            -o {outf}.data1 \
+            -o {outf}1-{conn.addr}.data1 \
             {shard_arg} \
             -i {interarrival}",
             wd = "~/burrito",
             sudo = True,
-            background = True,
-            stdout=f"{outf}.out",
-            stderr=f"{outf}.err",
-            )
-    ok = conn.run(f"./target/release/ycsb \
-            --burrito-root=/tmp/burrito \
-            --addr \"udp://{server}:4242\" \
-            --accesses {wrkfile.format(2)} \
-            -o {outf}2.data1 \
-            {shard_arg} \
-            -i {interarrival}",
-            sudo=True,
-            wd = "~/burrito",
-            stdout=f"{outf}2.out",
-            stderr=f"{outf}2.err",
+            stdout=f"{outf}1-{conn.addr}.out",
+            stderr=f"{outf}1-{conn.addr}.err",
+            timeout=600,
             )
     check(ok, "ycsb client", conn.addr)
-    # wait for the other one
-    wait_start = time.monotonic()
-    while True:
-        agenda.subtask("Checking for background ycsb to finish")
-        ok = conn.run(f"ls {outf}.data1", wd="~/burrito")
-        if ok.exited == 0:
-            conn.run("sudo chmod 644 {outf}.data1")
-            break
-        else:
-            time.sleep(1)
-            if time.monotonic() - wait_start > 10.:
-                agenda.subfailure("Giving up waiting for ycsb client")
-                break
-
-    conn.run("sudo chmod 644 {outf}.out")
-    conn.run("sudo chmod 644 {outf}.err")
     agenda.subtask("client done")
 
 def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
@@ -296,7 +269,7 @@ def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
     ok = machines[0].run("DOCKER_HOST=unix:///var/run/burrito-docker.sock \
             docker run \
             --name burrito-shard-redis \
-            -d -p 6379:6379 redis:5",
+            -d -p 6379:6379 redis:6",
             sudo=True,
             wd="~/burrito")
     check(ok, "start redis", machines[0].addr)
@@ -311,7 +284,7 @@ def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
         stdout=f"{outdir}.out",
         stderr=f"{outdir}.err")
     agenda.subtask(f"Started burrito-shard-ctl on {machines[0].addr}")
-    redis_addr = machines[0].addr
+    redis_addr = machines[0].conn_addr
 
     # burrito-shard-ctl runs on all
     for m in machines[1:]:
@@ -319,29 +292,41 @@ def start_burrito_shard_ctl(machines, outdir, use_sudo=False):
             wd="~/burrito", sudo=use_sudo, background=True, stderr=f"{outdir}-{m.addr}.err")
         agenda.subtask(f"Started burrito-shard-ctl on {m.addr}")
 
-def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='uniform'):
-    shardctl_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-burritoshard"
-    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-kvserver"
-    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-ycsb"
+def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrkload='uniform'):
+    shardctl_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-{iter_num}-burritoshard"
+    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-{iter_num}-kvserver"
+    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-{iter_num}-ycsb"
 
     for m in machines:
+        if m.addr in ['127.0.0.1', '::1', 'localhost']:
+            m.run(f"mkdir -p {outdir}", wd="~/burrito")
+            continue
+        m.run(f"rm -rf {outdir}", wd="~/burrito")
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
-    if os.path.exists(f"{outf}-{machines[1].addr}.data"):
+    if os.path.exists(f"{outf}1-{machines[1].addr}.data"):
         agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
         return True
+    else:
+        agenda.task(f"running: {outf}1-{machines[1].addr}.data")
 
-    # load = 100 (client threads / proc) * 2 (procs/machine) * {len(machines) - 1} (machines) / {interarrival} (per client thread)
-    # interarrival = 100 * 2 * {len(machines) - 1} / load
-    interarrival_secs = 200 * len(machines[1:]) / ops_per_sec
+
+    # load = 100 (client threads / proc) * 3 (procs/machine) * {len(machines) - 1} (machines) / {interarrival} (per client thread)
+    # interarrival = 100 * 3 * {len(machines) - 1} / load
+    # n = 1 client/machine now
+    interarrival_secs = 4 * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
+
+    #if interarrival_us < 5000:
+    #    agenda.subfailure("Can't have interarrival < 5ms")
+    #    return False
 
     start_burrito_shard_ctl(machines, shardctl_prefix, use_sudo = (shardtype == "xdpserver" or shardtype == "client" or shardtype == "dyn"))
 
     time.sleep(5)
 
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec}, workload = {wrkload}, ops/s -> interarrival_us = {interarrival_us}")
+    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, workload = {wrkload}, iter = {iter_num}, load = {ops_per_sec}, ops/s -> interarrival_us = {interarrival_us}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
@@ -395,7 +380,6 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
     machines[0].run("sudo pkill -9 kvserver")
     for m in machines:
         m.run("pkill -9 burrito-shard", sudo=True)
-        m.run("pkill -9 ycsb", sudo=True)
         m.run("rm -rf /tmp/burrito/*", sudo=True)
 
     agenda.subtask("processes killed")
@@ -406,42 +390,71 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, wrkload='unifor
         machines[0].get(f"burrito/{shardctl_prefix}.out", local=f"{shardctl_prefix}.out", preserve_mode=False)
         machines[0].get(f"burrito/{shardctl_prefix}.err", local=f"{shardctl_prefix}.err", preserve_mode=False)
         machines[0].get(f"burrito/{shardctl_prefix}.log", local=f"{shardctl_prefix}.log", preserve_mode=False)
+
+        def get_files(num):
+            c.get(
+                f"burrito/{outf}{num}-{c.addr}.err",
+                local=f"{outf}{num}-{c.addr}.err",
+                preserve_mode=False,
+            )
+            c.get(
+                f"burrito/{outf}{num}-{c.addr}.out",
+                local=f"{outf}{num}-{c.addr}.out",
+                preserve_mode=False,
+            )
+            c.get(
+                f"burrito/{outf}{num}-{c.addr}.data1",
+                local=f"{outf}{num}-{c.addr}.data1",
+                preserve_mode=False,
+            )
+
         for c in machines[1:]:
             if c.addr in ['127.0.0.1', '::1', 'localhost']:
                 continue
-            c.get(f"burrito/{outf}.err", local=f"{outf}-{c.addr}.err", preserve_mode=False)
-            c.get(f"burrito/{outf}2.err", local=f"{outf}2-{c.addr}.err", preserve_mode=False)
-            c.get(f"burrito/{outf}.out", local=f"{outf}-{c.addr}.out", preserve_mode=False)
-            c.get(f"burrito/{outf}2.out", local=f"{outf}2-{c.addr}.out", preserve_mode=False)
-            c.get(f"burrito/{outf}.data1", local=f"{outf}-{c.addr}.data1", preserve_mode=False)
-            c.get(f"burrito/{outf}2.data1", local=f"{outf}2-{c.addr}.data1", preserve_mode=False)
-    except:
-        agenda.subfailure("At least one file missing")
+            get_files(1)
+            #get_files(2)
+            #get_files(3)
+    except Exception as e:
+        agenda.subfailure(f"At least one file missing: {e}")
         return False
 
-    agenda.task("done")
+    def awk_files(num):
+        subprocess.run(f"awk '{{if (!hdr) {{hdr=$1; print \"ShardType NumShards Wrkload Ops \"$0;}} else {{print \"{shardtype} {num_shards} {wrkload} {ops_per_sec} \"$0}} }}' {outf}{num}-{c.addr}.data1 > {outf}{num}-{c.addr}.data", shell=True, check=True)
 
     for c in machines[1:]:
         agenda.subtask(f"adding experiment info for {c.addr}")
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$1; print \"ShardType NumShards Wrkload Ops \"$0;}} else {{print \"{shardtype} {num_shards} {wrkload} {ops_per_sec} \"$0}} }}' {outf}-{c.addr}.data1 > {outf}-{c.addr}.data", shell=True)
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$0; print \"ShardType NumShards Wrkload Ops \"$0;}} else {{print \"{shardtype} {num_shards} {wrkload} {ops_per_sec} \"$0}} }}' {outf}2-{c.addr}.data1 > {outf}2-{c.addr}.data", shell=True)
+        try:
+            awk_files(1)
+            #awk_files(2)
+            #awk_files(3)
+        except:
+            agenda.subfailure(f"At least one file missing")
+            return False
 
+    agenda.task("done")
     return True
 
 def probe_ops(outdir, machines, num_shards, shardtype, low_ops, high_ops=None, wrkload='uniform'):
+    def try_n_times(n, ops):
+        for i in range(3):
+            ok = do_exp(outdir, machines, num_shards, shardtype, ops, i, wrkload=wrkload)
+            if not ok:
+                return False
+        return True
+
     if high_ops is not None and high_ops - low_ops < 20000:
         agenda.task(f"resolved: num_shards = {num_shards}, shardtype = {shardtype}, workload = {wrkload} => {low_ops} ops/s")
         return low_ops
     elif high_ops is not None:
         ops = (low_ops + high_ops) / 2
-        ok = do_exp(outdir, machines, num_shards, shardtype, ops, wrkload=wrkload)
+        ok = try_n_times(3, ops)
         if ok:
             return probe_ops(outdir, machines, num_shards, shardtype, ops, high_ops=high_ops, wrkload=wrkload)
         else:
             return probe_ops(outdir, machines, num_shards, shardtype, low_ops, high_ops=ops, wrkload=wrkload)
     else:
         # probe by doubling upwards until it fails
-        ok = do_exp(outdir, machines, num_shards, shardtype, low_ops, wrkload=wrkload)
+        ok = try_n_times(3, low_ops)
         if ok:
             return probe_ops(outdir, machines, num_shards, shardtype, low_ops*2, high_ops=None, wrkload=wrkload)
         else:
@@ -492,6 +505,9 @@ if __name__ == '__main__':
             agenda.failure(f"Unknown shardtype {t}")
             sys.exit(1)
 
+    agenda.task(f"Checking for connection vs experiment ip")
+    ips = [i.split(":") if len(i.split(":")) == 2 else (i,i) for i in ips]
+
     agenda.task(f"connecting to {ips}")
     machines, commits = zip(*[check_machine(ip) for ip in ips])
     # check all the commits are equal
@@ -501,10 +517,14 @@ if __name__ == '__main__':
 
     # build
     agenda.task("building burrito...")
+    thread_ok = True
     setups = [threading.Thread(target=setup_server, args=(machines[0],outdir))] +\
         [threading.Thread(target=setup_client, args=(m,outdir)) for m in machines[1:]]
     [t.start() for t in setups]
     [t.join() for t in setups]
+    if not thread_ok:
+        agenda.failure("Something went wrong")
+        sys.exit(1)
     agenda.task("...done building burrito")
 
     for w in args.wrk:
@@ -512,7 +532,7 @@ if __name__ == '__main__':
             for s in args.shards:
                 if args.mode == 'run':
                     for o in ops_per_sec:
-                        do_exp(outdir, machines, s, t, o, wrkload=w)
+                        do_exp(outdir, machines, s, t, o, 0, wrkload=w)
                         time.sleep(3)
                 else: # probe
                     probe_ops(outdir, machines, s, t, ops_per_sec, wrkload=w)
@@ -525,5 +545,5 @@ if __name__ == '__main__':
     subprocess.run(f"awk '{{print $1,$2,$3,$4}}' {outdir}/exp.data | uniq > {outdir}/exp-scaling.data1", shell=True)
     subprocess.run(f"python3 scripts/exp_max.py < {outdir}/exp-scaling.data1 > {outdir}/exp-scaling.data", shell=True)
     agenda.task("plotting")
-    subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)
+    #subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)
     subprocess.run(f"./scripts/kv-udp.R {outdir}/exp-scaling.data {outdir}/exp-scaling.pdf", shell=True)

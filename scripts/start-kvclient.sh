@@ -11,22 +11,21 @@ RUST_LOG=info ./target/release/burrito-shard -r "redis://$1:6379" &
 
 sleep 5
 
-sudo RUST_LOG="$RUST_LOG" cset shield --userset=kv --exec ./target/release/ycsb -- \
+sudo RUST_LOG="$RUST_LOG" ./target/release/ycsb \
             --burrito-root="/tmp/burrito" \
-            --addr "kv" \
+            --addr "$1:4242" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-100.access \
-            -i "$2" -n "$3" &
-client1=$!
-echo "started client 1: $client1"
+            -i "$2" -n "$3"
+echo "started client"
 
-./target/release/ycsb \
-    --burrito-root="/tmp/burrito" \
-    --addr "kv" \
-    --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadbunf2-100.access \
-    -i "$2" -n "$3" &
-client2=$!
-echo "started client 2: $client2"
+#./target/release/ycsb \
+#    --burrito-root="/tmp/burrito" \
+#    --addr "kv" \
+#    --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadbunf2-100.access \
+#    -i "$2" -n "$3" &
+#client2=$!
+#echo "started client 2: $client2"
 
-wait "$client1" "$client2"
+#wait "$client1" "$client2"
 sudo pkill -9 burrito-shard
 sudo rm -rf /tmp/burrito/*
