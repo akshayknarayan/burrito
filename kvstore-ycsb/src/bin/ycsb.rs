@@ -140,7 +140,7 @@ async fn main() -> Result<(), StdError> {
         cls
     };
 
-    let (mut durs, time) = do_exp(
+    let (mut interarrivals, mut durs, time) = do_exp(
         cls,
         opt.connections_per_client,
         opt.interarrival_client_micros,
@@ -150,6 +150,21 @@ async fn main() -> Result<(), StdError> {
     .await?;
 
     // done
+    interarrivals.sort();
+    let len = interarrivals.len() as f64;
+    let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
+    let quantiles: Vec<_> = quantile_idxs
+        .iter()
+        .map(|q| (len * q) as usize)
+        .map(|i| interarrivals[i])
+        .collect();
+    info!(
+        num = ?&interarrivals.len(), elapsed = ?time, wanted_mean_us = opt.interarrival_client_micros, min = ?interarrivals[0],
+        p25 = ?quantiles[0], p50 = ?quantiles[1], p75 = ?quantiles[2],
+        p95 = ?quantiles[3], max = ?interarrivals[interarrivals.len() - 1],
+        "Interarrivals"
+    );
+
     durs.sort();
     let len = durs.len() as f64;
     let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
@@ -162,7 +177,7 @@ async fn main() -> Result<(), StdError> {
         num = ?&durs.len(), elapsed = ?time, min = ?durs[0],
         p25 = ?quantiles[0], p50 = ?quantiles[1], p75 = ?quantiles[2],
         p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
-        "Did accesses"
+        "Request latencies"
     );
 
     if let Some(f) = opt.out_file {
@@ -246,7 +261,14 @@ async fn managed_sharding<S>(
     interarrival_micros: usize,
     loads: Vec<Op>,
     accesses: Vec<Op>,
-) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
+) -> Result<
+    (
+        Vec<std::time::Duration>,
+        Vec<std::time::Duration>,
+        std::time::Duration,
+    ),
+    StdError,
+>
 where
     S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>
         + Clone
@@ -270,7 +292,14 @@ async fn do_exp<S>(
     interarrival_micros: usize,
     loads: Vec<Op>,
     accesses: Vec<Op>,
-) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
+) -> Result<
+    (
+        Vec<std::time::Duration>,
+        Vec<std::time::Duration>,
+        std::time::Duration,
+    ),
+    StdError,
+>
 where
     S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>
         + Clone
@@ -461,7 +490,14 @@ async fn do_requests<S>(
     access_by_client: HashMap<usize, (Vec<kvstore::Client<S>>, Vec<Op>)>,
     interarrival_micros: u64,
     shard_fn: impl Fn(&Op) -> usize,
-) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
+) -> Result<
+    (
+        Vec<std::time::Duration>,
+        Vec<std::time::Duration>,
+        std::time::Duration,
+    ),
+    StdError,
+>
 where
     S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError> + Unpin,
     S::Future: 'static + Unpin,
@@ -473,6 +509,7 @@ where
         .map(|(client_id, (cls, ops))| {
             let mut inflight = FuturesOrdered::new();
             let mut durs = vec![];
+            let mut interarrivals = vec![];
             let done = done_rx.clone();
             assert!(!ops.is_empty());
             let mut ops = paced_ops_stream(ops, interarrival_micros, client_id);
@@ -487,6 +524,7 @@ where
                             let shard = shard_fn(&o);
                             pending.push(shard, o);
                             let interval = last_req_time.elapsed();
+                            interarrivals.push(interval);
                             last_req_time = tokio::time::Instant::now();
                             trace!(id = client_id, remaining_cnt, inflight = inflight.len(), shard_id = shard, pending = pending.len(shard), interarrival = ?interval, "new request");
                         }
@@ -514,23 +552,25 @@ where
                     }
                 }
 
-                Ok::<_, StdError>(durs)
+                Ok::<_, StdError>((interarrivals, durs))
             }
         })
         .collect();
 
     let access_start = tokio::time::Instant::now();
     // do the accesses until the first client is done.
-    let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
+    let (mut interarrivals, mut durs): (Vec<_>, Vec<_>) = reqs.try_next().await?.expect("durs");
     assert!(!durs.is_empty());
     let access_end = access_start.elapsed();
     info!("broadcasting done");
     done_tx.broadcast(true)?;
 
     // collect all the requests that have completed.
-    let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
-    assert!(!rest_durs.is_empty());
+    let rest: Vec<(Vec<_>, Vec<_>)> = reqs.try_collect().await?;
+    assert!(!rest.is_empty());
     info!("all clients reported");
+    let (rest_inters, rest_durs): (Vec<Vec<_>>, Vec<Vec<_>>) = rest.into_iter().unzip();
+    interarrivals.extend(rest_inters.into_iter().flat_map(|x| x.into_iter()));
     durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
-    Ok((durs, access_end))
+    Ok((interarrivals, durs, access_end))
 }
