@@ -177,7 +177,9 @@ def setup_client(conn, outdir):
     agenda.subtask(f"building burrito on {conn.addr}")
     ok = conn.run("~/.cargo/bin/cargo build --release --features=\"bin\"", wd = "~/burrito/burrito-shard-ctl")
     check(ok, "build", conn.addr)
-    ok = conn.run("~/.cargo/bin/cargo build --release", wd = "~/burrito/kvstore-ycsb")
+    #ok = conn.run("~/.cargo/bin/cargo build --release", wd = "~/burrito/kvstore-ycsb")
+    #check(ok, "build", conn.addr)
+    ok = conn.run("~/.cargo/bin/cargo build --release", wd = "~/burrito/ycsb-shenango")
     check(ok, "build", conn.addr)
     return conn
 
@@ -238,13 +240,23 @@ def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='u
     #    sys.exit(1)
 
     #conn.run("pkill -9 ycsb-sync", sudo=True)
+    conn.run("pkill -9 ycsb-shenango", sudo=True)
+    #conn.run("pkill -INT iokerneld", sudo=True)
+    #time.sleep(2)
+
+    #conn.run(f"./iokerneld",
+    #        wd = "~/shenango",
+    #        sudo = True,
+    #        background = True,
+    #        )
 
     shard_arg = f"-n {clientsharding}" if clientsharding is not None else ""
 
-    ok = conn.run(f"RUST_LOG=info,ycsb=debug ./target/release/ycsb \
+    ok = conn.run(f"RUST_LOG=info,ycsb_shenango=debug ./target/release/ycsb-shenango \
             --burrito-root=/tmp/burrito \
             --addr \"udp://{server}:4242\" \
             --accesses {wrkfile.format(1)} \
+            --shenango-config ./ycsb-shenango/client.config \
             -o {outf}1-{conn.addr}.data1 \
             {shard_arg} \
             -i {interarrival}",
@@ -255,6 +267,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='u
             timeout=600,
             )
     check(ok, "ycsb client", conn.addr)
+    #conn.run("pkill -INT iokerneld", sudo=True)
     agenda.subtask("client done")
 
 def start_burrito_shard_ctl(machines, outdir, use_sudo=False):

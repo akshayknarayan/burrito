@@ -11,10 +11,11 @@ RUST_LOG=info ./target/release/burrito-shard -r "redis://$1:6379" &
 
 sleep 5
 
-sudo RUST_LOG="$RUST_LOG" ./target/release/ycsb \
+sudo RUST_LOG="$RUST_LOG" ./target/release/ycsb-shenango \
             --burrito-root="/tmp/burrito" \
             --addr "$1:4242" \
             --accesses ./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-100.access \
+            --shenango-config ./ycsb-shenango/client.config \
             -i "$2" -n "$3"
 echo "started client"
 
