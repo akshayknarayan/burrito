@@ -16,9 +16,9 @@ incoming = "0.1"
 kvstore = {path = "../kvstore"}
 pin-project = "0.4"
 structopt = "0.3"
-tokio = {version = "0.2.13", features = ["full"]}
+tokio = {version = "0.2.20", features = ["full"]}
 async-timer = { version = "0.7", features = ["stream", "tokio_on"] }
-poisson-ticker = { git = "https://github.com/akshayknarayan/poisson-ticker" }
+poisson-ticker = { git = "https://github.com/akshayknarayan/poisson-ticker", branch="debug" }
 tower-buffer = "0.3"
 tower-service = "0.3"
 tracing = "0.1"

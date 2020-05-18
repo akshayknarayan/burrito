@@ -49,7 +49,7 @@ fn sk_shard_addrs(num_shards: usize, base_addr: String) -> Vec<std::net::SocketA
         .collect()
 }
 
-#[tokio::main]
+#[tokio::main(core_threads = 8, max_threads = 8)]
 async fn main() -> Result<(), StdError> {
     let opt = Opt::from_args();
 
@@ -219,14 +219,20 @@ fn group_by_client(accesses: Vec<Op>) -> HashMap<usize, Vec<Op>> {
 fn paced_ops_stream(
     ops: Vec<Op>,
     interarrival_micros: u64,
-) -> impl futures_util::stream::Stream<Item = ((), Op)> {
+    client_id: usize,
+) -> impl futures_util::stream::Stream<Item = (usize, Op)> {
+    let len = ops.len();
     use futures_util::stream::StreamExt;
     //let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
     //use async_timer as hrtimer;
     //let tkr = hrtimer::interval(std::time::Duration::from_micros(interarrival_micros as u64));
-    let tkr =
-        poisson_ticker::Ticker::new(std::time::Duration::from_micros(interarrival_micros as u64));
+    let tkr = poisson_ticker::SpinTicker::new_with_log_id(
+        std::time::Duration::from_micros(interarrival_micros as u64),
+        client_id,
+    )
+    .zip(futures_util::stream::iter((0..len).rev()));
     tkr.zip(futures_util::stream::iter(ops))
+        .map(|((_, i), o)| (i, o))
 }
 
 // Uncommenting the following causes:
@@ -281,8 +287,11 @@ where
 
     do_loads(&mut cls[0], loads).await?;
 
+    // take off the canonical address
+    let cls = cls[1..].to_vec();
+
     // now, measure the accesses.
-    let num_shards = cls.len() - 1;
+    let num_shards = cls.len();
     let shard_fn = move |o: &Op| {
         /* xdp_shard version of FNV: take the first 4 bytes of the key
         * u64 hash = FNV1_64_INIT;
@@ -466,17 +475,17 @@ where
             let mut durs = vec![];
             let done = done_rx.clone();
             assert!(!ops.is_empty());
-            let mut ops = paced_ops_stream(ops, interarrival_micros);
+            let mut ops = paced_ops_stream(ops, interarrival_micros, client_id);
             let mut pending = PendingServices::new(cls);
             let shard_fn = &shard_fn;
             async move {
                 debug!(id = client_id, "starting");
                 loop {
                     tokio::select!(
-                        Some((_, o)) = ops.next() => {
+                        Some((remaining_cnt, o)) = ops.next() => {
                             let shard = shard_fn(&o);
                             pending.push(shard, o);
-                            trace!(id = client_id, inflight = inflight.len(), shard_id = shard, pending = pending.len(shard), "new request");
+                            trace!(id = client_id, remaining_cnt, inflight = inflight.len(), shard_id = shard, pending = pending.len(shard), "new request");
                         }
                         Some(Ok((then, fut))) = pending.next() => {
                             inflight.push(async move {
