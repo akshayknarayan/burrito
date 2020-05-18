@@ -1,6 +1,4 @@
-use std::error::Error;
-
-type StdError = Box<dyn Error + Send + Sync + 'static>;
+type StdError = anyhow::Error;
 
 // TODO invoke ycsbc-mock
 //pub fn generate(specfile: impl AsRef<std::path::Path>) {
@@ -50,7 +48,7 @@ impl std::str::FromStr for Op {
         } else if sp.len() == 4 && sp[1] == "UPDATE" {
             Op::Update(sp[0].parse()?, sp[2].into(), sp[3].into())
         } else {
-            Err(format!("Invalid line: {:?}", s))?
+            Err(anyhow::anyhow!("Invalid line: {:?}", s))?
         })
     }
 }
