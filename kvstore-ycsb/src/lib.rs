@@ -48,7 +48,7 @@ impl std::str::FromStr for Op {
         Ok(if sp.len() == 3 && sp[1] == "GET" {
             Op::Get(sp[0].parse()?, sp[2].into())
         } else if sp.len() == 4 && sp[1] == "UPDATE" {
-            Op::Update(sp[0].parse()?, sp[1].into(), sp[2].into())
+            Op::Update(sp[0].parse()?, sp[2].into(), sp[3].into())
         } else {
             Err(format!("Invalid line: {:?}", s))?
         })
