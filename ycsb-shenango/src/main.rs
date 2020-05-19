@@ -273,11 +273,17 @@ fn do_exp(
     } else if shard_addrs.len() < 3 {
         // passing only one address means no sharding, which is equivalent to server sharding.
         // two addresses is a sharder and one shard, which is the same thing.
-        return managed_sharding(shard_addrs[0], interarrival_micros, accesses, out_file);
+        debug!(addr = ?shard_addrs, "Managed sharding");
+        return do_requests(
+            vec![shard_addrs[0]],
+            interarrival_micros,
+            accesses,
+            out_file,
+            |_| 0,
+        );
     };
 
     debug!(addr = ?shard_addrs, "Client sharding");
-    let start = std::time::Instant::now();
 
     // take off the canonical_addr
     let shard_addrs = shard_addrs[1..].to_vec();
@@ -308,6 +314,22 @@ fn do_exp(
         hash as usize % num_shards
     };
 
+    do_requests(
+        shard_addrs,
+        interarrival_micros,
+        accesses,
+        out_file,
+        shard_fn,
+    );
+}
+
+fn do_requests(
+    shard_addrs: Vec<std::net::SocketAddr>,
+    interarrival_micros: usize,
+    accesses: Vec<Op>,
+    out_file: Option<std::path::PathBuf>,
+    shard_fn: impl Fn(&Op) -> usize + Send + Sync + 'static,
+) {
     //for (id, ops) in group_by_client(accesses.clone()) {
     //    let ops_len = ops.len();
     //    debug!(id, num_ops = ops_len, "client");
@@ -321,10 +343,13 @@ fn do_exp(
     //    debug!(id, num_ops = ops_len, shards = ?shard_ctrs, "client shard counts");
     //}
 
+    let start = std::time::Instant::now();
+    let shard_fn = Arc::new(shard_fn);
     // now, measure the accesses.
     let mut workers = vec![];
     for (id, ops) in group_by_client(accesses) {
         let shard_addrs = shard_addrs.clone();
+        let shard_fn = shard_fn.clone();
         let jh = shenango::thread::spawn(move || {
             let res = (|| {
                 let mean_ns: f64 = interarrival_micros as f64 * 1e3;
@@ -350,20 +375,26 @@ fn do_exp(
 
                 let inflight: Arc<CHashMap<usize, Inflight>> =
                     Arc::new(CHashMap::with_capacity(num_ops));
+                let inflight_idx: Arc<Mutex<BTreeMap<std::time::Instant, usize>>> =
+                    Default::default();
                 let done: Arc<CHashMap<usize, std::time::Duration>> =
                     Arc::new(CHashMap::with_capacity(num_ops));
 
-                // sending thread
                 let send_inflight = Arc::clone(&inflight);
-                let send_done = Arc::clone(&done);
+                let send_inflight_idx = Arc::clone(&inflight_idx);
+                let send_done = done.clone();
                 let send_cls = cls.clone();
+                let send_shard_addrs = shard_addrs.clone();
                 shenango::thread::spawn(move || {
                     let inflight = send_inflight;
+                    let inflight_idx = send_inflight_idx;
+                    let shard_addrs = send_shard_addrs;
                     let done = send_done;
                     let cls = send_cls;
                     let mut rng = rand::thread_rng();
 
                     let mut shard_ctrs: Vec<_> = (0..cls.len()).map(|_| 0).collect();
+                    let mut interarrivals = vec![];
 
                     for o in ops {
                         // pace the request
@@ -381,12 +412,15 @@ fn do_exp(
                             shenango::delay_us(sleep_time.as_micros() as _);
                         }
 
+                        let inter = start.elapsed();
                         trace!(
                             id,
                             wanted = ?next_interarrival,
-                            actual = ?start.elapsed(),
+                            actual = ?inter,
                             "interarrival",
                         );
+
+                        interarrivals.push((next_interarrival, inter));
 
                         let shard_idx = shard_fn(&o);
                         let cl = &cls[shard_idx];
@@ -398,6 +432,7 @@ fn do_exp(
                             Op::Update(_, k, v) => Msg::put_req(k, v),
                         };
 
+                        let rid = req.id();
                         let addr = unwrap_ipv4(shard_addrs[shard_idx]);
                         let msg = bincode::serialize(&req).context("serialize")?;
                         trace!(
@@ -409,13 +444,37 @@ fn do_exp(
                         let req_inf = Inflight::new(req.clone());
                         cl.write_to(&msg, addr).context("socket write")?;
 
-                        if inflight.contains_key(&req.id()) {
-                            let mut ent = inflight.remove(&req.id()).unwrap();
+                        if inflight.contains_key(&rid) {
+                            let mut ent = inflight.remove(&rid).unwrap();
                             ent.retro_finish(req_inf.sent_time());
-                            done.insert(req.id(), ent.dur());
+                            done.insert(rid, ent.dur());
                         } else {
-                            inflight.insert(req.id(), req_inf);
+                            let time = req_inf.sent_time();
+                            inflight.insert_new(rid, req_inf);
+                            let mut inf = inflight_idx.lock().unwrap();
+                            inf.insert(time, rid);
                         }
+                    }
+
+                    fn quantiles(mut xs: Vec<Duration>, log: &str, id: usize) {
+                        if xs.is_empty() {
+                            return;
+                        }
+
+                        xs.sort();
+                        let len = xs.len() as f64;
+                        let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
+                        let quantiles: Vec<_> = quantile_idxs
+                            .iter()
+                            .map(|q| (len * q) as usize)
+                            .map(|i| xs[i])
+                            .collect();
+                        info!(id,
+                            num = ?&xs.len(), min = ?xs[0],
+                            p25 = ?quantiles[0], p50 = ?quantiles[1], p75 = ?quantiles[2],
+                            p95 = ?quantiles[3], max = ?xs[xs.len() - 1],
+                            log
+                        );
                     }
 
                     debug!(
@@ -425,6 +484,9 @@ fn do_exp(
                         shard_ctrs = ?shard_ctrs,
                         "done writing requests"
                     );
+                    let (wanted, actual) = interarrivals.into_iter().unzip();
+                    quantiles(wanted, "wanted interarrivals", id);
+                    quantiles(actual, "actual interarrivals", id);
                     Ok::<_, Error>(())
                 });
 
@@ -436,76 +498,81 @@ fn do_exp(
                     let recv_shard_id = shard_id;
                     shard_id += 1;
                     let recv_inflight = Arc::clone(&inflight);
+                    let recv_inflight_idx = Arc::clone(&inflight_idx);
                     let recv_done = Arc::clone(&done);
                     let recv_cl = cl.clone();
+                    let recv_shard_addrs = shard_addrs.clone();
                     let receive_on_shard = shenango::thread::spawn(move || {
                         let inflight = recv_inflight;
+                        let inflight_idx = recv_inflight_idx;
                         let done = recv_done;
                         let cl = recv_cl;
-                        let mut ctr = 0;
+                        let shard_addrs = recv_shard_addrs;
                         let shard_id = recv_shard_id;
 
                         let mut buf = [0u8; 1024];
                         loop {
-                            let (len, _) = match cl
-                                .read_from_timeout(std::time::Duration::from_secs(10), &mut buf)
+                            if let Ok((len, _)) = cl
+                                .read_from_timeout(std::time::Duration::from_millis(50), &mut buf)
+                                .context("read timed out")
                             {
-                                Err(_) if done.len() == num_ops => {
-                                    debug!(
-                                        id,
-                                        inflight = inflight.len(),
-                                        done = done.len(),
-                                        shard_id,
-                                        receiver_ctr = ctr,
-                                        "receiver done"
-                                    );
+                                let now = std::time::Instant::now();
+                                let resp: Msg =
+                                    bincode::deserialize(&buf[..len]).context("deserialize")?;
+                                trace!(id, shard_id, resp_id = resp.id(), "got response");
+                                let entry = inflight.remove(&resp.id());
+                                if let Some(mut i) = entry {
+                                    let time = i.retx_time();
+                                    i.finish();
+                                    let mut inf = inflight_idx.lock().unwrap();
+                                    // best effort, there's another sweep in the retx check.
+                                    inf.remove(&time).unwrap_or_else(|| 0);
+                                    done.insert(resp.id(), i.dur());
+                                } else {
+                                    inflight.insert(resp.id(), Inflight::Rcvd(resp.clone(), now));
+                                }
+
+                                if done.len() == num_ops {
                                     break;
                                 }
-                                r @ Err(_) => {
-                                    debug!(
-                                        id,
-                                        inflight = inflight.len(),
-                                        done = done.len(),
-                                        shard_id,
-                                        "read timed out"
-                                    );
-                                    r.context("timed out")?
-                                }
-                                r @ Ok(_) => r.unwrap(),
-                            };
-                            let now = std::time::Instant::now();
-                            let resp: Msg =
-                                bincode::deserialize(&buf[..len]).context("deserialize")?;
-                            let id = resp.id();
-                            let entry = inflight.remove(&id);
-                            if let Some(mut i) = entry {
-                                i.finish();
-                                done.insert(id, i.dur());
                             } else {
-                                inflight.insert(id, Inflight::Rcvd(resp.clone(), now));
+                                debug!(id, shard_id, "read timed out");
                             }
 
-                            ctr += 1;
-                            trace!(
-                                id,
-                                resp_id = resp.id(),
-                                inflight = inflight.len(),
-                                done = done.len(),
-                                shard_id,
-                                "got response"
-                            );
-
-                            if done.len() == num_ops {
-                                debug!(
-                                    id,
-                                    inflight = inflight.len(),
-                                    done = done.len(),
-                                    shard_id,
-                                    receiver_ctr = ctr,
-                                    "receiver done"
-                                );
-                                break;
-                            }
+                            // retransmits
+                            let mut inf = inflight_idx.lock().unwrap();
+                            let cutoff = Instant::now() - Duration::from_millis(50);
+                            // split_off returns entries after the cutoff.
+                            let mut still_inflight = inf.split_off(&cutoff);
+                            // we want to change the entries *before*, so swap the pointers so that inf
+                            // contains the after-cutoff values
+                            use std::ops::DerefMut;
+                            std::mem::swap(&mut still_inflight, inf.deref_mut());
+                            // still_inflight now contains before-cutoff values, so rename it.
+                            let expired_entries = still_inflight;
+                            let mut retx_entries = expired_entries
+                                .into_iter()
+                                .filter_map(|(_, idx)| {
+                                    if let Some(mut ent) = inflight.get_mut(&idx) {
+                                        let r = ent.msg();
+                                        let msg = bincode::serialize(&r).unwrap();
+                                        trace!(
+                                            id,
+                                            shard_id,
+                                            req_id = r.id(),
+                                            "retransmitting request"
+                                        );
+                                        let addr = unwrap_ipv4(shard_addrs[shard_id]);
+                                        cl.write_to(&msg, addr).unwrap();
+                                        let now = Instant::now();
+                                        ent.retx(now);
+                                        Some((now, r.id()))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            inf.append(&mut retx_entries);
                         }
 
                         Ok::<_, Error>(start.elapsed())
@@ -562,225 +629,6 @@ fn do_exp(
     let durs: Vec<_> = durs.into_iter().flat_map(|x| x).collect();
 
     done(durs, time, interarrival_micros, out_file);
-}
-
-fn managed_sharding(
-    a: std::net::SocketAddr,
-    interarrival_micros: usize,
-    accesses: Vec<Op>,
-    out_file: Option<std::path::PathBuf>,
-) {
-    debug!(addr = ?a, num_ops = accesses.len(), "Managed sharding");
-    let start = std::time::Instant::now();
-    let mut workers = vec![];
-    for (id, ops) in group_by_client(accesses) {
-        let jh = shenango::thread::spawn(move || {
-            let res = (|| {
-                let mean_ns: f64 = interarrival_micros as f64 * 1e3;
-                let lambda = 1. / mean_ns;
-                let r = Exp::new(lambda).expect("Make exponential distr");
-
-                info!(id, "client starting");
-                let p = 64347 + id;
-                let cl = Arc::new(shenango::udp::UdpConnection::listen(
-                    std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), p as _),
-                )?);
-
-                let num_ops = ops.len();
-
-                let inflight: Arc<CHashMap<usize, Inflight>> =
-                    Arc::new(CHashMap::with_capacity(num_ops));
-                let inflight_idx: Arc<Mutex<BTreeMap<std::time::Instant, usize>>> =
-                    Default::default();
-                let done: Arc<CHashMap<usize, std::time::Duration>> =
-                    Arc::new(CHashMap::with_capacity(num_ops));
-
-                let send_inflight = Arc::clone(&inflight);
-                let send_inflight_idx = Arc::clone(&inflight_idx);
-                let send_done = done.clone();
-                let send_cl = cl.clone();
-                shenango::thread::spawn(move || {
-                    let inflight = send_inflight;
-                    let inflight_idx = send_inflight_idx;
-                    let done = send_done;
-                    let cl = send_cl;
-                    let mut rng = rand::thread_rng();
-
-                    let mut interarrivals = vec![];
-
-                    for o in ops {
-                        // pace the request
-                        let mut next_interarrival_ns = r.sample(&mut rng) as u64;
-                        if next_interarrival_ns == 0 {
-                            next_interarrival_ns = 1;
-                        }
-
-                        let next_interarrival =
-                            std::time::Duration::from_nanos(next_interarrival_ns);
-                        let start = std::time::Instant::now();
-                        let next_req_start = start + next_interarrival;
-                        let sleep_time = std::time::Duration::from_micros(10);
-                        while std::time::Instant::now() < next_req_start - sleep_time {
-                            shenango::delay_us(sleep_time.as_micros() as _);
-                        }
-
-                        let inter = start.elapsed();
-                        trace!(
-                            id,
-                            wanted = ?next_interarrival,
-                            actual = ?inter,
-                            "interarrival",
-                        );
-
-                        interarrivals.push((next_interarrival, inter));
-
-                        // send the request
-                        let req = match o {
-                            Op::Get(_, k) => Msg::get_req(k),
-                            Op::Update(_, k, v) => Msg::put_req(k, v),
-                        };
-
-                        let rid = req.id();
-                        let addr = unwrap_ipv4(a);
-                        let msg = bincode::serialize(&req)?;
-                        trace!(id, req_id = rid, "sending request");
-                        let req_inf = Inflight::new(req.clone());
-                        cl.write_to(&msg, addr)?;
-
-                        if inflight.contains_key(&rid) {
-                            let mut ent = inflight.remove(&rid).unwrap();
-                            ent.retro_finish(req_inf.sent_time());
-                            done.insert(rid, ent.dur());
-                        } else {
-                            let time = req_inf.sent_time();
-                            inflight.insert_new(rid, req_inf);
-                            let mut inf = inflight_idx.lock().unwrap();
-                            inf.insert(time, rid);
-                        }
-                    }
-
-                    fn quantiles(mut xs: Vec<Duration>, log: &str, id: usize) {
-                        if xs.is_empty() {
-                            return;
-                        }
-
-                        xs.sort();
-                        let len = xs.len() as f64;
-                        let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
-                        let quantiles: Vec<_> = quantile_idxs
-                            .iter()
-                            .map(|q| (len * q) as usize)
-                            .map(|i| xs[i])
-                            .collect();
-                        info!(id,
-                            num = ?&xs.len(), min = ?xs[0],
-                            p25 = ?quantiles[0], p50 = ?quantiles[1], p75 = ?quantiles[2],
-                            p95 = ?quantiles[3], max = ?xs[xs.len() - 1],
-                            log
-                        );
-                    }
-
-                    debug!(id, "done writing requests");
-                    let (wanted, actual) = interarrivals.into_iter().unzip();
-                    quantiles(wanted, "wanted interarrivals", id);
-                    quantiles(actual, "actual interarrivals", id);
-
-                    Ok::<_, Error>(())
-                });
-
-                let mut buf = [0u8; 1024];
-                loop {
-                    if let Ok((len, _)) = cl
-                        .read_from_timeout(std::time::Duration::from_millis(50), &mut buf)
-                        .context("read timed out")
-                    {
-                        let now = std::time::Instant::now();
-                        let resp: Msg = bincode::deserialize(&buf[..len]).context("deserialize")?;
-                        trace!(id, resp_id = resp.id(), "got response");
-                        let entry = inflight.remove(&resp.id());
-                        if let Some(mut i) = entry {
-                            let time = i.retx_time();
-                            i.finish();
-                            let mut inf = inflight_idx.lock().unwrap();
-                            // best effort, there's another sweep in the retx check.
-                            inf.remove(&time).unwrap_or_else(|| 0);
-                            done.insert(resp.id(), i.dur());
-                        } else {
-                            inflight.insert(resp.id(), Inflight::Rcvd(resp.clone(), now));
-                        }
-
-                        if done.len() == num_ops {
-                            break;
-                        }
-                    } else {
-                        debug!(id, "read timed out");
-                    }
-
-                    // retransmits
-                    let mut inf = inflight_idx.lock().unwrap();
-                    let cutoff = Instant::now() - Duration::from_millis(50);
-                    // split_off returns entries after the cutoff.
-                    let mut still_inflight = inf.split_off(&cutoff);
-                    // we want to change the entries *before*, so swap the pointers so that inf
-                    // contains the after-cutoff values
-                    use std::ops::DerefMut;
-                    std::mem::swap(&mut still_inflight, inf.deref_mut());
-                    // still_inflight now contains before-cutoff values, so rename it.
-                    let expired_entries = still_inflight;
-                    let mut retx_entries = expired_entries
-                        .into_iter()
-                        .filter_map(|(_, idx)| {
-                            if let Some(mut ent) = inflight.get_mut(&idx) {
-                                let r = ent.msg();
-                                let msg = bincode::serialize(&r).unwrap();
-                                trace!(id, req_id = r.id(), "retransmitting request");
-                                cl.write_to(&msg, unwrap_ipv4(a)).unwrap();
-                                let now = Instant::now();
-                                ent.retx(now);
-                                Some((now, r.id()))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    inf.append(&mut retx_entries);
-                }
-
-                // necessary to allow the Arc to be dropped...
-                while Arc::strong_count(&done) > 1 {
-                    shenango::delay_us(100);
-                }
-
-                info!(id, "client done");
-                let done = Arc::try_unwrap(done)
-                    .map_err(|_| anyhow!("arc failed"))
-                    .unwrap();
-                let durs = done.into_iter().map(|(_, d)| d).collect();
-                Ok::<_, Error>(durs)
-            })();
-
-            match &res {
-                Err(e) => warn!(id, err = ?e, "client error"),
-                _ => (),
-            };
-
-            res
-        });
-
-        workers.push(jh);
-    }
-
-    // wait on the client threads
-    let durs: Vec<Result<Result<Vec<_>, _>, _>> = workers.into_iter().map(|jh| jh.join()).collect();
-    let durs: Result<Vec<Vec<_>>, _> = durs.into_iter().flat_map(|x| x).collect();
-    let durs: Result<Vec<_>, _> = durs.and_then(|vv| Ok(vv.into_iter().flat_map(|x| x).collect()));
-
-    done(
-        durs.context("Experiment results").unwrap(),
-        start.elapsed(),
-        interarrival_micros,
-        out_file,
-    );
 }
 
 // accesses group_by client
