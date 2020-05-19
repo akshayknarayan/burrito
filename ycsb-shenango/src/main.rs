@@ -191,15 +191,15 @@ fn done(
 
 #[derive(Debug, Clone)]
 enum Inflight {
-    Sent(Msg, std::time::Instant, std::time::Instant),
+    Sent(Msg, usize, std::time::Instant, std::time::Instant),
     Rcvd(Msg, std::time::Instant),
     Done(Msg, std::time::Duration),
 }
 
 impl Inflight {
-    fn new(m: Msg) -> Self {
+    fn new(m: Msg, shard_id: usize) -> Self {
         let t = std::time::Instant::now();
-        Self::Sent(m, t, t)
+        Self::Sent(m, shard_id, t, t)
     }
 
     //fn is_finished(&self) -> bool {
@@ -211,28 +211,38 @@ impl Inflight {
 
     fn sent_time(&self) -> std::time::Instant {
         match self {
-            Inflight::Sent(_, t, _) => *t,
+            Inflight::Sent(_, _, t, _) => *t,
+            _ => unreachable!(),
+        }
+    }
+
+    fn shard_id(&self) -> usize {
+        match self {
+            Inflight::Sent(_, s, _, _) => *s,
             _ => unreachable!(),
         }
     }
 
     fn retx_time(&self) -> std::time::Instant {
         match self {
-            Inflight::Sent(_, _, t) => *t,
-            _ => unreachable!(),
+            Inflight::Sent(_, _, _, t) => *t,
+            e => {
+                warn!(err = ?e, "invalid format");
+                unreachable!();
+            }
         }
     }
 
     fn retx(&mut self, now: Instant) {
         match self {
-            Inflight::Sent(_, _, ref mut t) => *t = now,
+            Inflight::Sent(_, _, _, ref mut t) => *t = now,
             _ => unreachable!(),
         }
     }
 
     fn msg(&self) -> Msg {
         match self {
-            Inflight::Sent(m, _, _) | Inflight::Rcvd(m, _) | Inflight::Done(m, _) => m.clone(),
+            Inflight::Sent(m, _, _, _) | Inflight::Rcvd(m, _) | Inflight::Done(m, _) => m.clone(),
         }
     }
 
@@ -254,7 +264,7 @@ impl Inflight {
 
     fn finish(&mut self) {
         let s = match self {
-            Inflight::Sent(i, s, _) => Inflight::Done(i.clone(), s.elapsed()),
+            Inflight::Sent(i, _, s, _) => Inflight::Done(i.clone(), s.elapsed()),
             _ => self.clone(),
         };
 
@@ -413,12 +423,12 @@ fn do_requests(
                         }
 
                         let inter = start.elapsed();
-                        trace!(
-                            id,
-                            wanted = ?next_interarrival,
-                            actual = ?inter,
-                            "interarrival",
-                        );
+                        //trace!(
+                        //    id,
+                        //    wanted = ?next_interarrival,
+                        //    actual = ?inter,
+                        //    "interarrival",
+                        //);
 
                         interarrivals.push((next_interarrival, inter));
 
@@ -441,7 +451,7 @@ fn do_requests(
                             shard_id = shard_idx,
                             "sending request"
                         );
-                        let req_inf = Inflight::new(req.clone());
+                        let req_inf = Inflight::new(req.clone(), shard_idx);
                         cl.write_to(&msg, addr).context("socket write")?;
 
                         if inflight.contains_key(&rid) {
@@ -528,7 +538,7 @@ fn do_requests(
                                     // best effort, there's another sweep in the retx check.
                                     inf.remove(&time).unwrap_or_else(|| 0);
                                     done.insert(resp.id(), i.dur());
-                                } else {
+                                } else if !done.contains_key(&resp.id()) {
                                     inflight.insert(resp.id(), Inflight::Rcvd(resp.clone(), now));
                                 }
 
@@ -537,24 +547,38 @@ fn do_requests(
                                 }
                             } else {
                                 debug!(id, shard_id, "read timed out");
+                                if inflight.is_empty() && done.len() == num_ops {
+                                    break;
+                                }
                             }
 
                             // retransmits
-                            let mut inf = inflight_idx.lock().unwrap();
                             let cutoff = Instant::now() - Duration::from_millis(50);
-                            // split_off returns entries after the cutoff.
-                            let mut still_inflight = inf.split_off(&cutoff);
-                            // we want to change the entries *before*, so swap the pointers so that inf
-                            // contains the after-cutoff values
-                            use std::ops::DerefMut;
-                            std::mem::swap(&mut still_inflight, inf.deref_mut());
-                            // still_inflight now contains before-cutoff values, so rename it.
-                            let expired_entries = still_inflight;
+                            let expired_entries = {
+                                let mut inf = inflight_idx.lock().unwrap();
+                                // split_off returns entries after the cutoff.
+                                let mut still_inflight = inf.split_off(&cutoff);
+                                // we want to change the entries *before*, so swap the pointers so that inf
+                                // contains the after-cutoff values
+                                use std::ops::DerefMut;
+                                std::mem::swap(&mut still_inflight, inf.deref_mut());
+                                // still_inflight now contains before-cutoff values, so rename it.
+                                let expired_entries = still_inflight;
+                                // TODO put a limit on the number of retransmits at a time
+                                expired_entries
+                            };
+
                             let mut retx_entries = expired_entries
                                 .into_iter()
                                 .filter_map(|(_, idx)| {
                                     if let Some(mut ent) = inflight.get_mut(&idx) {
                                         let r = ent.msg();
+                                        let shard_idx = ent.shard_id();
+                                        if shard_idx != shard_id {
+                                            // don't retransmit it if it's not part of this shard
+                                            return Some((ent.retx_time(), r.id()));
+                                        }
+
                                         let msg = bincode::serialize(&r).unwrap();
                                         trace!(
                                             id,
@@ -562,7 +586,7 @@ fn do_requests(
                                             req_id = r.id(),
                                             "retransmitting request"
                                         );
-                                        let addr = unwrap_ipv4(shard_addrs[shard_id]);
+                                        let addr = unwrap_ipv4(shard_addrs[shard_idx]);
                                         cl.write_to(&msg, addr).unwrap();
                                         let now = Instant::now();
                                         ent.retx(now);
@@ -572,7 +596,11 @@ fn do_requests(
                                     }
                                 })
                                 .collect();
-                            inf.append(&mut retx_entries);
+
+                            {
+                                let mut inf = inflight_idx.lock().unwrap();
+                                inf.append(&mut retx_entries);
+                            }
                         }
 
                         Ok::<_, Error>(start.elapsed())
