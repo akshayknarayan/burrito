@@ -1,9 +1,12 @@
 use anyhow::{anyhow, Context, Error};
+use chashmap::CHashMap;
 use kvstore::Msg;
 use kvstore_ycsb::{ops, Op};
 use rand_distr::{Distribution, Exp};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use structopt::StructOpt;
 use tracing::{debug, info, trace, warn};
 
@@ -188,14 +191,15 @@ fn done(
 
 #[derive(Debug, Clone)]
 enum Inflight {
-    Sent(usize, std::time::Instant),
-    Rcvd(usize, std::time::Instant),
-    Done(usize, std::time::Duration),
+    Sent(Msg, std::time::Instant, std::time::Instant),
+    Rcvd(Msg, std::time::Instant),
+    Done(Msg, std::time::Duration),
 }
 
 impl Inflight {
-    fn new(id: usize) -> Self {
-        Self::Sent(id, std::time::Instant::now())
+    fn new(m: Msg) -> Self {
+        let t = std::time::Instant::now();
+        Self::Sent(m, t, t)
     }
 
     //fn is_finished(&self) -> bool {
@@ -207,8 +211,28 @@ impl Inflight {
 
     fn sent_time(&self) -> std::time::Instant {
         match self {
-            Inflight::Sent(_, t) => *t,
+            Inflight::Sent(_, t, _) => *t,
             _ => unreachable!(),
+        }
+    }
+
+    fn retx_time(&self) -> std::time::Instant {
+        match self {
+            Inflight::Sent(_, _, t) => *t,
+            _ => unreachable!(),
+        }
+    }
+
+    fn retx(&mut self, now: Instant) {
+        match self {
+            Inflight::Sent(_, _, ref mut t) => *t = now,
+            _ => unreachable!(),
+        }
+    }
+
+    fn msg(&self) -> Msg {
+        match self {
+            Inflight::Sent(m, _, _) | Inflight::Rcvd(m, _) | Inflight::Done(m, _) => m.clone(),
         }
     }
 
@@ -221,7 +245,7 @@ impl Inflight {
 
     fn retro_finish(&mut self, sent: std::time::Instant) {
         let s = match self {
-            Inflight::Rcvd(i, s) => Inflight::Done(*i, *s - sent),
+            Inflight::Rcvd(i, s) => Inflight::Done(i.clone(), *s - sent),
             _ => self.clone(),
         };
 
@@ -230,7 +254,7 @@ impl Inflight {
 
     fn finish(&mut self) {
         let s = match self {
-            Inflight::Sent(i, s) => Inflight::Done(*i, s.elapsed()),
+            Inflight::Sent(i, s, _) => Inflight::Done(i.clone(), s.elapsed()),
             _ => self.clone(),
         };
 
@@ -324,8 +348,6 @@ fn do_exp(
                     .collect();
                 let cls = Arc::new(cls?);
 
-                use chashmap::CHashMap;
-
                 let inflight: Arc<CHashMap<usize, Inflight>> =
                     Arc::new(CHashMap::with_capacity(num_ops));
                 let done: Arc<CHashMap<usize, std::time::Duration>> =
@@ -384,7 +406,7 @@ fn do_exp(
                             shard_id = shard_idx,
                             "sending request"
                         );
-                        let req_inf = Inflight::new(req.id());
+                        let req_inf = Inflight::new(req.clone());
                         cl.write_to(&msg, addr).context("socket write")?;
 
                         if inflight.contains_key(&req.id()) {
@@ -454,12 +476,13 @@ fn do_exp(
                             let now = std::time::Instant::now();
                             let resp: Msg =
                                 bincode::deserialize(&buf[..len]).context("deserialize")?;
-                            let entry = inflight.remove(&resp.id());
+                            let id = resp.id();
+                            let entry = inflight.remove(&id);
                             if let Some(mut i) = entry {
                                 i.finish();
-                                done.insert(resp.id(), i.dur());
+                                done.insert(id, i.dur());
                             } else {
-                                inflight.insert(resp.id(), Inflight::Rcvd(resp.id(), now));
+                                inflight.insert(id, Inflight::Rcvd(resp.clone(), now));
                             }
 
                             ctr += 1;
@@ -547,7 +570,7 @@ fn managed_sharding(
     accesses: Vec<Op>,
     out_file: Option<std::path::PathBuf>,
 ) {
-    debug!(addr = ?a, "Managed sharding");
+    debug!(addr = ?a, num_ops = accesses.len(), "Managed sharding");
     let start = std::time::Instant::now();
     let mut workers = vec![];
     for (id, ops) in group_by_client(accesses) {
@@ -563,22 +586,27 @@ fn managed_sharding(
                     std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), p as _),
                 )?);
 
-                use chashmap::CHashMap;
-
                 let num_ops = ops.len();
+
                 let inflight: Arc<CHashMap<usize, Inflight>> =
                     Arc::new(CHashMap::with_capacity(num_ops));
+                let inflight_idx: Arc<Mutex<BTreeMap<std::time::Instant, usize>>> =
+                    Default::default();
                 let done: Arc<CHashMap<usize, std::time::Duration>> =
                     Arc::new(CHashMap::with_capacity(num_ops));
 
-                let send_inflight = inflight.clone();
+                let send_inflight = Arc::clone(&inflight);
+                let send_inflight_idx = Arc::clone(&inflight_idx);
                 let send_done = done.clone();
                 let send_cl = cl.clone();
                 shenango::thread::spawn(move || {
                     let inflight = send_inflight;
+                    let inflight_idx = send_inflight_idx;
                     let done = send_done;
                     let cl = send_cl;
                     let mut rng = rand::thread_rng();
+
+                    let mut interarrivals = vec![];
 
                     for o in ops {
                         // pace the request
@@ -596,12 +624,15 @@ fn managed_sharding(
                             shenango::delay_us(sleep_time.as_micros() as _);
                         }
 
+                        let inter = start.elapsed();
                         trace!(
                             id,
                             wanted = ?next_interarrival,
-                            actual = ?start.elapsed(),
+                            actual = ?inter,
                             "interarrival",
                         );
+
+                        interarrivals.push((next_interarrival, inter));
 
                         // send the request
                         let req = match o {
@@ -609,57 +640,110 @@ fn managed_sharding(
                             Op::Update(_, k, v) => Msg::put_req(k, v),
                         };
 
+                        let rid = req.id();
                         let addr = unwrap_ipv4(a);
                         let msg = bincode::serialize(&req)?;
-                        trace!(id, req_id = req.id(), "sending request");
-                        let req_inf = Inflight::new(req.id());
+                        trace!(id, req_id = rid, "sending request");
+                        let req_inf = Inflight::new(req.clone());
                         cl.write_to(&msg, addr)?;
 
-                        {
-                            if inflight.contains_key(&req.id()) {
-                                let mut ent = inflight.remove(&req.id()).unwrap();
-                                ent.retro_finish(req_inf.sent_time());
-                                done.insert(req.id(), ent.dur());
-                            } else {
-                                inflight.insert(req.id(), req_inf);
-                            }
+                        if inflight.contains_key(&rid) {
+                            let mut ent = inflight.remove(&rid).unwrap();
+                            ent.retro_finish(req_inf.sent_time());
+                            done.insert(rid, ent.dur());
+                        } else {
+                            let time = req_inf.sent_time();
+                            inflight.insert_new(rid, req_inf);
+                            let mut inf = inflight_idx.lock().unwrap();
+                            inf.insert(time, rid);
                         }
+                    }
+
+                    fn quantiles(mut xs: Vec<Duration>, log: &str, id: usize) {
+                        if xs.is_empty() {
+                            return;
+                        }
+
+                        xs.sort();
+                        let len = xs.len() as f64;
+                        let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
+                        let quantiles: Vec<_> = quantile_idxs
+                            .iter()
+                            .map(|q| (len * q) as usize)
+                            .map(|i| xs[i])
+                            .collect();
+                        info!(id,
+                            num = ?&xs.len(), min = ?xs[0],
+                            p25 = ?quantiles[0], p50 = ?quantiles[1], p75 = ?quantiles[2],
+                            p95 = ?quantiles[3], max = ?xs[xs.len() - 1],
+                            log
+                        );
                     }
 
                     debug!(id, "done writing requests");
+                    let (wanted, actual) = interarrivals.into_iter().unzip();
+                    quantiles(wanted, "wanted interarrivals", id);
+                    quantiles(actual, "actual interarrivals", id);
+
                     Ok::<_, Error>(())
                 });
 
-                let mut timeout_start = None;
                 let mut buf = [0u8; 1024];
                 loop {
-                    let (len, _) = cl
-                        .read_from_timeout(std::time::Duration::from_secs(10), &mut buf)
-                        .context("read timed out")?;
-                    let now = std::time::Instant::now();
-                    let resp: Msg = bincode::deserialize(&buf[..len]).context("deserialize")?;
-                    trace!(id, resp_id = resp.id(), "got response");
-                    let entry = inflight.remove(&resp.id());
-                    if let Some(mut i) = entry {
-                        i.finish();
-                        done.insert(resp.id(), i.dur());
-                    } else {
-                        inflight.insert(resp.id(), Inflight::Rcvd(resp.id(), now));
-                    }
-
-                    if inflight.is_empty() && !done.is_empty() {
-                        timeout_start = Some(std::time::Instant::now());
-                    }
-
-                    if done.len() == num_ops {
-                        break;
-                    }
-
-                    if let Some(to) = timeout_start {
-                        if to.elapsed() > std::time::Duration::from_secs(15) {
-                            return Err(anyhow!("Timing out 15s after last request sent"));
+                    if let Ok((len, _)) = cl
+                        .read_from_timeout(std::time::Duration::from_millis(50), &mut buf)
+                        .context("read timed out")
+                    {
+                        let now = std::time::Instant::now();
+                        let resp: Msg = bincode::deserialize(&buf[..len]).context("deserialize")?;
+                        trace!(id, resp_id = resp.id(), "got response");
+                        let entry = inflight.remove(&resp.id());
+                        if let Some(mut i) = entry {
+                            let time = i.retx_time();
+                            i.finish();
+                            let mut inf = inflight_idx.lock().unwrap();
+                            // best effort, there's another sweep in the retx check.
+                            inf.remove(&time).unwrap_or_else(|| 0);
+                            done.insert(resp.id(), i.dur());
+                        } else {
+                            inflight.insert(resp.id(), Inflight::Rcvd(resp.clone(), now));
                         }
+
+                        if done.len() == num_ops {
+                            break;
+                        }
+                    } else {
+                        debug!(id, "read timed out");
                     }
+
+                    // retransmits
+                    let mut inf = inflight_idx.lock().unwrap();
+                    let cutoff = Instant::now() - Duration::from_millis(50);
+                    // split_off returns entries after the cutoff.
+                    let mut still_inflight = inf.split_off(&cutoff);
+                    // we want to change the entries *before*, so swap the pointers so that inf
+                    // contains the after-cutoff values
+                    use std::ops::DerefMut;
+                    std::mem::swap(&mut still_inflight, inf.deref_mut());
+                    // still_inflight now contains before-cutoff values, so rename it.
+                    let expired_entries = still_inflight;
+                    let mut retx_entries = expired_entries
+                        .into_iter()
+                        .filter_map(|(_, idx)| {
+                            if let Some(mut ent) = inflight.get_mut(&idx) {
+                                let r = ent.msg();
+                                let msg = bincode::serialize(&r).unwrap();
+                                trace!(id, req_id = r.id(), "retransmitting request");
+                                cl.write_to(&msg, unwrap_ipv4(a)).unwrap();
+                                let now = Instant::now();
+                                ent.retx(now);
+                                Some((now, r.id()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    inf.append(&mut retx_entries);
                 }
 
                 // necessary to allow the Arc to be dropped...
