@@ -5,7 +5,7 @@ use kvstore_ycsb::{ops, Op};
 use rand_distr::{Distribution, Exp};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
 use tracing::{debug, info, trace, warn};
@@ -385,8 +385,14 @@ fn do_requests(
 
                 let inflight: Arc<CHashMap<usize, Inflight>> =
                     Arc::new(CHashMap::with_capacity(num_ops));
-                let inflight_idx: Arc<Mutex<BTreeMap<std::time::Instant, usize>>> =
-                    Default::default();
+                let inflight_idx: Arc<CHashMap<usize, BTreeMap<std::time::Instant, usize>>> =
+                    Arc::new(
+                        shard_addrs
+                            .iter()
+                            .map(|_| Default::default())
+                            .enumerate()
+                            .collect(),
+                    );
                 let done: Arc<CHashMap<usize, std::time::Duration>> =
                     Arc::new(CHashMap::with_capacity(num_ops));
 
@@ -461,7 +467,7 @@ fn do_requests(
                         } else {
                             let time = req_inf.sent_time();
                             inflight.insert_new(rid, req_inf);
-                            let mut inf = inflight_idx.lock().unwrap();
+                            let mut inf = inflight_idx.get_mut(&shard_idx).unwrap();
                             inf.insert(time, rid);
                         }
                     }
@@ -534,10 +540,10 @@ fn do_requests(
                                 if let Some(mut i) = entry {
                                     let time = i.retx_time();
                                     i.finish();
-                                    let mut inf = inflight_idx.lock().unwrap();
+                                    done.insert(resp.id(), i.dur());
+                                    let mut inf = inflight_idx.get_mut(&shard_id).unwrap();
                                     // best effort, there's another sweep in the retx check.
                                     inf.remove(&time).unwrap_or_else(|| 0);
-                                    done.insert(resp.id(), i.dur());
                                 } else if !done.contains_key(&resp.id()) {
                                     inflight.insert(resp.id(), Inflight::Rcvd(resp.clone(), now));
                                 }
@@ -553,9 +559,9 @@ fn do_requests(
                             }
 
                             // retransmits
-                            let cutoff = Instant::now() - Duration::from_millis(50);
+                            let cutoff = Instant::now() - Duration::from_millis(100);
                             let expired_entries = {
-                                let mut inf = inflight_idx.lock().unwrap();
+                                let mut inf = inflight_idx.get_mut(&shard_id).unwrap();
                                 // split_off returns entries after the cutoff.
                                 let mut still_inflight = inf.split_off(&cutoff);
                                 // we want to change the entries *before*, so swap the pointers so that inf
@@ -564,41 +570,42 @@ fn do_requests(
                                 std::mem::swap(&mut still_inflight, inf.deref_mut());
                                 // still_inflight now contains before-cutoff values, so rename it.
                                 let expired_entries = still_inflight;
-                                // TODO put a limit on the number of retransmits at a time
                                 expired_entries
                             };
 
                             let mut retx_entries = expired_entries
                                 .into_iter()
-                                .filter_map(|(_, idx)| {
-                                    if let Some(mut ent) = inflight.get_mut(&idx) {
-                                        let r = ent.msg();
-                                        let shard_idx = ent.shard_id();
-                                        if shard_idx != shard_id {
-                                            // don't retransmit it if it's not part of this shard
-                                            return Some((ent.retx_time(), r.id()));
-                                        }
+                                .enumerate()
+                                .filter_map(|(i, (t, idx))| {
+                                    if i < 2 {
+                                        if let Some(mut ent) = inflight.get_mut(&idx) {
+                                            let r = ent.msg();
+                                            let shard_idx = ent.shard_id();
+                                            assert_eq!(shard_idx, shard_id);
 
-                                        let msg = bincode::serialize(&r).unwrap();
-                                        trace!(
-                                            id,
-                                            shard_id,
-                                            req_id = r.id(),
-                                            "retransmitting request"
-                                        );
-                                        let addr = unwrap_ipv4(shard_addrs[shard_idx]);
-                                        cl.write_to(&msg, addr).unwrap();
-                                        let now = Instant::now();
-                                        ent.retx(now);
-                                        Some((now, r.id()))
+                                            let msg = bincode::serialize(&r).unwrap();
+                                            trace!(
+                                                id,
+                                                shard_id,
+                                                req_id = r.id(),
+                                                "retransmitting request"
+                                            );
+                                            let addr = unwrap_ipv4(shard_addrs[shard_idx]);
+                                            cl.write_to(&msg, addr).unwrap();
+                                            let now = Instant::now();
+                                            ent.retx(now);
+                                            Some((now, r.id()))
+                                        } else {
+                                            None
+                                        }
                                     } else {
-                                        None
+                                        Some((t, idx))
                                     }
                                 })
                                 .collect();
 
                             {
-                                let mut inf = inflight_idx.lock().unwrap();
+                                let mut inf = inflight_idx.get_mut(&shard_id).unwrap();
                                 inf.append(&mut retx_entries);
                             }
                         }
