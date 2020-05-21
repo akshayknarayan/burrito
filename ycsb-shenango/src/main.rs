@@ -525,36 +525,71 @@ fn do_requests(
                         let cl = recv_cl;
                         let shard_addrs = recv_shard_addrs;
                         let shard_id = recv_shard_id;
+                        let mut retxs = 0;
+                        let mut waste = 0;
+                        let mut timeout_time: Option<Instant> = None;
 
                         let mut buf = [0u8; 1024];
                         loop {
                             if let Ok((len, _)) = cl
-                                .read_from_timeout(std::time::Duration::from_millis(50), &mut buf)
+                                .read_from_timeout(std::time::Duration::from_millis(100), &mut buf)
                                 .context("read timed out")
                             {
                                 let now = std::time::Instant::now();
                                 let resp: Msg =
                                     bincode::deserialize(&buf[..len]).context("deserialize")?;
-                                trace!(id, shard_id, resp_id = resp.id(), "got response");
                                 let entry = inflight.remove(&resp.id());
                                 if let Some(mut i) = entry {
-                                    let time = i.retx_time();
+                                    //let time = i.retx_time();
                                     i.finish();
+                                    trace!(
+                                        id,
+                                        shard_id,
+                                        resp_id = resp.id(),
+                                        dur = ?i.dur(),
+                                        "got response"
+                                    );
                                     done.insert(resp.id(), i.dur());
-                                    let mut inf = inflight_idx.get_mut(&shard_id).unwrap();
-                                    // best effort, there's another sweep in the retx check.
-                                    inf.remove(&time).unwrap_or_else(|| 0);
+                                //let mut inf = inflight_idx.get_mut(&shard_id).unwrap();
+                                //// best effort, there's another sweep in the retx check.
+                                //inf.remove(&time).unwrap_or_else(|| 0);
                                 } else if !done.contains_key(&resp.id()) {
+                                    trace!(id, shard_id, resp_id = resp.id(), "got response");
                                     inflight.insert(resp.id(), Inflight::Rcvd(resp.clone(), now));
+                                } else {
+                                    waste += 1;
                                 }
+                            } else {
+                                debug!(
+                                    id,
+                                    shard_id,
+                                    remaining = num_ops - done.len(),
+                                    retransmits = retxs,
+                                    wasted_reqs = waste,
+                                    "read timed out"
+                                );
+                            }
 
+                            if inflight.len() + done.len() == num_ops {
                                 if done.len() == num_ops {
                                     break;
                                 }
-                            } else {
-                                debug!(id, shard_id, "read timed out");
-                                if inflight.is_empty() && done.len() == num_ops {
-                                    break;
+
+                                if timeout_time.is_none() {
+                                    timeout_time = Some(Instant::now());
+                                } else if timeout_time.as_ref().unwrap().elapsed()
+                                    > Duration::from_secs(15)
+                                {
+                                    warn!(
+                                        id,
+                                        shard_id,
+                                        remaining = num_ops - done.len(),
+                                        retransmits = retxs,
+                                        wasted_reqs = waste,
+                                        "client timed out"
+                                    );
+
+                                    panic!("client timing out");
                                 }
                             }
 
@@ -573,21 +608,25 @@ fn do_requests(
                                 expired_entries
                             };
 
+                            let curr_expired = expired_entries.len();
+
                             let mut retx_entries = expired_entries
                                 .into_iter()
                                 .enumerate()
                                 .filter_map(|(i, (t, idx))| {
-                                    if i < 2 {
-                                        if let Some(mut ent) = inflight.get_mut(&idx) {
+                                    if let Some(mut ent) = inflight.get_mut(&idx) {
+                                        if i < 1 {
                                             let r = ent.msg();
                                             let shard_idx = ent.shard_id();
                                             assert_eq!(shard_idx, shard_id);
 
                                             let msg = bincode::serialize(&r).unwrap();
+                                            retxs += 1;
                                             trace!(
                                                 id,
                                                 shard_id,
                                                 req_id = r.id(),
+                                                curr_expired,
                                                 "retransmitting request"
                                             );
                                             let addr = unwrap_ipv4(shard_addrs[shard_idx]);
@@ -596,10 +635,10 @@ fn do_requests(
                                             ent.retx(now);
                                             Some((now, r.id()))
                                         } else {
-                                            None
+                                            Some((t, idx))
                                         }
                                     } else {
-                                        Some((t, idx))
+                                        None
                                     }
                                 })
                                 .collect();
@@ -610,6 +649,13 @@ fn do_requests(
                             }
                         }
 
+                        debug!(
+                            id,
+                            shard_id,
+                            retransmits = retxs,
+                            wasted_reqs = waste,
+                            "receiver done"
+                        );
                         Ok::<_, Error>(start.elapsed())
                     });
 
