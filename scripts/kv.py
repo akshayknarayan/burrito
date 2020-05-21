@@ -546,6 +546,9 @@ if __name__ == '__main__':
                 if args.mode == 'run':
                     for o in ops_per_sec:
                         do_exp(outdir, machines, s, t, o, 0, wrkload=w)
+                        do_exp(outdir, machines, s, t, o, 1, wrkload=w)
+                        do_exp(outdir, machines, s, t, o, 2, wrkload=w)
+                        do_exp(outdir, machines, s, t, o, 3, wrkload=w)
                         time.sleep(3)
                 else: # probe
                     probe_ops(outdir, machines, s, t, ops_per_sec, wrkload=w)
