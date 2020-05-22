@@ -216,6 +216,13 @@ impl Inflight {
         }
     }
 
+    fn is_sent(&self) -> bool {
+        match self {
+            Inflight::Sent(_, _, _, _) => true,
+            _ => false,
+        }
+    }
+
     fn shard_id(&self) -> usize {
         match self {
             Inflight::Sent(_, s, _, _) => *s,
@@ -615,6 +622,10 @@ fn do_requests(
                                 .enumerate()
                                 .filter_map(|(i, (t, idx))| {
                                     if let Some(mut ent) = inflight.get_mut(&idx) {
+                                        if !ent.is_sent() {
+                                            return None;
+                                        }
+
                                         if i < 1 {
                                             let r = ent.msg();
                                             let shard_idx = ent.shard_id();

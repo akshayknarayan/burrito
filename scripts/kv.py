@@ -264,7 +264,7 @@ def run_client(conn, server, interarrival, outf, clientsharding=None, wrkload='u
             sudo = True,
             stdout=f"{outf}1-{conn.addr}.out",
             stderr=f"{outf}1-{conn.addr}.err",
-            timeout=600,
+            timeout=120,
             )
     check(ok, "ycsb client", conn.addr)
     #conn.run("pkill -INT iokerneld", sudo=True)
@@ -364,14 +364,15 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
             kwargs={'clientsharding':0, 'wrkload':wrkload}
         ) for m in machines[1:]]
     elif shardtype == "dyn":
+        x = (True, False) * 6
         clients = [threading.Thread(target=run_client, args=(
                 m,
                 server_addr,
                 interarrival_us,
                 outf
             ),
-            kwargs={'clientsharding':5, 'wrkload':wrkload}
-        ) for m in machines[1:]]
+            kwargs={'clientsharding':0, 'wrkload':wrkload} if s else {'wrkload':wrkload}
+         ) for s, m in zip(x, machines[1:])]
     elif shardtype == "xdpserver" or shardtype == "server":
         clients = [threading.Thread(target=run_client, args=(
                 m,
@@ -541,15 +542,18 @@ if __name__ == '__main__':
     agenda.task("...done building burrito")
 
     for w in args.wrk:
-        for t in args.shardtype:
-            for s in args.shards:
+        for s in args.shards:
+            for t in args.shardtype:
                 if args.mode == 'run':
                     for o in ops_per_sec:
+                        if int(s) < 4 and int(o) > 100000:
+                            agenda.task(f"skipping: num_shards = {s}, shardtype = {t}, load = {o} ops/s")
+                            continue
+
                         do_exp(outdir, machines, s, t, o, 0, wrkload=w)
                         do_exp(outdir, machines, s, t, o, 1, wrkload=w)
                         do_exp(outdir, machines, s, t, o, 2, wrkload=w)
                         do_exp(outdir, machines, s, t, o, 3, wrkload=w)
-                        time.sleep(3)
                 else: # probe
                     probe_ops(outdir, machines, s, t, ops_per_sec, wrkload=w)
 
@@ -561,5 +565,5 @@ if __name__ == '__main__':
     subprocess.run(f"awk '{{print $1,$2,$3,$4}}' {outdir}/exp.data | uniq > {outdir}/exp-scaling.data1", shell=True)
     subprocess.run(f"python3 scripts/exp_max.py < {outdir}/exp-scaling.data1 > {outdir}/exp-scaling.data", shell=True)
     agenda.task("plotting")
-    #subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)
+    subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)
     subprocess.run(f"./scripts/kv-udp.R {outdir}/exp-scaling.data {outdir}/exp-scaling.pdf", shell=True)
