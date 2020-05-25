@@ -20,6 +20,7 @@ struct Opt {
 #[tokio::main]
 async fn main() -> Result<(), failure::Error> {
     let log = burrito_util::logger();
+    tracing_subscriber::fmt::init();
     let opt = Opt::from_args();
 
     let srv_impl = rpcbench::Server::default();

@@ -275,7 +275,9 @@ impl BurritoNet {
     }
 
     async fn assign_insert(&self, service_addr: Addr) -> Result<Addr, String> {
-        let listen_addr = Addr::Unix(self.root.join(get_addr()));
+        let a = get_addr();
+        let p = [".", &a].iter().collect();
+        let listen_addr = Addr::Unix(p);
         let sa = service_addr.clone();
         let la = listen_addr.clone();
         self.name_table_insert(service_addr, listen_addr).await?;

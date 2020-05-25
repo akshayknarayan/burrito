@@ -112,7 +112,12 @@ impl Client {
         trace!(resolved_addr = ?&addr, "Resolved burrito address");
 
         Ok(match addr {
-            Addr::Unix(a) => crate::Addr::Unix(a),
+            Addr::Unix(a) => {
+                let a = self.burrito_root.join(a.file_name().ok_or_else(|| {
+                    failure::format_err!("Local address must have valid file name.")
+                })?);
+                crate::Addr::Unix(a)
+            }
             Addr::Tcp(a) => crate::Addr::Tcp(a),
             Addr::Udp(a) => crate::Addr::Other(a.to_string()),
             Addr::Burrito(a) => crate::Addr::Other(a),
@@ -203,6 +208,11 @@ impl Server {
                 Addr::Unix(la) => la,
                 x => Err(failure::format_err!("Expected local address: {}", x))?,
             };
+
+            let a =
+                burrito_root.as_ref().join(a.file_name().ok_or_else(|| {
+                    failure::format_err!("Local address must have valid file name.")
+                })?);
 
             debug!( addr = ?&a, "Got listening address");
             let ul = tokio::net::UnixListener::bind(a).context("Could not bind UnixListener")?;
