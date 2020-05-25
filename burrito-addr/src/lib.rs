@@ -112,6 +112,8 @@ impl Client {
             }
         }
 
+        debug!(addr = ?&addr, "Resolved address");
+
         Ok(match addr {
             Addr::Unix(a) => {
                 let a = self.burrito_root.join(a.file_name().ok_or_else(|| {
@@ -147,7 +149,7 @@ async fn discovery_ctl(
                 burrito_discovery_ctl::CONTROLLER_ADDRESS => acc.or_else(|| Some(address)),
                 burrito_localname_ctl::CONTROLLER_ADDRESS => {
                     if let Some(s) = acc {
-                        warn!(discarding = ?s, using = ?address, "Got duplicate local-name entry");
+                        debug!(discarding = ?s, using = ?address, "Got duplicate local-name entry");
                     }
 
                     Some(address)
