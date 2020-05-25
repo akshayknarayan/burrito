@@ -9,7 +9,8 @@ use failure::ResultExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, trace, warn};
+use tracing::{debug, span, trace, warn, Level};
+use tracing_futures::Instrument;
 
 mod conn;
 mod uri;
@@ -83,7 +84,9 @@ impl Client {
         let mut addr: Addr = if let Some(ref disc_cl) = self.disc_cl {
             trace!(addr = ?&name, "Resolving discovery-ctl address");
             let dc = disc_cl.lock().await;
-            discovery_ctl(dc, name).await?
+            discovery_ctl(dc, name)
+                .instrument(span!(Level::DEBUG, "query discovery-ctl"))
+                .await?
         } else {
             let a = name
                 .parse()
@@ -172,7 +175,10 @@ impl hyper::service::Service<hyper::Uri> for Client {
     fn call(&mut self, dst: hyper::Uri) -> Self::Future {
         let mut cl = self.clone();
         // this will error on UDP remotes
-        Box::pin(async move { cl.resolve(dst).await?.connect().await.map_err(|e| e.into()) })
+        Box::pin(
+            async move { cl.resolve(dst).await?.connect().await.map_err(|e| e.into()) }
+                .instrument(span!(Level::DEBUG, "burrito-addr connect")),
+        )
     }
 }
 

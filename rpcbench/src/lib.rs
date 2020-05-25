@@ -34,6 +34,7 @@ impl Into<PingParams> for SPingParams {
         PingParams {
             work: self.work,
             amount: self.amount,
+            padding: vec![],
         }
     }
 }
@@ -175,7 +176,7 @@ where
 
         let then = std::time::Instant::now();
         let channel = endpoint
-            .tcp_nodelay(false)
+            .tcp_nodelay(true)
             .connect_with_connector(ctr)
             .instrument(span!(Level::DEBUG, "connector"))
             .await?;

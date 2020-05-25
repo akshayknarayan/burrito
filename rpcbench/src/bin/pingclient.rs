@@ -1,6 +1,5 @@
-use slog::{info, trace};
+use slog::{debug, info};
 use structopt::StructOpt;
-use tracing_subscriber::layer::Layer;
 use tracing_timing::{Builder, Histogram};
 
 #[derive(Debug, StructOpt)]
@@ -16,6 +15,8 @@ struct Opt {
     amount: i64,
     #[structopt(short, long)]
     iters: usize,
+    #[structopt(short, long)]
+    size_of_req: Option<usize>,
     #[structopt(long)]
     reqs_per_iter: usize,
     #[structopt(short, long)]
@@ -31,6 +32,7 @@ async fn main() -> Result<(), failure::Error> {
         work: rpcbench::Work::from_i32(opt.work)
             .ok_or_else(|| failure::format_err!("Invalid work value"))? as i32,
         amount: opt.amount,
+        padding: vec![0u8; opt.size_of_req.unwrap_or_default()],
     };
 
     let per_iter = opt.reqs_per_iter;
@@ -48,14 +50,14 @@ async fn main() -> Result<(), failure::Error> {
             e.record(&mut f);
             val
         })
-        .layer(|| Histogram::new_with_max(10_000_000, 2).unwrap());
+        .build(|| Histogram::new_with_max(10_000_000, 2).unwrap());
     let sid = subscriber.downcaster();
-    let fmt = tracing_subscriber::fmt().finish();
-    let d = tracing::Dispatch::new(subscriber.with_subscriber(fmt));
+    let d = tracing::Dispatch::new(subscriber);
 
     if let None = opt.out_file {
         tracing_subscriber::fmt::init();
     } else {
+        //tracing_subscriber::fmt::init();
         tracing::dispatcher::set_global_default(d.clone()).expect("set tracing global default");
     }
 
@@ -64,7 +66,7 @@ async fn main() -> Result<(), failure::Error> {
         let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
         info!(&log, "burrito mode"; "burrito_root" => ?root, "addr" => ?&opt.addr);
         let cl = burrito_addr::Client::new(root).await?;
-        trace!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
+        debug!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
         rpcbench::client_ping(addr, cl, pp, opt.iters, opt.reqs_per_iter).await?
     } else if opt.addr.starts_with("http") {
         // raw tcp mode
@@ -91,10 +93,13 @@ async fn main() -> Result<(), failure::Error> {
 
     sid.downcast(&d).unwrap().force_synchronize();
 
+    tracing::info!("done");
     if let Some(ref path) = opt.out_file {
+        tracing::debug!("writing trace file");
         use std::io::Write;
         let path = path.with_extension("trace");
         let mut f = std::fs::File::create(path)?;
+        // these values are in nanoseconds
         sid.downcast(&d).unwrap().with_histograms(|hs| {
             for (span_group, hs) in hs {
                 for (event_group, h) in hs {
@@ -117,6 +122,7 @@ async fn main() -> Result<(), failure::Error> {
     }
 
     if let Some(path) = opt.out_file {
+        tracing::debug!("writing latencies file");
         use std::io::Write;
         let mut f = std::fs::File::create(path)?;
         write!(&mut f, "Total_us,Server_us\n")?;
