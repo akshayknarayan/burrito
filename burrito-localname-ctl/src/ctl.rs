@@ -234,7 +234,7 @@ impl BurritoNet {
                         if let Err(e) = c
                             .register(Service {
                                 name: service_addr.clone(),
-                                scope: burrito_discovery_ctl::proto::Scope::Local,
+                                scope: burrito_discovery_ctl::proto::Scope::Host,
                                 service: crate::CONTROLLER_ADDRESS.to_owned(),
                                 address: n,
                             })

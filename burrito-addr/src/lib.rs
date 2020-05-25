@@ -78,10 +78,10 @@ impl Client {
 
     pub async fn resolve(&mut self, dst: hyper::Uri) -> Result<crate::Addr, failure::Error> {
         let name = crate::Uri::socket_path(&dst)?;
-        trace!(addr = ?&name, "Resolving_burrito_address");
 
         use burrito_localname_ctl::proto::Addr;
         let mut addr: Addr = if let Some(ref disc_cl) = self.disc_cl {
+            trace!(addr = ?&name, "Resolving discovery-ctl address");
             let dc = disc_cl.lock().await;
             discovery_ctl(dc, name).await?
         } else {
@@ -99,17 +99,18 @@ impl Client {
             a
         };
 
+        trace!(resolved_addr = ?&addr, "Resolved discovery-ctl address");
+
         // 3. Resolve the local-name entry, if applicable.
         if let Some(ref cl) = self.local_cl {
             if let ref a @ Addr::Burrito(_) = addr {
+                trace!(addr = ?&addr, "Resolving localname address");
                 match cl.lock().await.query(a.clone()).await {
                     Ok(la) => addr = la.local_addr,
                     Err(e) => warn!(err = ?e, "Error querying localname-ctl"),
                 }
             }
         }
-
-        trace!(resolved_addr = ?&addr, "Resolved burrito address");
 
         Ok(match addr {
             Addr::Unix(a) => {
@@ -145,10 +146,6 @@ async fn discovery_ctl(
             match service.as_str() {
                 burrito_discovery_ctl::CONTROLLER_ADDRESS => acc.or_else(|| Some(address)),
                 burrito_localname_ctl::CONTROLLER_ADDRESS => {
-                    if let burrito_localname_ctl::proto::Addr::Burrito(_) = address {
-                        return acc;
-                    }
-
                     if let Some(s) = acc {
                         warn!(discarding = ?s, using = ?address, "Got duplicate local-name entry");
                     }
