@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 if [ -z "$1" ]; then
     echo "Usage: rpcbench-remote.sh <remote machine> <output dir> <local ip>"
     exit 1;
@@ -28,11 +30,12 @@ fi
 
 ssh $1 mkdir ~/burrito/$out
 
-cargo build --release &
-local_build=$!
-ssh $1 "cd ~/burrito && ~/.cargo/bin/cargo build --release" &
-remote_build=$!
-wait $local_build $remote_build
+cd burrito-discovery-ctl && cargo build --release --features "ctl" && cd ..
+cd burrito-localname-ctl && cargo build --release --features "ctl,docker" && cd ..
+cd rpcbench && cargo build --release && cd ..
+ssh $1 "cd ~/burrito/burrito-discovery-ctl && cargo build --release --features \"ctl\""
+ssh $1 "cd ~/burrito/burrito-localname-ctl && cargo build --release --features \"ctl,docker\""
+ssh $1 "cd ~/burrito/rpcbench && cargo build --release"
 
 echo "==> Baremetal TCP"
 ssh $1 "ps aux | grep \"release.*server\" | awk '{print \$2}' | head -n1 | xargs kill -9"
@@ -40,7 +43,7 @@ ssh $1 "cd ~/burrito && ./target/release/pingserver --port \"4242\"" &
 ssh_server=$!
 sleep 2
 ./target/release/pingclient --addr "http://$1:4242" -i 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
-    -o $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_baremetal.data || exit 1
+    -o $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_baremetal.data 
 kill -9 $ssh_server
 ssh $1 "ps aux | grep \"release.*server\" | awk '{print \$2}' | head -n1 | xargs kill -9"
 echo " -> baremetal TCP done"
@@ -68,17 +71,18 @@ sleep 2
 sudo docker rm -f rpcclient3
 ssh $1 sudo docker rm -f rpcbench-server
 ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./pingserver --port="4242"
-sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.pcap -i 10gp1 port 4242 &
+#sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.pcap -i 10gp1 port 4242 &
 sleep 4
-sudo docker run --name rpcclient3 -it $image_name \
-    ./pingclient --addr http://$1:4242 --amount 1000 -w 4 -i 10000 --reqs-per-iter 3 -o ./res.data || exit 1
+sudo docker run --name rpcclient3 -t -d $image_name \
+    ./pingclient --addr http://$1:4242 --amount 1000 -w 4 -i 10000 --reqs-per-iter 3 -o ./res.data 
+sudo docker container wait rpcclient3
 sudo docker cp rpcclient3:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.data
 sudo docker cp rpcclient3:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.trace
-sudo pkill tcpdump
+#sudo pkill tcpdump
 echo "-> docker TCP done"
 sleep 2
 
-echo "==> Burrito (tonic)"
+echo "==> Burrito"
 sudo docker rm -f rpcbench-redis
 echo "--> start redis"
 sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
@@ -90,104 +94,55 @@ ssh $1 "cd ~/burrito && sudo pkill -9 dump-docker && rm -f /tmp/burrito/controll
 rm -f /tmp/burrito/controller # need to rm, dump-docker doesn't have the signal handler to rm TODO
 sleep 2
 
-echo "--> start burrito-ctl (tonic) locally"
-sudo ./target/release/burrito \
+echo "--> start burrito-ctl locally"
+echo "--> start burrito-discovery-ctl"
+sudo ./target/release/burrito-discovery-ctl \
+    --redis-addr "redis://localhost:6379" \
+    --net-addr=$docker_host_addr \
+    -f \
+    > $out/burritoctl-discovery.log 2> $out/burritoctl-discovery.log &
+burritoctl=$!
+sleep 2
+echo "--> start burrito-localname-ctl"
+sudo ./target/release/burrito-localname \
     -i /var/run/docker.sock \
     -o /var/run/burrito-docker.sock \
-    --redis-addr "redis://localhost:6379" \
-    --net-addr=$3 \
-    --tracing-file $out/burritoctl-tonic-remote.trace \
-    --burrito-proto "tonic" \
-    > $out/burritoctl-tonic-remote.log 2> $out/burritoctl-tonic-remote.log &
-burritoctl=$!
+    -f \
+    > $out/burritoctl-local.log 2> $out/burritoctl-local.log &
+lburritoctl=$!
+sleep 2
 
-echo "--> start burrito-ctl (tonic) on $1"
+echo "--> start burrito-ctl on $1"
 ssh $1 "mkdir -p ~/burrito/$out"
-ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o /var/run/burrito-docker.sock --redis-addr \"redis://$3:6379\" --net-addr=$1 --tracing-file $out/burritoctl-tonic-remote.trace --burrito-proto \"tonic\" > $out/burritoctl-tonic-remote.log 2> $out/burritoctl-tonic-remote.log &"
+ssh $1 "cd ~/burrito && sudo ./target/release/burrito-discovery-ctl --redis-addr \"redis://$3:6379\" --net-addr=$docker_host_addr -f > $out/burritoctl-discovery-remote.log 2> $out/burritoctl-discovery-remote.log &"
+sleep 2
+echo "--> start burrito-localname-ctl on $1"
+ssh $1 "cd ~/burrito && sudo ./target/release/burrito-localname -i /var/run/docker.sock -o /var/run/burrito-docker.sock -f > $out/burritoctl-local-remote.log 2> $out/burritoctl-local-remote.log &"
+sleep 2
 
 sudo docker rm -f rpcclient1 rpcclient3
 ssh $1 sudo docker rm -f rpcbench-server
 ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./pingserver \
     --burrito-addr="pingserver" \
     --burrito-root="/burrito" \
-    --burrito-proto="tonic" \
     --port="4242"
 sleep 2
-sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.pcap -i 10gp1 port 4242 &
+#sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.pcap -i 10gp1 port 4242 &
 sudo docker run --name rpcclient3 -it $image_name ./pingclient \
     --addr "pingserver" \
     --burrito-root="/burrito" \
-    --burrito-proto="tonic" \
     --amount 1000 \
     -w 4 -i 10000 --reqs-per-iter 3 \
-    -o ./res.data || exit 1
+    -o ./res.data
 sudo docker cp rpcclient3:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.data
 sudo docker cp rpcclient3:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.trace
-sudo pkill tcpdump
-echo "-> burrito (tonic) done"
+#sudo pkill tcpdump
+echo "-> burrito done"
 
 sleep 2
 ssh $1 sudo docker rm -f rpcbench-server
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 ssh $1 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
-sleep 2
-
-echo "==> Burrito (flatbuf)"
-sudo docker rm -f rpcbench-redis
-echo "--> start redis"
-sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
-
-echo "--> stop burrito-ctl (flatbuf)"
-sudo kill -INT $burritoctl
-sudo pkill -INT burrito
-ssh $1 "cd ~/burrito && sudo pkill -INT burrito"
-sleep 2
-
-echo "--> start burrito-ctl (flatbuf) locally"
-sudo ./target/release/burrito \
-    -i /var/run/docker.sock \
-    -o /var/run/burrito-docker.sock \
-    --redis-addr "redis://localhost:6379" \
-    --net-addr=$3 \
-    --tracing-file $out/burritoctl-flatbuf-remote.trace \
-    --burrito-proto "flatbuf" \
-    > $out/burritoctl-flatbuf-remote.log 2> $out/burritoctl-flatbuf-remote.log &
-burritoctl=$!
-
-echo "--> start burrito-ctl (flatbuf) on $1"
-ssh $1 "mkdir -p ~/burrito/$out"
-ssh $1 "cd ~/burrito && sudo ./target/release/burrito -i /var/run/docker.sock -o /var/run/burrito-docker.sock --redis-addr \"redis://$3:6379\" --net-addr=$1 --tracing-file $out/burritoctl-flatbuf-remote.trace --burrito-proto \"flatbuf\" > $out/burritoctl-flatbuf-remote.log 2> $out/burritoctl-flatbuf-remote.log &"
-
-sudo docker rm -f rpcclient1 rpcclient3
-ssh $1 sudo docker rm -f rpcbench-server
-ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./pingserver \
-    --burrito-addr="pingserver" \
-    --burrito-root="/burrito" \
-    --burrito-proto="flatbuf" \
-    --port="4242"
-sleep 2
-sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_remote_docker.pcap -i 10gp1 port 4242 &
-sudo docker run --name rpcclient3 -it $image_name ./pingclient \
-    --addr "pingserver" \
-    --burrito-root="/burrito" \
-    --burrito-proto="flatbuf" \
-    --amount 1000 \
-    -w 4 -i 10000 --reqs-per-iter 3 \
-    -o ./res.data || exit 1
-sudo docker cp rpcclient3:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_remote_docker.data
-sudo docker cp rpcclient3:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_flatbuf-burrito_remote_docker.trace
-sudo pkill tcpdump
-echo "-> burrito (flatbuf) done"
-
-sleep 2
-ssh $1 sudo docker rm -f rpcbench-server
-sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
-ssh $1 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
-sleep 2
-
-sudo kill -INT $burritoctl
-sudo pkill -INT burrito
-ssh $1 "cd ~/burrito && sudo pkill -INT burrito"
 sleep 2
 
 python3 ./scripts/rpcbench-parse.py $out/work*.data > $out/combined.data
