@@ -1,4 +1,4 @@
-FROM rust:1.40
+FROM ubuntu:20.04
 
 WORKDIR /app
 ADD ./target/release/pingserver ./pingserver

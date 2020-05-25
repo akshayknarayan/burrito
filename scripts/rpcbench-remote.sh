@@ -18,7 +18,7 @@ if [ -z "$3" ]; then
 fi
 
 out="remote-$2"
-mkdir ./$out
+mkdir -p ./$out
 
 ssh $1 ls ~/burrito > /dev/null
 ok=$?
@@ -28,24 +28,30 @@ if [ $ok -gt 0 ]; then
     exit 2;
 fi
 
-ssh $1 mkdir ~/burrito/$out
+echo "=> remote: $1"
 
+ssh $1 mkdir -p ~/burrito/$out
+
+echo "  -> local build"
 cd burrito-discovery-ctl && cargo build --release --features "ctl" && cd ..
 cd burrito-localname-ctl && cargo build --release --features "ctl,docker" && cd ..
 cd rpcbench && cargo build --release && cd ..
-ssh $1 "cd ~/burrito/burrito-discovery-ctl && cargo build --release --features \"ctl\""
-ssh $1 "cd ~/burrito/burrito-localname-ctl && cargo build --release --features \"ctl,docker\""
-ssh $1 "cd ~/burrito/rpcbench && cargo build --release"
+echo "  -> remote build"
+ssh $1 "cd ~/burrito/burrito-discovery-ctl && ~/.cargo/bin/cargo build --release --features \"ctl\""
+ssh $1 "cd ~/burrito/burrito-localname-ctl && ~/.cargo/bin/cargo build --release --features \"ctl,docker\""
+ssh $1 "cd ~/burrito/rpcbench && ~/.cargo/bin/cargo build --release"
 
 echo "==> Baremetal TCP"
-ssh $1 "ps aux | grep \"release.*server\" | awk '{print \$2}' | head -n1 | xargs kill -9"
+ssh $1 "ps aux | grep \"release.*server\" | awk '{print \$2}' | head -n1 | xargs kill -9" || true
+echo " -> start server"
 ssh $1 "cd ~/burrito && ./target/release/pingserver --port \"4242\"" &
 ssh_server=$!
 sleep 2
+echo " -> start client"
 ./target/release/pingclient --addr "http://$1:4242" -i 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
     -o $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_baremetal.data 
-kill -9 $ssh_server
-ssh $1 "ps aux | grep \"release.*server\" | awk '{print \$2}' | head -n1 | xargs kill -9"
+kill -9 $ssh_server 
+ssh $1 "ps aux | grep \"release.*server\" | awk '{print \$2}' | head -n1 | xargs kill -9" 
 echo " -> baremetal TCP done"
 sleep 2
 
@@ -56,20 +62,23 @@ sudo ./target/release/dump-docker \
     -o /var/run/burrito-docker.sock \
     > $out/dumpdocker-remote.log 2> $out/dumpdocker-remote.log &
 burritoctl=$!
+echo " -> start remote docker-proxy"
 ssh $1 "cd ~/burrito && sudo ./target/release/dump-docker -i /var/run/docker.sock -o /var/run/burrito-docker.sock > $out/dumpdocker.log 2> $out/dumpdocker.log" &
 sleep 4
 
 image_name=rpcbench:`git rev-parse --short HEAD`
-sudo docker build -t $image_name . &
+echo " -> local build"
+cd ~/burrito && sudo docker build -t $image_name . &
 local_docker_build=$!
+echo " -> remote build"
 ssh 10.1.1.6 "cd ~/burrito && sudo docker build -t $image_name ." &
 remote_docker_build=$!
 echo "-> build docker image $image_name"
 wait $local_docker_build $remote_docker_build
 sleep 2
 
-sudo docker rm -f rpcclient3
-ssh $1 sudo docker rm -f rpcbench-server
+sudo docker rm -f rpcclient3 || true
+ssh $1 sudo docker rm -f rpcbench-server || true
 ssh $1 sudo docker run --name rpcbench-server -p 4242:4242 -d $image_name ./pingserver --port="4242"
 #sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tcp_remote_docker.pcap -i 10gp1 port 4242 &
 sleep 4
