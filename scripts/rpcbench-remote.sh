@@ -135,7 +135,7 @@ ssh $1 sudo docker rm -f rpcbench-server || true
 echo "--> start rpcbench-server"
 ssh $1 "sudo docker run --name rpcbench-server -e RUST_LOG=debug -p 4242:4242 -d $image_name ./pingserver --burrito-addr=\"pingserver\" --burrito-root=\"/burrito\" --port=\"4242\""
 sleep 2
-#sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.pcap -i 10gp1 port 4242 &
+#sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_burrito_remote_docker.pcap -i 10gp1 port 4242 &
 echo "--> start pingclient"
 sudo docker run --name rpcclient3 -t -e RUST_LOG=debug -d $image_name ./pingclient \
     --addr "pingserver" \
@@ -144,8 +144,8 @@ sudo docker run --name rpcclient3 -t -e RUST_LOG=debug -d $image_name ./pingclie
     -w 4 -i 10000 --reqs-per-iter 3 \
     -o ./res.data
 sudo docker container wait rpcclient3
-sudo docker cp rpcclient3:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.data
-sudo docker cp rpcclient3:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.trace
+sudo docker cp rpcclient3:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_burrito_remote_docker.data
+sudo docker cp rpcclient3:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_burrito_remote_docker.trace
 #sudo pkill tcpdump
 echo "-> burrito done"
 

@@ -116,12 +116,14 @@ sudo docker run --name lrpcclient -e RUST_LOG=debug -t -d $image_name ./pingclie
     --burrito-root="/burrito" \
     --amount 1000 -w 4 -i 10000 \
     --reqs-per-iter 3 \
-    -o ./res.data
+    -o ./res.data > res.log 2> res.err
 echo "-> wait rpcbench-client"
 sudo docker container wait lrpcclient
 echo "-> rpcbench-client done"
-sudo docker cp lrpcclient:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_burrito-burrito_localhost_docker.data
-sudo docker cp lrpcclient:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_burrito-burrito_localhost_docker.trace
+sudo docker cp lrpcclient:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.data
+sudo docker cp lrpcclient:/app/res.log $out/work_sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.log
+sudo docker cp lrpcclient:/app/res.err $out/work_sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.err
+sudo docker cp lrpcclient:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.trace
 
 sudo kill -INT $lburritoctl
 sudo kill -INT $burritoctl
