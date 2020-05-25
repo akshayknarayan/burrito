@@ -145,6 +145,10 @@ async fn discovery_ctl(
             match service.as_str() {
                 burrito_discovery_ctl::CONTROLLER_ADDRESS => acc.or_else(|| Some(address)),
                 burrito_localname_ctl::CONTROLLER_ADDRESS => {
+                    if let burrito_localname_ctl::proto::Addr::Burrito(_) = address {
+                        return acc;
+                    }
+
                     if let Some(s) = acc {
                         warn!(discarding = ?s, using = ?address, "Got duplicate local-name entry");
                     }
