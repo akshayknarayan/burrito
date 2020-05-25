@@ -106,7 +106,7 @@ sleep 2
 
 echo "--> start burrito-ctl locally"
 echo "--> start burrito-discovery-ctl"
-sudo RUST_LOG=info,burrito_addr=trace ./target/release/burrito-discovery-ctl \
+sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
     --redis-addr "redis://localhost:6379" \
     --net-addr=$3 \
     -f \
@@ -114,7 +114,7 @@ sudo RUST_LOG=info,burrito_addr=trace ./target/release/burrito-discovery-ctl \
 burritoctl=$!
 sleep 2
 echo "--> start burrito-localname-ctl"
-sudo RUST_LOG=info,burrito_addr=trace ./target/release/burrito-localname \
+sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localname \
     -i /var/run/docker.sock \
     -o /var/run/burrito-docker.sock \
     -f \
@@ -133,11 +133,11 @@ sleep 2
 sudo docker rm -f rpcclient3 || true
 ssh $1 sudo docker rm -f rpcbench-server || true
 echo "--> start rpcbench-server"
-ssh $1 "sudo docker run --name rpcbench-server -e RUST_LOG=debug,burrito_addr=trace -p 4242:4242 -d $image_name ./pingserver --burrito-addr=\"pingserver\" --burrito-root=\"/burrito\" --port=\"4242\""
+ssh $1 "sudo docker run --name rpcbench-server -e RUST_LOG=debug -p 4242:4242 -d $image_name ./pingserver --burrito-addr=\"pingserver\" --burrito-root=\"/burrito\" --port=\"4242\""
 sleep 2
 #sudo tcpdump -w $out/work_sqrts_1000-iters_10000_periter_3_tonic-burrito_remote_docker.pcap -i 10gp1 port 4242 &
 echo "--> start pingclient"
-sudo docker run --name rpcclient3 -t -e RUST_LOG=debug,burrito_addr=trace -d $image_name ./pingclient \
+sudo docker run --name rpcclient3 -t -e RUST_LOG=debug -d $image_name ./pingclient \
     --addr "pingserver" \
     --burrito-root="/burrito" \
     --amount 1000 \

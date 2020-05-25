@@ -90,7 +90,7 @@ sudo pkill -9 dump-docker 2> /dev/null || true
 sudo pkill -9 burrito || true
 sleep 2
 echo "--> start burrito-discovery-ctl"
-sudo RUST_LOG=debug ./target/release/burrito-discovery-ctl \
+sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
     --redis-addr "redis://localhost:6379" \
     --net-addr=$docker_host_addr \
     -f \
@@ -98,7 +98,7 @@ sudo RUST_LOG=debug ./target/release/burrito-discovery-ctl \
 burritoctl=$!
 sleep 2
 echo "--> start burrito-localname-ctl"
-sudo RUST_LOG=debug ./target/release/burrito-localname \
+sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localname \
     -i /var/run/docker.sock \
     -o /var/run/burrito-docker.sock \
     -f \
