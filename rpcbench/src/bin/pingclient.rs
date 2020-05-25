@@ -1,5 +1,6 @@
 use slog::{info, trace};
 use structopt::StructOpt;
+use tracing_subscriber::layer::Layer;
 use tracing_timing::{Builder, Histogram};
 
 #[derive(Debug, StructOpt)]
@@ -47,9 +48,10 @@ async fn main() -> Result<(), failure::Error> {
             e.record(&mut f);
             val
         })
-        .build(|| Histogram::new_with_max(10_000_000, 2).unwrap());
+        .layer(|| Histogram::new_with_max(10_000_000, 2).unwrap());
     let sid = subscriber.downcaster();
-    let d = tracing::Dispatch::new(subscriber);
+    let fmt = tracing_subscriber::fmt().finish();
+    let d = tracing::Dispatch::new(subscriber.with_subscriber(fmt));
 
     if let None = opt.out_file {
         tracing_subscriber::fmt::init();

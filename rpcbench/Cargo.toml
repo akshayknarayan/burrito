@@ -29,8 +29,8 @@ tower = "0.3"
 tower-make = "0.3"
 tracing = "0.1"
 tracing-futures = "0.2"
-tracing-timing  = "0.3"
-tracing-subscriber = "0.2"
+tracing-timing  = { version = "0.4", features = ["layer"] }
+tracing-subscriber = "0.2.5"
 
 [dev-dependencies]
 redis = "0.15"
