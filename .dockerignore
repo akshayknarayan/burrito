@@ -1,7 +1,9 @@
 .git/
 target/
-!target/release/server
-!target/release/client
+!target/release/pingserver
+!target/release/pingclient
+retry*/
+ycsb-shenango/target/
 *.txt
 *.data
 *.log
