@@ -13,6 +13,9 @@ cd burrito-discovery-ctl && cargo build --release --features "ctl" && cd ..
 cd burrito-localname-ctl && cargo build --release --features "ctl,docker" && cd ..
 cd rpcbench && cargo build --release && cd ..
 
+sudo pkill -9 pingserver || true
+sudo pkill -9 burrito || true
+
 echo "==> baremetal tcp"
 ./target/release/pingserver --port "4242" &
 server=$!
@@ -23,6 +26,8 @@ sleep 2
 kill -9 $server
 sleep 2
 
+###################################################
+
 echo "==> baremetal unix"
 rm -rf /tmp/burrito/server
 ./target/release/pingserver --unix-addr "/tmp/burrito/server" &
@@ -31,6 +36,8 @@ sleep 2
 ./target/release/pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
     -o $out/work_sqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data
 kill -9 $server
+
+###################################################
 
 echo "==> container tcp"
 echo "-> start docker-proxy"
@@ -70,6 +77,8 @@ echo "-> rpcbench-client done"
 sudo docker cp lrpcclient:/app/res.data $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data
 sudo docker cp lrpcclient:/app/res.trace $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.trace
 
+###################################################
+
 echo "==> container unix (burrito)"
 echo " -> stop all containers"
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
@@ -82,8 +91,56 @@ sleep 2
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 sleep 2
 
+###################################################
+
+echo "==> Baremetal Burrito"
+echo "--> start redis"
+sudo docker rm -f rpcbench-redis || true
+sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sleep 2
+sudo pkill -9 dump-docker 2> /dev/null || true
+sudo pkill -9 burrito || true
+sleep 2
+echo "--> start burrito-discovery-ctl"
+sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
+    --redis-addr "redis://localhost:6379" \
+    --net-addr=$docker_host_addr \
+    -f \
+    > $out/burritoctl-discovery.log 2> $out/burritoctl-discovery.log &
+burritoctl=$!
+sleep 2
+echo "--> start burrito-localname-ctl"
+sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localname \
+    -i /var/run/docker.sock \
+    -o /var/run/burrito-docker.sock \
+    -f \
+    > $out/burritoctl-local.log 2> $out/burritoctl-local.log &
+lburritoctl=$!
+sleep 2
+
+sudo RUST_LOG=info ./target/release/pingserver \
+    --burrito-addr="rpcbench" \
+    --burrito-root="/tmp/burrito" \
+    --port="4242" &
+sleep 2
+echo "-> start rpcbench-client"
+sudo RUST_LOG=info,rpcbench=trace,burrito_addr=trace ./target/release/pingclient \
+    --addr="rpcbench" \
+    --burrito-root="/tmp/burrito" \
+    --amount 1000 -w 4 -i 10000 \
+    --reqs-per-iter 3 \
+    -o $out/work_sqrts_1000-iters_10000_periter_3_burrito_localhost_baremetal.data
+echo "-> rpcbench-client done"
+sudo pkill -9 pingserver || true
+
+sudo kill -INT $lburritoctl
+sudo kill -INT $burritoctl
+
+###################################################
+
 echo "==> Burrito"
 echo "--> start redis"
+sudo docker rm -f rpcbench-redis || true
 sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
 sleep 2
 sudo pkill -9 dump-docker 2> /dev/null || true
@@ -127,6 +184,10 @@ sudo docker cp lrpcclient:/app/res.trace $out/work_sqrts_1000-iters_10000_perite
 sudo kill -INT $lburritoctl
 sudo kill -INT $burritoctl
 
+###################################################
+###################################################
+###################################################
+
 echo "===> 256B requests"
 
 echo "==> baremetal tcp"
@@ -139,6 +200,8 @@ sleep 2
 kill -9 $server
 sleep 2
 
+###################################################
+
 echo "==> baremetal unix"
 rm -rf /tmp/burrito/server
 ./target/release/pingserver --unix-addr "/tmp/burrito/server" &
@@ -147,6 +210,8 @@ sleep 2
 ./target/release/pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 256 \
     -o $out/work_256bsqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data
 kill -9 $server
+
+###################################################
 
 echo "==> container tcp"
 echo "-> start docker-proxy"
@@ -186,6 +251,8 @@ echo "-> rpcbench-client done"
 sudo docker cp lrpcclient:/app/res.data $out/work_256bsqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data
 sudo docker cp lrpcclient:/app/res.trace $out/work_256bsqrts_1000-iters_10000_periter_3_tcp_localhost_docker.trace
 
+###################################################
+
 echo "==> container unix (burrito)"
 echo " -> stop all containers"
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
@@ -198,8 +265,11 @@ sleep 2
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 sleep 2
 
-echo "==> Burrito"
+###################################################
+
+echo "==> Baremetal Burrito"
 echo "--> start redis"
+sudo docker rm -f rpcbench-redis || true
 sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
 sleep 2
 sudo pkill -9 dump-docker 2> /dev/null || true
@@ -218,7 +288,52 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
     -i /var/run/docker.sock \
     -o /var/run/burrito-docker.sock \
     -f \
-    > $out/sec-burritoctl-local.log 2> $out/sec-burritoctl-local.log &
+    > $out/burritoctl-local.log 2> $out/burritoctl-local.log &
+lburritoctl=$!
+sleep 2
+
+sudo RUST_LOG=info ./target/release/pingserver \
+    --burrito-addr="rpcbench" \
+    --burrito-root="/tmp/burrito" \
+    --port="4242" &
+sleep 2
+echo "-> start rpcbench-client"
+sudo RUST_LOG=info,rpcbench=trace,burrito_addr=trace ./target/release/pingclient \
+    --addr="rpcbench" \
+    --burrito-root="/tmp/burrito" \
+    --amount 1000 -w 4 -i 10000 \
+    --reqs-per-iter 3 -s 256 \
+    -o $out/work_256bsqrts_1000-iters_10000_periter_3_burrito_localhost_baremetal.data
+echo "-> rpcbench-client done"
+sudo pkill -9 pingserver || true
+
+sudo kill -INT $lburritoctl
+sudo kill -INT $burritoctl
+
+###################################################
+
+echo "==> Container Burrito"
+echo "--> start redis"
+sudo docker rm -f rpcbench-redis || true
+sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sleep 2
+sudo pkill -9 dump-docker 2> /dev/null || true
+sudo pkill -9 burrito || true
+sleep 2
+echo "--> start burrito-discovery-ctl"
+sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
+    --redis-addr "redis://localhost:6379" \
+    --net-addr=$docker_host_addr \
+    -f \
+    > $out/burritoctl-discovery.log 2> $out/burritoctl-discovery.log &
+burritoctl=$!
+sleep 2
+echo "--> start burrito-localname-ctl"
+sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localname \
+    -i /var/run/docker.sock \
+    -o /var/run/burrito-docker.sock \
+    -f \
+    > $out/burritoctl-local.log 2> $out/burritoctl-local.log &
 lburritoctl=$!
 sleep 2
 sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver \
@@ -243,6 +358,10 @@ sudo docker cp lrpcclient:/app/res.trace $out/work_256bsqrts_1000-iters_10000_pe
 sudo kill -INT $lburritoctl
 sudo kill -INT $burritoctl
 
+###################################################
+###################################################
+###################################################
+
 echo "===> 10k requests"
 
 echo "==> baremetal tcp"
@@ -255,6 +374,8 @@ sleep 2
 kill -9 $server
 sleep 2
 
+###################################################
+
 echo "==> baremetal unix"
 rm -rf /tmp/burrito/server
 ./target/release/pingserver --unix-addr "/tmp/burrito/server" &
@@ -263,6 +384,8 @@ sleep 2
 ./target/release/pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 10240 \
     -o $out/work_10ksqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data
 kill -9 $server
+
+###################################################
 
 echo "==> container tcp"
 echo "-> start docker-proxy"
@@ -302,6 +425,8 @@ echo "-> rpcbench-client done"
 sudo docker cp lrpcclient:/app/res.data $out/work_10ksqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data
 sudo docker cp lrpcclient:/app/res.trace $out/work_10ksqrts_1000-iters_10000_periter_3_tcp_localhost_docker.trace
 
+###################################################
+
 echo "==> container unix (burrito)"
 echo " -> stop all containers"
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
@@ -314,8 +439,56 @@ sleep 2
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 sleep 2
 
+###################################################
+
+echo "==> Baremetal Burrito"
+echo "--> start redis"
+sudo docker rm -f rpcbench-redis || true
+sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sleep 2
+sudo pkill -9 dump-docker 2> /dev/null || true
+sudo pkill -9 burrito || true
+sleep 2
+echo "--> start burrito-discovery-ctl"
+sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
+    --redis-addr "redis://localhost:6379" \
+    --net-addr=$docker_host_addr \
+    -f \
+    > $out/burritoctl-discovery.log 2> $out/burritoctl-discovery.log &
+burritoctl=$!
+sleep 2
+echo "--> start burrito-localname-ctl"
+sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localname \
+    -i /var/run/docker.sock \
+    -o /var/run/burrito-docker.sock \
+    -f \
+    > $out/burritoctl-local.log 2> $out/burritoctl-local.log &
+lburritoctl=$!
+sleep 2
+
+sudo RUST_LOG=info ./target/release/pingserver \
+    --burrito-addr="rpcbench" \
+    --burrito-root="/tmp/burrito" \
+    --port="4242" &
+sleep 2
+echo "-> start rpcbench-client"
+sudo RUST_LOG=info,rpcbench=trace,burrito_addr=trace ./target/release/pingclient \
+    --addr="rpcbench" \
+    --burrito-root="/tmp/burrito" \
+    --amount 1000 -w 4 -i 10000 \
+    --reqs-per-iter 3 -s 10240 \
+    -o $out/work_10ksqrts_1000-iters_10000_periter_3_burrito_localhost_baremetal.data
+echo "-> rpcbench-client done"
+sudo pkill -9 pingserver || true
+
+sudo kill -INT $lburritoctl
+sudo kill -INT $burritoctl
+
+###################################################
+
 echo "==> Burrito"
 echo "--> start redis"
+sudo docker rm -f rpcbench-redis || true
 sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
 sleep 2
 sudo pkill -9 dump-docker 2> /dev/null || true
@@ -358,6 +531,11 @@ sudo docker cp lrpcclient:/app/res.trace $out/work_10ksqrts_1000-iters_10000_per
 
 sudo kill -INT $lburritoctl
 sudo kill -INT $burritoctl
+
+###################################################
+###################################################
+###################################################
+###################################################
 
 echo "-> parse script"
 python3 ./scripts/rpcbench-parse.py $out/work*.data > $out/combined.data

@@ -21,7 +21,7 @@ def read_file(fn: str, first: bool):
     file_first = True
     with open(fn) as f:
         for line in f:
-            if file_first and line != "Total_us,Server_us\n":
+            if file_first and line != "Elapsed_us,Total_us,Server_us\n":
                 continue
 
             if line.strip() == "":

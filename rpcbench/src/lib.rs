@@ -159,7 +159,7 @@ pub async fn client_ping<A, C>(
     msg: PingParams,
     iters: usize,
     reqs_per_iter: usize,
-) -> Result<Vec<(i64, i64)>, Error>
+) -> Result<Vec<(std::time::Duration, i64, i64)>, Error>
 where
     A: std::convert::TryInto<tonic::transport::Endpoint> + Clone,
     A::Error: Send + Sync + std::error::Error + 'static,
@@ -168,6 +168,7 @@ where
     C::Future: Send + 'static,
     Box<dyn std::error::Error + Send + Sync>: From<C::Error> + Send + 'static,
 {
+    let start = std::time::Instant::now();
     let mut durs = vec![];
     for i in 0..iters {
         trace!(iter = i, "start_loop");
@@ -187,7 +188,7 @@ where
             trace!(iter = i, which = j, "ping_start");
             let (tot, srv) = do_one_ping(&mut client, msg.clone()).await?;
             trace!(iter = i, which = j, "ping_end");
-            durs.push((tot, srv));
+            durs.push((start.elapsed(), tot, srv));
         }
 
         let elap: i64 = then.elapsed().as_micros().try_into()?;

@@ -125,9 +125,9 @@ async fn main() -> Result<(), failure::Error> {
         tracing::debug!("writing latencies file");
         use std::io::Write;
         let mut f = std::fs::File::create(path)?;
-        write!(&mut f, "Total_us,Server_us\n")?;
-        for (t, s) in durs {
-            write!(&mut f, "{},{}\n", t, s)?;
+        write!(&mut f, "Elapsed_us,Total_us,Server_us\n")?;
+        for (time, t, s) in durs {
+            write!(&mut f, "{},{},{}\n", time.as_micros(), t, s)?;
         }
     }
 
