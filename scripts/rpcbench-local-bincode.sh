@@ -13,7 +13,7 @@ cd burrito-discovery-ctl && cargo build --release --features "ctl" && cd ..
 cd burrito-localname-ctl && cargo build --release --features "ctl,docker" && cd ..
 cd rpcbench && cargo build --release && cd ..
 
-sudo pkill -9 pingserver || true
+sudo pkill -9 bincode || true
 sudo pkill -9 burrito || true
 
 echo "==> baremetal tcp"
@@ -100,7 +100,7 @@ sudo docker build -t $image_name .
 
 echo "-> start rpcbench-server"
 # server
-sudo docker run --name rpcbench-server \
+sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name rpcbench-server \
     --mount type=bind,source=/tmp/burrito/,target=/burrito \
     -e RUST_LOG=debug -d $image_name \
     ./bincode-pingserver --unix-addr "/burrito/server"
@@ -110,7 +110,7 @@ echo "container ip: $container_ip"
 
 # client 
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient \
+sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name lrpcclient \
     --mount type=bind,source=/tmp/burrito/,target=/burrito \
     -e RUST_LOG=debug \
     -t -d $image_name \
@@ -251,6 +251,7 @@ sleep 2
 
 ###################################################
 
+sudo kill -9 $burritoctl
 echo "==> baremetal unix"
 rm -rf /tmp/burrito/server
 ./target/release/bincode-pingserver --unix-addr "/tmp/burrito/server" &
@@ -295,6 +296,50 @@ sudo docker container wait lrpcclient
 echo "-> rpcbench-client done"
 sudo docker cp lrpcclient:/app/res.data $out/work_256bsqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data
 sudo docker cp lrpcclient:/app/res.trace $out/work_256bsqrts_1000-iters_10000_periter_3_tcp_localhost_docker.trace
+
+###################################################
+
+echo "==> container unix"
+rm -f /tmp/burrito/server
+echo "-> start docker-proxy"
+sleep 2
+sudo ./target/release/dump-docker \
+    -i /var/run/docker.sock \
+    -o /var/run/burrito-docker.sock \
+    > $out/dumpdocker-local.log 2> $out/dumpdocker-local.log &
+burritoctl=$!
+sleep 5
+
+sleep 2
+sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f || true
+sleep 2
+
+echo "-> start rpcbench-server"
+# server
+sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name rpcbench-server \
+    --mount type=bind,source=/tmp/burrito/,target=/burrito \
+    -e RUST_LOG=debug -d $image_name \
+    ./bincode-pingserver --unix-addr "/burrito/server"
+sleep 4
+container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-server)
+echo "container ip: $container_ip"
+
+# client 
+echo "-> start rpcbench-client"
+sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name lrpcclient \
+    --mount type=bind,source=/tmp/burrito/,target=/burrito \
+    -e RUST_LOG=debug \
+    -t -d $image_name \
+    ./bincode-pingclient \
+    --addr "/burrito/server" \
+    --amount 1000 -w 4 -i 10000 \
+    --reqs-per-iter 3 -s 256 \
+    -o ./res.data
+echo "-> wait rpcbench-client"
+sudo docker container wait lrpcclient
+echo "-> rpcbench-client done"
+sudo docker cp lrpcclient:/app/res.data $out/work_256bsqrts_1000-iters_10000_periter_3_unix_localhost_docker.data
+sudo docker cp lrpcclient:/app/res.trace $out/work_256bsqrts_1000-iters_10000_periter_3_unix_localhost_docker.trace
 
 ###################################################
 
@@ -465,6 +510,50 @@ sudo docker container wait lrpcclient
 echo "-> rpcbench-client done"
 sudo docker cp lrpcclient:/app/res.data $out/work_10ksqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data
 sudo docker cp lrpcclient:/app/res.trace $out/work_10ksqrts_1000-iters_10000_periter_3_tcp_localhost_docker.trace
+
+###################################################
+
+echo "==> container unix"
+rm -f /tmp/burrito/server
+echo "-> start docker-proxy"
+sleep 2
+sudo ./target/release/dump-docker \
+    -i /var/run/docker.sock \
+    -o /var/run/burrito-docker.sock \
+    > $out/dumpdocker-local.log 2> $out/dumpdocker-local.log &
+burritoctl=$!
+sleep 5
+
+sleep 2
+sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f || true
+sleep 2
+
+echo "-> start rpcbench-server"
+# server
+sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name rpcbench-server \
+    --mount type=bind,source=/tmp/burrito/,target=/burrito \
+    -e RUST_LOG=debug -d $image_name \
+    ./bincode-pingserver --unix-addr "/burrito/server"
+sleep 4
+container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-server)
+echo "container ip: $container_ip"
+
+# client 
+echo "-> start rpcbench-client"
+sudo DOCKER_HOST=unix:///var/run/burrito-docker.sock docker run --name lrpcclient \
+    --mount type=bind,source=/tmp/burrito/,target=/burrito \
+    -e RUST_LOG=debug \
+    -t -d $image_name \
+    ./bincode-pingclient \
+    --addr "/burrito/server" \
+    --amount 1000 -w 4 -i 10000 \
+    --reqs-per-iter 3 -s 10240 \
+    -o ./res.data
+echo "-> wait rpcbench-client"
+sudo docker container wait lrpcclient
+echo "-> rpcbench-client done"
+sudo docker cp lrpcclient:/app/res.data $out/work_10ksqrts_1000-iters_10000_periter_3_unix_localhost_docker.data
+sudo docker cp lrpcclient:/app/res.trace $out/work_10ksqrts_1000-iters_10000_periter_3_unix_localhost_docker.trace
 
 ###################################################
 
