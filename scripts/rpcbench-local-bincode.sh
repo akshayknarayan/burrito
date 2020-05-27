@@ -152,7 +152,7 @@ sudo pkill -9 burrito || true
 sleep 2
 echo "--> start burrito-discovery-ctl"
 sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
-    --redis-addr "redis://localhost:6379" \
+    --redis-addr "redis://127.0.0.1:6379" \
     --net-addr=$docker_host_addr \
     -f \
     > $out/burritoctl-discovery.log 2> $out/burritoctl-discovery.log &
@@ -198,7 +198,7 @@ sudo pkill -9 burrito || true
 sleep 2
 echo "--> start burrito-discovery-ctl"
 sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
-    --redis-addr "redis://localhost:6379" \
+    --redis-addr "redis://127.0.0.1:6379" \
     --net-addr=$docker_host_addr \
     -f \
     > $out/sec-burritoctl-discovery.log 2> $out/sec-burritoctl-discovery.log &
@@ -369,7 +369,7 @@ sudo pkill -9 burrito || true
 sleep 2
 echo "--> start burrito-discovery-ctl"
 sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
-    --redis-addr "redis://localhost:6379" \
+    --redis-addr "redis://127.0.0.1:6379" \
     --net-addr=$docker_host_addr \
     -f \
     > $out/burritoctl-discovery.log 2> $out/burritoctl-discovery.log &
@@ -414,7 +414,7 @@ sudo pkill -9 burrito || true
 sleep 2
 echo "--> start burrito-discovery-ctl"
 sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
-    --redis-addr "redis://localhost:6379" \
+    --redis-addr "redis://127.0.0.1:6379" \
     --net-addr=$docker_host_addr \
     -f \
     > $out/burritoctl-discovery.log 2> $out/burritoctl-discovery.log &
@@ -584,7 +584,7 @@ sudo pkill -9 burrito || true
 sleep 2
 echo "--> start burrito-discovery-ctl"
 sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
-    --redis-addr "redis://localhost:6379" \
+    --redis-addr "redis://127.0.0.1:6379" \
     --net-addr=$docker_host_addr \
     -f \
     > $out/burritoctl-discovery.log 2> $out/burritoctl-discovery.log &
@@ -630,7 +630,7 @@ sudo pkill -9 burrito || true
 sleep 2
 echo "--> start burrito-discovery-ctl"
 sudo RUST_LOG=info,burrito_discovery_ctl=debug ./target/release/burrito-discovery-ctl \
-    --redis-addr "redis://localhost:6379" \
+    --redis-addr "redis://127.0.0.1:6379" \
     --net-addr=$docker_host_addr \
     -f \
     > $out/burritoctl-discovery.log 2> $out/burritoctl-discovery.log &
