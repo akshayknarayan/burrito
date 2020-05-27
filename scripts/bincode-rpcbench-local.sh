@@ -17,11 +17,11 @@ sudo pkill -9 pingserver || true
 sudo pkill -9 burrito || true
 
 echo "==> baremetal tcp"
-./target/release/pingserver --port "4242" &
+./target/release/bincode-pingserver --port "4242" &
 server=$!
 sleep 2
 
-./target/release/pingclient --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
+./target/release/bincode-pingclient --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
     -o $out/work_sqrts_1000-iters_10000_periter_3_tcp_localhost_baremetal.data
 kill -9 $server
 sleep 2
@@ -30,10 +30,10 @@ sleep 2
 
 echo "==> baremetal unix"
 rm -rf /tmp/burrito/server
-./target/release/pingserver --unix-addr "/tmp/burrito/server" &
+./target/release/bincode-pingserver --unix-addr "/tmp/burrito/server" &
 server=$!
 sleep 2
-./target/release/pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
+./target/release/bincode-pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 \
     -o $out/work_sqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data
 kill -9 $server
 
@@ -59,14 +59,14 @@ sudo docker build -t $image_name .
 
 echo "-> start rpcbench-server"
 # server
-sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver --port="4242"
+sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./bincode-pingserver --port="4242"
 sleep 4
 container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-server)
 echo "container ip: $container_ip"
 
 # client 
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient -e RUST_LOG=debug -t -d $image_name ./pingclient \
+sudo docker run --name lrpcclient -e RUST_LOG=debug -t -d $image_name ./bincode-pingclient \
     --addr http://$container_ip:4242 \
     --amount 1000 -w 4 -i 10000 \
     --reqs-per-iter 3 \
@@ -118,13 +118,13 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
 lburritoctl=$!
 sleep 2
 
-sudo RUST_LOG=info ./target/release/pingserver \
+sudo RUST_LOG=info ./target/release/bincode-pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/tmp/burrito" \
     --port="4242" &
 sleep 2
 echo "-> start rpcbench-client"
-sudo RUST_LOG=info,rpcbench=trace,burrito_addr=trace ./target/release/pingclient \
+sudo RUST_LOG=info,rpcbench=trace,burrito_addr=trace ./target/release/bincode-pingclient \
     --addr="rpcbench" \
     --burrito-root="/tmp/burrito" \
     --amount 1000 -w 4 -i 10000 \
@@ -162,13 +162,13 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
     > $out/sec-burritoctl-local.log 2> $out/sec-burritoctl-local.log &
 lburritoctl=$!
 sleep 2
-sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver \
+sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./bincode-pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
     --port="4242"
 sleep 2
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./pingclient \
+sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./bincode-pingclient \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
     --amount 1000 -w 4 -i 10000 \
@@ -210,13 +210,13 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
     > $out/sec-burritoctl-local.log 2> $out/sec-burritoctl-local.log &
 lburritoctl=$!
 sleep 2
-sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver \
+sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./bincode-pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
     --port="4242"
 sleep 2
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./pingclient \
+sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./bincode-pingclient \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
     --amount 0 -w 0 -i 10000 \
@@ -239,11 +239,11 @@ sudo kill -INT $burritoctl
 echo "===> 256B requests"
 
 echo "==> baremetal tcp"
-./target/release/pingserver --port "4242" &
+./target/release/bincode-pingserver --port "4242" &
 server=$!
 sleep 2
 
-./target/release/pingclient --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 256 \
+./target/release/bincode-pingclient --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 256 \
     -o $out/work_256bsqrts_1000-iters_10000_periter_3_tcp_localhost_baremetal.data
 kill -9 $server
 sleep 2
@@ -252,10 +252,10 @@ sleep 2
 
 echo "==> baremetal unix"
 rm -rf /tmp/burrito/server
-./target/release/pingserver --unix-addr "/tmp/burrito/server" &
+./target/release/bincode-pingserver --unix-addr "/tmp/burrito/server" &
 server=$!
 sleep 2
-./target/release/pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 256 \
+./target/release/bincode-pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 256 \
     -o $out/work_256bsqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data
 kill -9 $server
 
@@ -281,14 +281,14 @@ sudo docker build -t $image_name .
 
 echo "-> start rpcbench-server"
 # server
-sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver --port="4242"
+sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./bincode-pingserver --port="4242"
 sleep 4
 container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-server)
 echo "container ip: $container_ip"
 
 # client 
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient -e RUST_LOG=debug -t -d $image_name ./pingclient \
+sudo docker run --name lrpcclient -e RUST_LOG=debug -t -d $image_name ./bincode-pingclient \
     --addr http://$container_ip:4242 \
     --amount 1000 -w 4 -i 10000 \
     --reqs-per-iter 3 -s 256 \
@@ -340,13 +340,13 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
 lburritoctl=$!
 sleep 2
 
-sudo RUST_LOG=info ./target/release/pingserver \
+sudo RUST_LOG=info ./target/release/bincode-pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/tmp/burrito" \
     --port="4242" &
 sleep 2
 echo "-> start rpcbench-client"
-sudo RUST_LOG=info,rpcbench=trace,burrito_addr=trace ./target/release/pingclient \
+sudo RUST_LOG=info,rpcbench=trace,burrito_addr=trace ./target/release/bincode-pingclient \
     --addr="rpcbench" \
     --burrito-root="/tmp/burrito" \
     --amount 1000 -w 4 -i 10000 \
@@ -384,13 +384,13 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
     > $out/burritoctl-local.log 2> $out/burritoctl-local.log &
 lburritoctl=$!
 sleep 2
-sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver \
+sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./bincode-pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
     --port="4242"
 sleep 2
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./pingclient \
+sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./bincode-pingclient \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
     --amount 1000 -w 4 -i 10000 \
@@ -432,13 +432,13 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
     > $out/sec-burritoctl-local.log 2> $out/sec-burritoctl-local.log &
 lburritoctl=$!
 sleep 2
-sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver \
+sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./bincode-pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
     --port="4242"
 sleep 2
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./pingclient \
+sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./bincode-pingclient \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
     --amount 0 -w 0 -i 10000 \
@@ -461,11 +461,11 @@ sudo kill -INT $burritoctl
 echo "===> 10k requests"
 
 echo "==> baremetal tcp"
-./target/release/pingserver --port "4242" &
+./target/release/bincode-pingserver --port "4242" &
 server=$!
 sleep 2
 
-./target/release/pingclient --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 10240 \
+./target/release/bincode-pingclient --addr "http://127.0.0.1:4242" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 10240 \
     -o $out/work_10ksqrts_1000-iters_10000_periter_3_tcp_localhost_baremetal.data
 kill -9 $server
 sleep 2
@@ -474,10 +474,10 @@ sleep 2
 
 echo "==> baremetal unix"
 rm -rf /tmp/burrito/server
-./target/release/pingserver --unix-addr "/tmp/burrito/server" &
+./target/release/bincode-pingserver --unix-addr "/tmp/burrito/server" &
 server=$!
 sleep 2
-./target/release/pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 10240 \
+./target/release/bincode-pingclient --addr "/tmp/burrito/server" --iters 10000 --work 4 --amount 1000 --reqs-per-iter 3 -s 10240 \
     -o $out/work_10ksqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data
 kill -9 $server
 
@@ -503,14 +503,14 @@ sudo docker build -t $image_name .
 
 echo "-> start rpcbench-server"
 # server
-sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver --port="4242"
+sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./bincode-pingserver --port="4242"
 sleep 4
 container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-server)
 echo "container ip: $container_ip"
 
 # client 
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient -e RUST_LOG=debug -t -d $image_name ./pingclient \
+sudo docker run --name lrpcclient -e RUST_LOG=debug -t -d $image_name ./bincode-pingclient \
     --addr http://$container_ip:4242 \
     --amount 1000 -w 4 -i 10000 \
     --reqs-per-iter 3 -s 10240 \
@@ -562,13 +562,13 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
 lburritoctl=$!
 sleep 2
 
-sudo RUST_LOG=info ./target/release/pingserver \
+sudo RUST_LOG=info ./target/release/bincode-pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/tmp/burrito" \
     --port="4242" &
 sleep 2
 echo "-> start rpcbench-client"
-sudo RUST_LOG=info,rpcbench=trace,burrito_addr=trace ./target/release/pingclient \
+sudo RUST_LOG=info,rpcbench=trace,burrito_addr=trace ./target/release/bincode-pingclient \
     --addr="rpcbench" \
     --burrito-root="/tmp/burrito" \
     --amount 1000 -w 4 -i 10000 \
@@ -606,13 +606,13 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
     > $out/sec-burritoctl-local.log 2> $out/sec-burritoctl-local.log &
 lburritoctl=$!
 sleep 2
-sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver \
+sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./bincode-pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
     --port="4242"
 sleep 2
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./pingclient \
+sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./bincode-pingclient \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
     --amount 1000 -w 4 -i 10000 \
@@ -654,13 +654,13 @@ sudo RUST_LOG=info,burrito_localname_ctl=debug ./target/release/burrito-localnam
     > $out/sec-burritoctl-local.log 2> $out/sec-burritoctl-local.log &
 lburritoctl=$!
 sleep 2
-sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./pingserver \
+sudo docker run --name rpcbench-server -e RUST_LOG=debug -d $image_name ./bincode-pingserver \
     --burrito-addr="rpcbench" \
     --burrito-root="/burrito" \
     --port="4242"
 sleep 2
 echo "-> start rpcbench-client"
-sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./pingclient \
+sudo docker run --name lrpcclient -e RUST_LOG=debug,rpcbench=trace,burrito_addr=trace -t -d $image_name ./bincode-pingclient \
     --addr="rpcbench" \
     --burrito-root="/burrito" \
     --amount 0 -w 0 -i 10000 \

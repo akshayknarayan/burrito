@@ -14,10 +14,11 @@ mod ping {
 pub use ping::ping_server::{Ping, PingServer};
 pub use ping::{ping_params::Work, PingParams, Pong};
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SPingParams {
     pub work: i32,
     pub amount: i64,
+    pub padding: Vec<u8>,
 }
 
 impl From<PingParams> for SPingParams {
@@ -25,6 +26,7 @@ impl From<PingParams> for SPingParams {
         Self {
             work: p.work,
             amount: p.amount,
+            padding: p.padding,
         }
     }
 }
@@ -34,7 +36,7 @@ impl Into<PingParams> for SPingParams {
         PingParams {
             work: self.work,
             amount: self.amount,
-            padding: vec![],
+            padding: self.padding,
         }
     }
 }
@@ -217,6 +219,63 @@ where
         .await?;
     let elap = then.elapsed().as_micros().try_into()?;
     let srv_dur = response.into_inner().duration_us;
+    Ok((elap, srv_dur))
+}
+
+use std::future::Future;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+#[tracing::instrument(skip(addr, connector))]
+pub async fn bincode_client_ping<A, C, F, E, S>(
+    addr: A,
+    connector: C,
+    msg: SPingParams,
+    iters: usize,
+    reqs_per_iter: usize,
+) -> Result<Vec<(std::time::Duration, i64, i64)>, Error>
+where
+    A: Clone,
+    C: Fn(A) -> F,
+    F: Future<Output = Result<S, E>>,
+    S: AsyncRead + AsyncWrite + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let start = std::time::Instant::now();
+    let mut durs = vec![];
+    let mut buf = [0u8; 64];
+    for i in 0..iters {
+        trace!(iter = i, "start_loop");
+
+        let then = std::time::Instant::now();
+        let mut st = connector(addr.clone()).await?;
+        trace!(iter = i, "connected");
+        for j in 0..reqs_per_iter {
+            trace!(iter = i, which = j, "ping_start");
+            let (tot, srv) = do_one_bincode_ping(&mut st, &mut buf, msg.clone()).await?;
+            trace!(iter = i, which = j, "ping_end");
+            durs.push((start.elapsed(), tot, srv));
+        }
+
+        let elap: i64 = then.elapsed().as_micros().try_into()?;
+        trace!(iter = i, overall_time = elap, "end_loop");
+    }
+
+    Ok(durs)
+}
+
+async fn do_one_bincode_ping(
+    st: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    buf: &mut [u8],
+    msg: SPingParams,
+) -> Result<(i64, i64), Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let then = std::time::Instant::now();
+    let msg = bincode::serialize(&msg)?;
+    st.write(&msg).await?;
+    let len = st.read(buf).await?;
+    let response: SPong = bincode::deserialize(&buf[..len])?;
+    let elap = then.elapsed().as_micros().try_into()?;
+    let srv_dur = response.duration_us;
     Ok((elap, srv_dur))
 }
 

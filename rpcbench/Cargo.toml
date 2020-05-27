@@ -31,6 +31,8 @@ tracing = "0.1"
 tracing-futures = "0.2"
 tracing-timing  = { version = "0.4", features = ["layer"] }
 tracing-subscriber = "0.2.5"
+bincode = "1"
+futures-util = "0.3"
 
 [dev-dependencies]
 redis = "0.15"
