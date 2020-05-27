@@ -271,9 +271,16 @@ async fn do_one_bincode_ping(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let then = std::time::Instant::now();
     let msg = bincode::serialize(&msg)?;
+    let msg_len = msg.len() as u32;
+    st.write(&msg_len.to_be_bytes()).await?;
     st.write(&msg).await?;
-    let len = st.read(buf).await?;
-    let response: SPong = bincode::deserialize(&buf[..len])?;
+    st.read_exact(&mut buf[0..4]).await?;
+    let resp_len = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+    if resp_len == 0 {
+        tracing::warn!("msg header says 0 length");
+    }
+    st.read_exact(&mut buf[0..resp_len as usize]).await?;
+    let response: SPong = bincode::deserialize(&buf[..resp_len as usize])?;
     let elap = then.elapsed().as_micros().try_into()?;
     let srv_dur = response.duration_us;
     Ok((elap, srv_dur))

@@ -1,6 +1,7 @@
 use futures_util::stream::StreamExt;
 use rpcbench::{SPingParams, SPong};
 use slog::{info, warn};
+use std::convert::TryInto;
 use structopt::StructOpt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -29,11 +30,20 @@ async fn serve(
     l.for_each_concurrent(None, |st| async {
         let mut buf = [0u8; 12000];
         let mut st = st.expect("accept failed");
+        tracing::trace!("New connection");
         loop {
-            let len = st.read(&mut buf).await.unwrap();
-            let p: SPingParams = bincode::deserialize(&buf[..len]).unwrap();
+            if let Err(_) = st.read_exact(&mut buf[0..4]).await {
+                tracing::trace!("connection done");
+                return;
+            }
+
+            let resp_len = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+            st.read_exact(&mut buf[0..resp_len as usize]).await.unwrap();
+            let p: SPingParams = bincode::deserialize(&buf[..resp_len as usize]).unwrap();
             let ans: SPong = srv.do_ping(p.into()).await.unwrap().into();
             let resp = bincode::serialize(&ans).unwrap();
+            let resp_len = resp.len() as u32;
+            st.write(&resp_len.to_be_bytes()).await.unwrap();
             st.write(&resp).await.unwrap();
         }
     })

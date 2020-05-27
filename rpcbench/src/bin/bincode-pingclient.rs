@@ -78,10 +78,11 @@ async fn main() -> Result<(), failure::Error> {
         };
         debug!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
         rpcbench::bincode_client_ping(addr, fncl, pp.into(), opt.iters, opt.reqs_per_iter).await?
-    } else if opt.addr.starts_with("http") {
+    } else if opt.addr.starts_with("http://") {
+        let addr = &opt.addr[7..];
         // raw tcp mode
-        info!(&log, "TCP mode"; "addr" => ?&opt.addr);
-        let addr: std::net::SocketAddr = opt.addr.parse()?;
+        info!(&log, "TCP mode"; "addr" => ?&addr);
+        let addr: std::net::SocketAddr = addr.parse()?;
         let http = |addr| async move { tokio::net::TcpStream::connect(addr).await };
         rpcbench::bincode_client_ping(addr, http, pp.into(), opt.iters, opt.reqs_per_iter).await?
     } else {
