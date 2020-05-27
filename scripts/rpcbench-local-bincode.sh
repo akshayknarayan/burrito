@@ -131,7 +131,8 @@ echo "==> container unix (burrito)"
 echo " -> stop all containers"
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 echo "--> start redis"
-sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sudo docker run --name rpcbench-redis -d -p 127.0.0.1:6379:6379 redis:5
+sleep 2
 echo "--> stop docker-proxy"
 sudo kill -INT $burritoctl # kill dump-docker
 sudo pkill -INT dump-docker
@@ -190,7 +191,7 @@ sudo kill -INT $burritoctl
 echo "==> Burrito"
 echo "--> start redis"
 sudo docker rm -f rpcbench-redis || true
-sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sudo docker run --name rpcbench-redis -d -p 127.0.0.1:6379:6379 redis:5
 sleep 2
 sudo pkill -9 dump-docker 2> /dev/null || true
 sudo pkill -9 burrito || true
@@ -347,7 +348,8 @@ echo "==> container unix (burrito)"
 echo " -> stop all containers"
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 echo "--> start redis"
-sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sudo docker run --name rpcbench-redis -d -p 127.0.0.1:6379:6379 redis:5
+sleep 2
 echo "--> stop docker-proxy"
 sudo kill -INT $burritoctl # kill dump-docker
 sudo pkill -INT dump-docker
@@ -360,7 +362,7 @@ sleep 2
 echo "==> Baremetal Burrito"
 echo "--> start redis"
 sudo docker rm -f rpcbench-redis || true
-sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sudo docker run --name rpcbench-redis -d -p 127.0.0.1:6379:6379 redis:5
 sleep 2
 sudo pkill -9 dump-docker 2> /dev/null || true
 sudo pkill -9 burrito || true
@@ -405,7 +407,7 @@ sudo kill -INT $burritoctl
 echo "==> Container Burrito"
 echo "--> start redis"
 sudo docker rm -f rpcbench-redis || true
-sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sudo docker run --name rpcbench-redis -d -p 127.0.0.1:6379:6379 redis:5
 sleep 2
 sudo pkill -9 dump-docker 2> /dev/null || true
 sudo pkill -9 burrito || true
@@ -561,7 +563,8 @@ echo "==> container unix (burrito)"
 echo " -> stop all containers"
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f
 echo "--> start redis"
-sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sudo docker run --name rpcbench-redis -d -p 127.0.0.1:6379:6379 redis:5
+sleep 2
 echo "--> stop docker-proxy"
 sudo kill -INT $burritoctl # kill dump-docker
 sudo pkill -INT dump-docker
@@ -574,7 +577,7 @@ sleep 2
 echo "==> Baremetal Burrito"
 echo "--> start redis"
 sudo docker rm -f rpcbench-redis || true
-sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sudo docker run --name rpcbench-redis -d -p 127.0.0.1:6379:6379 redis:5
 sleep 2
 sudo pkill -9 dump-docker 2> /dev/null || true
 sudo pkill -9 burrito || true
@@ -620,7 +623,7 @@ sudo kill -INT $burritoctl
 echo "==> Burrito"
 echo "--> start redis"
 sudo docker rm -f rpcbench-redis || true
-sudo docker run --name rpcbench-redis -d -p 6379:6379 redis:5
+sudo docker run --name rpcbench-redis -d -p 127.0.0.1:6379:6379 redis:5
 sleep 2
 sudo pkill -9 dump-docker 2> /dev/null || true
 sudo pkill -9 burrito || true
