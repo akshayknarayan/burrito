@@ -117,10 +117,10 @@ sudo docker rm -f rpcclient3 || true
 ssh $1 sudo docker rm -f rpcbench-server || true
 sudo docker rm -f rpcbench-server || true
 echo "--> start rpcbench-server"
-ssh $1 "sudo docker run --name rpcbench-server -e RUST_LOG=debug -p 4242:4242 -d $image_name ./pingserver --burrito-addr=\"pingserver\" --burrito-root=\"/burrito\" --port=\"4242\""
+ssh $1 "sudo docker run --name rpcbench-server -e RUST_LOG=debug -p 4242:4242 -d $image_name ./bincode-pingserver --burrito-addr=\"pingserver\" --burrito-root=\"/burrito\" --port=\"4242\""
 sleep 2
 echo "--> start pingclient"
-sudo docker run --name rpcclient3 -t -e RUST_LOG=debug -d $image_name ./pingclient \
+sudo docker run --name rpcclient3 -t -e RUST_LOG=debug -d $image_name ./bincode-pingclient \
     --addr "pingserver" \
     --burrito-root="/burrito" \
     --amount 1000 \
@@ -128,13 +128,13 @@ sudo docker run --name rpcclient3 -t -e RUST_LOG=debug -d $image_name ./pingclie
     -o ./res.data
 
 # start a local version of the server after some delay
-sleep 10
+sleep 3
 echo "--> start local server"
 sudo docker run --name rpcbench-server -t \
     -e RUST_LOG=info,rpcbench=debug,burrito_addr=debug \
     -p 4242:4242 \
     -d $image_name \
-    ./pingserver \
+    ./bincode-pingserver \
     --burrito-addr="pingserver" \
     --burrito-root="/burrito" \
     --port="4242"

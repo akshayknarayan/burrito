@@ -9,7 +9,7 @@ fi
 
 out="local-$1"
 mkdir -p ./$out
-cd burrito-discovery-ctl && cargo build --release --features "ctl" && cd ..
+cd burrito-discovery-ctl && cargo build --release --features "bin" && cd ..
 cd burrito-localname-ctl && cargo build --release --features "ctl,docker" && cd ..
 cd rpcbench && cargo build --release && cd ..
 
