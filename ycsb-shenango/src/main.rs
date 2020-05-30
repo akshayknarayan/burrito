@@ -535,11 +535,15 @@ fn do_requests(
                         let mut retxs = 0;
                         let mut waste = 0;
                         let mut timeout_time: Option<Instant> = None;
+                        let read_to = std::cmp::max(
+                            std::time::Duration::from_millis(100),
+                            std::time::Duration::from_micros(2 * interarrival_micros as u64),
+                        );
 
                         let mut buf = [0u8; 1024];
                         loop {
                             if let Ok((len, _)) = cl
-                                .read_from_timeout(std::time::Duration::from_millis(100), &mut buf)
+                                .read_from_timeout(read_to, &mut buf)
                                 .context("read timed out")
                             {
                                 let now = std::time::Instant::now();
