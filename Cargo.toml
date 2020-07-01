@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
+    "bertha",
     "burrito-addr",
     "burrito-discovery-ctl",
     "burrito-localname-ctl",
