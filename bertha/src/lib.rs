@@ -2,21 +2,27 @@ use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
 
-mod tcp;
+pub mod reliable;
 
 /// An implementation of some Chunnel type's functionality.
 pub trait Chunnel {
-    type Addr;
-    type Connection;
+    type Data;
 
-    fn with_context<C: Chunnel>(&mut self, cx: C) -> &mut Self;
+    fn send(&self, data: Self::Data) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>>>>;
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>>>>;
 
-    fn init(&mut self);
-    fn teardown(&mut self);
+    fn init(&mut self) {}
+    fn teardown(&mut self) {}
+
     fn scope(&self) -> Scope;
     fn endedness(&self) -> Endedness;
     fn implementation_priority(&self) -> usize;
     // fn resource_requirements(&self) -> ?;
+}
+
+pub trait Connector {
+    type Addr;
+    type Connection;
 
     fn listen(
         &mut self,
@@ -45,9 +51,9 @@ pub enum Endedness {
     Either,
 }
 
-pub fn register_chunnel<A, C>(name: &str, factory: impl Fn(A) -> C, endpt: Endedness, sc: Scope)
-where
-    C: Chunnel,
-{
-    unimplemented!();
-}
+//pub fn register_chunnel<A, C>(name: &str, factory: impl Fn(A) -> C, endpt: Endedness, sc: Scope)
+//where
+//    C: Chunnel,
+//{
+//    unimplemented!();
+//}
