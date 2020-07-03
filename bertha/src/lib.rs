@@ -2,14 +2,22 @@ use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
 
+pub mod chan_transport;
 pub mod reliable;
 
 /// An implementation of some Chunnel type's functionality.
 pub trait Chunnel {
     type Data;
 
-    fn send(&self, data: Self::Data) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>>>>;
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>>>>;
+    /// Send a message
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>>;
+
+    /// Retrieve next incoming message.
+    fn recv(&self)
+        -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>>;
 
     fn init(&mut self) {}
     fn teardown(&mut self) {}
@@ -27,7 +35,7 @@ pub trait Connector {
     fn listen(
         &mut self,
         a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Box<dyn Stream<Item = Self::Connection>>>>>;
+    ) -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Self::Connection>>>>>>;
     fn connect(&mut self, a: Self::Addr) -> Pin<Box<dyn Future<Output = Self::Connection>>>;
 }
 
