@@ -1,12 +1,14 @@
 //! Chunnel implementing reliability.
 
 use crate::{Chunnel, Endedness, Scope};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tracing::{debug, trace};
@@ -15,6 +17,7 @@ use tracing_futures::Instrument;
 #[derive(Default)]
 struct ReliabilityState {
     inflight: HashMap<u32, (Vec<u8>, Option<oneshot::Sender<Result<(), eyre::Report>>>)>, // list of inflight seqs
+    retx_tracker: BTreeMap<Instant, u32>,
     pending_payload: VecDeque<(u32, Vec<u8>)>, // payloads we have received that are waiting for a recv() call
 }
 
@@ -56,11 +59,13 @@ where
             return Box::pin(async move { Ok(()) });
         }
 
+        let seq = data.0;
+
         // TODO check/arm timer
         // TODO retx on timer expiry
 
         let mut state = self.state.clone();
-        let inner = self.inner.clone();
+        let mut inner = self.inner.clone();
         Box::pin(
             async move {
                 let (s, r) = oneshot::channel();
@@ -70,7 +75,8 @@ where
                     let mut buf = seq.to_be_bytes().to_vec();
                     buf.extend(&data);
                     state.inflight.insert(seq, (data, Some(s)));
-                    trace!(inflight = state.inflight.len(), "sent");
+                    state.retx_tracker.insert(Instant::now(), seq);
+                    trace!(inflight = state.inflight.len(), seq = ?seq, "sent");
                     buf
                 };
 
@@ -82,19 +88,20 @@ where
                     }),
                     Box::pin(
                         async move {
-                            let r = do_recv(inner, &mut state).await?;
-                            let mut st = state.write().await;
-                            st.pending_payload.push_back(r);
-                            Ok::<_, eyre::Report>(())
+                            loop {
+                                let r = do_recv(&mut inner, &mut state).await?;
+                                let mut st = state.write().await;
+                                st.pending_payload.push_back(r);
+                            }
                         }
-                        .instrument(tracing::debug_span!("send_select_recv", seq=?seq)),
+                        .instrument(tracing::debug_span!("send_select_recv")),
                     ),
                 )
                 .await
                 .factor_first()
                 .0
             }
-            .instrument(tracing::debug_span!("send")),
+            .instrument(tracing::debug_span!("send", seq = ?seq)),
         )
     }
 
@@ -102,7 +109,7 @@ where
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
         let mut state = self.state.clone();
-        let inner = self.inner.clone();
+        let mut inner = self.inner.clone();
 
         Box::pin(
             async move {
@@ -115,7 +122,7 @@ where
                     }
                 }
 
-                do_recv(inner, &mut state).await
+                do_recv(&mut inner, &mut state).await
             }
             .instrument(tracing::debug_span!("recv")),
         )
@@ -135,7 +142,7 @@ where
 }
 
 async fn do_recv<C>(
-    inner: Arc<C>,
+    inner: &mut Arc<C>,
     state: &mut Arc<RwLock<ReliabilityState>>,
 ) -> Result<(u32, Vec<u8>), eyre::Report>
 where
