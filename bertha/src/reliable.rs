@@ -46,7 +46,7 @@ impl<Cx> Reliability<Cx> {
         Reliability {
             timeout: self.timeout,
             inner: Arc::new(cx),
-            state: Default::default(),
+            state: self.state,
         }
     }
 
@@ -82,8 +82,8 @@ where
 
         let seq = data.0;
 
-        let mut state = self.state.clone();
-        let mut inner = self.inner.clone();
+        let mut state = Arc::clone(&self.state);
+        let mut inner = Arc::clone(&self.inner);
         let timeout = self.timeout;
         Box::pin(
             async move {
@@ -131,21 +131,31 @@ where
 
                                         if need_retx {
                                             debug!("checking retransmissions");
-                                            let mut st = state.write().await;
-
-                                            let cutoff = Instant::now() - timeout;
-                                            let mut unexpired = st.retx_tracker.split_off(&cutoff);
-                                            std::mem::swap(&mut unexpired, &mut st.retx_tracker);
-                                            let expired = unexpired;
+                                            let expired = {
+                                                let mut st = state.write().await;
+                                                let cutoff = Instant::now() - timeout;
+                                                let mut unexpired = st.retx_tracker.split_off(&cutoff);
+                                                std::mem::swap(&mut unexpired, &mut st.retx_tracker);
+                                                unexpired
+                                            };
 
                                             for (_, seq) in expired {
-                                                if let Some((d, _)) = st.inflight.get(&seq) {
+                                                let st = state.read().await;
+                                                let d = if let Some((d, _)) = st.inflight.get(&seq) {
                                                     debug!(seq = ?seq, "retransmitting");
+                                                    Some(d.clone())
+                                                } else { None };
+                                                // avoid holding lock across the await
+                                                std::mem::drop(st); 
+
+                                                if let Some(d) = d {
                                                     inner.send(d.clone()).await?;
+                                                    let mut st = state.write().await;
                                                     st.retx_tracker.insert(Instant::now(), seq);
                                                 }
                                             }
 
+                                            let mut st = state.write().await;
                                             st.last_timeout = Some(Instant::now());
                                         }
                                     }
@@ -176,8 +186,8 @@ where
     fn recv(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
-        let mut state = self.state.clone();
-        let mut inner = self.inner.clone();
+        let mut state = Arc::clone(&self.state);
+        let mut inner = Arc::clone(&self.inner);
 
         Box::pin(
             async move {
@@ -328,9 +338,9 @@ mod test {
             async move {
                 let mut t = Chan::default();
                 let ctr: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
-                t.lossy(move || {
+                t.link_conditions(move |x| {
                     let c = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    c == 2
+                    if c != 2 { x } else {None}
                 });
                 let mut rcv = t.listen(()).await;
                 let rcv_cn = rcv.next().await.unwrap();

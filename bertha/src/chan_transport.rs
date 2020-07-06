@@ -13,7 +13,7 @@ pub struct Chan<Data> {
     rcv1: Option<mpsc::Receiver<Data>>,
     snd2: Option<mpsc::Sender<Data>>,
     rcv2: Option<mpsc::Receiver<Data>>,
-    loss: Arc<dyn Fn() -> bool + Send + Sync + 'static>,
+    link: Arc<dyn Fn(Option<Data>) -> Option<Data> + Send + Sync + 'static>,
 }
 
 impl Default for Chan<Vec<u8>> {
@@ -25,14 +25,22 @@ impl Default for Chan<Vec<u8>> {
             rcv1: Some(r1),
             snd2: Some(s2),
             rcv2: Some(r2),
-            loss: Arc::new(|| false),
+            link: Arc::new(|x| x),
         }
     }
 }
 
 impl<T> Chan<T> {
-    pub fn lossy(&mut self, loss: impl Fn() -> bool + Send + Sync + 'static) -> &mut Self {
-        self.loss = Arc::new(loss);
+    /// For testing, provide a function that `Chan` will use to drop or reorder packets.
+    ///
+    /// For each segment `d` the `ChanChunnel` gets, it will call `link` with `Some(d)`. Then, it
+    /// will repeatedly call `link` with `None`, transmitting all returned segments until `link`
+    /// returns `None`.
+    pub fn link_conditions(
+        &mut self,
+        link: impl Fn(Option<T>) -> Option<T> + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.link = Arc::new(link);
         self
     }
 }
@@ -51,7 +59,7 @@ where
         let r = ChanChunnel::new(
             self.snd1.take().unwrap(),
             self.rcv2.take().unwrap(),
-            Arc::clone(&self.loss),
+            Arc::clone(&self.link),
         );
         Box::pin(async move { Box::pin(futures_util::stream::once(async { r })) as _ })
     }
@@ -60,7 +68,7 @@ where
         let r = ChanChunnel::new(
             self.snd2.take().unwrap(),
             self.rcv1.take().unwrap(),
-            Arc::clone(&self.loss),
+            Arc::clone(&self.link),
         );
         Box::pin(async { r })
     }
@@ -69,19 +77,19 @@ where
 pub struct ChanChunnel<Data> {
     snd: Arc<Mutex<mpsc::Sender<Data>>>,
     rcv: Arc<Mutex<mpsc::Receiver<Data>>>,
-    loss: Arc<dyn Fn() -> bool + Send + Sync + 'static>,
+    link: Arc<dyn Fn(Option<Data>) -> Option<Data> + Send + Sync + 'static>,
 }
 
 impl<D> ChanChunnel<D> {
     fn new(
         s: mpsc::Sender<D>,
         r: mpsc::Receiver<D>,
-        loss: Arc<dyn Fn() -> bool + Send + Sync + 'static>,
+        link: Arc<dyn Fn(Option<D>) -> Option<D> + Send + Sync + 'static>,
     ) -> Self {
         Self {
             snd: Arc::new(Mutex::new(s)),
             rcv: Arc::new(Mutex::new(r)),
-            loss,
+            link,
         }
     }
 }
@@ -96,15 +104,21 @@ where
         &self,
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
-        let s = self.snd.clone();
-        let drop = (self.loss)();
+        let s = Arc::clone(&self.snd);
+        let link = Arc::clone(&self.link);
 
         Box::pin(async move {
-            if !drop {
+            if let Some(data) = link(Some(data)) {
                 s.lock().await.send(data).await.map_err(|_| ()).unwrap();
             } else {
-                debug!("dropping message");
+                debug!("dropping send");
             }
+
+            while let Some(d) = link(None) {
+                debug!("sending deferred segment");
+                s.lock().await.send(d).await.map_err(|_| ()).unwrap();
+            }
+
             Ok(())
         })
     }

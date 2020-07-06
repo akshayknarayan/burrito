@@ -4,6 +4,7 @@ use std::pin::Pin;
 
 pub mod chan_transport;
 pub mod reliable;
+pub mod tagger;
 
 /// An implementation of some Chunnel type's functionality.
 pub trait Chunnel {
