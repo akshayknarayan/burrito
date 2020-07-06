@@ -1,4 +1,7 @@
 //! Chunnel implementing reliability.
+//!
+//! Takes as Data a `(u32, Vec<u8>)`, where the `u32` is a unique tag corresponding to a data
+//! segment, the `Vec<u8>`.
 
 use crate::{Chunnel, Endedness, Scope};
 use std::collections::BTreeMap;
