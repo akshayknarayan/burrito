@@ -5,30 +5,96 @@ use std::collections::BinaryHeap;
 use std::convert::TryInto;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicUsize, Arc};
 use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
-#[derive(Default)]
-struct TaggerState {
-    snd_nxt: u32,
-    expected_recv: u32,
-    recvd: BinaryHeap<(u32, Vec<u8>)>, // list of out-of-order received seqs
+/// Assigns an sequential tag to data segments and ignores the tag otherwise.
+pub struct Tagger<C> {
+    snd_nxt: Arc<AtomicUsize>,
+    inner: Arc<C>,
 }
 
-/// `Tagger` takes in `Vec<u8>` Data segments and tags them for use with `(u32, Vec<u8>)` Chunnels.
-///
-/// It returns data segments in the order they were sent.
-pub struct Tagger<C> {
-    hole_thresh: usize,
-    inner: Arc<C>,
-    state: Arc<RwLock<TaggerState>>,
+impl<C> Chunnel for Tagger<C>
+where
+    C: Chunnel<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
+{
+    type Data = Vec<u8>;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+        let inner = Arc::clone(&self.inner);
+        let snd_nxt = Arc::clone(&self.snd_nxt);
+        Box::pin(
+            async move {
+                let seq = snd_nxt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u32;
+                trace!(seq = ?seq, "sending");
+                inner.send((seq, data)).await?;
+                trace!(seq = ?seq, "sent");
+                Ok(())
+            }
+            .instrument(tracing::trace_span!("tagger_send")),
+        )
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(
+            async move {
+                let (seq, d) = inner.recv().await?;
+                trace!(seq = ?seq, "received");
+                return Ok(d);
+            }
+            .instrument(tracing::trace_span!("tagger_recv")),
+        )
+    }
+
+    fn scope(&self) -> Scope {
+        Scope::Application
+    }
+
+    fn endedness(&self) -> Endedness {
+        Endedness::Either
+    }
+
+    fn implementation_priority(&self) -> usize {
+        1
+    }
 }
 
 impl<Cx> Tagger<Cx> {
     pub fn with_context<C>(self, cx: C) -> Tagger<C> {
         Tagger {
+            snd_nxt: Default::default(),
+            inner: Arc::new(cx),
+        }
+    }
+}
+
+#[derive(Default)]
+struct OrderedState {
+    snd_nxt: u32,
+    expected_recv: u32,
+    recvd: BinaryHeap<(u32, Vec<u8>)>, // list of out-of-order received seqs
+}
+
+/// `Ordered` takes in `Vec<u8>` Data segments and tags them for use with `(u32, Vec<u8>)` Chunnels.
+///
+/// It returns data segments in the order they were sent.
+pub struct Ordered<C> {
+    hole_thresh: usize,
+    inner: Arc<C>,
+    state: Arc<RwLock<OrderedState>>,
+}
+
+impl<Cx> Ordered<Cx> {
+    pub fn with_context<C>(self, cx: C) -> Ordered<C> {
+        Ordered {
             hole_thresh: self.hole_thresh,
             inner: Arc::new(cx),
             state: self.state,
@@ -41,7 +107,7 @@ impl<Cx> Tagger<Cx> {
     }
 }
 
-impl<C: Default> Default for Tagger<C> {
+impl<C: Default> Default for Ordered<C> {
     fn default() -> Self {
         Self {
             hole_thresh: 5,
@@ -51,7 +117,7 @@ impl<C: Default> Default for Tagger<C> {
     }
 }
 
-impl<C> Chunnel for Tagger<C>
+impl<C> Chunnel for Ordered<C>
 where
     C: Chunnel<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
 {
@@ -205,14 +271,14 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::{SeqUnreliable, Tagger};
+    use super::{Ordered, SeqUnreliable};
     use crate::chan_transport::Chan;
     use crate::{Chunnel, Connector};
     use futures_util::StreamExt;
     use tracing::{debug, info, trace};
     use tracing_futures::Instrument;
 
-    async fn do_transmit<C>(snd_ch: Tagger<C>, rcv_ch: Tagger<C>)
+    async fn do_transmit<C>(snd_ch: Ordered<C>, rcv_ch: Ordered<C>)
     where
         C: Chunnel<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
     {
@@ -271,11 +337,11 @@ mod test {
                 let mut t = Chan::default();
                 let mut rcv = t.listen(()).await;
                 let rcv_cn = rcv.next().await.unwrap();
-                let rcv_ch = Tagger::<()>::default()
+                let rcv_ch = Ordered::<()>::default()
                     .with_context(SeqUnreliable::<()>::default().with_context(rcv_cn));
 
                 let snd = t.connect(()).await;
-                let snd_ch = Tagger::<()>::default()
+                let snd_ch = Ordered::<()>::default()
                     .with_context(SeqUnreliable::<()>::default().with_context(snd));
 
                 do_transmit(snd_ch, rcv_ch).await;
@@ -322,11 +388,11 @@ mod test {
                 });
                 let mut rcv = t.listen(()).await;
                 let rcv_cn = rcv.next().await.unwrap();
-                let rcv_ch = Tagger::<()>::default()
+                let rcv_ch = Ordered::<()>::default()
                     .with_context(SeqUnreliable::<()>::default().with_context(rcv_cn));
 
                 let snd = t.connect(()).await;
-                let snd_ch = Tagger::<()>::default()
+                let snd_ch = Ordered::<()>::default()
                     .with_context(SeqUnreliable::<()>::default().with_context(snd));
 
                 do_transmit(snd_ch, rcv_ch).await;
