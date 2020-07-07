@@ -2,6 +2,7 @@ use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
 
+pub mod bincode;
 pub mod chan_transport;
 pub mod reliable;
 pub mod tagger;
