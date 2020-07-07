@@ -11,6 +11,7 @@ use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
 /// Assigns an sequential tag to data segments and ignores the tag otherwise.
+#[derive(Default)]
 pub struct Tagger<C> {
     snd_nxt: Arc<AtomicUsize>,
     inner: Arc<C>,
@@ -271,16 +272,44 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::{Ordered, SeqUnreliable};
+    use super::{Ordered, SeqUnreliable, Tagger};
     use crate::chan_transport::Chan;
     use crate::{Chunnel, Connector};
     use futures_util::StreamExt;
     use tracing::{debug, info, trace};
     use tracing_futures::Instrument;
 
-    async fn do_transmit<C>(snd_ch: Ordered<C>, rcv_ch: Ordered<C>)
+    #[test]
+    fn tag_only() {
+        let _guard = tracing_subscriber::fmt::try_init();
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let mut t = Chan::default();
+                let mut rcv = t.listen(()).await;
+                let rcv_cn = rcv.next().await.unwrap();
+                let rcv_ch = Tagger::<()>::default()
+                    .with_context(SeqUnreliable::<()>::default().with_context(rcv_cn));
+
+                let snd = t.connect(()).await;
+                let snd_ch = Tagger::<()>::default()
+                    .with_context(SeqUnreliable::<()>::default().with_context(snd));
+
+                do_transmit(snd_ch, rcv_ch).await;
+            }
+            .instrument(tracing::info_span!("no_drops")),
+        );
+    }
+
+    async fn do_transmit<C>(snd_ch: C, rcv_ch: C)
     where
-        C: Chunnel<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
+        C: Chunnel<Data = Vec<u8>> + Send + Sync + 'static,
     {
         let msgs = vec![vec![0u8; 10], vec![1u8; 10], vec![2u8; 10], vec![3u8; 10]];
         let (s, r) = tokio::sync::oneshot::channel::<()>();

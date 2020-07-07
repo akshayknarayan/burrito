@@ -7,7 +7,7 @@ pub mod chan_transport;
 pub mod reliable;
 pub mod tagger;
 
-/// An implementation of some Chunnel type's functionality.
+/// A connection with the semantics of the Chunnel type's functionality.
 pub trait Chunnel {
     type Data;
 
@@ -30,6 +30,7 @@ pub trait Chunnel {
     // fn resource_requirements(&self) -> ?;
 }
 
+/// A way to produce `Chunnel` connections.
 pub trait Connector {
     type Addr;
     type Connection;
