@@ -1,6 +1,6 @@
 //! Channel-based Chunnel which acts as a transport.
 
-use crate::{Chunnel, Connector, Endedness, Scope};
+use crate::{Chunnel, ChunnelConnection, Endedness, Scope};
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
@@ -8,15 +8,19 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
 
-pub struct Chan<Data> {
+pub struct Srv;
+pub struct Cln;
+
+pub struct Chan<Data, Side> {
     snd1: Option<mpsc::Sender<Data>>,
     rcv1: Option<mpsc::Receiver<Data>>,
     snd2: Option<mpsc::Sender<Data>>,
     rcv2: Option<mpsc::Receiver<Data>>,
     link: Arc<dyn Fn(Option<Data>) -> Option<Data> + Send + Sync + 'static>,
+    _side: std::marker::PhantomData<Side>,
 }
 
-impl Default for Chan<Vec<u8>> {
+impl Default for Chan<Vec<u8>, ()> {
     fn default() -> Self {
         let (s1, r1) = mpsc::channel(100);
         let (s2, r2) = mpsc::channel(100);
@@ -26,11 +30,12 @@ impl Default for Chan<Vec<u8>> {
             snd2: Some(s2),
             rcv2: Some(r2),
             link: Arc::new(|x| x),
+            _side: Default::default(),
         }
     }
 }
 
-impl<T> Chan<T> {
+impl<T, U> Chan<T, U> {
     /// For testing, provide a function that `Chan` will use to drop or reorder packets.
     ///
     /// For each segment `d` the `ChanChunnel` gets, it will call `link` with `Some(d)`. Then, it
@@ -43,9 +48,31 @@ impl<T> Chan<T> {
         self.link = Arc::new(link);
         self
     }
+
+    /// Split into a (server, client) pair.
+    pub fn split(self) -> (Chan<T, Srv>, Chan<T, Cln>) {
+        (
+            Chan {
+                snd1: self.snd1,
+                rcv2: self.rcv2,
+                rcv1: None,
+                snd2: None,
+                link: self.link.clone(),
+                _side: Default::default(),
+            },
+            Chan {
+                snd2: self.snd2,
+                rcv1: self.rcv1,
+                rcv2: None,
+                snd1: None,
+                link: self.link.clone(),
+                _side: Default::default(),
+            },
+        )
+    }
 }
 
-impl<D> Connector for Chan<D>
+impl<D> Chunnel for Chan<D, Srv>
 where
     D: Send + Sync + 'static,
 {
@@ -65,12 +92,55 @@ where
     }
 
     fn connect(&mut self, _: Self::Addr) -> Pin<Box<dyn Future<Output = Self::Connection>>> {
+        unreachable!()
+    }
+
+    fn scope(&self) -> Scope {
+        Scope::Application
+    }
+
+    fn endedness(&self) -> Endedness {
+        Endedness::Both
+    }
+
+    fn implementation_priority(&self) -> usize {
+        1
+    }
+}
+
+impl<D> Chunnel for Chan<D, Cln>
+where
+    D: Send + Sync + 'static,
+{
+    type Addr = ();
+    type Connection = ChanChunnel<D>;
+
+    fn listen(
+        &mut self,
+        _: Self::Addr,
+    ) -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Self::Connection>>>>>> {
+        unreachable!()
+    }
+
+    fn connect(&mut self, _: Self::Addr) -> Pin<Box<dyn Future<Output = Self::Connection>>> {
         let r = ChanChunnel::new(
             self.snd2.take().unwrap(),
             self.rcv1.take().unwrap(),
             Arc::clone(&self.link),
         );
         Box::pin(async { r })
+    }
+
+    fn scope(&self) -> Scope {
+        Scope::Application
+    }
+
+    fn endedness(&self) -> Endedness {
+        Endedness::Both
+    }
+
+    fn implementation_priority(&self) -> usize {
+        1
     }
 }
 
@@ -94,7 +164,7 @@ impl<D> ChanChunnel<D> {
     }
 }
 
-impl<D> Chunnel for ChanChunnel<D>
+impl<D> ChunnelConnection for ChanChunnel<D>
 where
     D: Send + Sync + 'static,
 {
@@ -128,17 +198,5 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
         let r = Arc::clone(&self.rcv);
         Box::pin(async move { Ok(r.lock().await.recv().await.unwrap()) })
-    }
-
-    fn scope(&self) -> Scope {
-        Scope::Application
-    }
-
-    fn endedness(&self) -> Endedness {
-        Endedness::Both
-    }
-
-    fn implementation_priority(&self) -> usize {
-        1
     }
 }

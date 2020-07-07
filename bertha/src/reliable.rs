@@ -3,7 +3,7 @@
 //! Takes as Data a `(u32, Vec<u8>)`, where the `u32` is a unique tag corresponding to a data
 //! segment, the `Vec<u8>`.
 
-use crate::{Chunnel, Endedness, Scope};
+use crate::{Chunnel, ChunnelConnection, Context, InheritChunnel};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -16,6 +16,61 @@ use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
+
+pub struct ReliabilityChunnel<C> {
+    inner: Arc<C>,
+    timeout: Duration,
+}
+
+impl<Cx> From<Cx> for ReliabilityChunnel<Cx> {
+    fn from(cx: Cx) -> ReliabilityChunnel<Cx> {
+        ReliabilityChunnel {
+            inner: Arc::new(cx),
+            timeout: Duration::from_millis(100),
+        }
+    }
+}
+
+impl<Cx> ReliabilityChunnel<Cx> {
+    pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
+        self.timeout = to;
+        self
+    }
+}
+
+impl<C> Context for ReliabilityChunnel<C> {
+    type ChunnelType = C;
+
+    fn context(&self) -> &Self::ChunnelType {
+        &self.inner
+    }
+
+    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
+        Arc::get_mut(&mut self.inner)
+    }
+}
+
+impl<C> InheritChunnel for ReliabilityChunnel<C>
+where
+    C: Chunnel,
+    C::Connection: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+{
+    type Connection = Reliability<C::Connection>;
+    type Config = Duration;
+
+    fn get_config(&mut self) -> Self::Config {
+        self.timeout
+    }
+
+    fn make_connection(
+        cx: <<Self as Context>::ChunnelType as Chunnel>::Connection,
+        cfg: Self::Config,
+    ) -> Self::Connection {
+        let mut c = Reliability::from(cx);
+        c.set_timeout(cfg);
+        c
+    }
+}
 
 #[derive(Default)]
 struct ReliabilityState {
@@ -31,6 +86,13 @@ pub struct Reliability<C> {
     state: Arc<RwLock<ReliabilityState>>,
 }
 
+impl<C> Reliability<C> {
+    pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
+        self.timeout = to;
+        self
+    }
+}
+
 impl<C: Default> Default for Reliability<C> {
     fn default() -> Self {
         Self {
@@ -41,18 +103,13 @@ impl<C: Default> Default for Reliability<C> {
     }
 }
 
-impl<Cx> Reliability<Cx> {
-    pub fn with_context<C>(self, cx: C) -> Reliability<C> {
+impl<Cx> From<Cx> for Reliability<Cx> {
+    fn from(cx: Cx) -> Reliability<Cx> {
         Reliability {
-            timeout: self.timeout,
             inner: Arc::new(cx),
-            state: self.state,
+            timeout: Duration::from_millis(100),
+            state: Default::default(),
         }
-    }
-
-    pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
-        self.timeout = to;
-        self
     }
 }
 
@@ -66,9 +123,21 @@ impl<C> Clone for Reliability<C> {
     }
 }
 
-impl<C> Chunnel for Reliability<C>
+impl<C> Context for Reliability<C> {
+    type ChunnelType = C;
+
+    fn context(&self) -> &Self::ChunnelType {
+        &self.inner
+    }
+
+    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
+        Arc::get_mut(&mut self.inner)
+    }
+}
+
+impl<C> ChunnelConnection for Reliability<C>
 where
-    C: Chunnel<Data = Vec<u8>> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
 {
     type Data = (u32, Vec<u8>); // a tag and its data.
 
@@ -146,7 +215,7 @@ where
                                                     Some(d.clone())
                                                 } else { None };
                                                 // avoid holding lock across the await
-                                                std::mem::drop(st); 
+                                                std::mem::drop(st);
 
                                                 if let Some(d) = d {
                                                     inner.send(d.clone()).await?;
@@ -205,18 +274,6 @@ where
             .instrument(tracing::debug_span!("recv")),
         )
     }
-
-    fn scope(&self) -> Scope {
-        Scope::Application
-    }
-
-    fn endedness(&self) -> Endedness {
-        Endedness::Both // we add a header
-    }
-
-    fn implementation_priority(&self) -> usize {
-        1
-    }
 }
 
 async fn do_recv<C>(
@@ -224,7 +281,7 @@ async fn do_recv<C>(
     state: &mut Arc<RwLock<ReliabilityState>>,
 ) -> Result<(u32, Vec<u8>), eyre::Report>
 where
-    C: Chunnel<Data = Vec<u8>> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
 {
     loop {
         trace!("call inner recv");
@@ -256,9 +313,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::Reliability;
+    use super::{Reliability, ReliabilityChunnel};
     use crate::chan_transport::Chan;
-    use crate::{Chunnel, Connector};
+    use crate::{Chunnel, ChunnelConnection};
     use futures_util::StreamExt;
     use tracing::{debug, info};
     use tracing_futures::Instrument;
@@ -268,7 +325,7 @@ mod test {
         rcv_ch: Reliability<C>,
         msgs: Vec<(u32, Vec<u8>)>,
     ) where
-        C: Chunnel<Data = Vec<u8>> + Send + Sync + 'static,
+        C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
     {
         // recv side
         tokio::spawn(
@@ -307,15 +364,16 @@ mod test {
 
         rt.block_on(
             async move {
-                let mut t = Chan::default();
-                let mut rcv = t.listen(()).await;
-                let rcv_cn = rcv.next().await.unwrap();
-                let rcv_ch = Reliability::<()>::default().with_context(rcv_cn);
+                let (srv, cln) = Chan::default().split();
 
-                let snd = t.connect(()).await;
-                let snd_ch = Reliability::<()>::default().with_context(snd);
+                let mut rcv = ReliabilityChunnel::from(srv);
+                let mut rcv = rcv.listen(()).await;
+                let rcv = rcv.next().await.unwrap();
 
-                do_transmit(snd_ch, rcv_ch, msgs).await;
+                let mut snd = ReliabilityChunnel::from(cln);
+                let snd = snd.connect(()).await;
+
+                do_transmit(snd, rcv, msgs).await;
             }
             .instrument(tracing::info_span!("no_drops")),
         );
@@ -340,16 +398,22 @@ mod test {
                 let ctr: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
                 t.link_conditions(move |x| {
                     let c = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if c != 2 { x } else {None}
+                    if c != 2 {
+                        x
+                    } else {
+                        None
+                    }
                 });
-                let mut rcv = t.listen(()).await;
-                let rcv_cn = rcv.next().await.unwrap();
-                let rcv_ch = Reliability::<()>::default().with_context(rcv_cn);
+                let (srv, cln) = t.split();
 
-                let snd = t.connect(()).await;
-                let snd_ch = Reliability::<()>::default().with_context(snd);
+                let mut rcv = ReliabilityChunnel::from(srv);
+                let mut rcv = rcv.listen(()).await;
+                let rcv = rcv.next().await.unwrap();
 
-                do_transmit(snd_ch, rcv_ch, msgs).await;
+                let mut snd = ReliabilityChunnel::from(cln);
+                let snd = snd.connect(()).await;
+
+                do_transmit(snd, rcv, msgs).await;
             }
             .instrument(tracing::info_span!("drop_2")),
         );

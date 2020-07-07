@@ -1,9 +1,54 @@
 //! Serialization chunnel with bincode.
 
-use crate::{Chunnel, Endedness, Scope};
+use crate::{Chunnel, ChunnelConnection, Context, InheritChunnel};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+pub struct SerializeChunnel<C, D> {
+    inner: Arc<C>,
+    _data: std::marker::PhantomData<D>,
+}
+
+impl<Cx, D> From<Cx> for SerializeChunnel<Cx, D> {
+    fn from(cx: Cx) -> SerializeChunnel<Cx, D> {
+        SerializeChunnel {
+            inner: Arc::new(cx),
+            _data: Default::default(),
+        }
+    }
+}
+
+impl<C, D> Context for SerializeChunnel<C, D> {
+    type ChunnelType = C;
+
+    fn context(&self) -> &Self::ChunnelType {
+        &self.inner
+    }
+
+    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
+        Arc::get_mut(&mut self.inner)
+    }
+}
+
+impl<C, D> InheritChunnel for SerializeChunnel<C, D>
+where
+    C: Chunnel,
+    C::Connection: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Connection = Serialize<C::Connection, D>;
+    type Config = ();
+
+    fn get_config(&mut self) -> Self::Config {}
+
+    fn make_connection(
+        cx: <<Self as Context>::ChunnelType as Chunnel>::Connection,
+        _cfg: Self::Config,
+    ) -> Self::Connection {
+        Serialize::from(cx)
+    }
+}
 
 #[derive(Default)]
 pub struct Serialize<C, D> {
@@ -11,8 +56,20 @@ pub struct Serialize<C, D> {
     _data: std::marker::PhantomData<D>,
 }
 
-impl<Cx, D> Serialize<Cx, D> {
-    pub fn with_context<C>(self, cx: C) -> Serialize<C, D> {
+impl<C, D> Context for Serialize<C, D> {
+    type ChunnelType = C;
+
+    fn context(&self) -> &Self::ChunnelType {
+        &self.inner
+    }
+
+    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
+        Arc::get_mut(&mut self.inner)
+    }
+}
+
+impl<Cx, D> From<Cx> for Serialize<Cx, D> {
+    fn from(cx: Cx) -> Serialize<Cx, D> {
         Serialize {
             inner: Arc::new(cx),
             _data: Default::default(),
@@ -20,9 +77,9 @@ impl<Cx, D> Serialize<Cx, D> {
     }
 }
 
-impl<C, D> Chunnel for Serialize<C, D>
+impl<C, D> ChunnelConnection for Serialize<C, D>
 where
-    C: Chunnel<Data = Vec<u8>> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     type Data = D;
@@ -49,31 +106,19 @@ where
             Ok(data)
         })
     }
-
-    fn scope(&self) -> Scope {
-        Scope::Application
-    }
-
-    fn endedness(&self) -> Endedness {
-        Endedness::Both
-    }
-
-    fn implementation_priority(&self) -> usize {
-        1
-    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::Serialize;
+    use super::SerializeChunnel;
     use crate::chan_transport::Chan;
-    use crate::{Chunnel, Connector};
+    use crate::{Chunnel, ChunnelConnection};
     use futures_util::StreamExt;
     use tracing::trace;
     use tracing_futures::Instrument;
 
     async fn send_thingy<
-        C: Chunnel<Data = T>,
+        C: ChunnelConnection<Data = T>,
         T: serde::Serialize
             + serde::de::DeserializeOwned
             + std::fmt::Debug
@@ -104,15 +149,16 @@ mod test {
             .unwrap();
         rt.block_on(
             async move {
-                let mut t = Chan::default();
-                let mut rcv = t.listen(()).await;
-                let rcv_cn = rcv.next().await.unwrap();
-                let rcv_ch = Serialize::<(), _>::default().with_context(rcv_cn);
+                let (srv, cln) = Chan::default().split();
 
-                let snd = t.connect(()).await;
-                let snd_ch = Serialize::<(), _>::default().with_context(snd);
+                let mut rcv = SerializeChunnel::from(srv);
+                let mut rcv = rcv.listen(()).await;
+                let rcv = rcv.next().await.unwrap();
 
-                send_thingy(snd_ch, rcv_ch, 42u32).await;
+                let mut snd = SerializeChunnel::from(cln);
+                let snd = snd.connect(()).await;
+
+                send_thingy(snd, rcv, 42u32).await;
             }
             .instrument(tracing::info_span!("send_u32")),
         );
@@ -136,17 +182,18 @@ mod test {
 
         rt.block_on(
             async move {
-                let mut t = Chan::default();
-                let mut rcv = t.listen(()).await;
-                let rcv_cn = rcv.next().await.unwrap();
-                let rcv_ch = Serialize::<(), _>::default().with_context(rcv_cn);
+                let (srv, cln) = Chan::default().split();
 
-                let snd = t.connect(()).await;
-                let snd_ch = Serialize::<(), _>::default().with_context(snd);
+                let mut rcv = SerializeChunnel::from(srv);
+                let mut rcv = rcv.listen(()).await;
+                let rcv = rcv.next().await.unwrap();
+
+                let mut snd = SerializeChunnel::from(cln);
+                let snd = snd.connect(()).await;
 
                 send_thingy(
-                    snd_ch,
-                    rcv_ch,
+                    snd,
+                    rcv,
                     Foo {
                         a: 4,
                         b: 5,
