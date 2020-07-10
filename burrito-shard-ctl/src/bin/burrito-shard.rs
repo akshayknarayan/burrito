@@ -1,4 +1,4 @@
-use anyhow::Error;
+use eyre::Error;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]

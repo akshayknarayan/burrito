@@ -81,17 +81,26 @@ where
 
     fn listen(
         &mut self,
-        _: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Self::Connection>>>>>> {
+        _a: Self::Addr,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
+            >,
+        >,
+    > {
         let r = ChanChunnel::new(
             self.snd1.take().unwrap(),
             self.rcv2.take().unwrap(),
             Arc::clone(&self.link),
         );
-        Box::pin(async move { Box::pin(futures_util::stream::once(async { r })) as _ })
+        Box::pin(async move { Box::pin(futures_util::stream::once(async { Ok(r) })) as _ })
     }
 
-    fn connect(&mut self, _: Self::Addr) -> Pin<Box<dyn Future<Output = Self::Connection>>> {
+    fn connect(
+        &mut self,
+        _a: Self::Addr,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
         unreachable!()
     }
 
@@ -117,18 +126,27 @@ where
 
     fn listen(
         &mut self,
-        _: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Self::Connection>>>>>> {
+        _a: Self::Addr,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
+            >,
+        >,
+    > {
         unreachable!()
     }
 
-    fn connect(&mut self, _: Self::Addr) -> Pin<Box<dyn Future<Output = Self::Connection>>> {
+    fn connect(
+        &mut self,
+        _a: Self::Addr,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
         let r = ChanChunnel::new(
             self.snd2.take().unwrap(),
             self.rcv1.take().unwrap(),
             Arc::clone(&self.link),
         );
-        Box::pin(async { r })
+        Box::pin(async { Ok(r) })
     }
 
     fn scope(&self) -> Scope {

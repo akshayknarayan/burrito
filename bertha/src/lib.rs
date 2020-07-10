@@ -7,7 +7,7 @@ pub mod chan_transport;
 pub mod reliable;
 pub mod tagger;
 
-/// A specification of semantics.
+/// A specification of application network semantics.
 pub trait Chunnel {
     type Addr;
     type Connection: ChunnelConnection;
@@ -15,9 +15,18 @@ pub trait Chunnel {
     fn listen(
         &mut self,
         a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Self::Connection>>>>>>;
+    ) -> Pin<
+        Box<
+            dyn Future<
+                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
+            >,
+        >,
+    >;
 
-    fn connect(&mut self, a: Self::Addr) -> Pin<Box<dyn Future<Output = Self::Connection>>>;
+    fn connect(
+        &mut self,
+        a: Self::Addr,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>>;
 
     fn init(&mut self) {}
     fn teardown(&mut self) {}
@@ -43,6 +52,7 @@ pub trait ChunnelConnection {
         -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>>;
 }
 
+/// A standard way to access the downstream chunnel.
 pub trait Context {
     type ChunnelType;
     fn context(&self) -> &Self::ChunnelType;
@@ -77,7 +87,13 @@ where
     fn listen(
         &mut self,
         a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Self::Connection>>>>>> {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
+            >,
+        >,
+    > {
         use futures_util::StreamExt;
         let f = self
             .context_mut()
@@ -89,18 +105,21 @@ where
             let conn_stream = f.await;
             Box::pin(conn_stream.map(move |conn| {
                 let cfg = cfg.clone();
-                C::make_connection(conn, cfg)
+                Ok(C::make_connection(conn?, cfg))
             })) as _
         })
     }
 
-    fn connect(&mut self, a: Self::Addr) -> Pin<Box<dyn Future<Output = Self::Connection>>> {
+    fn connect(
+        &mut self,
+        a: Self::Addr,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
         let f = self
             .context_mut()
             .expect("There were multiple references to the Arc<Context>")
             .connect(a);
         let cfg = self.get_config();
-        Box::pin(async move { C::make_connection(f.await, cfg) })
+        Box::pin(async move { Ok(C::make_connection(f.await?, cfg)) })
     }
 
     fn init(&mut self) {

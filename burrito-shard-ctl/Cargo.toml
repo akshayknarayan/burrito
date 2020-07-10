@@ -8,13 +8,15 @@ edition = "2018"
 
 [features]
 default = []
+chunnels = ["bertha"]
 ebpf = ["xdp-shard/ebpf"]
 bin = ["structopt", "ctrlc", "redis", "tower-service", "tracing-subscriber", "tokio/rt-threaded", "tokio/macros", "tokio/time"]
 ebpf-bin = ["bin", "ebpf"]
 
 [dependencies]
-anyhow = "1"
 burrito-discovery-ctl = { path = "../burrito-discovery-ctl" }
+bertha = { path = "../bertha", optional = true }
+eyre = "0.6"
 async-bincode = "0.5"
 bincode = "1"
 futures-util = { version = "0.3", features = ["sink"] }

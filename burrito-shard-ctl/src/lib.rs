@@ -10,7 +10,7 @@ pub use srv::*;
 #[cfg(feature = "bin")]
 mod srv {
     use crate::proto;
-    use anyhow::Error;
+    use eyre::{eyre, Error};
     use std::collections::HashMap;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -168,10 +168,7 @@ mod srv {
                     match a {
                         proto::Addr::Udp(_) | proto::Addr::Burrito(_) => (),
                         a => {
-                            return Err(anyhow::anyhow!(
-                                "Must pass either name or Udp address: {}",
-                                a
-                            ));
+                            return Err(eyre!("Must pass either name or Udp address: {}", a));
                         }
                     }
                 }
@@ -179,10 +176,7 @@ mod srv {
                 match &si.canonical_addr {
                     proto::Addr::Udp(_) | proto::Addr::Burrito(_) => (),
                     a => {
-                        return Err(anyhow::anyhow!(
-                            "Must pass either name or Udp address: {}",
-                            a
-                        ));
+                        return Err(eyre!("Must pass either name or Udp address: {}", a));
                     }
                 };
 
@@ -344,7 +338,7 @@ mod srv {
         async fn shard_table_insert(&self, serv: proto::ShardInfo) -> Result<(), Error> {
             let sn = serv.canonical_addr.clone();
             if let Some(s) = self.shard_table.write().await.insert(sn.clone(), serv) {
-                Err(anyhow::anyhow!(
+                Err(eyre!(
                     "Shard service address {} already in use at: {}",
                     sn,
                     s.canonical_addr
@@ -491,7 +485,7 @@ mod srv {
     }
 }
 
-use anyhow::Error;
+use eyre::{eyre, Error};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -535,7 +529,7 @@ pub async fn resolve_shardinfo(
                                 }
                                 // other cases are not possible, so we error
                                 a => {
-                                    return Err(anyhow::anyhow!(
+                                    return Err(eyre!(
                                         "Must resolve to Udp address: {} -> {}",
                                         addr,
                                         a
@@ -616,7 +610,7 @@ pub async fn resolve_shardinfo(
 #[cfg(test)]
 mod tests {
     use crate::proto;
-    use anyhow::Error;
+    use eyre::Error;
     use slog::debug;
     use std::sync::Arc;
     use test_util::*;
