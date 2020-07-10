@@ -235,7 +235,7 @@ pub use chunnels::*;
 mod chunnels {
     use super::{Shard, ShardCtlClient};
     use crate::proto;
-    use bertha::{Chunnel, ChunnelConnection};
+    use bertha::{Chunnel, ChunnelConnection, Either};
     use burrito_discovery_ctl::client::DiscoveryClient;
     use eyre::WrapErr;
     use futures_util::stream::{Stream, StreamExt};
@@ -254,6 +254,76 @@ mod chunnels {
 
         type Val;
         fn val(&self) -> Self::Val;
+    }
+
+    pub struct ShardServer<C, S> {
+        external: Arc<Mutex<C>>,
+        internal: Arc<Mutex<S>>,
+    }
+
+    impl<C, S, D> Chunnel for ShardServer<C, S>
+    where
+        C: Chunnel<Addr = proto::Addr> + 'static,
+        C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
+        S: Chunnel<Addr = proto::Addr> + 'static,
+        S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
+        D: Kv + Send + Sync + 'static,
+        <D as Kv>::Key: AsRef<str>,
+    {
+        type Addr = proto::Addr;
+        type Connection = Either<C::Connection, S::Connection>;
+
+        fn listen(
+            &mut self,
+            a: Self::Addr,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                    Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
+                >,
+            >,
+        > {
+            let ext = Arc::clone(&self.external);
+            let int = Arc::clone(&self.internal);
+            Box::pin(async move {
+                let ext_str = ext
+                    .lock()
+                    .await
+                    .listen(a.clone())
+                    .await
+                    .map(|conn| Ok(Either::Left(conn?)));
+                let int_str = int
+                    .lock()
+                    .await
+                    .listen(a)
+                    .await
+                    .map(|conn| Ok(Either::Right(conn?)));
+
+                Box::pin(futures_util::stream::select(ext_str, int_str)) as _
+            })
+        }
+
+        fn connect(
+            &mut self,
+            _a: Self::Addr,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
+            unimplemented!()
+        }
+
+        fn init(&mut self) {}
+        fn teardown(&mut self) {}
+
+        fn scope(&self) -> bertha::Scope {
+            bertha::Scope::Local
+        }
+
+        fn endedness(&self) -> bertha::Endedness {
+            bertha::Endedness::Either
+        }
+
+        fn implementation_priority(&self) -> usize {
+            1
+        }
     }
 
     pub struct ShardCanonicalServer<C, S> {

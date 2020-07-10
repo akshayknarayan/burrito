@@ -52,6 +52,38 @@ pub trait ChunnelConnection {
         -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>>;
 }
 
+pub enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+impl<A, B, D> ChunnelConnection for Either<A, B>
+where
+    A: ChunnelConnection<Data = D>,
+    B: ChunnelConnection<Data = D>,
+{
+    type Data = D;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+        match self {
+            Either::Left(a) => a.send(data),
+            Either::Right(b) => b.send(data),
+        }
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+        match self {
+            Either::Left(a) => a.recv(),
+            Either::Right(b) => b.recv(),
+        }
+    }
+}
+
 /// A standard way to access the downstream chunnel.
 pub trait Context {
     type ChunnelType;
