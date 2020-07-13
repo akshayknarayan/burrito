@@ -368,10 +368,10 @@ mod test {
 
                 let mut rcv = ReliabilityChunnel::from(srv);
                 let mut rcv = rcv.listen(()).await;
-                let rcv = rcv.next().await.unwrap();
+                let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = ReliabilityChunnel::from(cln);
-                let snd = snd.connect(()).await;
+                let snd = snd.connect(()).await.unwrap();
 
                 do_transmit(snd, rcv, msgs).await;
             }
@@ -408,10 +408,10 @@ mod test {
 
                 let mut rcv = ReliabilityChunnel::from(srv);
                 let mut rcv = rcv.listen(()).await;
-                let rcv = rcv.next().await.unwrap();
+                let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = ReliabilityChunnel::from(cln);
-                let snd = snd.connect(()).await;
+                let snd = snd.connect(()).await.unwrap();
 
                 do_transmit(snd, rcv, msgs).await;
             }

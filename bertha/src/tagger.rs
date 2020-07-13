@@ -408,10 +408,10 @@ mod test {
 
                 let mut rcv = TaggerChunnel::from(SeqUnreliableChunnel::from(srv));
                 let mut rcv = rcv.listen(()).await;
-                let rcv = rcv.next().await.unwrap();
+                let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = TaggerChunnel::from(SeqUnreliableChunnel::from(cln));
-                let snd = snd.connect(()).await;
+                let snd = snd.connect(()).await.unwrap();
 
                 do_transmit(snd, rcv).await;
             }
@@ -479,10 +479,10 @@ mod test {
 
                 let mut rcv = OrderedChunnel::from(SeqUnreliableChunnel::from(srv));
                 let mut rcv = rcv.listen(()).await;
-                let rcv = rcv.next().await.unwrap();
+                let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = OrderedChunnel::from(SeqUnreliableChunnel::from(cln));
-                let snd = snd.connect(()).await;
+                let snd = snd.connect(()).await.unwrap();
 
                 do_transmit(snd, rcv).await;
             }
@@ -530,10 +530,10 @@ mod test {
                 let (srv, cln) = t.split();
                 let mut rcv = OrderedChunnel::from(SeqUnreliableChunnel::from(srv));
                 let mut rcv = rcv.listen(()).await;
-                let rcv = rcv.next().await.unwrap();
+                let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = OrderedChunnel::from(SeqUnreliableChunnel::from(cln));
-                let snd = snd.connect(()).await;
+                let snd = snd.connect(()).await.unwrap();
 
                 do_transmit(snd, rcv).await;
             }

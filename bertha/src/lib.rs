@@ -6,6 +6,7 @@ pub mod bincode;
 pub mod chan_transport;
 pub mod reliable;
 pub mod tagger;
+pub mod udp;
 
 /// A specification of application network semantics.
 pub trait Chunnel {

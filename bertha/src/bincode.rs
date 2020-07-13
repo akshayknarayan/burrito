@@ -153,10 +153,10 @@ mod test {
 
                 let mut rcv = SerializeChunnel::from(srv);
                 let mut rcv = rcv.listen(()).await;
-                let rcv = rcv.next().await.unwrap();
+                let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = SerializeChunnel::from(cln);
-                let snd = snd.connect(()).await;
+                let snd = snd.connect(()).await.unwrap();
 
                 send_thingy(snd, rcv, 42u32).await;
             }
@@ -186,10 +186,10 @@ mod test {
 
                 let mut rcv = SerializeChunnel::from(srv);
                 let mut rcv = rcv.listen(()).await;
-                let rcv = rcv.next().await.unwrap();
+                let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = SerializeChunnel::from(cln);
-                let snd = snd.connect(()).await;
+                let snd = snd.connect(()).await.unwrap();
 
                 send_thingy(
                     snd,
