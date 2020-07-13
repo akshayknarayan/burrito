@@ -256,6 +256,10 @@ mod chunnels {
         fn val(&self) -> Self::Val;
     }
 
+    /// A Chunnel for a single shard.
+    ///
+    /// Listens on an external chunnel, for direct connections from clients, as well as an internal
+    /// chunnel from the canonical_addr proxy.  Does not implement `connect()`.
     pub struct ShardServer<C, S> {
         external: Arc<Mutex<C>>,
         internal: Arc<Mutex<S>>,
@@ -326,6 +330,12 @@ mod chunnels {
         }
     }
 
+    /// A chunnel managing a sharded service.
+    ///
+    /// Listens on an external connection, then forwards messages to one of the internal
+    /// connections after evaluating the sharding function. Also registers with shard-ctl, which
+    /// will perform other setup (loading XDP program, answering client queries, etc).  Does not
+    /// implement `connect()`.
     pub struct ShardCanonicalServer<C, S> {
         inner: Arc<Mutex<C>>,
         shards_inner: Arc<Mutex<S>>,
@@ -464,6 +474,12 @@ mod chunnels {
         }
     }
 
+    /// Chunnel implementing the client side of a sharding service.
+    ///
+    /// Includes client-side evaluation of the sharding function. Does not implement `send()`,
+    /// since the server does not send messages unprompted.  Similarly, the Data type is `()`,
+    /// since any received message is forwarded to the appropriate shard. Expected usage is to call
+    /// `recv()` in a loop.
     pub struct ShardCanonicalServerConnection<C, S>
     where
         C: ChunnelConnection,
@@ -511,11 +527,14 @@ mod chunnels {
             &self,
             _data: Self::Data,
         ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
-            // the canonical address doesn't send things unprompted.
             unimplemented!()
         }
     }
 
+    /// Client-side sharding chunnel implementation.
+    ///
+    /// Contacts shard-ctl for sharding information, and does client-side sharding.
+    /// Does not implement `listen()`, since what would that do?
     pub struct ClientShardChunnelClient<C> {
         inner: Arc<Mutex<C>>,
         burrito_root: String,
@@ -639,6 +658,7 @@ mod chunnels {
         }
     }
 
+    /// `ChunnelConnection` type for ClientShardChunnelClient.
     pub struct ClientShardClientConnection<C>
     where
         C: ChunnelConnection,
