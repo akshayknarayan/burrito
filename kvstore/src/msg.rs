@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Which operation to perform
 // bincode represents this as a u32
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Op {
     Get, // = 0
     Put, // = 1
@@ -24,7 +24,7 @@ pub enum Op {
 // byte n: 1 = Some, 0 = None
 // bytes n-(n+8) (if Some): val length
 // bytes (n+8)-m: val
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize)]
 pub struct Msg {
     pub(crate) id: usize,
     pub(crate) op: Op,
@@ -76,6 +76,18 @@ impl Msg {
             val: val.into(),
             ..self
         }
+    }
+}
+
+impl burrito_shard_ctl::Kv for Msg {
+    type Key = String;
+    fn key(&self) -> Self::Key {
+        self.key().into()
+    }
+
+    type Val = Option<String>;
+    fn val(&self) -> Self::Val {
+        self.val()
     }
 }
 
