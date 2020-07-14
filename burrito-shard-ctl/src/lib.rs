@@ -4,6 +4,15 @@ pub mod proto;
 
 pub const CONTROLLER_ADDRESS: &str = "shard-ctl";
 
+/// Key-value getter.
+pub trait Kv {
+    type Key;
+    fn key(&self) -> Self::Key;
+
+    type Val;
+    fn val(&self) -> Self::Val;
+}
+
 #[cfg(feature = "bin")]
 pub use srv::*;
 

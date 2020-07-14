@@ -234,12 +234,13 @@ pub use chunnels::*;
 #[cfg(feature = "chunnels")]
 mod chunnels {
     use super::{Shard, ShardCtlClient};
-    use crate::proto;
-    use bertha::{Chunnel, ChunnelConnection, Either};
+    use crate::{proto, Kv};
+    use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener, Either};
     use burrito_discovery_ctl::client::DiscoveryClient;
     use eyre::WrapErr;
     use futures_util::stream::{Stream, StreamExt};
     use std::future::Future;
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -247,14 +248,6 @@ mod chunnels {
 
     const FNV1_64_INIT: u64 = 0xcbf29ce484222325u64;
     const FNV_64_PRIME: u64 = 0x100000001b3u64;
-
-    pub trait Kv {
-        type Key;
-        fn key(&self) -> Self::Key;
-
-        type Val;
-        fn val(&self) -> Self::Val;
-    }
 
     /// A Chunnel for a single shard.
     ///
@@ -265,11 +258,22 @@ mod chunnels {
         internal: Arc<Mutex<S>>,
     }
 
-    impl<C, S, D> Chunnel for ShardServer<C, S>
+    impl<C, S> ShardServer<C, S> {
+        /// internal: A way to listen for messages forwarded from the fallback canonical address listener.
+        /// external: Listen for messages over the network.
+        pub fn new<C1, S1>(internal: S1, external: C1) -> ShardServer<C1, S1> {
+            ShardServer {
+                internal: Arc::new(Mutex::new(internal)),
+                external: Arc::new(Mutex::new(external)),
+            }
+        }
+    }
+
+    impl<C, S, D> ChunnelListener for ShardServer<C, S>
     where
-        C: Chunnel<Addr = proto::Addr> + 'static,
+        C: ChunnelListener<Addr = proto::Addr> + 'static,
         C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
-        S: Chunnel<Addr = proto::Addr> + 'static,
+        S: ChunnelListener<Addr = proto::Addr> + 'static,
         S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
         D: Kv + Send + Sync + 'static,
         <D as Kv>::Key: AsRef<str>,
@@ -307,16 +311,6 @@ mod chunnels {
             })
         }
 
-        fn connect(
-            &mut self,
-            _a: Self::Addr,
-        ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
-            unimplemented!()
-        }
-
-        fn init(&mut self) {}
-        fn teardown(&mut self) {}
-
         fn scope(&self) -> bertha::Scope {
             bertha::Scope::Local
         }
@@ -339,14 +333,30 @@ mod chunnels {
     pub struct ShardCanonicalServer<C, S> {
         inner: Arc<Mutex<C>>,
         shards_inner: Arc<Mutex<S>>,
-        burrito_root: String,
+        burrito_root: PathBuf,
     }
 
-    impl<C, S, D> Chunnel for ShardCanonicalServer<C, S>
+    impl<C, S> ShardCanonicalServer<C, S> {
+        /// Inner is a chunnel for the external connection.
+        /// Shards is a chunnel for an internal connection to the shards.
+        pub fn new<C1, S1>(
+            inner: C1,
+            shards: S1,
+            burrito_root: PathBuf,
+        ) -> ShardCanonicalServer<C1, S1> {
+            ShardCanonicalServer {
+                inner: Arc::new(Mutex::new(inner)),
+                shards_inner: Arc::new(Mutex::new(shards)),
+                burrito_root,
+            }
+        }
+    }
+
+    impl<C, S, D> ChunnelListener for ShardCanonicalServer<C, S>
     where
-        C: Chunnel<Addr = proto::Addr> + 'static,
+        C: ChunnelListener<Addr = proto::Addr> + 'static,
         C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
-        S: Chunnel<Addr = proto::Addr> + 'static,
+        S: ChunnelConnector<Addr = proto::Addr> + 'static,
         S::Connection: ChunnelConnection<Data = D> + Clone + Send + Sync + 'static,
         D: Kv + Send + Sync + 'static,
         <D as Kv>::Key: AsRef<str>,
@@ -369,10 +379,10 @@ mod chunnels {
             let shards_inner = Arc::clone(&self.shards_inner);
             Box::pin(async move {
                 async fn register_shardctl(
-                    root: &str,
+                    root: &Path,
                     a: proto::ShardInfo,
                 ) -> Result<(), eyre::Report> {
-                    let mut shardctl = match ShardCtlClient::new(&root).await {
+                    let mut shardctl = match ShardCtlClient::new(root).await {
                         Ok(s) => s,
                         Err(e) => Err(eyre::eyre!("Could not contact ShardCtl: err = {}", e))?,
                     };
@@ -450,16 +460,6 @@ mod chunnels {
                 ) as _
             })
         }
-
-        fn connect(
-            &mut self,
-            _a: Self::Addr,
-        ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
-            unimplemented!()
-        }
-
-        fn init(&mut self) {}
-        fn teardown(&mut self) {}
 
         fn scope(&self) -> bertha::Scope {
             bertha::Scope::Local
@@ -540,28 +540,15 @@ mod chunnels {
         burrito_root: String,
     }
 
-    impl<C> Chunnel for ClientShardChunnelClient<C>
+    impl<C> ChunnelConnector for ClientShardChunnelClient<C>
     where
-        C: Chunnel<Addr = proto::Addr> + 'static,
+        C: ChunnelConnector<Addr = proto::Addr> + 'static,
         C::Connection: Send + Sync + 'static,
         <C::Connection as ChunnelConnection>::Data: Kv + Send + Sync + 'static,
         <<C::Connection as ChunnelConnection>::Data as Kv>::Key: AsRef<str>,
     {
         type Addr = proto::Addr;
         type Connection = ClientShardClientConnection<C::Connection>;
-
-        fn listen(
-            &mut self,
-            _a: Self::Addr,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                    Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-                >,
-            >,
-        > {
-            unimplemented!()
-        }
 
         fn connect(
             &mut self,
@@ -641,9 +628,6 @@ mod chunnels {
                 })
             })
         }
-
-        fn init(&mut self) {}
-        fn teardown(&mut self) {}
 
         fn scope(&self) -> bertha::Scope {
             bertha::Scope::Local
