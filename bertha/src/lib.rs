@@ -9,7 +9,7 @@ pub mod tagger;
 pub mod udp;
 
 /// A specification of application network semantics.
-pub trait Chunnel {
+pub trait ChunnelListener {
     type Addr;
     type Connection: ChunnelConnection;
 
@@ -24,13 +24,20 @@ pub trait Chunnel {
         >,
     >;
 
+    fn scope(&self) -> Scope;
+    fn endedness(&self) -> Endedness;
+    fn implementation_priority(&self) -> usize;
+    // fn resource_requirements(&self) -> ?;
+}
+
+pub trait ChunnelConnector {
+    type Addr;
+    type Connection: ChunnelConnection;
+
     fn connect(
         &mut self,
         a: Self::Addr,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>>;
-
-    fn init(&mut self) {}
-    fn teardown(&mut self) {}
 
     fn scope(&self) -> Scope;
     fn endedness(&self) -> Endedness;
@@ -93,28 +100,22 @@ pub trait Context {
 }
 
 /// A simpler trait to implement for traits with simpler (or no) Chunnel setup.
-pub trait InheritChunnel: Context
-where
-    <Self as Context>::ChunnelType: Chunnel,
-{
+pub trait InheritChunnel<CxConn: ChunnelConnection>: Context {
     type Connection: ChunnelConnection;
     type Config: Clone + Send + Sync + 'static;
 
     fn get_config(&mut self) -> Self::Config;
-
-    fn make_connection(
-        cx: <<Self as Context>::ChunnelType as Chunnel>::Connection,
-        cfg: Self::Config,
-    ) -> Self::Connection;
+    fn make_connection(cx: CxConn, cfg: Self::Config) -> Self::Connection;
 }
 
-impl<C> Chunnel for C
+impl<C> ChunnelListener for C
 where
-    C: InheritChunnel,
-    <C as Context>::ChunnelType: Chunnel,
-    <<C as Context>::ChunnelType as Chunnel>::Connection: 'static,
+    C: Context,
+    <C as Context>::ChunnelType: ChunnelListener,
+    <<C as Context>::ChunnelType as ChunnelListener>::Connection: 'static,
+    C: InheritChunnel<<<C as Context>::ChunnelType as ChunnelListener>::Connection>,
 {
-    type Addr = <<C as Context>::ChunnelType as Chunnel>::Addr;
+    type Addr = <<C as Context>::ChunnelType as ChunnelListener>::Addr;
     type Connection = C::Connection;
 
     fn listen(
@@ -143,6 +144,30 @@ where
         })
     }
 
+    fn scope(&self) -> Scope {
+        self.context().scope()
+    }
+
+    fn endedness(&self) -> Endedness {
+        self.context().endedness()
+    }
+
+    fn implementation_priority(&self) -> usize {
+        self.context().implementation_priority()
+    }
+    // fn resource_requirements(&self) -> ?;
+}
+
+impl<C> ChunnelConnector for C
+where
+    C: Context,
+    <C as Context>::ChunnelType: ChunnelConnector,
+    <<C as Context>::ChunnelType as ChunnelConnector>::Connection: 'static,
+    C: InheritChunnel<<<C as Context>::ChunnelType as ChunnelConnector>::Connection>,
+{
+    type Addr = <<C as Context>::ChunnelType as ChunnelConnector>::Addr;
+    type Connection = C::Connection;
+
     fn connect(
         &mut self,
         a: Self::Addr,
@@ -153,18 +178,6 @@ where
             .connect(a);
         let cfg = self.get_config();
         Box::pin(async move { Ok(C::make_connection(f.await?, cfg)) })
-    }
-
-    fn init(&mut self) {
-        if let Some(c) = self.context_mut() {
-            c.init();
-        }
-    }
-
-    fn teardown(&mut self) {
-        if let Some(c) = self.context_mut() {
-            c.teardown();
-        }
     }
 
     fn scope(&self) -> Scope {

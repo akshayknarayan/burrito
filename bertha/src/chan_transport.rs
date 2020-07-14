@@ -1,7 +1,8 @@
 //! Channel-based Chunnel which acts as a transport.
 
-use crate::{Chunnel, ChunnelConnection, Endedness, Scope};
-use futures_util::stream::Stream;
+use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Once, Scope};
+use futures_util::stream::{Stream, StreamExt};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -72,7 +73,7 @@ impl<T, U> Chan<T, U> {
     }
 }
 
-impl<D> Chunnel for Chan<D, Srv>
+impl<D> ChunnelListener for Chan<D, Srv>
 where
     D: Send + Sync + 'static,
 {
@@ -97,13 +98,6 @@ where
         Box::pin(async move { Box::pin(futures_util::stream::once(async { Ok(r) })) as _ })
     }
 
-    fn connect(
-        &mut self,
-        _a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
-        unreachable!()
-    }
-
     fn scope(&self) -> Scope {
         Scope::Application
     }
@@ -117,25 +111,12 @@ where
     }
 }
 
-impl<D> Chunnel for Chan<D, Cln>
+impl<D> ChunnelConnector for Chan<D, Cln>
 where
     D: Send + Sync + 'static,
 {
     type Addr = ();
     type Connection = ChanChunnel<D>;
-
-    fn listen(
-        &mut self,
-        _a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-            >,
-        >,
-    > {
-        unreachable!()
-    }
 
     fn connect(
         &mut self,

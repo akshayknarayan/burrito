@@ -1,6 +1,6 @@
 //! Serialization chunnel with bincode.
 
-use crate::{Chunnel, ChunnelConnection, Context, InheritChunnel};
+use crate::{ChunnelConnection, Context, InheritChunnel};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -31,21 +31,17 @@ impl<C, D> Context for SerializeChunnel<C, D> {
     }
 }
 
-impl<C, D> InheritChunnel for SerializeChunnel<C, D>
+impl<B, C, D> InheritChunnel<C> for SerializeChunnel<B, D>
 where
-    C: Chunnel,
-    C::Connection: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    type Connection = Serialize<C::Connection, D>;
+    type Connection = Serialize<C, D>;
     type Config = ();
 
     fn get_config(&mut self) -> Self::Config {}
 
-    fn make_connection(
-        cx: <<Self as Context>::ChunnelType as Chunnel>::Connection,
-        _cfg: Self::Config,
-    ) -> Self::Connection {
+    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
         Serialize::from(cx)
     }
 }
@@ -112,7 +108,7 @@ where
 mod test {
     use super::SerializeChunnel;
     use crate::chan_transport::Chan;
-    use crate::{Chunnel, ChunnelConnection};
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::StreamExt;
     use tracing::trace;
     use tracing_futures::Instrument;

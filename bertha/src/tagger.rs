@@ -1,6 +1,6 @@
 //! Chunnel which tags Data to provide at-most-once delivery.
 
-use crate::{Chunnel, ChunnelConnection, Context, InheritChunnel};
+use crate::{ChunnelConnection, Context, InheritChunnel};
 use std::collections::BinaryHeap;
 use std::convert::TryInto;
 use std::future::Future;
@@ -34,20 +34,16 @@ impl<C> Context for TaggerChunnel<C> {
     }
 }
 
-impl<C> InheritChunnel for TaggerChunnel<C>
+impl<B, C> InheritChunnel<C> for TaggerChunnel<B>
 where
-    C: Chunnel,
-    C::Connection: ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
 {
-    type Connection = Tagger<C::Connection>;
+    type Connection = Tagger<C>;
     type Config = ();
 
     fn get_config(&mut self) -> Self::Config {}
 
-    fn make_connection(
-        cx: <<Self as Context>::ChunnelType as Chunnel>::Connection,
-        _cfg: Self::Config,
-    ) -> Self::Connection {
+    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
         Tagger::from(cx)
     }
 }
@@ -149,22 +145,18 @@ impl<C> Context for OrderedChunnel<C> {
     }
 }
 
-impl<C> InheritChunnel for OrderedChunnel<C>
+impl<B, C> InheritChunnel<C> for OrderedChunnel<B>
 where
-    C: Chunnel,
-    C::Connection: ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
 {
-    type Connection = Ordered<C::Connection>;
+    type Connection = Ordered<C>;
     type Config = usize;
 
     fn get_config(&mut self) -> Self::Config {
         self.hole_thresh
     }
 
-    fn make_connection(
-        cx: <<Self as Context>::ChunnelType as Chunnel>::Connection,
-        cfg: Self::Config,
-    ) -> Self::Connection {
+    fn make_connection(cx: C, cfg: Self::Config) -> Self::Connection {
         Ordered {
             inner: Arc::new(cx),
             hole_thresh: cfg,
@@ -299,20 +291,16 @@ impl<C> Context for SeqUnreliableChunnel<C> {
     }
 }
 
-impl<C> InheritChunnel for SeqUnreliableChunnel<C>
+impl<B, C> InheritChunnel<C> for SeqUnreliableChunnel<B>
 where
-    C: Chunnel,
-    C::Connection: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
 {
-    type Connection = SeqUnreliable<C::Connection>;
+    type Connection = SeqUnreliable<C>;
     type Config = ();
 
     fn get_config(&mut self) -> Self::Config {}
 
-    fn make_connection(
-        cx: <<Self as Context>::ChunnelType as Chunnel>::Connection,
-        _cfg: Self::Config,
-    ) -> Self::Connection {
+    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
         SeqUnreliable::from(cx)
     }
 }
@@ -387,7 +375,7 @@ where
 mod test {
     use super::{OrderedChunnel, SeqUnreliableChunnel, TaggerChunnel};
     use crate::chan_transport::Chan;
-    use crate::{Chunnel, ChunnelConnection};
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::StreamExt;
     use tracing::{debug, info, trace};
     use tracing_futures::Instrument;

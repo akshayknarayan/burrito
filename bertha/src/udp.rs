@@ -1,6 +1,6 @@
 //! UDP chunnel.
 
-use crate::{Chunnel, ChunnelConnection, Endedness, Scope};
+use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope};
 use futures_util::{future::FutureExt, stream::Stream};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 #[derive(Default, Clone, Debug)]
 pub struct UdpChunnel {}
 
-impl Chunnel for UdpChunnel {
+impl ChunnelListener for UdpChunnel {
     type Addr = SocketAddr;
     type Connection = UdpConn;
 
@@ -39,6 +39,22 @@ impl Chunnel for UdpChunnel {
             Box::pin(futures_util::stream::once(sk)) as _
         })
     }
+
+    fn scope(&self) -> Scope {
+        Scope::Host
+    }
+    fn endedness(&self) -> Endedness {
+        Endedness::Both
+    }
+
+    fn implementation_priority(&self) -> usize {
+        1
+    }
+}
+
+impl ChunnelConnector for UdpChunnel {
+    type Addr = SocketAddr;
+    type Connection = UdpConn;
 
     fn connect(
         &mut self,
@@ -108,7 +124,7 @@ impl ChunnelConnection for UdpConn {
 #[cfg(test)]
 mod test {
     use super::UdpChunnel;
-    use crate::{Chunnel, ChunnelConnection};
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::StreamExt;
     use std::net::ToSocketAddrs;
     use tracing_futures::Instrument;

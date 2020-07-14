@@ -3,7 +3,7 @@
 //! Takes as Data a `(u32, Vec<u8>)`, where the `u32` is a unique tag corresponding to a data
 //! segment, the `Vec<u8>`.
 
-use crate::{Chunnel, ChunnelConnection, Context, InheritChunnel};
+use crate::{ChunnelConnection, Context, InheritChunnel};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -50,22 +50,18 @@ impl<C> Context for ReliabilityChunnel<C> {
     }
 }
 
-impl<C> InheritChunnel for ReliabilityChunnel<C>
+impl<C, D> InheritChunnel<C> for ReliabilityChunnel<D>
 where
-    C: Chunnel,
-    C::Connection: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
 {
-    type Connection = Reliability<C::Connection>;
+    type Connection = Reliability<C>;
     type Config = Duration;
 
     fn get_config(&mut self) -> Self::Config {
         self.timeout
     }
 
-    fn make_connection(
-        cx: <<Self as Context>::ChunnelType as Chunnel>::Connection,
-        cfg: Self::Config,
-    ) -> Self::Connection {
+    fn make_connection(cx: C, cfg: Self::Config) -> Self::Connection {
         let mut c = Reliability::from(cx);
         c.set_timeout(cfg);
         c
@@ -315,7 +311,7 @@ where
 mod test {
     use super::{Reliability, ReliabilityChunnel};
     use crate::chan_transport::Chan;
-    use crate::{Chunnel, ChunnelConnection};
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::StreamExt;
     use tracing::{debug, info};
     use tracing_futures::Instrument;
