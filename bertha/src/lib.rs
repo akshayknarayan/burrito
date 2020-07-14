@@ -1,6 +1,8 @@
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub mod bincode;
 pub mod chan_transport;
@@ -192,6 +194,110 @@ where
         self.context().implementation_priority()
     }
     // fn resource_requirements(&self) -> ?;
+}
+
+/// Dummy connection type for non-connection-oriented chunnels.
+///
+/// Exposes each message in the stream as a "connection". Receive-only.
+pub struct Once<D>(Arc<Mutex<Option<D>>>);
+
+impl<D> Once<D> {
+    pub fn new(d: D) -> Self {
+        Self(Arc::new(Mutex::new(Some(d))))
+    }
+}
+
+impl<D> ChunnelConnection for Once<D>
+where
+    D: Send + Sync + 'static,
+{
+    type Data = Option<D>;
+
+    fn send(
+        &self,
+        _data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+        unimplemented!()
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+        let d = Arc::clone(&self.0);
+        Box::pin(async move { Ok(d.lock().await.take()) })
+    }
+}
+
+/// Chunnel type transposing the Data type of the underlying connection
+/// to be `Option`-wrapped.
+pub struct OptionWrap<C>(Arc<C>);
+
+impl<C> OptionWrap<C> {
+    pub fn new(inner: C) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+impl<C> Context for OptionWrap<C> {
+    type ChunnelType = C;
+
+    fn context(&self) -> &Self::ChunnelType {
+        &self.0
+    }
+
+    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
+        Arc::get_mut(&mut self.0)
+    }
+}
+
+impl<B, C, D> InheritChunnel<C> for OptionWrap<B>
+where
+    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+{
+    type Connection = OptionWrapCn<C>;
+    type Config = ();
+
+    fn get_config(&mut self) -> Self::Config {}
+
+    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
+        OptionWrapCn::new(cx)
+    }
+}
+
+pub struct OptionWrapCn<C>(Arc<C>);
+
+impl<C> OptionWrapCn<C> {
+    pub fn new(inner: C) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+impl<C, D> ChunnelConnection for OptionWrapCn<C>
+where
+    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+{
+    type Data = Option<D>;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+        if let Some(d) = data {
+            self.0.send(d)
+        } else {
+            Box::pin(futures_util::future::ready(Ok(()))) as _
+        }
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+        let c = Arc::clone(&self.0);
+        Box::pin(async move {
+            let d = c.recv().await;
+            Ok(Some(d?))
+        })
+    }
 }
 
 /// Where the Chunnel implementation allows functionality to be implemented.
