@@ -12,6 +12,126 @@ use tracing::debug;
 pub struct Srv;
 pub struct Cln;
 
+/// Channel connector where server registers on listen(), and client grabs client on connect().
+///
+/// The connection stream listen() returns will only have one connection. Sending on that
+/// connection will fail.
+#[derive(Debug)]
+pub struct RendezvousChannel<Addr, Data, Side> {
+    channel_size: usize,
+    map: Arc<Mutex<HashMap<Addr, mpsc::Sender<Data>>>>,
+    side: std::marker::PhantomData<Side>,
+}
+
+impl<A, D> RendezvousChannel<A, D, ()> {
+    pub fn new(channel_size: usize) -> Self {
+        Self {
+            channel_size,
+            map: Default::default(),
+            side: Default::default(),
+        }
+    }
+
+    pub fn split(self) -> (RendezvousChannel<A, D, Srv>, RendezvousChannel<A, D, Cln>) {
+        (
+            RendezvousChannel {
+                channel_size: self.channel_size,
+                map: Arc::clone(&self.map),
+                side: Default::default(),
+            },
+            RendezvousChannel {
+                channel_size: self.channel_size,
+                map: Arc::clone(&self.map),
+                side: Default::default(),
+            },
+        )
+    }
+}
+
+impl<A, D, S> Clone for RendezvousChannel<A, D, S> {
+    fn clone(&self) -> Self {
+        Self {
+            channel_size: self.channel_size,
+            map: Arc::clone(&self.map),
+            side: Default::default(),
+        }
+    }
+}
+
+impl<A, D> ChunnelListener for RendezvousChannel<A, D, Srv>
+where
+    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + 'static,
+    D: Send + Sync + 'static,
+{
+    type Addr = A;
+    type Connection = Once<D>;
+
+    fn listen(
+        &mut self,
+        a: Self::Addr,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
+            >,
+        >,
+    > {
+        let channel_size = self.channel_size;
+        let (s, r) = mpsc::channel(channel_size);
+        let m = Arc::clone(&self.map);
+        Box::pin(async move {
+            m.lock().await.insert(a, s);
+            Box::pin(r.map(|d| Ok(Once::new(d)))) as _
+        })
+    }
+
+    fn scope(&self) -> Scope {
+        crate::Scope::Application
+    }
+    fn endedness(&self) -> Endedness {
+        crate::Endedness::Both
+    }
+    fn implementation_priority(&self) -> usize {
+        1
+    }
+}
+
+impl<A, D> ChunnelConnector for RendezvousChannel<A, D, Cln>
+where
+    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + 'static,
+    D: Send + Sync + 'static,
+{
+    type Addr = A;
+    type Connection = ChanChunnel<D>;
+
+    fn connect(
+        &mut self,
+        a: Self::Addr,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
+        let addr = a.clone();
+        let m = Arc::clone(&self.map);
+        Box::pin(async move {
+            let s = m.lock().await.remove(&a);
+            if let Some(s) = s {
+                let (_, r1) = mpsc::channel(0);
+                Ok(ChanChunnel::new(s, r1, Arc::new(|x| x)))
+            } else {
+                Err(eyre::eyre!("Address not found: {:?}", addr))
+            }
+        })
+    }
+
+    fn scope(&self) -> Scope {
+        crate::Scope::Application
+    }
+    fn endedness(&self) -> Endedness {
+        crate::Endedness::Both
+    }
+    fn implementation_priority(&self) -> usize {
+        1
+    }
+}
+
 pub struct Chan<Data, Side> {
     snd1: Option<mpsc::Sender<Data>>,
     rcv1: Option<mpsc::Receiver<Data>>,
