@@ -1,22 +1,35 @@
 //! UDP chunnel.
+//!
+//! UDP chunnels are interesting because they involve a piece of metadata, the recv_from addr to
+//! send a response to (in the case of e.g. sharding), which should be remembered.
+//! There are two possible solutions, both implemented here.
+//!
+//! `UdpSkChunnel` exposes `Data = (SocketAddr, Vec<u8>)`. The address is considered part of the
+//! data, and the connection type `UdpSk` has full generality.
+//!
+//! `UdpReqChunnel` exposes `Data = Vec<u8>`. `listen()` returns a bound connection such that
+//! further `recv()`s will only be from the same address, and further sends will send to the same
+//! address as the original recv_from.
 
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope};
+use eyre::WrapErr;
 use futures_util::{future::FutureExt, stream::Stream};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 /// UDP Chunnel connector.
 ///
 /// Carries no state.
 #[derive(Default, Clone, Debug)]
-pub struct UdpChunnel {}
+pub struct UdpSkChunnel {}
 
-impl ChunnelListener for UdpChunnel {
+impl ChunnelListener for UdpSkChunnel {
     type Addr = SocketAddr;
-    type Connection = UdpConn;
+    type Connection = UdpSk;
 
     fn listen(
         &mut self,
@@ -31,7 +44,7 @@ impl ChunnelListener for UdpChunnel {
         Box::pin(async move {
             let sk = tokio::net::UdpSocket::bind(a).map(|sk| {
                 let (recv, send) = sk?.split();
-                Ok(UdpConn {
+                Ok(UdpSk {
                     send: Arc::new(Mutex::new(send)),
                     recv: Arc::new(Mutex::new(recv)),
                 })
@@ -52,9 +65,9 @@ impl ChunnelListener for UdpChunnel {
     }
 }
 
-impl ChunnelConnector for UdpChunnel {
+impl ChunnelConnector for UdpSkChunnel {
     type Addr = SocketAddr;
-    type Connection = UdpConn;
+    type Connection = UdpSk;
 
     fn connect(
         &mut self,
@@ -68,7 +81,7 @@ impl ChunnelConnector for UdpChunnel {
             .await
             .unwrap()
             .split();
-            Ok(UdpConn {
+            Ok(UdpSk {
                 send: Arc::new(Mutex::new(send)),
                 recv: Arc::new(Mutex::new(recv)),
             })
@@ -87,12 +100,12 @@ impl ChunnelConnector for UdpChunnel {
     }
 }
 
-pub struct UdpConn {
+pub struct UdpSk {
     send: Arc<Mutex<tokio::net::udp::SendHalf>>,
     recv: Arc<Mutex<tokio::net::udp::RecvHalf>>,
 }
 
-impl ChunnelConnection for UdpConn {
+impl ChunnelConnection for UdpSk {
     type Data = (SocketAddr, Vec<u8>);
 
     fn send(
@@ -121,9 +134,113 @@ impl ChunnelConnection for UdpConn {
     }
 }
 
+pub struct UdpReqChunnel {}
+
+impl ChunnelListener for UdpReqChunnel {
+    type Addr = SocketAddr;
+    type Connection = UdpConn;
+
+    fn listen(
+        &mut self,
+        a: Self::Addr,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
+            >,
+        >,
+    > {
+        Box::pin(async move {
+            let sk = tokio::net::UdpSocket::bind(a).await;
+            if let Err(e) = sk {
+                return Box::pin(futures_util::stream::once(async {
+                    Err(e).wrap_err("Bind failed")
+                })) as _;
+            }
+
+            let (recv, send) = sk.unwrap().split();
+            Box::pin(futures_util::stream::try_unfold(
+                (
+                    recv,
+                    Arc::new(Mutex::new(send)),
+                    HashMap::<_, mpsc::Sender<Vec<u8>>>::new(),
+                ),
+                |(mut r, s, mut map)| async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let (len, from) = r.recv_from(&mut buf).await?;
+                        let data = buf[0..len].to_vec();
+
+                        if let Some(c) = map.get_mut(&from) {
+                            if let Err(_) = c.send(data).await {
+                                map.remove(&from);
+                            }
+                        } else {
+                            let (sch, rch) = mpsc::channel(100);
+                            map.insert(from, sch);
+
+                            return Ok(Some((
+                                UdpConn {
+                                    resp_addr: from,
+                                    recv: Arc::new(Mutex::new(rch)),
+                                    send: Arc::clone(&s),
+                                },
+                                (r, s, map),
+                            )));
+                        }
+                    }
+                },
+            )) as _
+        })
+    }
+
+    fn scope(&self) -> Scope {
+        Scope::Host
+    }
+    fn endedness(&self) -> Endedness {
+        Endedness::Both
+    }
+
+    fn implementation_priority(&self) -> usize {
+        1
+    }
+}
+
+pub struct UdpConn {
+    resp_addr: SocketAddr,
+    recv: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    send: Arc<Mutex<tokio::net::udp::SendHalf>>,
+}
+
+impl ChunnelConnection for UdpConn {
+    type Data = Vec<u8>;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+        let sk = Arc::clone(&self.send);
+        let addr = self.resp_addr;
+        Box::pin(async move {
+            sk.lock().await.send_to(&data, &addr).await?;
+            Ok(())
+        })
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+        let r = Arc::clone(&self.recv);
+        Box::pin(async move {
+            let d = r.lock().await.recv().await;
+            d.ok_or_else(|| eyre::eyre!("Nothing more to receive"))
+        }) as _
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::UdpChunnel;
+    use super::UdpSkChunnel;
     use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::StreamExt;
     use std::net::ToSocketAddrs;
@@ -143,7 +260,7 @@ mod test {
         rt.block_on(
             async move {
                 let addr = "127.0.0.1:35133".to_socket_addrs().unwrap().next().unwrap();
-                let srv = UdpChunnel::default()
+                let srv = UdpSkChunnel::default()
                     .listen(addr)
                     .await
                     .next()
@@ -151,7 +268,7 @@ mod test {
                     .unwrap()
                     .unwrap();
 
-                let cli = UdpChunnel::default().connect(addr).await.unwrap();
+                let cli = UdpSkChunnel::default().connect(addr).await.unwrap();
 
                 tokio::spawn(async move {
                     loop {
