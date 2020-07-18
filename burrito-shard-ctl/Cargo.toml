@@ -15,11 +15,10 @@ burrito-discovery-ctl = { path = "../burrito-discovery-ctl" }
 bertha = { path = "../bertha" }
 xdp-shard = { path = "../xdp-shard", optional = true }
 eyre = "0.6"
-async-bincode = "0.5"
 bincode = "1"
 tracing = "0.1"
 tracing-futures = "0.2"
-futures-util = { version = "0.3", features = ["sink"] }
+futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "0.2", features = ["sync", "rt-core", "uds", "time"] }
+tokio = { version = "0.2", features = ["sync", "time"] }
 redis = { version = "0.15" }
