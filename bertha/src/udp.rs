@@ -134,6 +134,7 @@ impl ChunnelConnection for UdpSk {
     }
 }
 
+#[derive(Default, Clone, Copy, Debug)]
 pub struct UdpReqChunnel {}
 
 impl ChunnelListener for UdpReqChunnel {
