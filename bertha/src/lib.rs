@@ -196,6 +196,22 @@ where
     // fn resource_requirements(&self) -> ?;
 }
 
+/// For address types to expose ip and port information for inner addresses.
+pub trait IpPort {
+    fn ip(&self) -> std::net::IpAddr;
+    fn port(&self) -> u16;
+}
+
+impl IpPort for std::net::SocketAddr {
+    fn ip(&self) -> std::net::IpAddr {
+        self.ip()
+    }
+
+    fn port(&self) -> u16 {
+        self.port()
+    }
+}
+
 /// Dummy connection type for non-connection-oriented chunnels.
 ///
 /// Exposes each message in the stream as a "connection". Receive-only.
