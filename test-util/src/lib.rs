@@ -1,26 +1,15 @@
-use anyhow::Error;
-use slog::debug;
+use eyre::{eyre, Error};
+use tracing::debug;
 
-pub fn test_logger() -> slog::Logger {
-    use slog::Drain;
-    let plain = slog_term::PlainSyncDecorator::new(slog_term::TestStdoutWriter);
-    let drain = slog_term::FullFormat::new(plain).build().fuse();
-    slog::Logger::root(drain, slog::o!())
-}
-
-pub async fn block_for(d: std::time::Duration) {
-    tokio::time::delay_for(d).await;
-}
-
-pub fn reset_root_dir(path: &std::path::Path, log: &slog::Logger) {
-    debug!(log, "removing"; "dir" => ?&path);
+pub fn reset_root_dir(path: &std::path::Path) {
+    debug!(dir = ?&path, "removing");
     std::fs::remove_dir_all(&path).unwrap_or_default();
-    debug!(log, "creating"; "dir" => ?&path);
+    debug!(dir = ?&path, "creating");
     std::fs::create_dir_all(&path).unwrap();
 }
 
-pub fn start_redis(log: &slog::Logger, port: u16) -> Redis {
-    Redis::start(log, port).expect("starting redis")
+pub fn start_redis(port: u16) -> Redis {
+    Redis::start(port).expect("starting redis")
 }
 
 #[must_use]
@@ -29,7 +18,7 @@ pub struct Redis {
 }
 
 impl Redis {
-    pub fn start(log: &slog::Logger, port: u16) -> Result<Self, Error> {
+    pub fn start(port: u16) -> Result<Self, Error> {
         let name = format!("test-burritoctl-redis-{:?}", port);
         kill_redis(port);
 
@@ -50,7 +39,7 @@ impl Redis {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         if let Ok(Some(_)) = redis.try_wait() {
-            Err(anyhow::anyhow!("Could not start redis"))?;
+            Err(eyre!("Could not start redis"))?;
         }
 
         let red_conn_string = format!("redis://localhost:{}", port);
@@ -60,7 +49,7 @@ impl Redis {
         }
 
         let s = Self { port };
-        debug!(&log, "started redis"; "url" => s.get_addr());
+        debug!(url = ?s.get_addr(), "started redis");
         Ok(s)
     }
 
