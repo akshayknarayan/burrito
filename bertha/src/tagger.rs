@@ -73,7 +73,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         let snd_nxt = Arc::clone(&self.snd_nxt);
         Box::pin(
@@ -90,7 +90,7 @@ where
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(
             async move {
@@ -202,7 +202,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let state = Arc::clone(&self.state);
         let inner = Arc::clone(&self.inner);
         Box::pin(
@@ -225,7 +225,7 @@ where
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let state = Arc::clone(&self.state);
         let inner = Arc::clone(&self.inner);
         let hole_thresh = self.hole_thresh;
@@ -340,7 +340,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(
             async move {
@@ -356,7 +356,7 @@ where
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(
             async move {

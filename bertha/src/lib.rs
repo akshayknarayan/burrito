@@ -1,3 +1,4 @@
+use eyre::eyre;
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
@@ -21,8 +22,15 @@ pub trait ChunnelListener {
     ) -> Pin<
         Box<
             dyn Future<
-                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-            >,
+                    Output = Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
+                                + Send
+                                + 'static,
+                        >,
+                    >,
+                > + Send
+                + 'static,
         >,
     >;
 
@@ -39,7 +47,7 @@ pub trait ChunnelConnector {
     fn connect(
         &mut self,
         a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>;
 
     fn scope(&self) -> Scope;
     fn endedness(&self) -> Endedness;
@@ -55,11 +63,12 @@ pub trait ChunnelConnection {
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>>;
 
     /// Retrieve next incoming message.
-    fn recv(&self)
-        -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>>;
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>>;
 }
 
 pub enum Either<A, B> {
@@ -77,7 +86,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         match self {
             Either::Left(a) => a.send(data),
             Either::Right(b) => b.send(data),
@@ -86,7 +95,7 @@ where
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         match self {
             Either::Left(a) => a.recv(),
             Either::Right(b) => b.recv(),
@@ -126,8 +135,15 @@ where
     ) -> Pin<
         Box<
             dyn Future<
-                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-            >,
+                    Output = Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
+                                + Send
+                                + 'static,
+                        >,
+                    >,
+                > + Send
+                + 'static,
         >,
     > {
         use futures_util::StreamExt;
@@ -173,7 +189,8 @@ where
     fn connect(
         &mut self,
         a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
+    {
         let f = self
             .context_mut()
             .expect("There were multiple references to the Arc<Context>")
@@ -214,31 +231,36 @@ impl IpPort for std::net::SocketAddr {
 
 /// Dummy connection type for non-connection-oriented chunnels.
 ///
-/// Exposes each message in the stream as a "connection". Receive-only.
-pub struct Once<D>(Arc<Mutex<Option<D>>>);
+/// Exposes each message in the stream as a "connection". Sends via the C chunnel type.
+pub struct Once<C, D>(Arc<Mutex<Option<D>>>, Arc<C>);
 
-impl<D> Once<D> {
-    pub fn new(d: D) -> Self {
-        Self(Arc::new(Mutex::new(Some(d))))
+impl<C, D> Once<C, D> {
+    pub fn new(send: Arc<C>, d: D) -> Self {
+        Self(Arc::new(Mutex::new(Some(d))), send)
     }
 }
 
-impl<D> ChunnelConnection for Once<D>
+impl<C, D> ChunnelConnection for Once<C, D>
 where
+    C: ChunnelConnection<Data = D>,
     D: Send + Sync + 'static,
 {
     type Data = Option<D>;
 
     fn send(
         &self,
-        _data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
-        unimplemented!()
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        if let Some(d) = data {
+            self.1.send(d)
+        } else {
+            Box::pin(futures_util::future::ready(Err(eyre!("Can't send None")))) as _
+        }
     }
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let d = Arc::clone(&self.0);
         Box::pin(async move { Ok(d.lock().await.take()) })
     }
@@ -251,6 +273,12 @@ pub struct OptionWrap<C>(Arc<C>);
 impl<C> OptionWrap<C> {
     pub fn new(inner: C) -> Self {
         Self(Arc::new(inner))
+    }
+}
+
+impl<C> From<C> for OptionWrap<C> {
+    fn from(f: C) -> OptionWrap<C> {
+        OptionWrap::new(f)
     }
 }
 
@@ -297,7 +325,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         if let Some(d) = data {
             self.0.send(d)
         } else {
@@ -307,12 +335,180 @@ where
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let c = Arc::clone(&self.0);
         Box::pin(async move {
             let d = c.recv().await;
             Ok(Some(d?))
         })
+    }
+}
+
+/// Chunnel combinator for working with Option types.
+///
+/// Deals with inner chunnel that has Data = Option<T> by transofrming None into an error.
+pub struct OptionUnwrap<C>(Arc<C>);
+
+impl<C> OptionUnwrap<C> {
+    pub fn new(inner: C) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+impl<C> From<C> for OptionUnwrap<C> {
+    fn from(f: C) -> OptionUnwrap<C> {
+        OptionUnwrap::new(f)
+    }
+}
+
+impl<C: Clone> Clone for OptionUnwrap<C> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<C> Context for OptionUnwrap<C> {
+    type ChunnelType = C;
+
+    fn context(&self) -> &Self::ChunnelType {
+        &self.0
+    }
+
+    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
+        Arc::get_mut(&mut self.0)
+    }
+}
+
+impl<B, C, D> InheritChunnel<C> for OptionUnwrap<B>
+where
+    C: ChunnelConnection<Data = Option<D>> + Send + Sync + 'static,
+{
+    type Connection = OptionUnwrapCn<C>;
+    type Config = ();
+
+    fn get_config(&mut self) -> Self::Config {}
+
+    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
+        OptionUnwrapCn::new(cx)
+    }
+}
+
+pub struct OptionUnwrapCn<C>(Arc<C>);
+
+impl<C> OptionUnwrapCn<C> {
+    pub fn new(inner: C) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+impl<C, D> ChunnelConnection for OptionUnwrapCn<C>
+where
+    C: ChunnelConnection<Data = Option<D>> + Send + Sync + 'static,
+{
+    type Data = D;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        self.0.send(Some(data))
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        let c = Arc::clone(&self.0);
+        Box::pin(async move {
+            Ok(c.recv()
+                .await?
+                .ok_or_else(|| eyre!("Received None value"))?)
+        })
+    }
+}
+
+/// Chunnel translating between passing Address with Data and passing address in `connect()`.
+///
+/// Start with Address = (), Data = (Address, Data), produce Address = Address, Data = Data: by remembering the Address
+/// via connect().
+pub struct AddrWrap<C>(C);
+impl<C> AddrWrap<C> {
+    pub fn new(inner: C) -> Self {
+        Self(inner)
+    }
+}
+
+impl<C> From<C> for AddrWrap<C> {
+    fn from(f: C) -> AddrWrap<C> {
+        AddrWrap::new(f)
+    }
+}
+
+impl<C: Clone> Clone for AddrWrap<C> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<A, C, N, D> ChunnelConnector for AddrWrap<C>
+where
+    A: Clone + Send + 'static,
+    C: ChunnelConnector<Addr = (), Connection = N> + Clone + Send + Sync + 'static,
+    N: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
+    D: Send + 'static,
+{
+    type Addr = A;
+    type Connection = AddrWrapCn<A, N>;
+
+    fn connect(
+        &mut self,
+        a: Self::Addr,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
+    {
+        let mut c = self.0.clone();
+        Box::pin(async move {
+            let cn = c.connect(()).await?;
+            Ok(AddrWrapCn::new(a, cn))
+        })
+    }
+
+    fn scope(&self) -> Scope {
+        self.0.scope()
+    }
+    fn endedness(&self) -> Endedness {
+        self.0.endedness()
+    }
+    fn implementation_priority(&self) -> usize {
+        self.0.implementation_priority()
+    }
+}
+
+pub struct AddrWrapCn<A, C>(A, Arc<C>);
+
+impl<A, C> AddrWrapCn<A, C> {
+    pub fn new(addr: A, inner: C) -> Self {
+        Self(addr, Arc::new(inner))
+    }
+}
+
+impl<A, C, D> ChunnelConnection for AddrWrapCn<A, C>
+where
+    A: Clone,
+    C: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
+{
+    type Data = D;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        self.1.send((self.0.clone(), data))
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        let c = Arc::clone(&self.1);
+        Box::pin(async move { Ok(c.recv().await?.1) })
     }
 }
 

@@ -16,10 +16,9 @@ pub struct Cln;
 ///
 /// The connection stream listen() returns will only have one connection. Sending on that
 /// connection will fail.
-#[derive(Debug)]
 pub struct RendezvousChannel<Addr, Data, Side> {
     channel_size: usize,
-    map: Arc<Mutex<HashMap<Addr, mpsc::Sender<Data>>>>,
+    map: Arc<Mutex<HashMap<Addr, ChanChunnel<Data>>>>,
     side: std::marker::PhantomData<Side>,
 }
 
@@ -60,11 +59,11 @@ impl<A, D, S> Clone for RendezvousChannel<A, D, S> {
 
 impl<A, D> ChunnelListener for RendezvousChannel<A, D, Srv>
 where
-    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + 'static,
+    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     type Addr = A;
-    type Connection = Once<D>;
+    type Connection = Once<ChanChunnel<D>, D>;
 
     fn listen(
         &mut self,
@@ -72,16 +71,32 @@ where
     ) -> Pin<
         Box<
             dyn Future<
-                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-            >,
+                    Output = Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
+                                + Send
+                                + 'static,
+                        >,
+                    >,
+                > + Send
+                + 'static,
         >,
     > {
         let channel_size = self.channel_size;
         let (s, r) = mpsc::channel(channel_size);
+        let (s1, r1) = mpsc::channel(channel_size);
         let m = Arc::clone(&self.map);
         Box::pin(async move {
-            m.lock().await.insert(a, s);
-            Box::pin(r.map(|d| Ok(Once::new(d)))) as _
+            m.lock()
+                .await
+                .insert(a, ChanChunnel::new(s, r1, Arc::new(|x| x)));
+            // `r.map` maps over the messages in the receive channel stream.
+            Box::pin(r.map(move |d| {
+                // Once will not call recv() on the inner C, so pass a dummy receiver.
+                let (_, r2) = mpsc::channel(0);
+                let resp_chunnel = ChanChunnel::new(s1.clone(), r2, Arc::new(|x| x));
+                Ok(Once::new(Arc::new(resp_chunnel), d))
+            })) as _
         })
     }
 
@@ -98,7 +113,7 @@ where
 
 impl<A, D> ChunnelConnector for RendezvousChannel<A, D, Cln>
 where
-    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + 'static,
+    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     type Addr = A;
@@ -107,14 +122,14 @@ where
     fn connect(
         &mut self,
         a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
+    {
         let addr = a.clone();
         let m = Arc::clone(&self.map);
         Box::pin(async move {
-            let s = m.lock().await.remove(&a);
+            let s = m.lock().await.remove(&addr);
             if let Some(s) = s {
-                let (_, r1) = mpsc::channel(0);
-                Ok(ChanChunnel::new(s, r1, Arc::new(|x| x)))
+                Ok(s)
             } else {
                 Err(eyre::eyre!("Address not found: {:?}", addr))
             }
@@ -206,8 +221,15 @@ where
     ) -> Pin<
         Box<
             dyn Future<
-                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-            >,
+                    Output = Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
+                                + Send
+                                + 'static,
+                        >,
+                    >,
+                > + Send
+                + 'static,
         >,
     > {
         let r = ChanChunnel::new(
@@ -241,7 +263,8 @@ where
     fn connect(
         &mut self,
         _a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
+    {
         let r = ChanChunnel::new(
             self.snd2.take().unwrap(),
             self.rcv1.take().unwrap(),
@@ -292,7 +315,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let s = Arc::clone(&self.snd);
         let link = Arc::clone(&self.link);
 
@@ -314,7 +337,7 @@ where
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let r = Arc::clone(&self.rcv);
         Box::pin(async move { Ok(r.lock().await.recv().await.unwrap()) })
     }

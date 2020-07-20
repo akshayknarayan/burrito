@@ -51,6 +51,21 @@ pub trait Kv {
     fn val(&self) -> Self::Val;
 }
 
+impl<T> Kv for Option<T>
+where
+    T: Kv,
+{
+    type Key = Option<T::Key>;
+    fn key(&self) -> Self::Key {
+        self.as_ref().map(|t| t.key())
+    }
+
+    type Val = Option<T::Val>;
+    fn val(&self) -> Self::Val {
+        self.as_ref().map(|t| t.val())
+    }
+}
+
 const FNV1_64_INIT: u64 = 0xcbf29ce484222325u64;
 const FNV_64_PRIME: u64 = 0x100000001b3u64;
 
@@ -71,11 +86,7 @@ pub struct ShardCanonicalServer<C, S> {
 impl<C, S> ShardCanonicalServer<C, S> {
     /// Inner is a chunnel for the external connection.
     /// Shards is a chunnel for an internal connection to the shards.
-    pub async fn new<C1, S1>(
-        inner: C1,
-        shards: S1,
-        redis_addr: &str,
-    ) -> Result<ShardCanonicalServer<C1, S1>, Error> {
+    pub async fn new(inner: C, shards: S, redis_addr: &str) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)?;
         let redis_listen_connection =
             Arc::new(Mutex::new(redis_client.get_async_connection().await?));
@@ -89,27 +100,35 @@ impl<C, S> ShardCanonicalServer<C, S> {
         })
     }
 
+    /// Future which will poll stats from the ebpf program.
+    ///
+    /// If file is Some, the stats will be dumped to the file in addition to being logged via
+    /// the tracing crate.
     #[cfg(feature = "ebpf")]
     pub async fn log_shard_stats(&self, file: Option<std::fs::File>) {
-        ebpf::read_shard_stats(Arc::clone(&self.handles), file).await
+        ebpf::read_shard_stats(Arc::clone(&self.handles), file)
+            .instrument(tracing::info_span!("read-shard-stats"))
+            .await
     }
 }
 
 impl<C, A, S, D> ChunnelListener for ShardCanonicalServer<C, S>
 where
-    C: ChunnelListener<Addr = A> + 'static,
+    C: ChunnelListener<Addr = A> + Send + Sync + 'static,
     C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
-    S: ChunnelConnector<Addr = A> + 'static,
-    S::Connection: ChunnelConnection<Data = D> + Clone + Send + Sync + 'static,
+    S: ChunnelConnector<Addr = A> + Send + Sync + 'static,
+    S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
     <D as Kv>::Key: AsRef<str>,
     A: IpPort
         + Clone
-        + Serialize
-        + DeserializeOwned
         + std::fmt::Debug
         + std::fmt::Display
-        + 'static,
+        + Send
+        + Sync
+        + 'static
+        + Serialize
+        + DeserializeOwned,
 {
     type Addr = ShardInfo<A>;
     type Connection = ShardCanonicalServerConnection<C::Connection, S::Connection>;
@@ -120,8 +139,15 @@ where
     ) -> Pin<
         Box<
             dyn Future<
-                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-            >,
+                    Output = Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
+                                + Send
+                                + 'static,
+                        >,
+                    >,
+                > + Send
+                + 'static,
         >,
     > {
         let a1 = a.clone();
@@ -145,10 +171,10 @@ where
                     ebpf::register_shardinfo(handles, a).await;
                 }
 
-                // serve canonical address
                 let num_shards = a.shard_addrs.len();
                 let addrs = a.shard_addrs.clone();
 
+                // connect to shards
                 let conns: Vec<Arc<S::Connection>> = match futures_util::future::join_all(
                     addrs.clone().into_iter().map(|addr| async {
                         Ok::<_, eyre::Report>(Arc::new(
@@ -168,6 +194,7 @@ where
                     }
                 };
 
+                // serve canonical address
                 // we are only responsible for the canonical address here.
                 Box::pin(
                     inner
@@ -250,7 +277,7 @@ where
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         let shard_fn = Arc::clone(&self.shard_fn);
         let shard_conns = self.shards.clone();
@@ -268,7 +295,13 @@ where
             let shard_idx = (shard_fn)(&data);
             let conn = shard_conns[shard_idx].clone();
 
+            // 2. Forward to the shard.
             conn.send(data).await?;
+
+            // 3. Get response from the shard, and send back to client.
+            let resp = conn.recv().await?;
+            inner.send(resp).await?;
+
             Ok(())
         })
     }
@@ -276,7 +309,7 @@ where
     fn send(
         &self,
         _data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         unimplemented!()
     }
 }
@@ -290,10 +323,10 @@ pub struct ShardServer<C, S> {
     internal: Arc<Mutex<S>>,
 }
 
-impl<C, S> ShardServer<C, S> {
+impl ShardServer<(), ()> {
     /// internal: A way to listen for messages forwarded from the fallback canonical address listener.
     /// external: Listen for messages over the network.
-    pub fn new<C1, S1>(internal: S1, external: C1) -> ShardServer<C1, S1> {
+    pub fn new<C, S>(internal: S, external: C) -> ShardServer<C, S> {
         ShardServer {
             internal: Arc::new(Mutex::new(internal)),
             external: Arc::new(Mutex::new(external)),
@@ -303,13 +336,21 @@ impl<C, S> ShardServer<C, S> {
 
 impl<C, A, S, D> ChunnelListener for ShardServer<C, S>
 where
-    C: ChunnelListener<Addr = A> + 'static,
+    C: ChunnelListener<Addr = A> + Send + Sync + 'static,
     C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
-    S: ChunnelListener<Addr = A> + 'static,
+    S: ChunnelListener<Addr = A> + Send + Sync + 'static,
     S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
     <D as Kv>::Key: AsRef<str>,
-    A: Clone + 'static,
+    A: IpPort
+        + Clone
+        + std::fmt::Debug
+        + std::fmt::Display
+        + Send
+        + Sync
+        + 'static
+        + Serialize
+        + DeserializeOwned,
 {
     type Addr = A;
     type Connection = Either<C::Connection, S::Connection>;
@@ -320,8 +361,15 @@ where
     ) -> Pin<
         Box<
             dyn Future<
-                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-            >,
+                    Output = Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
+                                + Send
+                                + 'static,
+                        >,
+                    >,
+                > + Send
+                + 'static,
         >,
     > {
         let ext = Arc::clone(&self.external);
@@ -366,11 +414,22 @@ pub struct ClientShardChunnelClient<C> {
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
 }
 
-impl<C> ClientShardChunnelClient<C> {
-    pub async fn new<C1, S1>(
-        inner: C1,
-        redis_addr: &str,
-    ) -> Result<ClientShardChunnelClient<C1>, Error> {
+impl<A, C> ClientShardChunnelClient<C>
+where
+    C: ChunnelConnector<Addr = A> + Send + Sync + 'static,
+    C::Connection: Send + Sync + 'static,
+    <C::Connection as ChunnelConnection>::Data: Kv + Send + Sync + 'static,
+    <<C::Connection as ChunnelConnection>::Data as Kv>::Key: AsRef<str>,
+    A: Serialize
+        + DeserializeOwned
+        + std::cmp::PartialEq
+        + std::fmt::Debug
+        + std::fmt::Display
+        + Send
+        + Sync
+        + 'static,
+{
+    pub async fn new(inner: C, redis_addr: &str) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)?;
         let redis_listen_connection =
             Arc::new(Mutex::new(redis_client.get_async_connection().await?));
@@ -384,7 +443,7 @@ impl<C> ClientShardChunnelClient<C> {
 
 impl<A, C> ChunnelConnector for ClientShardChunnelClient<C>
 where
-    C: ChunnelConnector<Addr = A> + 'static,
+    C: ChunnelConnector<Addr = A> + Send + Sync + 'static,
     C::Connection: Send + Sync + 'static,
     <C::Connection as ChunnelConnection>::Data: Kv + Send + Sync + 'static,
     <<C::Connection as ChunnelConnection>::Data as Kv>::Key: AsRef<str>,
@@ -393,6 +452,7 @@ where
         + std::cmp::PartialEq
         + std::fmt::Debug
         + std::fmt::Display
+        + Send
         + Sync
         + 'static,
 {
@@ -402,7 +462,8 @@ where
     fn connect(
         &mut self,
         a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
+    {
         let inner = Arc::clone(&self.inner);
         let redis_conn = Arc::clone(&self.redis_listen_connection);
         Box::pin(
@@ -494,7 +555,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         // figure out which shard to send to.
         let shard_idx = (self.shard_fn)(&data);
         let cl = self.inners[shard_idx].clone();
@@ -503,7 +564,7 @@ where
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let cls = self.inners.clone();
         Box::pin(async move {
             let (rcv, _, _) =
@@ -705,5 +766,182 @@ mod ebpf {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{ClientShardChunnelClient, ShardCanonicalServer, ShardInfo, ShardServer};
+    use bertha::{
+        bincode::SerializeChunnel,
+        chan_transport::RendezvousChannel,
+        reliable::ReliabilityChunnel,
+        tagger::TaggerChunnel,
+        udp::{UdpReqChunnel, UdpSkChunnel},
+        AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, OptionUnwrap,
+    };
+    use futures_util::TryStreamExt;
+    use serde::{Deserialize, Serialize};
+    use std::net::SocketAddr;
+    use tracing::debug;
+    use tracing_futures::Instrument;
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct Msg {
+        k: String,
+        v: String,
+    }
+
+    impl super::Kv for Msg {
+        type Key = String;
+        fn key(&self) -> Self::Key {
+            self.k.clone()
+        }
+        type Val = String;
+        fn val(&self) -> Self::Val {
+            self.v.clone()
+        }
+    }
+
+    #[test]
+    fn shard_test() {
+        let _guard = tracing_subscriber::fmt::try_init();
+
+        // 1. start redis.
+        let redis_port = 15215;
+        let _redis = test_util::start_redis(redis_port);
+        let redis_addr = format!("redis://127.0.0.1:{}", redis_port);
+
+        // 2. Define addr.
+        let si: ShardInfo<SocketAddr> = ShardInfo {
+            canonical_addr: "127.0.0.1:21421".parse().unwrap(),
+            shard_addrs: vec![
+                "127.0.0.1:21422".parse().unwrap(),
+                "127.0.0.1:21423".parse().unwrap(),
+            ],
+            shard_info: super::SimpleShardPolicy {
+                packet_data_offset: 18,
+                packet_data_length: 4,
+            },
+        };
+
+        // 3. Make rt.
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        // 4. start shard servers
+        let si_sh = si.clone();
+        rt.block_on(
+            async move {
+                let (internal_srv, internal_cli) =
+                    RendezvousChannel::<SocketAddr, Msg, _>::new(100).split();
+
+                for a in si_sh.shard_addrs {
+                    let internal_srv = OptionUnwrap::from(internal_srv.clone());
+                    let external = SerializeChunnel::<_, Msg>::from(TaggerChunnel::from(
+                        ReliabilityChunnel::from(UdpReqChunnel::default()),
+                    ));
+
+                    // we use the below block to check that the types work out.
+                    //
+                    //use bertha::ChunnelConnection;
+                    //use futures_util::StreamExt;
+                    //let mut foo: Box<dyn ChunnelListener<Addr = SocketAddr, Connection = _>> =
+                    //    Box::new(internal_srv) as _;
+                    //let foo_c: Box<dyn ChunnelConnection<Data = Msg>> =
+                    //    Box::new(foo.listen(a.clone()).await.next().await.unwrap().unwrap()) as _;
+
+                    //let mut bar: Box<dyn ChunnelListener<Addr = SocketAddr, Connection = _>> =
+                    //    Box::new(external) as _;
+                    //let bar_c: Box<dyn ChunnelConnection<Data = Msg>> =
+                    //    Box::new(bar.listen(a.clone()).await.next().await.unwrap().unwrap()) as _;
+
+                    tokio::spawn(async move {
+                        let mut shard = ShardServer::new(internal_srv.clone(), external);
+                        loop {
+                            let st = shard.listen(a).await;
+
+                            match st
+                                .try_for_each_concurrent(None, |once| async move {
+                                    let msg = once.recv().await?;
+                                    // just echo.
+                                    once.send(msg).await?;
+                                    Ok(())
+                                })
+                                .await
+                            {
+                                Err(e) => debug!(err = ?e, shard_addr = ?a,  "Shard errorred"),
+                                Ok(_) => (),
+                            }
+                        }
+                    });
+                }
+
+                // 5. start canonical server
+                let external = SerializeChunnel::<_, Msg>::from(TaggerChunnel::from(
+                    ReliabilityChunnel::from(UdpReqChunnel::default()),
+                ));
+
+                // yet more type inference blah
+                //
+                //let mut foo: Box<dyn ChunnelConnector<Addr = SocketAddr, Connection = _>> =
+                //    Box::new(internal_cli) as _;
+                //let foo_c: Box<dyn ChunnelConnection<Data = Msg>> =
+                //    Box::new(foo.connect(si.canonical_addr).await.unwrap()) as _;
+                //
+                //use futures_util::stream::StreamExt;
+                //let mut bar: Box<dyn ChunnelListener<Addr = SocketAddr, Connection = _>> =
+                //    Box::new(external) as _;
+                //let bar_c: Box<dyn ChunnelConnection<Data = Msg>> = Box::new(
+                //    bar.listen(si.canonical_addr)
+                //        .await
+                //        .next()
+                //        .await
+                //        .unwrap()
+                //        .unwrap(),
+                //) as _;
+
+                let mut cnsrv = ShardCanonicalServer::new(external, internal_cli, &redis_addr)
+                    .await
+                    .unwrap();
+                let st = cnsrv.listen(si.clone()).await;
+
+                tokio::spawn(async move {
+                    st.try_for_each_concurrent(None, |r| async move {
+                        r.recv().await?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap()
+                });
+
+                // 6. make client
+                let external = SerializeChunnel::<_, Msg>::from(TaggerChunnel::from(
+                    ReliabilityChunnel::from(AddrWrap::from(UdpSkChunnel::default())),
+                ));
+                let mut cl = ClientShardChunnelClient::new(external, &redis_addr)
+                    .await
+                    .unwrap();
+                let cn = cl.connect(si.canonical_addr).await.unwrap();
+
+                // 7. issue a request
+                cn.send(Msg {
+                    k: "a".to_owned(),
+                    v: "b".to_owned(),
+                })
+                .await
+                .unwrap();
+
+                let m = cn.recv().await.unwrap();
+                use super::Kv;
+                assert_eq!(m.key(), "a");
+                assert_eq!(m.val(), "b");
+            }
+            .instrument(tracing::debug_span!("shard_test")),
+        );
     }
 }

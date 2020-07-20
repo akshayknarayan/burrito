@@ -83,7 +83,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let buf = bincode::serialize(&data)?;
@@ -94,7 +94,7 @@ where
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let buf = inner.recv().await?;

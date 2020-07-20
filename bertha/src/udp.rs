@@ -13,7 +13,10 @@
 
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope};
 use eyre::WrapErr;
-use futures_util::{future::FutureExt, stream::Stream};
+use futures_util::{
+    future::FutureExt,
+    stream::{Stream, StreamExt},
+};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -37,8 +40,15 @@ impl ChunnelListener for UdpSkChunnel {
     ) -> Pin<
         Box<
             dyn Future<
-                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-            >,
+                    Output = Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
+                                + Send
+                                + 'static,
+                        >,
+                    >,
+                > + Send
+                + 'static,
         >,
     > {
         Box::pin(async move {
@@ -66,13 +76,14 @@ impl ChunnelListener for UdpSkChunnel {
 }
 
 impl ChunnelConnector for UdpSkChunnel {
-    type Addr = SocketAddr;
+    type Addr = ();
     type Connection = UdpSk;
 
     fn connect(
         &mut self,
         _a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
+    {
         Box::pin(async move {
             use std::net::ToSocketAddrs;
             let (recv, send) = tokio::net::UdpSocket::bind(
@@ -111,7 +122,7 @@ impl ChunnelConnection for UdpSk {
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let sk = Arc::clone(&self.send);
         Box::pin(async move {
             let (addr, data) = data;
@@ -122,7 +133,7 @@ impl ChunnelConnection for UdpSk {
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let mut buf = [0u8; 1024];
         let sk = Arc::clone(&self.recv);
 
@@ -147,8 +158,15 @@ impl ChunnelListener for UdpReqChunnel {
     ) -> Pin<
         Box<
             dyn Future<
-                Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
-            >,
+                    Output = Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
+                                + Send
+                                + 'static,
+                        >,
+                    >,
+                > + Send
+                + 'static,
         >,
     > {
         Box::pin(async move {
@@ -160,35 +178,49 @@ impl ChunnelListener for UdpReqChunnel {
             }
 
             let (recv, send) = sk.unwrap().split();
+            let sends = futures_util::stream::FuturesUnordered::new();
             Box::pin(futures_util::stream::try_unfold(
                 (
                     recv,
                     Arc::new(Mutex::new(send)),
+                    sends,
                     HashMap::<_, mpsc::Sender<Vec<u8>>>::new(),
                 ),
-                |(mut r, s, mut map)| async move {
+                |(mut r, s, mut sends, mut map)| async move {
                     let mut buf = [0u8; 1024];
                     loop {
-                        let (len, from) = r.recv_from(&mut buf).await?;
-                        let data = buf[0..len].to_vec();
+                        tokio::select!(
+                            Ok((len, from)) = r.recv_from(&mut buf) => {
+                                let data = buf[0..len].to_vec();
 
-                        if let Some(c) = map.get_mut(&from) {
-                            if let Err(_) = c.send(data).await {
-                                map.remove(&from);
+                                let mut done = None;
+                                let c = map.entry(from).or_insert_with(|| {
+                                    let (sch, rch) = mpsc::channel(100);
+                                    done = Some(UdpConn {
+                                        resp_addr: from,
+                                        recv: Arc::new(Mutex::new(rch)),
+                                        send: Arc::clone(&s),
+                                    });
+
+                                    sch
+                                });
+
+                                let mut c = c.clone();
+                                sends.push(async move {
+                                    let res = c.send(data).await;
+                                    (from, res)
+                                });
+
+                                if let Some(d) = done {
+                                    return Ok(Some((d, (r, s, sends,  map))));
+                                }
                             }
-                        } else {
-                            let (sch, rch) = mpsc::channel(100);
-                            map.insert(from, sch);
-
-                            return Ok(Some((
-                                UdpConn {
-                                    resp_addr: from,
-                                    recv: Arc::new(Mutex::new(rch)),
-                                    send: Arc::clone(&s),
-                                },
-                                (r, s, map),
-                            )));
-                        }
+                            Some((from, res)) = sends.next() => {
+                                if let Err(_) = res  {
+                                    map.remove(&from);
+                                }
+                            }
+                        )
                     }
                 },
             )) as _
@@ -219,7 +251,7 @@ impl ChunnelConnection for UdpConn {
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let sk = Arc::clone(&self.send);
         let addr = self.resp_addr;
         Box::pin(async move {
@@ -230,7 +262,7 @@ impl ChunnelConnection for UdpConn {
 
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let r = Arc::clone(&self.recv);
         Box::pin(async move {
             let d = r.lock().await.recv().await;

@@ -22,3 +22,8 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "0.2", features = ["sync", "time"] }
 redis = { version = "0.15" }
+
+[dev-dependencies]
+test-util = { path = "../test-util" }
+tokio = { version = "0.2", features = ["rt-core"] }
+tracing-subscriber = "0.2"
