@@ -301,7 +301,7 @@ mod test {
                     .unwrap()
                     .unwrap();
 
-                let cli = UdpSkChunnel::default().connect(addr).await.unwrap();
+                let cli = UdpSkChunnel::default().connect(()).await.unwrap();
 
                 tokio::spawn(async move {
                     loop {
