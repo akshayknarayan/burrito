@@ -87,13 +87,14 @@ where
         let (s1, r1) = mpsc::channel(channel_size);
         let m = Arc::clone(&self.map);
         Box::pin(async move {
+            debug!(addr = ?&a, "RendezvousChannel listening");
             m.lock()
                 .await
                 .insert(a, ChanChunnel::new(s, r1, Arc::new(|x| x)));
             // `r.map` maps over the messages in the receive channel stream.
             Box::pin(r.map(move |d| {
                 // Once will not call recv() on the inner C, so pass a dummy receiver.
-                let (_, r2) = mpsc::channel(0);
+                let (_, r2) = mpsc::channel(1);
                 let resp_chunnel = ChanChunnel::new(s1.clone(), r2, Arc::new(|x| x));
                 Ok(Once::new(Arc::new(resp_chunnel), d))
             })) as _
