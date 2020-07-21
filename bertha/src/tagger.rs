@@ -29,8 +29,8 @@ impl<C> Context for TaggerChunnel<C> {
         &self.inner
     }
 
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
-        Arc::get_mut(&mut self.inner)
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.inner).unwrap()
     }
 }
 
@@ -140,8 +140,8 @@ impl<C> Context for OrderedChunnel<C> {
         &self.inner
     }
 
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
-        Arc::get_mut(&mut self.inner)
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.inner).unwrap()
     }
 }
 
@@ -188,8 +188,8 @@ impl<C> Context for Ordered<C> {
         &self.inner
     }
 
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
-        Arc::get_mut(&mut self.inner)
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.inner).unwrap()
     }
 }
 
@@ -286,8 +286,8 @@ impl<C> Context for SeqUnreliableChunnel<C> {
         &self.inner
     }
 
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
-        Arc::get_mut(&mut self.inner)
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.inner).unwrap()
     }
 }
 
@@ -326,8 +326,8 @@ impl<C> Context for SeqUnreliable<C> {
         &self.inner
     }
 
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
-        Arc::get_mut(&mut self.inner)
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.inner).unwrap()
     }
 }
 

@@ -26,8 +26,8 @@ impl<C, D> Context for SerializeChunnel<C, D> {
         &self.inner
     }
 
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
-        Arc::get_mut(&mut self.inner)
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.inner).unwrap()
     }
 }
 
@@ -59,8 +59,8 @@ impl<C, D> Context for Serialize<C, D> {
         &self.inner
     }
 
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
-        Arc::get_mut(&mut self.inner)
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.inner).unwrap()
     }
 }
 

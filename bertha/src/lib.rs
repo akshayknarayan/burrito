@@ -107,7 +107,7 @@ where
 pub trait Context {
     type ChunnelType;
     fn context(&self) -> &Self::ChunnelType;
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType>;
+    fn context_mut(&mut self) -> &mut Self::ChunnelType;
 }
 
 /// A simpler trait to implement for traits with simpler (or no) Chunnel setup.
@@ -147,10 +147,8 @@ where
         >,
     > {
         use futures_util::StreamExt;
-        let f = self
-            .context_mut()
-            .expect("There were multiple references to the Arc<Context>")
-            .listen(a);
+
+        let f = self.context_mut().listen(a);
         let cfg = self.get_config();
         Box::pin(async move {
             let cfg = cfg;
@@ -191,10 +189,7 @@ where
         a: Self::Addr,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
     {
-        let f = self
-            .context_mut()
-            .expect("There were multiple references to the Arc<Context>")
-            .connect(a);
+        let f = self.context_mut().connect(a);
         let cfg = self.get_config();
         Box::pin(async move { Ok(C::make_connection(f.await?, cfg)) })
     }
@@ -289,8 +284,8 @@ impl<C> Context for OptionWrap<C> {
         &self.0
     }
 
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
-        Arc::get_mut(&mut self.0)
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.0).unwrap()
     }
 }
 
@@ -363,7 +358,7 @@ impl<C> From<C> for OptionUnwrap<C> {
 
 impl<C: Clone> Clone for OptionUnwrap<C> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(Arc::new(self.0.as_ref().clone()))
     }
 }
 
@@ -374,8 +369,8 @@ impl<C> Context for OptionUnwrap<C> {
         &self.0
     }
 
-    fn context_mut(&mut self) -> Option<&mut Self::ChunnelType> {
-        Arc::get_mut(&mut self.0)
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.0).unwrap()
     }
 }
 
