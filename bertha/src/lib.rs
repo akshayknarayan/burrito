@@ -341,7 +341,7 @@ where
 
 /// Chunnel combinator for working with Option types.
 ///
-/// Deals with inner chunnel that has Data = Option<T> by transofrming None into an error.
+/// Deals with inner chunnel that has Data = Option<T> by transforming None into an error.
 pub struct OptionUnwrap<C>(Arc<C>);
 
 impl<C> OptionUnwrap<C> {
