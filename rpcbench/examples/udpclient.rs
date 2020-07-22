@@ -27,6 +27,7 @@ async fn main() -> Result<(), StdError> {
     let pp: rpcbench::SPingParams = rpcbench::PingParams {
         work: rpcbench::Work::BusyWorkConst as _,
         amount: 100,
+        padding: vec![],
     }
     .into();
 
