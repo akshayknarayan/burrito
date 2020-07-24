@@ -1,5 +1,5 @@
 use burrito_localname_ctl::ctl;
-use failure::Error;
+use eyre::Error;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -23,7 +23,7 @@ struct Opt {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let opt = Opt::from_args();
-    let log = burrito_util::logger();
+    color_eyre::install()?;
     tracing_subscriber::fmt::init();
 
     if cfg!(feature = "docker") {
@@ -33,12 +33,11 @@ async fn main() -> Result<(), Error> {
             opt.force_burrito,
             opt.in_addr_docker,
             opt.out_addr_docker,
-            log,
         )
         .await;
         Ok(())
     } else {
-        ctl::serve_ctl(opt.burrito_coordinator_addr, opt.force_burrito, log).await?;
+        ctl::serve_ctl(opt.burrito_coordinator_addr, opt.force_burrito).await?;
         Ok(())
     }
 }

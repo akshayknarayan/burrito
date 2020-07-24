@@ -1,7 +1,6 @@
 use bollard::container::Config;
 use core::task::{Context, Poll};
-use failure::Error;
-use failure::ResultExt;
+use eyre::{Error, WrapErr};
 use futures_util::future::FutureExt;
 use hyper::{Body, Client, Request, Response, StatusCode};
 use hyper_unix_connector::UnixClient;
@@ -9,12 +8,9 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use tower_service as tower;
+use tracing::{info, trace, warn};
 
-pub async fn serve(
-    in_addr_docker: PathBuf,
-    out_addr_docker: PathBuf,
-    log: slog::Logger,
-) -> Result<(), Error> {
+pub async fn serve(in_addr_docker: PathBuf, out_addr_docker: PathBuf) -> Result<(), Error> {
     // get docker-proxy serving future
     std::fs::remove_file(&in_addr_docker).unwrap_or_default(); // ignore error if file was not present
     use hyper_unix_connector::UnixConnector;
@@ -23,22 +19,20 @@ pub async fn serve(
         .into();
     let make_service = MakeDockerProxy {
         out_addr: out_addr_docker.clone(),
-        log: log.new(slog::o!("server" => "docker_proxy")),
     };
     let docker_proxy_server = hyper::server::Server::builder(uc).serve(make_service);
 
-    slog::info!(log, "docker proxy starting"; "listening at" => ?&in_addr_docker, "proxying to" => ?&out_addr_docker);
+    info!(listening_at = ?&in_addr_docker, proxying_to = ?&out_addr_docker, "docker proxy starting" );
     Ok(docker_proxy_server.await?)
 }
 
 pub struct MakeDockerProxy {
     pub out_addr: std::path::PathBuf,
-    pub log: slog::Logger,
 }
 
 impl<T> tower::Service<T> for MakeDockerProxy {
     type Response = DockerProxy;
-    type Error = failure::Error;
+    type Error = Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Sync + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -47,12 +41,10 @@ impl<T> tower::Service<T> for MakeDockerProxy {
 
     fn call(&mut self, _: T) -> Self::Future {
         let out_addr = self.out_addr.clone();
-        let log = self.log.clone();
         Box::pin(async {
             Ok(DockerProxy {
                 out_addr,
                 client: Client::builder().build(UnixClient),
-                log,
             })
         })
     }
@@ -64,7 +56,6 @@ impl<T> tower::Service<T> for MakeDockerProxy {
 pub struct DockerProxy {
     out_addr: std::path::PathBuf,
     client: hyper::client::Client<UnixClient, Body>,
-    log: slog::Logger,
 }
 
 impl tower::Service<Request<Body>> for DockerProxy {
@@ -85,23 +76,23 @@ impl tower::Service<Request<Body>> for DockerProxy {
         // check if request is creating a container
         let req = match (req.method(), req.uri().path()) {
             (&hyper::Method::POST, path) if DOCKER_CREATE_CONTAINER_RE.is_match(path) => {
-                slog::info!(&self.log, "create container request";
-                    "path" => ?req.uri().path_and_query(),
-                    "headers" => ?req.headers(),
-                    "body" => ?req.body(),
+                info!(
+                    path = ?req.uri().path_and_query(),
+                    headers = ?req.headers(),
+                    body = ?req.body(),
+                    "create container request"
                 );
 
-                Box::pin(DockerProxy::rewrite_create_container_request(
-                    req,
-                    self.log.clone(),
-                )) as Pin<Box<dyn Future<Output = _> + Send>>
+                Box::pin(DockerProxy::rewrite_create_container_request(req))
+                    as Pin<Box<dyn Future<Output = _> + Send>>
             }
             _ => {
                 // log the request
-                slog::trace!(&self.log, "got request";
-                    "path" => ?req.uri().path_and_query(),
-                    "headers" => ?req.headers(),
-                    "body" => ?req.body(),
+                trace!(
+                    path = ?req.uri().path_and_query(),
+                    headers = ?req.headers(),
+                    body = ?req.body(),
+                    "got request"
                 );
 
                 Box::pin(async move { Ok(req) }) as Pin<Box<dyn Future<Output = _> + Send>>
@@ -110,7 +101,6 @@ impl tower::Service<Request<Body>> for DockerProxy {
 
         let oa = self.out_addr.clone();
         let cl = self.client.clone();
-        let lg = self.log.clone();
 
         Box::pin(async move {
             let req: Result<Request<Body>, Error> = req.await;
@@ -118,10 +108,10 @@ impl tower::Service<Request<Body>> for DockerProxy {
                 Ok(req) => {
                     if req.headers().contains_key(hyper::header::UPGRADE) {
                         // if req contains an upgrade header, handle the upgrade
-                        DockerProxy::handle_upgrade(req, oa, cl, lg).await
+                        DockerProxy::handle_upgrade(req, oa, cl).await
                     } else {
                         // else just forward the request
-                        DockerProxy::forward_request(req, oa, cl, lg).await
+                        DockerProxy::forward_request(req, oa, cl).await
                     }
                 }
                 Err(e) => error_response(e),
@@ -133,7 +123,6 @@ impl tower::Service<Request<Body>> for DockerProxy {
 impl DockerProxy {
     async fn rewrite_create_container_request(
         req: hyper::Request<Body>,
-        log: slog::Logger,
     ) -> Result<hyper::Request<Body>, Error> {
         use futures_util::stream::TryStreamExt;
 
@@ -141,9 +130,10 @@ impl DockerProxy {
         let payload: Vec<u8> = body.map_ok(|x| x.to_vec()).try_concat().await?;
         let mut cfg: Config<String> = serde_json::from_slice(&payload).map_err(|e| {
             let payload_str = String::from_utf8(payload.to_vec()).expect("body utf8");
-            slog::warn!(log, "payload parse failed";
-                "err" => ?e,
-                "raw" => payload_str,
+            warn!(
+                err = ?e,
+                raw = ?payload_str,
+                "payload parse failed"
             );
 
             e
@@ -167,9 +157,10 @@ impl DockerProxy {
             }
         };
 
-        slog::info!(log, "create container payload";
-            "parts" => ?parts,
-            "body" => ?cfg,
+        info!(
+            parts = ?parts,
+            body = ?cfg,
+            "create container payload"
         );
 
         let cfg_body = serde_json::to_vec(&cfg)?;
@@ -187,7 +178,6 @@ impl DockerProxy {
         req: Request<Body>,
         addr: std::path::PathBuf,
         client: hyper::client::Client<UnixClient, Body>,
-        log: slog::Logger,
     ) -> Result<Response<Body>, hyper::Error> {
         let mut req: Request<Body> = req;
         let uri = hyper_unix_connector::Uri::new(
@@ -199,8 +189,9 @@ impl DockerProxy {
         );
         *req.uri_mut() = uri.into();
 
-        slog::trace!(&log, "forwarding request";
-            "path" => ?req.uri().path_and_query(),
+        trace!(
+            path = ?req.uri().path_and_query(),
+            "forwarding request"
         );
 
         client
@@ -208,10 +199,11 @@ impl DockerProxy {
             .map(move |resp| {
                 if let Ok(ref r) = resp {
                     // log the response
-                    slog::trace!(log, "got response";
-                        "code" => ?r.status(),
-                        "headers" => ?r.headers(),
-                        "body" => ?r.body(),
+                    trace!(
+                        code = ?r.status(),
+                        headers = ?r.headers(),
+                        body = ?r.body(),
+                        "got response"
                     );
                 }
 
@@ -224,30 +216,27 @@ impl DockerProxy {
         req: Request<Body>,
         addr: std::path::PathBuf,
         client: hyper::client::Client<UnixClient, Body>,
-        log: slog::Logger,
     ) -> Result<Response<Body>, hyper::Error> {
         use futures_util::stream::{StreamExt, TryStreamExt};
 
         let (parts, mut body) = req.into_parts();
         let payload: Vec<u8> = body.by_ref().map_ok(|x| x.to_vec()).try_concat().await?;
         let payload_str = std::str::from_utf8(&payload).expect("body utf8");
-        slog::trace!(log, "upgrade request body"; "body" => payload_str);
+        trace!(body = ?payload_str, "upgrade request body");
         // reassemble request
         let req = Request::from_parts(parts, Body::from(payload));
         let request_upgrade_fut = body.on_upgrade();
 
         // forward request
-        let resp = DockerProxy::forward_request(req, addr, client, log.clone()).await;
+        let resp = DockerProxy::forward_request(req, addr, client).await;
 
         let (parts, mut body) = resp?.into_parts();
         let payload: Vec<u8> = body.by_ref().map_ok(|x| x.to_vec()).try_concat().await?;
         let payload_str = std::str::from_utf8(&payload).expect("body utf8");
-        slog::trace!(log, "upgrade response body"; "body" => payload_str);
+        trace!(body = ?payload_str, "upgrade response body");
         // reassemble response
         let resp = Response::from_parts(parts, Body::from(payload));
         let response_upgrade_fut = body.on_upgrade();
-
-        let copier_log = log.clone();
 
         // copy between request_upgrade_fut <--> response_upgrade_fut until both are EOFed
         tokio::spawn(async move {
@@ -257,14 +246,14 @@ impl DockerProxy {
             let req_upgrade = match req_upgrade {
                 Ok(r) => r,
                 Err(e) => {
-                    slog::warn!(copier_log, "Upgrade error"; "where" => "request upgrade", "err" => ?e);
+                    warn!(on = "request upgrade", err = ?e, "Upgrade error");
                     return;
                 }
             };
             let resp_upgrade = match resp_upgrade {
                 Ok(r) => r,
                 Err(e) => {
-                    slog::warn!(copier_log, "Upgrade error"; "where" => "response upgrade", "err" => ?e);
+                    warn!(on = "response upgrade", err = ?e, "Upgrade error");
                     return;
                 }
             };
@@ -272,17 +261,15 @@ impl DockerProxy {
             let (mut req_read, mut req_write) = tokio::io::split(req_upgrade);
             let (mut resp_read, mut resp_write) = tokio::io::split(resp_upgrade);
 
-            let l2 = log.clone();
             tokio::spawn(async move {
                 if let Err(e) = tokio::io::copy(&mut req_read, &mut resp_write).await {
-                    slog::warn!(l2, "Upgrade error"; "where" => "copy req -> resp", "err" => ?e);
+                    warn!(on = "copy req -> resp", err = ?e, "Upgrade error");
                 };
             });
 
-            let l3 = log.clone();
             tokio::spawn(async move {
                 if let Err(e) = tokio::io::copy(&mut resp_read, &mut req_write).await {
-                    slog::warn!(l3, "Upgrade error"; "where" => "copy resp -> req", "err" => ?e);
+                    warn!(on = "copy resp -> req", err = ?e,  "Upgrade error");
                 };
             });
         });

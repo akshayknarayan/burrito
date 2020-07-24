@@ -1,4 +1,3 @@
-pub use burrito_discovery_ctl::proto::Addr;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;

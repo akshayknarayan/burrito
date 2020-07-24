@@ -16,13 +16,6 @@ pub mod ctl;
 #[cfg(feature = "docker")]
 pub mod docker_proxy;
 
-// docker_proxy remains entirely separate.
-//
-// run and connect to ctl local store - stays a thing.
-// - chunnel listener:
-// on addr type (string, A):
-// returns connection that listens on select(listen(a), listen(u))
-
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener, Either};
 use eyre::Error;
 use futures_util::stream::{Stream, StreamExt};
@@ -33,6 +26,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// LocalNameSrv is a ChunnelListener
+///
+/// On addr a of type SocketAddr from the inner chunnel,
+/// registers with local-name-ctl to get a local address u, and
+/// returns connection that listens on select(listen(a), listen(u))
 pub struct LocalNameSrv<C, L> {
     cl: Arc<Mutex<client::LocalNameClient>>,
     pub_inner: Arc<Mutex<C>>,
@@ -119,15 +117,17 @@ where
     }
 }
 
+/// `LocalNameCln` is a `ChuunelConnector`.
+///
+/// on addr a of type SocketAddr, it queries local-name-ctl.
+/// if local address u is found, it returns a local connection to it.
+/// otherwise it connects to a and returns that connection.
 pub struct LocalNameCln<C, L> {
     cl: Arc<Mutex<client::LocalNameClient>>,
     pub_inner: Arc<Mutex<C>>,
     local_inner: Arc<Mutex<L>>,
 }
 
-// - chuunel connector:
-// on addr type string
-// returns connection to appropriate service
 impl<C, L, Cn, Ln, D> ChunnelConnector for LocalNameCln<C, L>
 where
     C: ChunnelConnector<Addr = SocketAddr, Connection = Cn> + Send + 'static,

@@ -1,5 +1,6 @@
 use burrito_localname_ctl::docker_proxy;
 use structopt::StructOpt;
+use tracing::{error, info};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "dump-docker-proxy")]
@@ -12,9 +13,10 @@ struct Opt {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), failure::Error> {
+async fn main() -> Result<(), eyre::Error> {
     let opt = Opt::from_args();
-    let log = burrito_util::logger();
+    color_eyre::install()?;
+    tracing_subscriber::fmt::init();
 
     let out_addr = opt.out_addr.clone();
 
@@ -23,13 +25,12 @@ async fn main() -> Result<(), failure::Error> {
     let uc: UnixConnector = tokio::net::UnixListener::bind(&opt.in_addr)?.into();
     let make_service = docker_proxy::MakeDockerProxy {
         out_addr: out_addr.clone(),
-        log: log.clone(),
     };
     let server = hyper::server::Server::builder(uc).serve(make_service);
 
-    slog::info!(log, "starting"; "listening at" => ?&opt.in_addr, "proxying to" => ?&opt.out_addr);
+    info!(listening_at = ?&opt.in_addr, proxying_to = ?&opt.out_addr, "starting");
     if let Err(e) = server.await {
-        slog::crit!(log, "server crashed"; "err" => ?e);
+        error!(err = ?e, "server crashed");
     }
 
     Ok(())
