@@ -39,7 +39,7 @@ pub struct LocalNameSrv<C, L> {
 
 impl<C, L> LocalNameSrv<C, L> {
     pub async fn new(root: impl AsRef<Path>, pub_inner: C, local_inner: L) -> Result<Self, Error> {
-        let cl = client::LocalNameClient::new(root).await?;
+        let cl = client::LocalNameClient::new(root.as_ref()).await?;
         Ok(LocalNameSrv {
             cl: Arc::new(Mutex::new(cl)),
             pub_inner: Arc::new(Mutex::new(pub_inner)),
@@ -128,6 +128,17 @@ pub struct LocalNameCln<C, L> {
     local_inner: Arc<Mutex<L>>,
 }
 
+impl<C, L> LocalNameCln<C, L> {
+    pub async fn new(root: impl AsRef<Path>, pub_inner: C, local_inner: L) -> Result<Self, Error> {
+        let cl = client::LocalNameClient::new(root.as_ref()).await?;
+        Ok(LocalNameCln {
+            cl: Arc::new(Mutex::new(cl)),
+            pub_inner: Arc::new(Mutex::new(pub_inner)),
+            local_inner: Arc::new(Mutex::new(local_inner)),
+        })
+    }
+}
+
 impl<C, L, Cn, Ln, D> ChunnelConnector for LocalNameCln<C, L>
 where
     C: ChunnelConnector<Addr = SocketAddr, Connection = Cn> + Send + 'static,
@@ -164,5 +175,94 @@ where
     }
     fn implementation_priority(&self) -> usize {
         1
+    }
+}
+
+#[cfg(feature = "ctl")]
+#[cfg(test)]
+mod test {
+    use super::{LocalNameCln, LocalNameSrv};
+    use crate::ctl::serve_ctl;
+    use bertha::{
+        chan_transport::RendezvousChannel,
+        udp::{UdpReqChunnel, UdpSkChunnel},
+        AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, Never, OptionUnwrap,
+    };
+    use eyre::Error;
+    use futures_util::stream::TryStreamExt;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use tracing::{debug, info, trace};
+    use tracing_futures::Instrument;
+
+    #[test]
+    fn local_name() {
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap();
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+        rt.block_on(
+            async move {
+                let root = PathBuf::from(r"./tmp-test-local-name");
+
+                std::fs::remove_dir_all(&root).unwrap_or_else(|_| ());
+                trace!(dir = ?&root, "create dir");
+                std::fs::create_dir(&root)?;
+                debug!(dir = ?&root, "start ctl");
+                let r1 = root.clone();
+                tokio::spawn(
+                    async move { serve_ctl(Some(r1), false).await.unwrap() }
+                        .instrument(tracing::info_span!("localname-ctl")),
+                );
+
+                tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
+
+                let (srv, cln) = RendezvousChannel::new(10).split();
+                // udp |> localnamesrv server
+                let udp_addr: SocketAddr = "127.0.0.1:21987".parse()?;
+                let mut srv = LocalNameSrv::new(
+                    root.clone(),
+                    Never::from(UdpReqChunnel::default()),
+                    OptionUnwrap::from(srv),
+                )
+                .await?;
+
+                tokio::spawn(
+                    async move {
+                        let st = srv.listen(udp_addr).await;
+                        st.try_for_each_concurrent(None, |cn| async move {
+                            let m = cn.recv().await?;
+                            cn.send(m).await?;
+                            Ok(())
+                        })
+                        .await
+                    }
+                    .instrument(tracing::debug_span!("server")),
+                );
+
+                // udp |> localnamecln client
+                let mut cln = LocalNameCln::new(
+                    root.clone(),
+                    Never::from(AddrWrap::from(UdpSkChunnel::default())),
+                    cln,
+                )
+                .await?;
+                info!("connecting client");
+                let cn = cln.connect(udp_addr).await?;
+
+                cn.send(vec![1u8; 8]).await?;
+                let d = cn.recv().await?;
+                assert_eq!(d, vec![1u8; 8]);
+
+                Ok::<_, Error>(())
+            }
+            .instrument(tracing::info_span!("local_name")),
+        )
+        .unwrap();
     }
 }

@@ -35,6 +35,9 @@ regex = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
 hyper = {version = "0.13", features = ["stream"], optional = true }
 
+[dev-dependencies]
+tracing-futures = "0.2"
+
 [[bin]]
 name = "burrito-localname"
 required-features = ["ctl", "docker"]

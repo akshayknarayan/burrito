@@ -21,8 +21,8 @@ pub struct LocalNameClient {
 }
 
 impl LocalNameClient {
-    pub async fn new(burrito_root: impl AsRef<Path>) -> Result<Self, Error> {
-        let controller_addr = burrito_root.as_ref().join(CONTROLLER_ADDRESS);
+    pub async fn new(burrito_root: &Path) -> Result<Self, Error> {
+        let controller_addr = burrito_root.join(CONTROLLER_ADDRESS);
         let uc: async_bincode::AsyncBincodeStream<_, proto::Reply, proto::Request, _> =
             UnixStream::connect(controller_addr).await?.into();
         let uc = uc.for_async();
