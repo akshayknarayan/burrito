@@ -1,24 +1,20 @@
 pub use burrito_discovery_ctl::proto::Addr;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
-/// Callers must pass exactly one Addr::Burrito in name, and exactly one of:
-/// - zero or one Addr::Tcp in register, which will be recursively registered with discovery-ctl.
-/// - zero or one Addr::Unix in register will be regsitered locally (corresponding to the Addr::Burrito).
-///
-/// If an Addr::Tcp was given, the response will contain an Addr::Unix to listen on.
-/// Any Addr::Udp or Addr::Burrito given in register wil be ignored silently.
+/// Callers must pass exactly one String in name, and exactly one of:
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
-    pub name: Addr,
-    pub register: Option<Addr>,
+    pub name: SocketAddr,
 }
 
-/// register_addr: The Addr::Burrito that was passed.
-/// local_addr: The assigned Addr::Unix to listen on.
+/// register_addr: The name that was passed.
+/// local_addr: The assigned path to listen on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterReplyOk {
-    pub register_addr: Addr,
-    pub local_addr: Addr,
+    pub register_addr: SocketAddr,
+    pub local_addr: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +37,8 @@ impl Into<Result<RegisterReplyOk, String>> for RegisterReply {
 /// Returns all service entries matching the query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryNameReplyOk {
-    pub addr: Addr,
-    pub local_addr: Addr,
+    pub addr: SocketAddr,
+    pub local_addr: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +59,7 @@ impl Into<Result<QueryNameReplyOk, String>> for QueryNameReply {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Register(RegisterRequest),
-    Query(Addr),
+    Query(SocketAddr),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

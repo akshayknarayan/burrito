@@ -1,6 +1,7 @@
 use crate::{proto, CONTROLLER_ADDRESS};
-use failure::Error;
-use std::path::Path;
+use eyre::{bail, eyre, Error};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;
 use tokio_tower::pipeline;
 use tower_service::Service;
@@ -30,36 +31,37 @@ impl LocalNameClient {
         Ok(LocalNameClient { cl })
     }
 
-    pub async fn register(
-        &mut self,
-        name: proto::Addr,
-        register: Option<proto::Addr>,
-    ) -> Result<proto::RegisterReplyOk, Error> {
+    pub async fn register(&mut self, name: SocketAddr) -> Result<PathBuf, Error> {
         futures_util::future::poll_fn(|cx| self.cl.poll_ready(cx)).await?;
         match self
             .cl
-            .call(proto::Request::Register(proto::RegisterRequest {
-                name,
-                register,
-            }))
+            .call(proto::Request::Register(proto::RegisterRequest { name }))
             .await
         {
             Ok(proto::Reply::Register(r)) => {
                 let r: Result<proto::RegisterReplyOk, String> = r.into();
-                r.map_err(|s| failure::format_err!("{}", s))
+                r.map_err(|s| eyre!("{}", s)).map(|r| r.local_addr)
             }
-            _ => failure::bail!("Reply mismatched request type"),
+            _ => bail!("Reply mismatched request type"),
         }
     }
 
-    pub async fn query(&mut self, req: proto::Addr) -> Result<proto::QueryNameReplyOk, Error> {
+    pub async fn query(&mut self, req: SocketAddr) -> Result<Option<PathBuf>, Error> {
         futures_util::future::poll_fn(|cx| self.cl.poll_ready(cx)).await?;
         match self.cl.call(proto::Request::Query(req)).await {
             Ok(proto::Reply::Query(r)) => {
                 let r: Result<proto::QueryNameReplyOk, String> = r.into();
-                r.map_err(|s| failure::format_err!("{}", s))
+                r.map_err(|s| eyre!("{}", s)).and_then(
+                    |proto::QueryNameReplyOk { addr, local_addr }| {
+                        if addr != req {
+                            bail!("Reply mismatched request address")
+                        }
+
+                        Ok(local_addr)
+                    },
+                )
             }
-            _ => failure::bail!("Reply mismatched request type"),
+            _ => bail!("Reply mismatched request type"),
         }
     }
 }
