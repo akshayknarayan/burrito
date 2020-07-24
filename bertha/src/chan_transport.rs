@@ -13,9 +13,6 @@ pub struct Srv;
 pub struct Cln;
 
 /// Channel connector where server registers on listen(), and client grabs client on connect().
-///
-/// The connection stream listen() returns will only have one connection. Sending on that
-/// connection will fail.
 pub struct RendezvousChannel<Addr, Data, Side> {
     channel_size: usize,
     map: Arc<Mutex<HashMap<Addr, ChanChunnel<Data>>>>,

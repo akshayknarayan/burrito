@@ -507,6 +507,86 @@ where
     }
 }
 
+/// For testing-assertion purposes, a chunnel that errors if send() is called or inner.recv()
+/// returns data.
+pub struct Never<C>(Arc<C>);
+
+impl<C> Never<C> {
+    pub fn new(inner: C) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+impl<C> From<C> for Never<C> {
+    fn from(f: C) -> Never<C> {
+        Never::new(f)
+    }
+}
+
+impl<C: Clone> Clone for Never<C> {
+    fn clone(&self) -> Self {
+        Self(Arc::new(self.0.as_ref().clone()))
+    }
+}
+
+impl<C> Context for Never<C> {
+    type ChunnelType = C;
+
+    fn context(&self) -> &Self::ChunnelType {
+        &self.0
+    }
+
+    fn context_mut(&mut self) -> &mut Self::ChunnelType {
+        Arc::get_mut(&mut self.0).unwrap()
+    }
+}
+
+impl<B, C, D> InheritChunnel<C> for Never<B>
+where
+    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+{
+    type Connection = NeverCn<C>;
+    type Config = ();
+
+    fn get_config(&mut self) -> Self::Config {}
+
+    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
+        NeverCn::new(cx)
+    }
+}
+
+pub struct NeverCn<C>(Arc<C>);
+
+impl<C> NeverCn<C> {
+    pub fn new(inner: C) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+impl<C, D> ChunnelConnection for NeverCn<C>
+where
+    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+{
+    type Data = D;
+
+    fn send(
+        &self,
+        _: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        Box::pin(async move { Err(eyre!("No sends allowed on Never Chunnel")) })
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        let c = Arc::clone(&self.0);
+        Box::pin(async move {
+            let _ = c.recv().await?;
+            Err(eyre!("Unexpected recv in Never chunnel"))
+        })
+    }
+}
+
 /// Where the Chunnel implementation allows functionality to be implemented.
 pub enum Scope {
     /// Must be inside the application.
