@@ -1,10 +1,99 @@
+use color_eyre::eyre::{eyre, Report};
+use serde::{Deserialize, Serialize};
+use std::convert::TryInto;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use structopt::StructOpt;
+use tracing::debug_span;
 
-type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct Pong {
+    duration_us: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PingParams {
+    work: Work,
+    amount: i64,
+    padding: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct Server {
+    req_cnt: Arc<AtomicUsize>,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            req_cnt: Arc::new(0.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum Work {
+    Immediate,
+    Const,         // work as duration in us
+    Poisson,       // work as mean duration in us
+    BusyTimeConst, // work as busy-spin duration in us
+    BusyWorkConst, // work as number of operations to perform
+}
+
+impl Server {
+    fn get_counter(&self) -> Arc<AtomicUsize> {
+        self.req_cnt.clone()
+    }
+
+    async fn do_ping(&self, ping_req: PingParams) -> Result<Pong, Report> {
+        let span = debug_span!("ping()", req = ?ping_req);
+        let _span = span.enter();
+        let then = std::time::Instant::now();
+
+        let w: Work = ping_req.work;
+
+        self.req_cnt
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let amt = ping_req.amount.try_into().expect("u64 to i64 cast");
+
+        match w {
+            Work::Immediate => (),
+            Work::Const => {
+                let completion_time = then + std::time::Duration::from_micros(amt);
+                tokio::time::delay_until(tokio::time::Instant::from_std(completion_time)).await;
+            }
+            Work::Poisson => {
+                let completion_time = then + gen_poisson_duration(amt as f64)?;
+                tokio::time::delay_until(tokio::time::Instant::from_std(completion_time)).await;
+            }
+            Work::BusyTimeConst => {
+                let completion_time = then + std::time::Duration::from_micros(amt);
+                while std::time::Instant::now() < completion_time {
+                    // spin
+                }
+            }
+            Work::BusyWorkConst => {
+                // copy from shenango:
+                // https://github.com/shenango/shenango/blob/master/apps/synthetic/src/fakework.rs#L54
+                let k = 2350845.545;
+                for i in 0..amt {
+                    criterion::black_box(f64::sqrt(k * i as f64));
+                }
+            }
+        }
+
+        Ok(Pong {
+            duration_us: then
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .expect("u128 to i64 cast"),
+        })
+    }
+}
 
 #[derive(Debug, StructOpt)]
 struct Opt {
@@ -47,7 +136,7 @@ fn dump_ctrs(
     }
 }
 
-async fn serve_udp(srv: rpcbench::Server, port: u16) -> Result<(), StdError> {
+async fn serve_udp(srv: Server, port: u16) -> Result<(), Report> {
     // udp server
     let mut buf = [0u8; 1024];
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
@@ -58,18 +147,19 @@ async fn serve_udp(srv: rpcbench::Server, port: u16) -> Result<(), StdError> {
         let (len, from_addr) = sk.recv_from(&mut buf).await?;
         let msg = &buf[..len];
         // deserialize
-        let msg: rpcbench::SPingParams = bincode::deserialize(msg)?;
-        let resp: rpcbench::SPong = srv.do_ping(msg.into()).await?.into();
+        let msg: PingParams = bincode::deserialize(msg)?;
+        let resp: Pong = srv.do_ping(msg.into()).await?.into();
         let msg = bincode::serialize(&resp)?;
         sk.send_to(&msg, from_addr).await?;
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), StdError> {
+async fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
 
     tracing_subscriber::fmt::init();
+    color_eyre::install()?;
 
     // listen on ports
     let ctrs: Vec<(u16, Arc<AtomicUsize>)> = opt
@@ -77,7 +167,7 @@ async fn main() -> Result<(), StdError> {
         .clone()
         .into_iter()
         .map(|port| {
-            let srv = rpcbench::Server::default();
+            let srv = Server::default();
             let ctr = srv.get_counter();
             tokio::spawn(serve_udp(srv, port));
             (port, ctr)
@@ -134,4 +224,12 @@ async fn main() -> Result<(), StdError> {
     }
 
     Ok(())
+}
+
+fn gen_poisson_duration(amt: f64) -> Result<std::time::Duration, Report> {
+    use rand_distr::{Distribution, Poisson};
+
+    let mut rng = rand::thread_rng();
+    let pois = Poisson::new(amt as f64).map_err(|e| eyre!("Invalid amount {}: {:?}", amt, e))?;
+    Ok(std::time::Duration::from_micros(pois.sample(&mut rng)))
 }

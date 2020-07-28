@@ -1,14 +1,12 @@
 use structopt::StructOpt;
 
-type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
 #[derive(Debug, StructOpt)]
 struct Opt {
     #[structopt(short = "i", long = "interface")]
     interface: String,
 }
 
-fn main() -> Result<(), StdError> {
+fn main() -> Result<(), color_eyre::eyre::Report> {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -17,6 +15,7 @@ fn main() -> Result<(), StdError> {
     let opt = Opt::from_args();
 
     tracing_subscriber::fmt::init();
+    color_eyre::install()?;
 
     let mut prog =
         xdp_shard::BpfHandles::<xdp_shard::Ingress>::load_on_interface_name(&opt.interface)?;

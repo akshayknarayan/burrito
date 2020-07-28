@@ -1,5 +1,5 @@
 use crate::bindings::*;
-use crate::StdError;
+use eyre::{eyre, Report};
 use std::collections::HashMap;
 use xdp_shard_prog::Datarec;
 
@@ -13,7 +13,7 @@ struct Record {
 
 impl Record {
     // map_key is the rxq
-    fn update(&mut self, fd: std::os::raw::c_int) -> Result<(), StdError> {
+    fn update(&mut self, fd: std::os::raw::c_int) -> Result<(), Report> {
         let map_key = self.rxq_id;
 
         // collect stats.
@@ -28,9 +28,7 @@ impl Record {
             )
         };
         if ok != 0 {
-            Err(String::from(
-                "Could not bpf_map_lookup_elem for stats_global_map",
-            ))?;
+            Err(eyre!("Could not bpf_map_lookup_elem for stats_global_map",))?;
         }
 
         self.timestamp = std::time::Instant::now();
@@ -98,7 +96,7 @@ impl StatsRecord {
         }
     }
 
-    pub fn update(&mut self, rx_queue_index_map: std::os::raw::c_int) -> Result<(), StdError> {
+    pub fn update(&mut self, rx_queue_index_map: std::os::raw::c_int) -> Result<(), Report> {
         for rxq in self.rxqs.iter_mut() {
             rxq.update(rx_queue_index_map)?;
         }

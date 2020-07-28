@@ -1,7 +1,4 @@
-use std::error::Error;
 use structopt::StructOpt;
-
-type StdError = Box<dyn Error + Send + Sync + 'static>;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "xdp_clear")]
@@ -13,9 +10,10 @@ struct Opt {
     interface: Option<String>,
 }
 
-fn main() -> Result<(), StdError> {
+fn main() -> Result<(), color_eyre::eyre::Report> {
     let opt = Opt::from_args();
     tracing_subscriber::fmt::init();
+    color_eyre::install()?;
 
     if let Some(addr) = opt.ip_addr {
         xdp_shard::remove_xdp_on_address(addr)?

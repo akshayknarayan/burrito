@@ -1,6 +1,5 @@
+use eyre::Report;
 use std::collections::HashMap;
-
-type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[cfg(feature = "ebpf")]
 pub mod bindings;
@@ -38,7 +37,7 @@ pub fn diff_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMa
 }
 
 /// Wraps `getifaddrs`.
-pub fn get_interface_name(addr: std::net::IpAddr) -> Result<Vec<String>, StdError> {
+pub fn get_interface_name(addr: std::net::IpAddr) -> Result<Vec<String>, Report> {
     use nix::ifaddrs;
     let ifaddrs = ifaddrs::getifaddrs()?
         .filter_map(|a| match a {
@@ -55,6 +54,6 @@ pub fn get_interface_name(addr: std::net::IpAddr) -> Result<Vec<String>, StdErro
 }
 
 /// Wraps `if_nametoindex`.
-pub fn get_interface_id(interface_name: &str) -> Result<u32, StdError> {
+pub fn get_interface_id(interface_name: &str) -> Result<u32, Report> {
     Ok(nix::net::if_::if_nametoindex(interface_name)?)
 }
