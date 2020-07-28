@@ -11,7 +11,7 @@ pub mod reliable;
 pub mod tagger;
 pub mod udp;
 
-/// A specification of application network semantics.
+/// `ChunnelListener`s are used to get a stream of incoming connections.
 pub trait ChunnelListener {
     type Future: Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static;
     type Addr;
@@ -27,6 +27,7 @@ pub trait ChunnelListener {
     // fn resource_requirements(&self) -> ?;
 }
 
+/// `ChunnelConnector`s connect to a single remote Chunnel endpoint and return one connection.
 pub trait ChunnelConnector {
     type Future: Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static;
     type Addr;

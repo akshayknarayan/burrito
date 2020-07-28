@@ -80,8 +80,6 @@ pub struct ShardCanonicalServer<C, S> {
     inner: Arc<Mutex<C>>,
     shards_inner: Arc<Mutex<S>>,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
-    #[cfg(feature = "ebpf")]
-    handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
 }
 
 impl<C, S> ShardCanonicalServer<C, S> {
@@ -96,20 +94,7 @@ impl<C, S> ShardCanonicalServer<C, S> {
             inner: Arc::new(Mutex::new(inner)),
             shards_inner: Arc::new(Mutex::new(shards)),
             redis_listen_connection,
-            #[cfg(feature = "ebpf")]
-            handles: Default::default(),
         })
-    }
-
-    /// Future which will poll stats from the ebpf program.
-    ///
-    /// If file is Some, the stats will be dumped to the file in addition to being logged via
-    /// the tracing crate.
-    #[cfg(feature = "ebpf")]
-    pub async fn log_shard_stats(&self, file: Option<std::fs::File>) {
-        ebpf::read_shard_stats(Arc::clone(&self.handles), file)
-            .instrument(tracing::info_span!("read-shard-stats"))
-            .await
     }
 }
 
@@ -143,20 +128,12 @@ where
         let inner = Arc::clone(&self.inner);
         let shards_inner = Arc::clone(&self.shards_inner);
         let redis_conn = Arc::clone(&self.redis_listen_connection);
-        #[cfg(feature = "ebpf")]
-        let handles = Arc::clone(&self.handles);
         Box::pin(
             async move {
                 // redis insert
                 redis_insert(redis_conn, &a)
                     .await
                     .wrap_err("Could not register shard info")?;
-
-                // if ebpf, ebpf initialization
-                #[cfg(feature = "ebpf")]
-                {
-                    ebpf::register_shardinfo(handles, a).await;
-                }
 
                 let num_shards = a.shard_addrs.len();
                 let addrs = a.shard_addrs.clone();
@@ -587,10 +564,185 @@ where
 }
 
 #[cfg(feature = "ebpf")]
+pub use ebpf::ShardCanonicalServerEbpf;
+
+#[cfg(feature = "ebpf")]
 mod ebpf {
-    use bertha::IpPort;
+    use super::eyre::Error;
+    use super::eyre::{Report, WrapErr};
+    use super::ShardCanonicalServerConnection;
+    use crate::{Kv, ShardInfo};
+    use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener, IpPort};
+    use futures_util::stream::{Stream, StreamExt};
+    use serde::{de::DeserializeOwned, Serialize};
     use std::collections::HashMap;
-    use tracing::{debug, info, trace};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tracing::{debug, info, trace, warn};
+    use tracing_futures::Instrument;
+
+    /// A chunnel managing a sharded service.
+    ///
+    /// Listens on an external connection, then forwards messages to one of the internal
+    /// connections after evaluating the sharding function. Also registers with shard-ctl, which
+    /// will perform other setup (loading XDP program, answering client queries, etc).  Does not
+    /// implement `connect()`.
+    pub struct ShardCanonicalServerEbpf<C, S> {
+        inner: Arc<Mutex<C>>,
+        shards_inner: Arc<Mutex<S>>,
+        redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
+        handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
+    }
+
+    impl<C, S> ShardCanonicalServerEbpf<C, S> {
+        /// Inner is a chunnel for the external connection.
+        /// Shards is a chunnel for an internal connection to the shards.
+        pub async fn new(inner: C, shards: S, redis_addr: &str) -> Result<Self, Report> {
+            let redis_client = redis::Client::open(redis_addr)?;
+            let redis_listen_connection =
+                Arc::new(Mutex::new(redis_client.get_async_connection().await?));
+
+            Ok(ShardCanonicalServerEbpf {
+                inner: Arc::new(Mutex::new(inner)),
+                shards_inner: Arc::new(Mutex::new(shards)),
+                redis_listen_connection,
+                handles: Default::default(),
+            })
+        }
+
+        /// Future which will poll stats from the ebpf program.
+        ///
+        /// If file is Some, the stats will be dumped to the file in addition to being logged via
+        /// the tracing crate.
+        pub async fn log_shard_stats(&self, file: Option<std::fs::File>) {
+            read_shard_stats(Arc::clone(&self.handles), file)
+                .instrument(tracing::info_span!("read-shard-stats"))
+                .await
+                .expect("read_shard_stats")
+        }
+    }
+
+    impl<C, A, S, D> ChunnelListener for ShardCanonicalServerEbpf<C, S>
+    where
+        C: ChunnelListener<Addr = A, Error = Report> + Send + Sync + 'static,
+        C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
+        S: ChunnelConnector<Addr = A, Error = Report> + Send + Sync + 'static,
+        S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
+        D: Kv + Send + Sync + 'static,
+        <D as Kv>::Key: AsRef<str>,
+        A: IpPort
+            + Clone
+            + std::fmt::Debug
+            + std::fmt::Display
+            + Send
+            + Sync
+            + 'static
+            + Serialize
+            + DeserializeOwned,
+    {
+        type Addr = ShardInfo<A>;
+        type Connection = ShardCanonicalServerConnection<C::Connection, S::Connection>;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+        type Stream =
+            Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+        type Error = Report;
+
+        fn listen(&mut self, a: Self::Addr) -> Self::Future {
+            let a1 = a.clone();
+            let inner = Arc::clone(&self.inner);
+            let shards_inner = Arc::clone(&self.shards_inner);
+            let redis_conn = Arc::clone(&self.redis_listen_connection);
+            let handles = Arc::clone(&self.handles);
+            Box::pin(
+                async move {
+                    // redis insert
+                    super::redis_insert(redis_conn, &a)
+                        .await
+                        .wrap_err("Could not register shard info")?;
+
+                    // if ebpf, ebpf initialization
+                    register_shardinfo(handles, a.clone())
+                        .instrument(tracing::debug_span!("register-shardinfo-ebpf"))
+                        .await;
+
+                    let num_shards = a.shard_addrs.len();
+                    let addrs = a.shard_addrs.clone();
+
+                    // connect to shards
+                    let conns: Vec<Arc<S::Connection>> = match futures_util::future::join_all(
+                        addrs.clone().into_iter().map(|addr| async {
+                            Ok::<_, Report>(Arc::new(
+                                shards_inner.lock().await.connect(addr).await?,
+                            ))
+                        }),
+                    )
+                    .await
+                    .into_iter()
+                    .collect()
+                    {
+                        Ok(a) => a,
+                        Err(e) => {
+                            return Err(e).wrap_err("Could not connect to shards");
+                        }
+                    };
+
+                    // serve canonical address
+                    // we are only responsible for the canonical address here.
+                    Ok(
+                        Box::pin(inner.lock().await.listen(a.canonical_addr).await?.map(
+                            move |conn| {
+                                Ok(ShardCanonicalServerConnection {
+                                    inner: Arc::new(conn?),
+                                    shards: conns.clone(),
+                                    shard_fn: Arc::new(move |d| {
+                                        /* xdp_shard version of FNV: take the first 4 bytes of the key
+                                        * u64 hash = FNV1_64_INIT;
+                                        * // ...
+                                        * // value start
+                                        * pkt_val = ((u8*) app_data) + offset;
+
+                                        * // compute FNV hash
+                                        * #pragma clang loop unroll(full)
+                                        * for (i = 0; i < 4; i++) {
+                                        *     hash = hash ^ ((u64) pkt_val[i]);
+                                        *     hash *= FNV_64_PRIME;
+                                        * }
+
+                                        * // map to a shard and assign to that port.
+                                        * idx = hash % shards->num;
+                                        */
+                                        let mut hash = super::FNV1_64_INIT;
+                                        for b in d.key().as_ref().as_bytes()[0..4].iter() {
+                                            hash = hash ^ (*b as u64);
+                                            hash = u64::wrapping_mul(hash, super::FNV_64_PRIME);
+                                        }
+
+                                        hash as usize % num_shards
+                                    }),
+                                })
+                            },
+                        )) as _,
+                    )
+                }
+                .instrument(tracing::debug_span!("listen", addr = ?&a1)),
+            )
+        }
+
+        fn scope(&self) -> bertha::Scope {
+            bertha::Scope::Local
+        }
+
+        fn endedness(&self) -> bertha::Endedness {
+            bertha::Endedness::Either
+        }
+
+        fn implementation_priority(&self) -> usize {
+            1
+        }
+    }
 
     async fn clear_port<T>(
         handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<T>>>>,
@@ -599,23 +751,25 @@ mod ebpf {
         let mut map = handles.lock().await;
         for h in map.values_mut() {
             if let Err(e) = h.clear_port(port) {
-                debug!(err = ?e, port = ?sk, "Failed to clear port map");
+                debug!(err = ?e, port = ?port, "Failed to clear port map");
             }
         }
     }
 
-    async fn register_shardinfo<A: IpPort>(
+    pub(crate) async fn register_shardinfo<A: IpPort + Clone>(
         handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
-        si: proto::ShardInfo<A>,
+        si: ShardInfo<A>,
     ) {
         let shard_ports: Vec<u16> = si.shard_addrs.iter().map(|a| a.port()).collect();
-        let sk = si.canonical_addr;
+        let sk = si.canonical_addr.clone();
+
+        clear_port(handles.clone(), sk.port()).await;
 
         // see if handles are there already
         let ifnames = match xdp_shard::get_interface_name(sk.ip()) {
             Ok(ifnames) => ifnames,
             Err(e) => {
-                warn!(err = ?e, sk = ?sk, "Error getting interface");
+                warn!(err = ?e, ip = ?sk.ip(), port = ?sk.port(), "Error getting interface");
                 return;
             }
         };
@@ -632,7 +786,7 @@ mod ebpf {
                     }
                 };
 
-                info!(service = ?si.canonical_addr, "Loaded XDP program");
+                info!(service_ip = ?&si.canonical_addr.ip(), service_port = ?&si.canonical_addr.port(), "Loaded XDP program");
 
                 map.insert(ifn.clone(), handle);
             }
@@ -659,14 +813,15 @@ mod ebpf {
             }
 
             info!(
-                service = ?si.canonical_addr,
+                service_ip = ?si.canonical_addr.ip(),
+                service_port = ?si.canonical_addr.port(),
                 interface = ?&ifn,
                 "Registered sharding with XDP program"
             );
         }
     }
 
-    async fn read_shard_stats(
+    pub(crate) async fn read_shard_stats(
         handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
         mut stats_log: Option<std::fs::File>,
     ) -> Result<(), Error> {
