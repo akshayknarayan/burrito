@@ -61,24 +61,12 @@ where
 {
     type Addr = A;
     type Connection = Once<ChanChunnel<D>, D>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = eyre::Report;
 
-    fn listen(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
-                                + Send
-                                + 'static,
-                        >,
-                    >,
-                > + Send
-                + 'static,
-        >,
-    > {
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
         let channel_size = self.channel_size;
         let (s, r) = mpsc::channel(channel_size);
         let (s1, r1) = mpsc::channel(channel_size);
@@ -89,12 +77,12 @@ where
                 .await
                 .insert(a, ChanChunnel::new(s, r1, Arc::new(|x| x)));
             // `r.map` maps over the messages in the receive channel stream.
-            Box::pin(r.map(move |d| {
+            Ok(Box::pin(r.map(move |d| {
                 // Once will not call recv() on the inner C, so pass a dummy receiver.
                 let (_, r2) = mpsc::channel(1);
                 let resp_chunnel = ChanChunnel::new(s1.clone(), r2, Arc::new(|x| x));
                 Ok(Once::new(Arc::new(resp_chunnel), d))
-            })) as _
+            })) as _)
         })
     }
 
@@ -116,12 +104,11 @@ where
 {
     type Addr = A;
     type Connection = ChanChunnel<D>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = eyre::Report;
 
-    fn connect(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
-    {
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
         let addr = a.clone();
         let m = Arc::clone(&self.map);
         Box::pin(async move {
@@ -212,30 +199,18 @@ where
 {
     type Addr = ();
     type Connection = ChanChunnel<D>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = eyre::Report;
 
-    fn listen(
-        &mut self,
-        _a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
-                                + Send
-                                + 'static,
-                        >,
-                    >,
-                > + Send
-                + 'static,
-        >,
-    > {
+    fn listen(&mut self, _a: Self::Addr) -> Self::Future {
         let r = ChanChunnel::new(
             self.snd1.take().unwrap(),
             self.rcv2.take().unwrap(),
             Arc::clone(&self.link),
         );
-        Box::pin(async move { Box::pin(futures_util::stream::once(async { Ok(r) })) as _ })
+        Box::pin(async move { Ok(Box::pin(futures_util::stream::once(async { Ok(r) })) as _) })
     }
 
     fn scope(&self) -> Scope {
@@ -257,12 +232,11 @@ where
 {
     type Addr = ();
     type Connection = ChanChunnel<D>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = eyre::Report;
 
-    fn connect(
-        &mut self,
-        _a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
-    {
+    fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         let r = ChanChunnel::new(
             self.snd2.take().unwrap(),
             self.rcv1.take().unwrap(),

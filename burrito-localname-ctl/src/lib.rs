@@ -50,59 +50,41 @@ impl<C, L> LocalNameSrv<C, L> {
 
 impl<C, Cn, L, Ln, D> ChunnelListener for LocalNameSrv<C, L>
 where
-    C: ChunnelListener<Addr = SocketAddr, Connection = Cn> + Send + 'static,
-    L: ChunnelListener<Addr = PathBuf, Connection = Ln> + Send + 'static,
+    C: ChunnelListener<Addr = SocketAddr, Connection = Cn, Error = Error> + Send + 'static,
+    L: ChunnelListener<Addr = PathBuf, Connection = Ln, Error = Error> + Send + 'static,
     Cn: ChunnelConnection<Data = D> + 'static,
     Ln: ChunnelConnection<Data = D> + 'static,
 {
     type Addr = SocketAddr;
     type Connection = Either<Cn, Ln>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Error;
 
-    fn listen(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
-                                + Send
-                                + 'static,
-                        >,
-                    >,
-                > + Send
-                + 'static,
-        >,
-    > {
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
         let cl = Arc::clone(&self.cl);
         let pub_inner = Arc::clone(&self.pub_inner);
         let local_inner = Arc::clone(&self.local_inner);
         Box::pin(async move {
             // call client.register
-            let local_addr = cl.lock().await.register(a).await;
-            if let Err(e) = local_addr {
-                return Box::pin(futures_util::stream::once(async {
-                    Err(e.wrap_err("Could not register local address"))
-                })) as _;
-            }
-            let local_addr = local_addr.unwrap();
+            let local_addr = cl.lock().await.register(a).await?;
 
             // listen selects on returned addr and inner.listen(addr)
             let ext_str = pub_inner
                 .lock()
                 .await
                 .listen(a)
-                .await
+                .await?
                 .map(|conn| Ok(Either::Left(conn?)));
             let int_str = local_inner
                 .lock()
                 .await
                 .listen(local_addr)
-                .await
+                .await?
                 .map(|conn| Ok(Either::Right(conn?)));
 
-            Box::pin(futures_util::stream::select(ext_str, int_str)) as _
+            Ok(Box::pin(futures_util::stream::select(ext_str, int_str)) as _)
         })
     }
 
@@ -141,19 +123,18 @@ impl<C, L> LocalNameCln<C, L> {
 
 impl<C, L, Cn, Ln, D> ChunnelConnector for LocalNameCln<C, L>
 where
-    C: ChunnelConnector<Addr = SocketAddr, Connection = Cn> + Send + 'static,
-    L: ChunnelConnector<Addr = PathBuf, Connection = Ln> + Send + 'static,
-    Cn: ChunnelConnection<Data = D>,
-    Ln: ChunnelConnection<Data = D>,
+    C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = Error> + Send + 'static,
+    L: ChunnelConnector<Addr = PathBuf, Connection = Ln, Error = Error> + Send + 'static,
+    Cn: ChunnelConnection<Data = D> + 'static,
+    Ln: ChunnelConnection<Data = D> + 'static,
 {
     type Addr = SocketAddr;
     type Connection = Either<C::Connection, L::Connection>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Error;
 
-    fn connect(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
-    {
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
         let cl = Arc::clone(&self.cl);
         let ext = Arc::clone(&self.pub_inner);
         let inn = Arc::clone(&self.local_inner);
@@ -234,7 +215,7 @@ mod test {
 
                 tokio::spawn(
                     async move {
-                        let st = srv.listen(udp_addr).await;
+                        let st = srv.listen(udp_addr).await.unwrap();
                         st.try_for_each_concurrent(None, |cn| async move {
                             let m = cn.recv().await?;
                             cn.send(m).await?;

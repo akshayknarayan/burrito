@@ -363,7 +363,7 @@ mod test {
                 let (srv, cln) = Chan::default().split();
 
                 let mut rcv = ReliabilityChunnel::from(srv);
-                let mut rcv = rcv.listen(()).await;
+                let mut rcv = rcv.listen(()).await.unwrap();
                 let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = ReliabilityChunnel::from(cln);
@@ -403,7 +403,7 @@ mod test {
                 let (srv, cln) = t.split();
 
                 let mut rcv = ReliabilityChunnel::from(srv);
-                let mut rcv = rcv.listen(()).await;
+                let mut rcv = rcv.listen(()).await.unwrap();
                 let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = ReliabilityChunnel::from(cln);

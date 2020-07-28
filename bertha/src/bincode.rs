@@ -148,7 +148,7 @@ mod test {
                 let (srv, cln) = Chan::default().split();
 
                 let mut rcv = SerializeChunnel::from(srv);
-                let mut rcv = rcv.listen(()).await;
+                let mut rcv = rcv.listen(()).await.unwrap();
                 let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = SerializeChunnel::from(cln);
@@ -181,7 +181,7 @@ mod test {
                 let (srv, cln) = Chan::default().split();
 
                 let mut rcv = SerializeChunnel::from(srv);
-                let mut rcv = rcv.listen(()).await;
+                let mut rcv = rcv.listen(()).await.unwrap();
                 let rcv = rcv.next().await.unwrap().unwrap();
 
                 let mut snd = SerializeChunnel::from(cln);

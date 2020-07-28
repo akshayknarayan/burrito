@@ -13,26 +13,13 @@ pub mod udp;
 
 /// A specification of application network semantics.
 pub trait ChunnelListener {
+    type Future: Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static;
     type Addr;
-    type Connection: ChunnelConnection;
+    type Connection: ChunnelConnection + 'static;
+    type Error: Send + Sync + 'static;
+    type Stream: Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static;
 
-    fn listen(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
-                                + Send
-                                + 'static,
-                        >,
-                    >,
-                > + Send
-                + 'static,
-        >,
-    >;
+    fn listen(&mut self, a: Self::Addr) -> Self::Future;
 
     fn scope(&self) -> Scope;
     fn endedness(&self) -> Endedness;
@@ -41,13 +28,12 @@ pub trait ChunnelListener {
 }
 
 pub trait ChunnelConnector {
+    type Future: Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static;
     type Addr;
-    type Connection: ChunnelConnection;
+    type Connection: ChunnelConnection + 'static;
+    type Error: Send + Sync + 'static;
 
-    fn connect(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>;
+    fn connect(&mut self, a: Self::Addr) -> Self::Future;
 
     fn scope(&self) -> Scope;
     fn endedness(&self) -> Endedness;
@@ -125,38 +111,28 @@ where
     <C as Context>::ChunnelType: ChunnelListener,
     <<C as Context>::ChunnelType as ChunnelListener>::Connection: 'static,
     C: InheritChunnel<<<C as Context>::ChunnelType as ChunnelListener>::Connection>,
+    <C as InheritChunnel<<<C as Context>::ChunnelType as ChunnelListener>::Connection>>::Connection:
+        'static,
 {
     type Addr = <<C as Context>::ChunnelType as ChunnelListener>::Addr;
     type Connection = C::Connection;
+    type Error = <<C as Context>::ChunnelType as ChunnelListener>::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
-    fn listen(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
-                                + Send
-                                + 'static,
-                        >,
-                    >,
-                > + Send
-                + 'static,
-        >,
-    > {
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
         use futures_util::StreamExt;
 
         let f = self.context_mut().listen(a);
         let cfg = self.get_config();
         Box::pin(async move {
             let cfg = cfg;
-            let conn_stream = f.await;
-            Box::pin(conn_stream.map(move |conn| {
+            let conn_stream = f.await?;
+            Ok(Box::pin(conn_stream.map(move |conn| {
                 let cfg = cfg.clone();
                 Ok(C::make_connection(conn?, cfg))
-            })) as _
+            })) as _)
         })
     }
 
@@ -180,15 +156,16 @@ where
     <C as Context>::ChunnelType: ChunnelConnector,
     <<C as Context>::ChunnelType as ChunnelConnector>::Connection: 'static,
     C: InheritChunnel<<<C as Context>::ChunnelType as ChunnelConnector>::Connection>,
+    <C as InheritChunnel<<<C as Context>::ChunnelType as ChunnelConnector>::Connection>>::Connection:
+        'static,
 {
     type Addr = <<C as Context>::ChunnelType as ChunnelConnector>::Addr;
     type Connection = C::Connection;
+    type Error = <<C as Context>::ChunnelType as ChunnelConnector>::Error;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
-    fn connect(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
-    {
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
         let f = self.context_mut().connect(a);
         let cfg = self.get_config();
         Box::pin(async move { Ok(C::make_connection(f.await?, cfg)) })
@@ -444,21 +421,21 @@ impl<C: Clone> Clone for AddrWrap<C> {
     }
 }
 
-impl<A, C, N, D> ChunnelConnector for AddrWrap<C>
+impl<A, C, E, N, D> ChunnelConnector for AddrWrap<C>
 where
     A: Clone + Send + 'static,
-    C: ChunnelConnector<Addr = (), Connection = N> + Clone + Send + Sync + 'static,
+    C: ChunnelConnector<Addr = (), Connection = N, Error = E> + Clone + Send + Sync + 'static,
     N: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
     D: Send + 'static,
+    E: Send + Sync + 'static,
 {
     type Addr = A;
     type Connection = AddrWrapCn<A, N>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = E;
 
-    fn connect(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
-    {
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
         let mut c = self.0.clone();
         Box::pin(async move {
             let cn = c.connect(()).await?;

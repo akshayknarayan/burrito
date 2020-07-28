@@ -115,9 +115,9 @@ impl<C, S> ShardCanonicalServer<C, S> {
 
 impl<C, A, S, D> ChunnelListener for ShardCanonicalServer<C, S>
 where
-    C: ChunnelListener<Addr = A> + Send + Sync + 'static,
+    C: ChunnelListener<Addr = A, Error = Error> + Send + Sync + 'static,
     C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
-    S: ChunnelConnector<Addr = A> + Send + Sync + 'static,
+    S: ChunnelConnector<Addr = A, Error = Error> + Send + Sync + 'static,
     S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
     <D as Kv>::Key: AsRef<str>,
@@ -133,24 +133,12 @@ where
 {
     type Addr = ShardInfo<A>;
     type Connection = ShardCanonicalServerConnection<C::Connection, S::Connection>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Error;
 
-    fn listen(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
-                                + Send
-                                + 'static,
-                        >,
-                    >,
-                > + Send
-                + 'static,
-        >,
-    > {
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
         let a1 = a.clone();
         let inner = Arc::clone(&self.inner);
         let shards_inner = Arc::clone(&self.shards_inner);
@@ -160,11 +148,9 @@ where
         Box::pin(
             async move {
                 // redis insert
-                if let Err(e) = redis_insert(redis_conn, &a).await {
-                    return Box::pin(futures_util::stream::once(async {
-                        Err(e.wrap_err("Could not register shard info"))
-                    })) as _;
-                }
+                redis_insert(redis_conn, &a)
+                    .await
+                    .wrap_err("Could not register shard info")?;
 
                 // if ebpf, ebpf initialization
                 #[cfg(feature = "ebpf")]
@@ -189,20 +175,18 @@ where
                 {
                     Ok(a) => a,
                     Err(e) => {
-                        return Box::pin(futures_util::stream::once(async {
-                            Err(e).wrap_err("Could not connect to shards")
-                        })) as _
+                        return Err(e).wrap_err("Could not connect to shards");
                     }
                 };
 
                 // serve canonical address
                 // we are only responsible for the canonical address here.
-                Box::pin(
+                Ok(Box::pin(
                     inner
                         .lock()
                         .await
                         .listen(a.canonical_addr)
-                        .await
+                        .await?
                         .map(move |conn| {
                             Ok(ShardCanonicalServerConnection {
                                 inner: Arc::new(conn?),
@@ -234,7 +218,7 @@ where
                                 }),
                             })
                         }),
-                ) as _
+                ) as _)
             }
             .instrument(tracing::debug_span!("listen", addr = ?&a1)),
         )
@@ -337,9 +321,9 @@ impl ShardServer<(), ()> {
 
 impl<C, A, S, D> ChunnelListener for ShardServer<C, S>
 where
-    C: ChunnelListener<Addr = A> + Send + Sync + 'static,
+    C: ChunnelListener<Addr = A, Error = Error> + Send + Sync + 'static,
     C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
-    S: ChunnelListener<Addr = A> + Send + Sync + 'static,
+    S: ChunnelListener<Addr = A, Error = Error> + Send + Sync + 'static,
     S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
     <D as Kv>::Key: AsRef<str>,
@@ -355,24 +339,12 @@ where
 {
     type Addr = A;
     type Connection = Either<C::Connection, S::Connection>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Error;
 
-    fn listen(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
-                                + Send
-                                + 'static,
-                        >,
-                    >,
-                > + Send
-                + 'static,
-        >,
-    > {
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
         let ext = Arc::clone(&self.external);
         let int = Arc::clone(&self.internal);
         Box::pin(async move {
@@ -380,16 +352,16 @@ where
                 .lock()
                 .await
                 .listen(a.clone())
-                .await
+                .await?
                 .map(|conn| Ok(Either::Left(conn?)));
             let int_str = int
                 .lock()
                 .await
                 .listen(a)
-                .await
+                .await?
                 .map(|conn| Ok(Either::Right(conn?)));
 
-            Box::pin(futures_util::stream::select(ext_str, int_str)) as _
+            Ok(Box::pin(futures_util::stream::select(ext_str, int_str)) as _)
         })
     }
 
@@ -415,21 +387,7 @@ pub struct ClientShardChunnelClient<C> {
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
 }
 
-impl<A, C> ClientShardChunnelClient<C>
-where
-    C: ChunnelConnector<Addr = A> + Send + Sync + 'static,
-    C::Connection: Send + Sync + 'static,
-    <C::Connection as ChunnelConnection>::Data: Kv + Send + Sync + 'static,
-    <<C::Connection as ChunnelConnection>::Data as Kv>::Key: AsRef<str>,
-    A: Serialize
-        + DeserializeOwned
-        + std::cmp::PartialEq
-        + std::fmt::Debug
-        + std::fmt::Display
-        + Send
-        + Sync
-        + 'static,
-{
+impl<C> ClientShardChunnelClient<C> {
     pub async fn new(inner: C, redis_addr: &str) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)?;
         let redis_listen_connection =
@@ -444,7 +402,7 @@ where
 
 impl<A, C> ChunnelConnector for ClientShardChunnelClient<C>
 where
-    C: ChunnelConnector<Addr = A> + Send + Sync + 'static,
+    C: ChunnelConnector<Addr = A, Error = Error> + Send + Sync + 'static,
     C::Connection: Send + Sync + 'static,
     <C::Connection as ChunnelConnection>::Data: Kv + Send + Sync + 'static,
     <<C::Connection as ChunnelConnection>::Data as Kv>::Key: AsRef<str>,
@@ -459,19 +417,20 @@ where
 {
     type Addr = A;
     type Connection = ClientShardClientConnection<C::Connection>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Error;
 
-    fn connect(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
-    {
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
         let inner = Arc::clone(&self.inner);
         let redis_conn = Arc::clone(&self.redis_listen_connection);
         Box::pin(
             async move {
                 // query redis for si
                 trace!(addr = ?&a, "querying redis");
-                let si = redis_query(&a, redis_conn.lock().await).await?;
+                let si = redis_query(&a, redis_conn.lock().await)
+                    .await
+                    .wrap_err("redis query failed")?;
 
                 let addrs = match si {
                     None => vec![a],
@@ -484,13 +443,14 @@ where
 
                 debug!(addrs = ?&addrs, "Decided sharding plan");
                 let num_shards = addrs.len();
-                let conns: Vec<Arc<C::Connection>> =
-                    futures_util::future::join_all(addrs.into_iter().map(|a| async {
-                        Ok::<_, eyre::Report>(Arc::new(inner.lock().await.connect(a).await?))
-                    }))
-                    .await
-                    .into_iter()
-                    .collect::<Result<_, _>>()?;
+                let conns: Vec<Arc<C::Connection>> = futures_util::future::join_all(
+                    addrs
+                        .into_iter()
+                        .map(|a| async { Ok(Arc::new(inner.lock().await.connect(a).await?)) }),
+                )
+                .await
+                .into_iter()
+                .collect::<Result<_, Error>>()?;
                 Ok(ClientShardClientConnection {
                     inners: conns,
                     shard_fn: Arc::new(move |d| {
@@ -809,7 +769,7 @@ mod test {
     #[test]
     fn single_shard() {
         let _guard = tracing_subscriber::fmt::try_init();
-        color_eyre::install().unwrap();
+        color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
         let mut rt = tokio::runtime::Builder::new()
@@ -837,7 +797,7 @@ mod test {
                     async move {
                         let mut shard = ShardServer::new(internal_srv, external);
                         info!(addr = ?&addr, "listening");
-                        let st = shard.listen(addr).await;
+                        let st = shard.listen(addr).await.unwrap();
                         s.send(()).unwrap();
 
                         match st
@@ -922,6 +882,7 @@ mod test {
     #[test]
     fn shard_test() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
         let mut rt = tokio::runtime::Builder::new()
@@ -983,7 +944,7 @@ mod test {
 
                     tokio::spawn(async move {
                         let mut shard = ShardServer::new(internal_srv, external);
-                        let st = shard.listen(a).await;
+                        let st = shard.listen(a).await.unwrap();
 
                         s.send(()).unwrap();
 
@@ -1034,7 +995,7 @@ mod test {
                 let mut cnsrv = ShardCanonicalServer::new(external, internal_cli, &redis_addr)
                     .await
                     .unwrap();
-                let st = cnsrv.listen(si.clone()).await;
+                let st = cnsrv.listen(si.clone()).await.unwrap();
 
                 tokio::spawn(async move {
                     st.try_for_each_concurrent(None, |r| async move {

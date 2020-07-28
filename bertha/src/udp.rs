@@ -33,24 +33,12 @@ pub struct UdpSkChunnel {}
 impl ChunnelListener for UdpSkChunnel {
     type Addr = SocketAddr;
     type Connection = UdpSk;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = eyre::Report;
 
-    fn listen(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
-                                + Send
-                                + 'static,
-                        >,
-                    >,
-                > + Send
-                + 'static,
-        >,
-    > {
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
             let sk = tokio::net::UdpSocket::bind(a).map(|sk| {
                 let (recv, send) = sk?.split();
@@ -59,7 +47,7 @@ impl ChunnelListener for UdpSkChunnel {
                     recv: Arc::new(Mutex::new(recv)),
                 })
             });
-            Box::pin(futures_util::stream::once(sk)) as _
+            Ok(Box::pin(futures_util::stream::once(sk)) as _)
         })
     }
 
@@ -78,12 +66,11 @@ impl ChunnelListener for UdpSkChunnel {
 impl ChunnelConnector for UdpSkChunnel {
     type Addr = ();
     type Connection = UdpSk;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = eyre::Report;
 
-    fn connect(
-        &mut self,
-        _a: Self::Addr,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Connection, eyre::Report>> + Send + 'static>>
-    {
+    fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         Box::pin(async move {
             use std::net::ToSocketAddrs;
             let (recv, send) = tokio::net::UdpSocket::bind(
@@ -151,35 +138,20 @@ pub struct UdpReqChunnel {}
 impl ChunnelListener for UdpReqChunnel {
     type Addr = SocketAddr;
     type Connection = UdpConn;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = eyre::Report;
 
-    fn listen(
-        &mut self,
-        a: Self::Addr,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, eyre::Report>>
-                                + Send
-                                + 'static,
-                        >,
-                    >,
-                > + Send
-                + 'static,
-        >,
-    > {
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
-            let sk = tokio::net::UdpSocket::bind(a).await;
-            if let Err(e) = sk {
-                return Box::pin(futures_util::stream::once(async {
-                    Err(e).wrap_err("Bind failed")
-                })) as _;
-            }
+            let sk = tokio::net::UdpSocket::bind(a)
+                .await
+                .wrap_err("socket bind failed")?;
 
-            let (recv, send) = sk.unwrap().split();
+            let (recv, send) = sk.split();
             let sends = futures_util::stream::FuturesUnordered::new();
-            Box::pin(futures_util::stream::try_unfold(
+            Ok(Box::pin(futures_util::stream::try_unfold(
                 (
                     recv,
                     Arc::new(Mutex::new(send)),
@@ -223,7 +195,7 @@ impl ChunnelListener for UdpReqChunnel {
                         )
                     }
                 },
-            )) as _
+            )) as _)
         })
     }
 
@@ -296,6 +268,7 @@ mod test {
                 let srv = UdpSkChunnel::default()
                     .listen(addr)
                     .await
+                    .unwrap()
                     .next()
                     .await
                     .unwrap()
