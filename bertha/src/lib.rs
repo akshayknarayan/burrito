@@ -21,9 +21,9 @@ pub trait ChunnelListener {
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future;
 
-    fn scope(&self) -> Scope;
-    fn endedness(&self) -> Endedness;
-    fn implementation_priority(&self) -> usize;
+    fn scope() -> Scope;
+    fn endedness() -> Endedness;
+    fn implementation_priority() -> usize;
     // fn resource_requirements(&self) -> ?;
 }
 
@@ -36,9 +36,9 @@ pub trait ChunnelConnector {
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future;
 
-    fn scope(&self) -> Scope;
-    fn endedness(&self) -> Endedness;
-    fn implementation_priority(&self) -> usize;
+    fn scope() -> Scope;
+    fn endedness() -> Endedness;
+    fn implementation_priority() -> usize;
     // fn resource_requirements(&self) -> ?;
 }
 
@@ -105,16 +105,16 @@ where
         })
     }
 
-    fn scope(&self) -> Scope {
-        self.context().scope()
+    fn scope() -> Scope {
+        <C as Context>::ChunnelType::scope()
     }
 
-    fn endedness(&self) -> Endedness {
-        self.context().endedness()
+    fn endedness() -> Endedness {
+        <C as Context>::ChunnelType::endedness()
     }
 
-    fn implementation_priority(&self) -> usize {
-        self.context().implementation_priority()
+    fn implementation_priority() -> usize {
+        <C as Context>::ChunnelType::implementation_priority()
     }
     // fn resource_requirements(&self) -> ?;
 }
@@ -140,16 +140,16 @@ where
         Box::pin(async move { Ok(C::make_connection(f.await?, cfg)) })
     }
 
-    fn scope(&self) -> Scope {
-        self.context().scope()
+    fn scope() -> Scope {
+        <C as Context>::ChunnelType::scope()
     }
 
-    fn endedness(&self) -> Endedness {
-        self.context().endedness()
+    fn endedness() -> Endedness {
+        <C as Context>::ChunnelType::endedness()
     }
 
-    fn implementation_priority(&self) -> usize {
-        self.context().implementation_priority()
+    fn implementation_priority() -> usize {
+        <C as Context>::ChunnelType::implementation_priority()
     }
     // fn resource_requirements(&self) -> ?;
 }
@@ -445,14 +445,14 @@ where
         })
     }
 
-    fn scope(&self) -> Scope {
-        self.0.scope()
+    fn scope() -> Scope {
+        C::scope()
     }
-    fn endedness(&self) -> Endedness {
-        self.0.endedness()
+    fn endedness() -> Endedness {
+        C::endedness()
     }
-    fn implementation_priority(&self) -> usize {
-        self.0.implementation_priority()
+    fn implementation_priority() -> usize {
+        C::implementation_priority()
     }
 }
 

@@ -86,13 +86,13 @@ where
         })
     }
 
-    fn scope(&self) -> Scope {
+    fn scope() -> Scope {
         crate::Scope::Application
     }
-    fn endedness(&self) -> Endedness {
+    fn endedness() -> Endedness {
         crate::Endedness::Both
     }
-    fn implementation_priority(&self) -> usize {
+    fn implementation_priority() -> usize {
         1
     }
 }
@@ -121,13 +121,13 @@ where
         })
     }
 
-    fn scope(&self) -> Scope {
+    fn scope() -> Scope {
         crate::Scope::Application
     }
-    fn endedness(&self) -> Endedness {
+    fn endedness() -> Endedness {
         crate::Endedness::Both
     }
-    fn implementation_priority(&self) -> usize {
+    fn implementation_priority() -> usize {
         1
     }
 }
@@ -213,15 +213,15 @@ where
         Box::pin(async move { Ok(Box::pin(futures_util::stream::once(async { Ok(r) })) as _) })
     }
 
-    fn scope(&self) -> Scope {
+    fn scope() -> Scope {
         Scope::Application
     }
 
-    fn endedness(&self) -> Endedness {
+    fn endedness() -> Endedness {
         Endedness::Both
     }
 
-    fn implementation_priority(&self) -> usize {
+    fn implementation_priority() -> usize {
         1
     }
 }
@@ -245,15 +245,15 @@ where
         Box::pin(async { Ok(r) })
     }
 
-    fn scope(&self) -> Scope {
+    fn scope() -> Scope {
         Scope::Application
     }
 
-    fn endedness(&self) -> Endedness {
+    fn endedness() -> Endedness {
         Endedness::Both
     }
 
-    fn implementation_priority(&self) -> usize {
+    fn implementation_priority() -> usize {
         1
     }
 }

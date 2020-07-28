@@ -51,14 +51,14 @@ impl ChunnelListener for UdpSkChunnel {
         })
     }
 
-    fn scope(&self) -> Scope {
+    fn scope() -> Scope {
         Scope::Host
     }
-    fn endedness(&self) -> Endedness {
+    fn endedness() -> Endedness {
         Endedness::Both
     }
 
-    fn implementation_priority(&self) -> usize {
+    fn implementation_priority() -> usize {
         1
     }
 }
@@ -86,14 +86,14 @@ impl ChunnelConnector for UdpSkChunnel {
         })
     }
 
-    fn scope(&self) -> Scope {
+    fn scope() -> Scope {
         Scope::Host
     }
-    fn endedness(&self) -> Endedness {
+    fn endedness() -> Endedness {
         Endedness::Both
     }
 
-    fn implementation_priority(&self) -> usize {
+    fn implementation_priority() -> usize {
         1
     }
 }
@@ -199,14 +199,14 @@ impl ChunnelListener for UdpReqChunnel {
         })
     }
 
-    fn scope(&self) -> Scope {
+    fn scope() -> Scope {
         Scope::Host
     }
-    fn endedness(&self) -> Endedness {
+    fn endedness() -> Endedness {
         Endedness::Both
     }
 
-    fn implementation_priority(&self) -> usize {
+    fn implementation_priority() -> usize {
         1
     }
 }

@@ -88,13 +88,13 @@ where
         })
     }
 
-    fn scope(&self) -> bertha::Scope {
+    fn scope() -> bertha::Scope {
         bertha::Scope::Local
     }
-    fn endedness(&self) -> bertha::Endedness {
+    fn endedness() -> bertha::Endedness {
         bertha::Endedness::Either
     }
-    fn implementation_priority(&self) -> usize {
+    fn implementation_priority() -> usize {
         1
     }
 }
@@ -148,13 +148,13 @@ where
         })
     }
 
-    fn scope(&self) -> bertha::Scope {
+    fn scope() -> bertha::Scope {
         bertha::Scope::Local
     }
-    fn endedness(&self) -> bertha::Endedness {
+    fn endedness() -> bertha::Endedness {
         bertha::Endedness::Either
     }
-    fn implementation_priority(&self) -> usize {
+    fn implementation_priority() -> usize {
         1
     }
 }
