@@ -16,6 +16,7 @@ tracing-futures = "0.2"
 rand = "0.7"
 serde = "1"
 bincode = "1"
+pin-project = "0.4"
 
 [dev-dependencies]
 tokio = { version = "0.2", features = ["rt-core"] }
