@@ -118,3 +118,129 @@ where
         unimplemented!()
     }
 }
+
+#[cfg(test)]
+mod test {
+    use crate::{ChunnelConnector, ChunnelListener, Endedness, Scope};
+
+    macro_rules! test_scope_impl {
+        ($name:ident,$scope:expr) => {
+            struct $name<C>(C);
+
+            impl<C> ChunnelConnector for $name<C>
+            where
+                C: ChunnelConnector + Send + Sync + 'static,
+            {
+                type Addr = C::Addr;
+                type Connection = C::Connection;
+                type Future = C::Future;
+                type Error = C::Error;
+
+                fn connect(&mut self, a: Self::Addr) -> Self::Future {
+                    self.0.connect(a)
+                }
+
+                fn scope() -> Scope {
+                    $scope
+                }
+                fn endedness() -> Endedness {
+                    C::endedness()
+                }
+                fn implementation_priority() -> usize {
+                    C::implementation_priority()
+                }
+            }
+
+            impl<C> ChunnelListener for $name<C>
+            where
+                C: ChunnelListener + Send + Sync + 'static,
+            {
+                type Addr = C::Addr;
+                type Connection = C::Connection;
+                type Future = C::Future;
+                type Stream = C::Stream;
+                type Error = C::Error;
+
+                fn listen(&mut self, a: Self::Addr) -> Self::Future {
+                    self.0.listen(a)
+                }
+
+                fn scope() -> Scope {
+                    $scope
+                }
+                fn endedness() -> Endedness {
+                    C::endedness()
+                }
+                fn implementation_priority() -> usize {
+                    C::implementation_priority()
+                }
+            }
+        };
+    }
+
+    test_scope_impl!(ImplA, Scope::Host);
+    test_scope_impl!(ImplB, Scope::Local);
+
+    use super::NegotiatorChunnel;
+    use crate::chan_transport::RendezvousChannel;
+    use crate::util::{Never, OptionUnwrap};
+    use crate::ChunnelConnection;
+    use futures_util::TryStreamExt;
+    use tracing::info;
+    use tracing_futures::Instrument;
+
+    #[test]
+    fn negotiate() {
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap();
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+        rt.block_on(
+            async move {
+                let (srv, cln) = RendezvousChannel::new(10).split();
+                let mut srv = OptionUnwrap::from(srv);
+                let (s, r) = tokio::sync::oneshot::channel();
+
+                tokio::spawn(
+                    async move {
+                        let st = srv.listen(3u8).await.unwrap();
+                        s.send(()).unwrap();
+                        st.try_for_each_concurrent(None, |cn| async move {
+                            let m = cn.recv().await?;
+                            cn.send(m).await?;
+                            Ok::<_, eyre::Report>(())
+                        })
+                        .await
+                    }
+                    .instrument(tracing::debug_span!("server")),
+                );
+
+                let mut cln = NegotiatorChunnel(ImplA(cln.clone()), ImplB(Never::from(cln)));
+                let _: () = r.await.unwrap();
+                info!("connecting client");
+                let cn = cln
+                    .connect(3u8)
+                    .instrument(tracing::debug_span!("connect"))
+                    .await
+                    .unwrap();
+
+                cn.send(vec![1u8; 8])
+                    .instrument(tracing::debug_span!("send"))
+                    .await
+                    .unwrap();
+                let d = cn
+                    .recv()
+                    .instrument(tracing::debug_span!("recv"))
+                    .await
+                    .unwrap();
+                assert_eq!(d, vec![1u8; 8]);
+            }
+            .instrument(tracing::debug_span!("negotiate")),
+        );
+    }
+}
