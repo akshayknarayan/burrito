@@ -167,7 +167,8 @@ mod test {
     use bertha::{
         chan_transport::RendezvousChannel,
         udp::{UdpReqChunnel, UdpSkChunnel},
-        AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, Never, OptionUnwrap,
+        util::{AddrWrap, Never, OptionUnwrap},
+        ChunnelConnection, ChunnelConnector, ChunnelListener,
     };
     use eyre::Error;
     use futures_util::stream::TryStreamExt;

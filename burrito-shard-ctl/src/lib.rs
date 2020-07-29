@@ -202,7 +202,7 @@ where
     }
 
     fn scope() -> bertha::Scope {
-        bertha::Scope::Local
+        bertha::Scope::Global
     }
 
     fn endedness() -> bertha::Endedness {
@@ -343,7 +343,7 @@ where
     }
 
     fn scope() -> bertha::Scope {
-        bertha::Scope::Local
+        bertha::Scope::Global
     }
 
     fn endedness() -> bertha::Endedness {
@@ -462,7 +462,7 @@ where
     }
 
     fn scope() -> bertha::Scope {
-        bertha::Scope::Local
+        bertha::Scope::Global
     }
 
     fn endedness() -> bertha::Endedness {
@@ -732,7 +732,7 @@ mod ebpf {
         }
 
         fn scope() -> bertha::Scope {
-            bertha::Scope::Local
+            bertha::Scope::Host
         }
 
         fn endedness() -> bertha::Endedness {
@@ -740,7 +740,7 @@ mod ebpf {
         }
 
         fn implementation_priority() -> usize {
-            1
+            2
         }
     }
 
@@ -894,7 +894,8 @@ mod test {
         reliable::ReliabilityChunnel,
         tagger::TaggerChunnel,
         udp::{UdpReqChunnel, UdpSkChunnel},
-        AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, OptionUnwrap,
+        util::{AddrWrap, OptionUnwrap},
+        ChunnelConnection, ChunnelConnector, ChunnelListener,
     };
     use color_eyre::eyre;
     use eyre::{eyre, WrapErr};
