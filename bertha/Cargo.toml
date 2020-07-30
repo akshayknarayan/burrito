@@ -8,7 +8,7 @@ edition = "2018"
 
 [dependencies]
 futures-util = "0.3"
-tokio = { version = "0.2", features = ["sync", "time", "macros", "tcp", "stream", "udp"] }
+tokio = { version = "0.2", features = ["sync", "time", "macros", "tcp", "stream", "udp", "uds"] }
 color-eyre = "0.5"
 eyre = "0.6"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
