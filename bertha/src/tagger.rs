@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
+#[derive(Clone, Debug)]
 pub struct TaggerChunnel<C> {
     inner: Arc<C>,
 }
@@ -49,7 +50,7 @@ where
 }
 
 /// Assigns an sequential tag to data segments and ignores the tag otherwise.
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 pub struct Tagger<C> {
     inner: Arc<C>,
     snd_nxt: Arc<AtomicUsize>,
@@ -103,6 +104,7 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct OrderedChunnel<C> {
     inner: Arc<C>,
     hole_thresh: usize,
@@ -165,7 +167,7 @@ where
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct OrderedState {
     snd_nxt: u32,
     expected_recv: u32,
@@ -175,6 +177,7 @@ struct OrderedState {
 /// `Ordered` takes in `Vec<u8>` Data segments and tags them for use with `(u32, Vec<u8>)` Chunnels.
 ///
 /// It returns data segments in the order they were sent.
+#[derive(Clone, Debug)]
 pub struct Ordered<C> {
     inner: Arc<C>,
     hole_thresh: usize,
@@ -267,6 +270,7 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct SeqUnreliableChunnel<C> {
     inner: Arc<C>,
 }
@@ -306,7 +310,7 @@ where
 }
 
 /// `SeqUnreliable` accepts (u32, Vec<u8>) pairs as Data for transmission.
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub struct SeqUnreliable<C> {
     inner: Arc<C>,
 }

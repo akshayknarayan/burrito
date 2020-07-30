@@ -46,6 +46,7 @@ where
 
 /// Chunnel type transposing the Data type of the underlying connection
 /// to be `Option`-wrapped.
+#[derive(Debug, Clone)]
 pub struct OptionWrap<C>(Arc<C>);
 
 impl<C> OptionWrap<C> {
@@ -86,6 +87,7 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct OptionWrapCn<C>(Arc<C>);
 
 impl<C> OptionWrapCn<C> {
@@ -125,6 +127,7 @@ where
 /// Chunnel combinator for working with Option types.
 ///
 /// Deals with inner chunnel that has Data = Option<T> by transforming None into an error.
+#[derive(Debug)]
 pub struct OptionUnwrap<C>(Arc<C>);
 
 impl<C> OptionUnwrap<C> {
@@ -172,6 +175,7 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct OptionUnwrapCn<C>(Arc<C>);
 
 impl<C> OptionUnwrapCn<C> {
@@ -209,6 +213,7 @@ where
 ///
 /// Start with Address = (), Data = (Address, Data), produce Address = Address, Data = Data: by remembering the Address
 /// via connect().
+#[derive(Debug)]
 pub struct AddrWrap<C>(C);
 impl<C> AddrWrap<C> {
     pub fn new(inner: C) -> Self {
@@ -261,6 +266,7 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct AddrWrapCn<A, C>(A, Arc<C>);
 
 impl<A, C> AddrWrapCn<A, C> {
@@ -293,6 +299,7 @@ where
 
 /// For testing-assertion purposes, a chunnel that errors if send() is called or inner.recv()
 /// returns data.
+#[derive(Debug)]
 pub struct Never<C>(Arc<C>);
 
 impl<C> Never<C> {
@@ -339,6 +346,7 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct NeverCn<C>(Arc<C>);
 
 impl<C> NeverCn<C> {

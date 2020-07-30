@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
 pub struct SerializeChunnel<C, D> {
     inner: Arc<C>,
     _data: std::marker::PhantomData<D>,
@@ -46,7 +47,7 @@ where
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub struct Serialize<C, D> {
     inner: Arc<C>,
     _data: std::marker::PhantomData<D>,

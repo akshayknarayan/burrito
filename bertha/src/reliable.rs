@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
+#[derive(Debug, Clone)]
 pub struct ReliabilityChunnel<C> {
     inner: Arc<C>,
     timeout: Duration,
@@ -68,7 +69,7 @@ where
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ReliabilityState {
     inflight: HashMap<u32, (Vec<u8>, Option<oneshot::Sender<Result<(), eyre::Report>>>)>, // list of inflight seqs
     retx_tracker: BTreeMap<Instant, u32>,
@@ -76,6 +77,7 @@ struct ReliabilityState {
     pending_payload: VecDeque<(u32, Vec<u8>)>, // payloads we have received that are waiting for a recv() call
 }
 
+#[derive(Debug)]
 pub struct Reliability<C> {
     timeout: Duration,
     inner: Arc<C>,

@@ -52,7 +52,7 @@ impl ChunnelListener for UdpSkChunnel {
     }
 
     fn scope() -> Scope {
-        Scope::Host
+        Scope::Global
     }
     fn endedness() -> Endedness {
         Endedness::Both
@@ -87,7 +87,7 @@ impl ChunnelConnector for UdpSkChunnel {
     }
 
     fn scope() -> Scope {
-        Scope::Host
+        Scope::Global
     }
     fn endedness() -> Endedness {
         Endedness::Both
@@ -98,6 +98,7 @@ impl ChunnelConnector for UdpSkChunnel {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct UdpSk {
     send: Arc<Mutex<tokio::net::udp::SendHalf>>,
     recv: Arc<Mutex<tokio::net::udp::RecvHalf>>,
@@ -200,7 +201,7 @@ impl ChunnelListener for UdpReqChunnel {
     }
 
     fn scope() -> Scope {
-        Scope::Host
+        Scope::Local
     }
     fn endedness() -> Endedness {
         Endedness::Both
@@ -211,6 +212,7 @@ impl ChunnelListener for UdpReqChunnel {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
     recv: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
@@ -254,6 +256,7 @@ mod test {
     #[test]
     fn echo() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()

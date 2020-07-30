@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 #[pin_project::pin_project(project = EitherProj)]
+#[derive(Debug, Clone, Copy)]
 pub enum Either<A, B> {
     Left(#[pin] A),
     Right(#[pin] B),
