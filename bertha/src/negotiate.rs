@@ -9,15 +9,16 @@ use tracing::debug;
 
 impl<A, E, T1, C1, T2, C2, D> ChunnelListener for (T1, T2)
 where
+    A: Clone,
     T1: ChunnelListener<Addr = A, Error = E, Connection = C1>,
     T2: ChunnelListener<Addr = A, Error = E, Connection = C2>,
     C1: ChunnelConnection<Data = D> + 'static,
     C2: ChunnelConnection<Data = D> + 'static,
-    E: Send + Sync + 'static,
+    E: Into<Report> + Send + Sync + 'static,
 {
     type Addr = A;
     type Connection = Either<T1::Connection, T2::Connection>;
-    type Error = E;
+    type Error = Report;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -35,31 +36,81 @@ where
 
         use futures_util::TryStreamExt;
 
+        let left_fut = self.0.listen(a.clone());
+        let right_fut = self.1.listen(a);
         if use_t1 {
             debug!(chunnel_type = std::any::type_name::<T1>(), "picking");
-            let fut = self.0.listen(a);
             Box::pin(async move {
-                Ok::<_, E>(Box::pin(fut.await?.map_ok(|c| Either::Left(c)))
-                    as Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, Self::Error>>
-                                + Send
-                                + 'static,
-                        >,
-                    >)
+                match left_fut.await {
+                    Ok(st) => Ok(
+                        Box::pin(st.map_ok(|c| Either::Left(c)).map_err(|e| e.into()))
+                            as Pin<
+                                Box<
+                                    dyn Stream<Item = Result<Self::Connection, Self::Error>>
+                                        + Send
+                                        + 'static,
+                                >,
+                            >,
+                    ),
+                    Err(left_e) => {
+                        let left_e = left_e
+                            .into()
+                            .wrap_err(eyre!("First-choice chunnel listen() failed"));
+                        match right_fut.await {
+                            Ok(st) => Ok(Box::pin(
+                                st.map_ok(|c| Either::Right(c)).map_err(|e| e.into()),
+                            )
+                                as Pin<
+                                    Box<
+                                        dyn Stream<Item = Result<Self::Connection, Self::Error>>
+                                            + Send
+                                            + 'static,
+                                    >,
+                                >),
+                            Err(right_e) => Err(right_e
+                                .into()
+                                .wrap_err(eyre!("Second-choice chunnel listen() failed"))
+                                .wrap_err(left_e)),
+                        }
+                    }
+                }
             }) as _
         } else {
             debug!(chunnel_type = std::any::type_name::<T2>(), "picking");
-            let fut = self.1.listen(a);
             Box::pin(async move {
-                Ok::<_, E>(Box::pin(fut.await?.map_ok(|c| Either::Right(c)))
-                    as Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, Self::Error>>
-                                + Send
-                                + 'static,
-                        >,
-                    >)
+                match right_fut.await {
+                    Ok(st) => Ok(
+                        Box::pin(st.map_ok(|c| Either::Right(c)).map_err(|e| e.into()))
+                            as Pin<
+                                Box<
+                                    dyn Stream<Item = Result<Self::Connection, Self::Error>>
+                                        + Send
+                                        + 'static,
+                                >,
+                            >,
+                    ),
+                    Err(right_e) => {
+                        let right_e = right_e
+                            .into()
+                            .wrap_err(eyre!("First-choice chunnel listen() failed"));
+                        match left_fut.await {
+                            Ok(st) => Ok(Box::pin(
+                                st.map_ok(|c| Either::Left(c)).map_err(|e| e.into()),
+                            )
+                                as Pin<
+                                    Box<
+                                        dyn Stream<Item = Result<Self::Connection, Self::Error>>
+                                            + Send
+                                            + 'static,
+                                    >,
+                                >),
+                            Err(left_e) => Err(left_e
+                                .into()
+                                .wrap_err(eyre!("Second-choice chunnel listen() failed"))
+                                .wrap_err(right_e)),
+                        }
+                    }
+                }
             }) as _
         }
     }
