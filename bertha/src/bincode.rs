@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SerializeChunnel<C, D> {
     inner: Arc<C>,
     _data: std::marker::PhantomData<D>,
@@ -15,6 +15,19 @@ impl<Cx, D> From<Cx> for SerializeChunnel<Cx, D> {
     fn from(cx: Cx) -> SerializeChunnel<Cx, D> {
         SerializeChunnel {
             inner: Arc::new(cx),
+            _data: Default::default(),
+        }
+    }
+}
+
+impl<C, D> Clone for SerializeChunnel<C, D>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        let inner: C = self.inner.as_ref().clone();
+        Self {
+            inner: Arc::new(inner),
             _data: Default::default(),
         }
     }

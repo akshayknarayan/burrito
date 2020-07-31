@@ -6,6 +6,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 /// A standard way to access the downstream chunnel.
+///
+/// Be careful: Most implementors which contain Arcs will need to do a deep clone to implement
+/// context_mut().
 pub trait Context {
     type ChunnelType;
     fn context(&self) -> &Self::ChunnelType;

@@ -98,14 +98,16 @@ impl<C, S> ShardCanonicalServer<C, S> {
     }
 }
 
-impl<C, A, S, D> ChunnelListener for ShardCanonicalServer<C, S>
+impl<C, A, S, D, E1, E2> ChunnelListener for ShardCanonicalServer<C, S>
 where
-    C: ChunnelListener<Addr = A, Error = Error> + Send + Sync + 'static,
+    C: ChunnelListener<Addr = A, Error = E1> + Send + Sync + 'static,
     C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
-    S: ChunnelConnector<Addr = A, Error = Error> + Send + Sync + 'static,
+    S: ChunnelConnector<Addr = A, Error = E2> + Send + Sync + 'static,
     S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
     <D as Kv>::Key: AsRef<str>,
+    E1: Into<Error> + Send + Sync + 'static,
+    E2: Into<Error> + Send + Sync + 'static,
     A: IpPort
         + Clone
         + std::fmt::Debug
@@ -142,7 +144,12 @@ where
                 let conns: Vec<Arc<S::Connection>> = match futures_util::future::join_all(
                     addrs.clone().into_iter().map(|addr| async {
                         Ok::<_, eyre::Report>(Arc::new(
-                            shards_inner.lock().await.connect(addr).await?,
+                            shards_inner
+                                .lock()
+                                .await
+                                .connect(addr)
+                                .await
+                                .map_err(|e| e.into())?,
                         ))
                     }),
                 )
@@ -163,10 +170,11 @@ where
                         .lock()
                         .await
                         .listen(a.canonical_addr)
-                        .await?
+                        .await
+                        .map_err(|e| e.into())?
                         .map(move |conn| {
                             Ok(ShardCanonicalServerConnection {
-                                inner: Arc::new(conn?),
+                                inner: Arc::new(conn.map_err(|e| e.into())?),
                                 shards: conns.clone(),
                                 shard_fn: Arc::new(move |d| {
                                     /* xdp_shard version of FNV: take the first 4 bytes of the key
@@ -296,14 +304,16 @@ impl ShardServer<(), ()> {
     }
 }
 
-impl<C, A, S, D> ChunnelListener for ShardServer<C, S>
+impl<C, A, S, D, E1, E2> ChunnelListener for ShardServer<C, S>
 where
-    C: ChunnelListener<Addr = A, Error = Error> + Send + Sync + 'static,
+    C: ChunnelListener<Addr = A, Error = E1> + Send + Sync + 'static,
     C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
-    S: ChunnelListener<Addr = A, Error = Error> + Send + Sync + 'static,
+    S: ChunnelListener<Addr = A, Error = E2> + Send + Sync + 'static,
     S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
     <D as Kv>::Key: AsRef<str>,
+    E1: Into<Error> + Send + Sync + 'static,
+    E2: Into<Error> + Send + Sync + 'static,
     A: IpPort
         + Clone
         + std::fmt::Debug
@@ -329,14 +339,16 @@ where
                 .lock()
                 .await
                 .listen(a.clone())
-                .await?
-                .map(|conn| Ok(Either::Left(conn?)));
+                .await
+                .map_err(|e| e.into())?
+                .map(|conn| Ok(Either::Left(conn.map_err(|e| e.into())?)));
             let int_str = int
                 .lock()
                 .await
                 .listen(a)
-                .await?
-                .map(|conn| Ok(Either::Right(conn?)));
+                .await
+                .map_err(|e| e.into())?
+                .map(|conn| Ok(Either::Right(conn.map_err(|e| e.into())?)));
 
             Ok(Box::pin(futures_util::stream::select(ext_str, int_str)) as _)
         })
@@ -359,6 +371,7 @@ where
 ///
 /// Contacts shard-ctl for sharding information, and does client-side sharding.
 /// Does not implement `listen()`, since what would that do?
+#[derive(Clone)]
 pub struct ClientShardChunnelClient<C> {
     inner: Arc<Mutex<C>>,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
@@ -377,12 +390,13 @@ impl<C> ClientShardChunnelClient<C> {
     }
 }
 
-impl<A, C> ChunnelConnector for ClientShardChunnelClient<C>
+impl<A, C, E> ChunnelConnector for ClientShardChunnelClient<C>
 where
-    C: ChunnelConnector<Addr = A, Error = Error> + Send + Sync + 'static,
+    C: ChunnelConnector<Addr = A, Error = E> + Send + Sync + 'static,
     C::Connection: Send + Sync + 'static,
     <C::Connection as ChunnelConnection>::Data: Kv + Send + Sync + 'static,
     <<C::Connection as ChunnelConnection>::Data as Kv>::Key: AsRef<str>,
+    E: Into<Error> + Send + Sync + 'static,
     A: Serialize
         + DeserializeOwned
         + std::cmp::PartialEq
@@ -420,14 +434,15 @@ where
 
                 debug!(addrs = ?&addrs, "Decided sharding plan");
                 let num_shards = addrs.len();
-                let conns: Vec<Arc<C::Connection>> = futures_util::future::join_all(
-                    addrs
-                        .into_iter()
-                        .map(|a| async { Ok(Arc::new(inner.lock().await.connect(a).await?)) }),
-                )
-                .await
-                .into_iter()
-                .collect::<Result<_, Error>>()?;
+                let conns: Vec<Arc<C::Connection>> =
+                    futures_util::future::join_all(addrs.into_iter().map(|a| async {
+                        Ok(Arc::new(
+                            inner.lock().await.connect(a).await.map_err(|e| e.into())?,
+                        ))
+                    }))
+                    .await
+                    .into_iter()
+                    .collect::<Result<_, Error>>()?;
                 Ok(ClientShardClientConnection {
                     inners: conns,
                     shard_fn: Arc::new(move |d| {
@@ -624,14 +639,16 @@ mod ebpf {
         }
     }
 
-    impl<C, A, S, D> ChunnelListener for ShardCanonicalServerEbpf<C, S>
+    impl<C, A, S, D, E1, E2> ChunnelListener for ShardCanonicalServerEbpf<C, S>
     where
-        C: ChunnelListener<Addr = A, Error = Report> + Send + Sync + 'static,
+        C: ChunnelListener<Addr = A, Error = E1> + Send + Sync + 'static,
         C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
-        S: ChunnelConnector<Addr = A, Error = Report> + Send + Sync + 'static,
+        S: ChunnelConnector<Addr = A, Error = E2> + Send + Sync + 'static,
         S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
         D: Kv + Send + Sync + 'static,
         <D as Kv>::Key: AsRef<str>,
+        E1: Into<Error> + Send + Sync + 'static,
+        E2: Into<Error> + Send + Sync + 'static,
         A: IpPort
             + Clone
             + std::fmt::Debug
@@ -675,7 +692,12 @@ mod ebpf {
                     let conns: Vec<Arc<S::Connection>> = match futures_util::future::join_all(
                         addrs.clone().into_iter().map(|addr| async {
                             Ok::<_, Report>(Arc::new(
-                                shards_inner.lock().await.connect(addr).await?,
+                                shards_inner
+                                    .lock()
+                                    .await
+                                    .connect(addr)
+                                    .await
+                                    .map_err(|e| e.into())?,
                             ))
                         }),
                     )
@@ -691,11 +713,16 @@ mod ebpf {
 
                     // serve canonical address
                     // we are only responsible for the canonical address here.
-                    Ok(
-                        Box::pin(inner.lock().await.listen(a.canonical_addr).await?.map(
-                            move |conn| {
+                    Ok(Box::pin(
+                        inner
+                            .lock()
+                            .await
+                            .listen(a.canonical_addr)
+                            .await
+                            .map_err(|e| e.into())?
+                            .map(move |conn| {
                                 Ok(ShardCanonicalServerConnection {
-                                    inner: Arc::new(conn?),
+                                    inner: Arc::new(conn.map_err(|e| e.into())?),
                                     shards: conns.clone(),
                                     shard_fn: Arc::new(move |d| {
                                         /* xdp_shard version of FNV: take the first 4 bytes of the key
@@ -723,9 +750,8 @@ mod ebpf {
                                         hash as usize % num_shards
                                     }),
                                 })
-                            },
-                        )) as _,
-                    )
+                            }),
+                    ) as _)
                 }
                 .instrument(tracing::debug_span!("listen", addr = ?&a1)),
             )
@@ -1188,6 +1214,140 @@ mod test {
                 assert_eq!(m.val(), "bbbbbbbb");
             }
             .instrument(tracing::debug_span!("shard_test")),
+        );
+    }
+
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn shard_negotiate_test() {
+        use super::ebpf::ShardCanonicalServerEbpf;
+
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        // 0. Make rt.
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                // 1. start redis.
+                let redis_port = 12425;
+                let redis_addr = format!("redis://127.0.0.1:{}", redis_port);
+                info!(port = ?redis_port, "start redis");
+                let _redis = test_util::start_redis(redis_port);
+
+                // 2. Define addr.
+                let si: ShardInfo<SocketAddr> = ShardInfo {
+                    canonical_addr: "127.0.0.1:21471".parse().unwrap(),
+                    shard_addrs: vec![
+                        "127.0.0.1:21472".parse().unwrap(),
+                        "127.0.0.1:21473".parse().unwrap(),
+                    ],
+                    shard_info: super::SimpleShardPolicy {
+                        packet_data_offset: 18,
+                        packet_data_length: 4,
+                    },
+                };
+
+                // 3. start shard serv
+                let (internal_srv, internal_cli) =
+                    RendezvousChannel::<SocketAddr, Msg, _>::new(100).split();
+
+                let rdy = futures_util::stream::FuturesUnordered::new();
+
+                for a in si.clone().shard_addrs {
+                    info!(addr = ?&a, "start shard");
+                    let internal_srv = OptionUnwrap::from(internal_srv.clone());
+                    let external = SerializeChunnel::<_, Msg>::from(TaggerChunnel::from(
+                        ReliabilityChunnel::from(UdpReqChunnel::default()),
+                    ));
+
+                    let (s, r) = tokio::sync::oneshot::channel();
+
+                    tokio::spawn(async move {
+                        let mut shard = ShardServer::new(internal_srv, external);
+                        let st = shard.listen(a).await.unwrap();
+
+                        s.send(()).unwrap();
+
+                        match st
+                            .try_for_each_concurrent(None, |once| async move {
+                                let msg = once.recv().await?;
+                                // just echo.
+                                once.send(msg).await?;
+                                Ok(())
+                            })
+                            .await
+                        {
+                            Err(e) => debug!(err = ?e, shard_addr = ?a,  "Shard errorred"),
+                            Ok(_) => (),
+                        }
+                    });
+
+                    rdy.push(r);
+                }
+
+                let _: Vec<()> = rdy.try_collect().await.unwrap();
+
+                // 4. start canonical server
+                let external = SerializeChunnel::<_, Msg>::from(TaggerChunnel::from(
+                    ReliabilityChunnel::from(UdpReqChunnel::default()),
+                ));
+
+                info!(shard_info = ?&si, "start canonical server");
+                let cnsrv =
+                    ShardCanonicalServer::new(external.clone(), internal_cli.clone(), &redis_addr)
+                        .await
+                        .unwrap();
+                let cnsrv_ebpf = ShardCanonicalServerEbpf::new(external, internal_cli, &redis_addr)
+                    .await
+                    .unwrap();
+
+                let mut cnsrv = (cnsrv, cnsrv_ebpf);
+                let st = cnsrv.listen(si.clone()).await.unwrap();
+
+                tokio::spawn(async move {
+                    st.try_for_each_concurrent(None, |r| async move {
+                        r.recv().await?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap()
+                });
+
+                // 5. make client
+                let external = SerializeChunnel::<_, Msg>::from(TaggerChunnel::from(
+                    ReliabilityChunnel::from(AddrWrap::from(UdpSkChunnel::default())),
+                ));
+                let cl = ClientShardChunnelClient::new(external.clone(), &redis_addr)
+                    .await
+                    .unwrap();
+                let mut cl = (cl, external);
+
+                info!("connect client");
+                let cn = cl.connect(si.canonical_addr).await.unwrap();
+
+                // 6. issue a request
+                info!("send request");
+                cn.send(Msg {
+                    k: "aaaaaaaa".to_owned(),
+                    v: "bbbbbbbb".to_owned(),
+                })
+                .await
+                .unwrap();
+
+                info!("await response");
+                let m = cn.recv().await.unwrap();
+                use super::Kv;
+                assert_eq!(m.key(), "aaaaaaaa");
+                assert_eq!(m.val(), "bbbbbbbb");
+            }
+            .instrument(tracing::debug_span!("negotiate_test")),
         );
     }
 }

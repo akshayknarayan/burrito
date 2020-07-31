@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReliabilityChunnel<C> {
     inner: Arc<C>,
     timeout: Duration,
@@ -36,6 +36,19 @@ impl<Cx> ReliabilityChunnel<Cx> {
     pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
         self.timeout = to;
         self
+    }
+}
+
+impl<C> Clone for ReliabilityChunnel<C>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        let inner: C = self.inner.as_ref().clone();
+        Self {
+            inner: Arc::new(inner),
+            timeout: self.timeout,
+        }
     }
 }
 

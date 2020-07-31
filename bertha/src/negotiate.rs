@@ -1,14 +1,13 @@
 //! Chunnel wrapper types to negotiate between multiple implementations.
 
 use super::{ChunnelConnection, ChunnelConnector, ChunnelListener, Either, Endedness, Scope};
+use eyre::{eyre, Report};
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
+use tracing::debug;
 
-/// 2-ary negotiator.
-pub struct NegotiatorChunnel<T1, T2>(T1, T2);
-
-impl<A, E, T1, C1, T2, C2, D> ChunnelListener for NegotiatorChunnel<T1, T2>
+impl<A, E, T1, C1, T2, C2, D> ChunnelListener for (T1, T2)
 where
     T1: ChunnelListener<Addr = A, Error = E, Connection = C1>,
     T2: ChunnelListener<Addr = A, Error = E, Connection = C2>,
@@ -37,6 +36,7 @@ where
         use futures_util::TryStreamExt;
 
         if use_t1 {
+            debug!(chunnel_type = std::any::type_name::<T1>(), "picking");
             let fut = self.0.listen(a);
             Box::pin(async move {
                 Ok::<_, E>(Box::pin(fut.await?.map_ok(|c| Either::Left(c)))
@@ -49,6 +49,7 @@ where
                     >)
             }) as _
         } else {
+            debug!(chunnel_type = std::any::type_name::<T2>(), "picking");
             let fut = self.1.listen(a);
             Box::pin(async move {
                 Ok::<_, E>(Box::pin(fut.await?.map_ok(|c| Either::Right(c)))
@@ -74,17 +75,18 @@ where
     }
 }
 
-impl<A, E, T1, C1, T2, C2, D> ChunnelConnector for NegotiatorChunnel<T1, T2>
+impl<A, E, T1, C1, T2, C2, D> ChunnelConnector for (T1, T2)
 where
+    A: Clone,
     T1: ChunnelConnector<Addr = A, Error = E, Connection = C1>,
     T2: ChunnelConnector<Addr = A, Error = E, Connection = C2>,
-    C1: ChunnelConnection<Data = D> + 'static,
-    C2: ChunnelConnection<Data = D> + 'static,
-    E: Send + Sync + 'static,
+    C1: ChunnelConnection<Data = D> + Send + 'static,
+    C2: ChunnelConnection<Data = D> + Send + 'static,
+    E: Into<eyre::Error> + Send + Sync + 'static,
 {
     type Addr = A;
     type Connection = Either<T1::Connection, T2::Connection>;
-    type Error = E;
+    type Error = Report;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
@@ -99,12 +101,48 @@ where
             (Scope::Global, _) => true,
         };
 
+        let left_fut = self.0.connect(a.clone());
+        let right_fut = self.1.connect(a);
         if use_t1 {
-            let fut = self.0.connect(a);
-            Box::pin(async move { Ok(Either::Left(fut.await?)) }) as _
+            Box::pin(async move {
+                debug!(chunnel_type = std::any::type_name::<T1>(), "picking");
+                match left_fut.await {
+                    Ok(c) => Ok(Either::Left(c)),
+                    Err(left_e) => {
+                        let left_e = left_e
+                            .into()
+                            .wrap_err(eyre!("First-choice chunnel connect() failed"));
+                        debug!(chunnel_type = std::any::type_name::<T2>(), "fallback");
+                        match right_fut.await {
+                            Ok(c) => Ok(Either::Right(c)),
+                            Err(right_e) => Err(right_e
+                                .into()
+                                .wrap_err(eyre!("Second-choice chunnel connect() failed"))
+                                .wrap_err(left_e)),
+                        }
+                    }
+                }
+            })
         } else {
-            let fut = self.1.connect(a);
-            Box::pin(async move { Ok(Either::Right(fut.await?)) }) as _
+            Box::pin(async move {
+                debug!(chunnel_type = std::any::type_name::<T2>(), "picking");
+                match right_fut.await {
+                    Ok(c) => Ok(Either::Right(c)),
+                    Err(right_e) => {
+                        let right_e = right_e
+                            .into()
+                            .wrap_err(eyre!("First-choice chunnel connect() failed"));
+                        debug!(chunnel_type = std::any::type_name::<T1>(), "fallback");
+                        match left_fut.await {
+                            Ok(c) => Ok(Either::Left(c)),
+                            Err(left_e) => Err(left_e
+                                .into()
+                                .wrap_err(eyre!("Second-choice chunnel connect() failed"))
+                                .wrap_err(right_e)),
+                        }
+                    }
+                }
+            })
         }
     }
 
@@ -181,7 +219,6 @@ mod test {
     test_scope_impl!(ImplA, Scope::Host);
     test_scope_impl!(ImplB, Scope::Local);
 
-    use super::NegotiatorChunnel;
     use crate::chan_transport::RendezvousChannel;
     use crate::util::{Never, OptionUnwrap};
     use crate::ChunnelConnection;
@@ -220,7 +257,7 @@ mod test {
                     .instrument(tracing::debug_span!("server")),
                 );
 
-                let mut cln = NegotiatorChunnel(ImplA(cln.clone()), ImplB(Never::from(cln)));
+                let mut cln = (ImplA(cln.clone()), ImplB(Never::from(cln)));
                 let _: () = r.await.unwrap();
                 info!("connecting client");
                 let cn = cln

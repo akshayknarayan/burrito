@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TaggerChunnel<C> {
     inner: Arc<C>,
 }
@@ -19,6 +19,18 @@ impl<Cx> From<Cx> for TaggerChunnel<Cx> {
     fn from(cx: Cx) -> TaggerChunnel<Cx> {
         TaggerChunnel {
             inner: Arc::new(cx),
+        }
+    }
+}
+
+impl<C> Clone for TaggerChunnel<C>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        let inner: C = self.inner.as_ref().clone();
+        Self {
+            inner: Arc::new(inner),
         }
     }
 }
@@ -50,7 +62,7 @@ where
 }
 
 /// Assigns an sequential tag to data segments and ignores the tag otherwise.
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Debug)]
 pub struct Tagger<C> {
     inner: Arc<C>,
     snd_nxt: Arc<AtomicUsize>,
@@ -61,6 +73,19 @@ impl<Cx> From<Cx> for Tagger<Cx> {
         Tagger {
             inner: Arc::new(cx),
             snd_nxt: Default::default(),
+        }
+    }
+}
+
+impl<C> Clone for Tagger<C>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        let inner: C = self.inner.as_ref().clone();
+        Self {
+            inner: Arc::new(inner),
+            snd_nxt: self.snd_nxt.clone(),
         }
     }
 }
@@ -104,7 +129,7 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct OrderedChunnel<C> {
     inner: Arc<C>,
     hole_thresh: usize,
@@ -114,6 +139,19 @@ impl<Cx> OrderedChunnel<Cx> {
     pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
         self.hole_thresh = thresh;
         self
+    }
+}
+
+impl<C> Clone for OrderedChunnel<C>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        let inner: C = self.inner.as_ref().clone();
+        Self {
+            inner: Arc::new(inner),
+            hole_thresh: self.hole_thresh,
+        }
     }
 }
 
@@ -182,18 +220,6 @@ pub struct Ordered<C> {
     inner: Arc<C>,
     hole_thresh: usize,
     state: Arc<RwLock<OrderedState>>,
-}
-
-impl<C> Context for Ordered<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.inner
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.inner).unwrap()
-    }
 }
 
 impl<C> ChunnelConnection for Ordered<C>
@@ -270,7 +296,7 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SeqUnreliableChunnel<C> {
     inner: Arc<C>,
 }
@@ -279,6 +305,18 @@ impl<Cx> From<Cx> for SeqUnreliableChunnel<Cx> {
     fn from(cx: Cx) -> SeqUnreliableChunnel<Cx> {
         SeqUnreliableChunnel {
             inner: Arc::new(cx),
+        }
+    }
+}
+
+impl<C> Clone for SeqUnreliableChunnel<C>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        let inner: C = self.inner.as_ref().clone();
+        Self {
+            inner: Arc::new(inner),
         }
     }
 }
