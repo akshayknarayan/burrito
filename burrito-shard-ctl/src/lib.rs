@@ -495,7 +495,7 @@ where
     C: ChunnelConnection,
 {
     inners: Vec<Arc<C>>,
-    shard_fn: Arc<dyn Fn(&C::Data) -> usize>,
+    shard_fn: Arc<dyn Fn(&C::Data) -> usize + Send + Sync + 'static>,
 }
 
 impl<C> ChunnelConnection for ClientShardClientConnection<C>
@@ -1192,9 +1192,11 @@ mod test {
                 let external = SerializeChunnel::<_, Msg>::from(TaggerChunnel::from(
                     ReliabilityChunnel::from(AddrWrap::from(UdpSkChunnel::default())),
                 ));
-                let mut cl = ClientShardChunnelClient::new(external, &redis_addr)
+                let cl = ClientShardChunnelClient::new(external.clone(), &redis_addr)
                     .await
                     .unwrap();
+
+                let mut cl = (cl, external);
                 info!("make client");
                 let cn = cl.connect(si.canonical_addr).await.unwrap();
 

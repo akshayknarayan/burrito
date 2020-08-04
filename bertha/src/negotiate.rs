@@ -7,14 +7,98 @@ use std::future::Future;
 use std::pin::Pin;
 use tracing::debug;
 
-impl<A, E, T1, C1, T2, C2, D> ChunnelListener for (T1, T2)
+impl<A, E1, E2, T1, C1, T2, C2, D> ChunnelConnector for (T1, T2)
 where
     A: Clone,
-    T1: ChunnelListener<Addr = A, Error = E, Connection = C1>,
-    T2: ChunnelListener<Addr = A, Error = E, Connection = C2>,
+    T1: ChunnelConnector<Addr = A, Error = E1, Connection = C1>,
+    T2: ChunnelConnector<Addr = A, Error = E2, Connection = C2>,
+    C1: ChunnelConnection<Data = D> + Send + 'static,
+    C2: ChunnelConnection<Data = D> + Send + 'static,
+    E1: Into<eyre::Error> + Send + Sync + 'static,
+    E2: Into<eyre::Error> + Send + Sync + 'static,
+{
+    type Addr = A;
+    type Connection = Either<T1::Connection, T2::Connection>;
+    type Error = Report;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
+        let use_t1 = match (T1::scope(), T2::scope()) {
+            (Scope::Application, _) => true,
+            (_, Scope::Application) => false,
+            (Scope::Host, _) => true,
+            (_, Scope::Host) => false,
+            (Scope::Local, _) => true,
+            (_, Scope::Local) => false,
+            (Scope::Global, _) => true,
+        };
+
+        let left_fut = self.0.connect(a.clone());
+        let right_fut = self.1.connect(a);
+        if use_t1 {
+            Box::pin(async move {
+                debug!(chunnel_type = std::any::type_name::<T1>(), "picking");
+                match left_fut.await {
+                    Ok(c) => Ok(Either::Left(c)),
+                    Err(left_e) => {
+                        let left_e = left_e
+                            .into()
+                            .wrap_err(eyre!("First-choice chunnel connect() failed"));
+                        debug!(chunnel_type = std::any::type_name::<T2>(), "fallback");
+                        match right_fut.await {
+                            Ok(c) => Ok(Either::Right(c)),
+                            Err(right_e) => Err(right_e
+                                .into()
+                                .wrap_err(eyre!("Second-choice chunnel connect() failed"))
+                                .wrap_err(left_e)),
+                        }
+                    }
+                }
+            })
+        } else {
+            Box::pin(async move {
+                debug!(chunnel_type = std::any::type_name::<T2>(), "picking");
+                match right_fut.await {
+                    Ok(c) => Ok(Either::Right(c)),
+                    Err(right_e) => {
+                        let right_e = right_e
+                            .into()
+                            .wrap_err(eyre!("First-choice chunnel connect() failed"));
+                        debug!(chunnel_type = std::any::type_name::<T1>(), "fallback");
+                        match left_fut.await {
+                            Ok(c) => Ok(Either::Left(c)),
+                            Err(left_e) => Err(left_e
+                                .into()
+                                .wrap_err(eyre!("Second-choice chunnel connect() failed"))
+                                .wrap_err(right_e)),
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    fn scope() -> Scope {
+        unimplemented!()
+    }
+    fn endedness() -> Endedness {
+        unimplemented!()
+    }
+    fn implementation_priority() -> usize {
+        unimplemented!()
+    }
+}
+
+impl<A, T1, C1, T2, C2, E1, E2, D> ChunnelListener for (T1, T2)
+where
+    A: Clone,
+    T1: ChunnelListener<Addr = A, Error = E1, Connection = C1>,
+    T2: ChunnelListener<Addr = A, Error = E2, Connection = C2>,
     C1: ChunnelConnection<Data = D> + 'static,
     C2: ChunnelConnection<Data = D> + 'static,
-    E: Into<Report> + Send + Sync + 'static,
+    E1: Into<Report> + Send + Sync + 'static,
+    E2: Into<Report> + Send + Sync + 'static,
 {
     type Addr = A;
     type Connection = Either<T1::Connection, T2::Connection>;
@@ -126,88 +210,6 @@ where
     }
 }
 
-impl<A, E, T1, C1, T2, C2, D> ChunnelConnector for (T1, T2)
-where
-    A: Clone,
-    T1: ChunnelConnector<Addr = A, Error = E, Connection = C1>,
-    T2: ChunnelConnector<Addr = A, Error = E, Connection = C2>,
-    C1: ChunnelConnection<Data = D> + Send + 'static,
-    C2: ChunnelConnection<Data = D> + Send + 'static,
-    E: Into<eyre::Error> + Send + Sync + 'static,
-{
-    type Addr = A;
-    type Connection = Either<T1::Connection, T2::Connection>;
-    type Error = Report;
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn connect(&mut self, a: Self::Addr) -> Self::Future {
-        let use_t1 = match (T1::scope(), T2::scope()) {
-            (Scope::Application, _) => true,
-            (_, Scope::Application) => false,
-            (Scope::Host, _) => true,
-            (_, Scope::Host) => false,
-            (Scope::Local, _) => true,
-            (_, Scope::Local) => false,
-            (Scope::Global, _) => true,
-        };
-
-        let left_fut = self.0.connect(a.clone());
-        let right_fut = self.1.connect(a);
-        if use_t1 {
-            Box::pin(async move {
-                debug!(chunnel_type = std::any::type_name::<T1>(), "picking");
-                match left_fut.await {
-                    Ok(c) => Ok(Either::Left(c)),
-                    Err(left_e) => {
-                        let left_e = left_e
-                            .into()
-                            .wrap_err(eyre!("First-choice chunnel connect() failed"));
-                        debug!(chunnel_type = std::any::type_name::<T2>(), "fallback");
-                        match right_fut.await {
-                            Ok(c) => Ok(Either::Right(c)),
-                            Err(right_e) => Err(right_e
-                                .into()
-                                .wrap_err(eyre!("Second-choice chunnel connect() failed"))
-                                .wrap_err(left_e)),
-                        }
-                    }
-                }
-            })
-        } else {
-            Box::pin(async move {
-                debug!(chunnel_type = std::any::type_name::<T2>(), "picking");
-                match right_fut.await {
-                    Ok(c) => Ok(Either::Right(c)),
-                    Err(right_e) => {
-                        let right_e = right_e
-                            .into()
-                            .wrap_err(eyre!("First-choice chunnel connect() failed"));
-                        debug!(chunnel_type = std::any::type_name::<T1>(), "fallback");
-                        match left_fut.await {
-                            Ok(c) => Ok(Either::Left(c)),
-                            Err(left_e) => Err(left_e
-                                .into()
-                                .wrap_err(eyre!("Second-choice chunnel connect() failed"))
-                                .wrap_err(right_e)),
-                        }
-                    }
-                }
-            })
-        }
-    }
-
-    fn scope() -> Scope {
-        unimplemented!()
-    }
-    fn endedness() -> Endedness {
-        unimplemented!()
-    }
-    fn implementation_priority() -> usize {
-        unimplemented!()
-    }
-}
-
 #[cfg(test)]
 mod test {
     use crate::{ChunnelConnector, ChunnelListener, Endedness, Scope};
@@ -280,7 +282,7 @@ mod test {
     #[test]
     fn negotiate() {
         let _guard = tracing_subscriber::fmt::try_init();
-        color_eyre::install().unwrap();
+        color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
