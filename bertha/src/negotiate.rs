@@ -3,9 +3,104 @@
 use super::{ChunnelConnection, ChunnelConnector, ChunnelListener, Either, Endedness, Scope};
 use eyre::{eyre, Report};
 use futures_util::stream::Stream;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use tracing::debug;
+
+// remote negotiation
+// goal: need to pass a message describing what functionality goes where.
+//
+// "one-way handshake"
+// client, in connect(), offers a set of functionality known to the chunnel
+// server, in listen(), picks the right type out of {T1, T2, ..., Tn} given what the client said.
+//   - no need to respond because the client has already sent what it is doing.
+//
+// problems:
+//   - how to deal with arbitrary chunnel data types?
+//    - impl Into<C::Connection::Data>? "bring your own serialization"
+//
+// solutions:
+//   - how do we know what this functionality is?
+//     - chunnels describe via trait method implementation a type for the functionality set (Vec of
+//   enum)?
+
+/// A type that can list out the `universe()` of possible values it can have.
+pub trait CapabilitySet: Sized {
+    /// All possible values this type can have.
+    fn universe() -> Vec<Self>;
+}
+
+impl CapabilitySet for () {
+    fn universe() -> Vec<Self> {
+        vec![()]
+    }
+}
+
+/// Define an enum that implements the `CapabilitySet` trait.
+///
+/// Invoke with enum name (with optional `pub`) followed by variant names.
+///
+/// # Example
+/// ```rust
+/// # use bertha::enumerate_enum;
+/// enumerate_enum!(pub Foo, A, B, C);
+/// enumerate_enum!(Bar, A, B, C);
+/// fn main() {
+///     let f = Foo::B;
+///     let b = Bar::C;
+///     println!("{:?}, {:?}", f, b);
+/// }
+/// ```
+#[macro_export]
+macro_rules! enumerate_enum {
+    (pub $name:ident, $($variant:ident),+) => {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub enum $name {
+            $(
+                $variant
+            ),+
+        }
+
+        impl $crate::negotiate::CapabilitySet for $name {
+            fn universe() -> Vec<Self> {
+                vec![
+                    $($name::$variant),+
+                ]
+            }
+        }
+    };
+    ($(keyw:ident)* $name:ident, $($variant:ident),+) => {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum $name {
+            $(
+                $variant
+            ),+
+        }
+
+        impl $crate::negotiate::CapabilitySet for $name {
+            fn universe() -> Vec<Self> {
+                vec![
+                    $($name::$variant),+
+                ]
+            }
+        }
+    };
+}
+
+/// Expresses the ability to negotiate chunnel implementations over a set of capabilities enumerated
+/// by the `Capability` type.
+///
+/// Read: `Negotiate` *over* `Capability`.
+pub trait Negotiate<Capability: CapabilitySet> {
+    fn capabilities() -> Vec<Capability>;
+}
+
+impl<T> Negotiate<()> for T {
+    fn capabilities() -> Vec<()> {
+        vec![()]
+    }
+}
 
 impl<A, E1, E2, T1, C1, T2, C2, D> ChunnelConnector for (T1, T2)
 where
