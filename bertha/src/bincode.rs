@@ -60,6 +60,94 @@ where
     }
 }
 
+impl<Inner, D> crate::ChunnelListener<D> for SerializeChunnel<Inner, D>
+where
+    Inner: crate::ChunnelListener<Vec<u8>>,
+    Inner::Connection: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    Self: InheritChunnel<Inner::Connection, Connection = Serialize<Inner::Connection, D>>,
+    Self: Context<ChunnelType = Inner>,
+    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Addr = Inner::Addr;
+    type Connection = Serialize<Inner::Connection, D>;
+    type Error = Inner::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>,
+    >;
+    type Stream = Pin<
+        Box<
+            dyn futures_util::stream::Stream<Item = Result<Self::Connection, Self::Error>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
+        use futures_util::StreamExt;
+        let f = self.context_mut().listen(a);
+        let cfg = self.get_config();
+        Box::pin(async move {
+            let cfg = cfg;
+            let conn_stream = f.await?;
+            Ok(
+                Box::pin(conn_stream.map(move |conn: Result<Inner::Connection, _>| {
+                    Ok(Self::make_connection(conn?, cfg.clone()))
+                })) as _,
+            )
+        })
+    }
+
+    fn scope() -> crate::Scope {
+        Inner::scope()
+    }
+
+    fn endedness() -> crate::Endedness {
+        Inner::endedness()
+    }
+
+    fn implementation_priority() -> usize {
+        Inner::implementation_priority()
+    }
+}
+
+impl<Inner, D> crate::ChunnelConnector<D> for SerializeChunnel<Inner, D>
+where
+    Inner: crate::ChunnelConnector<Vec<u8>>,
+    Inner::Connection: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    Self: InheritChunnel<Inner::Connection, Connection = Serialize<Inner::Connection, D>>,
+    Self: Context<ChunnelType = Inner>,
+    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Addr = Inner::Addr;
+    type Connection = Serialize<Inner::Connection, D>;
+    type Error = Inner::Error;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Self::Connection, Self::Error>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
+        let f = self.context_mut().connect(a);
+        let cfg = self.get_config();
+        Box::pin(async move { Ok(Self::make_connection(f.await?, cfg)) })
+    }
+
+    fn scope() -> crate::Scope {
+        Inner::scope()
+    }
+
+    fn endedness() -> crate::Endedness {
+        Inner::endedness()
+    }
+
+    fn implementation_priority() -> usize {
+        Inner::implementation_priority()
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct Serialize<C, D> {
     inner: Arc<C>,

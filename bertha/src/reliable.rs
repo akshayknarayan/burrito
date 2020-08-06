@@ -82,6 +82,9 @@ where
     }
 }
 
+crate::inherit_listener!(ReliabilityChunnel, Vec<u8>, Reliability, (u32, Vec<u8>));
+crate::inherit_connector!(ReliabilityChunnel, Vec<u8>, Reliability, (u32, Vec<u8>));
+
 #[derive(Debug, Default)]
 struct ReliabilityState {
     inflight: HashMap<u32, (Vec<u8>, Option<oneshot::Sender<Result<(), eyre::Report>>>)>, // list of inflight seqs

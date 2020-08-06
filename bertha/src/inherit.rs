@@ -1,16 +1,15 @@
 //! Helper traits to avoid re-writing common Chunnel implementation code for simple Chunnels.
 
-use super::{ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope};
-use futures_util::stream::Stream;
-use std::future::Future;
-use std::pin::Pin;
+use super::ChunnelConnection;
 
 /// A standard way to access the downstream chunnel.
 ///
 /// Be careful: Most implementors which contain Arcs will need to do a deep clone to implement
 /// context_mut().
 pub trait Context {
+    /// The inner chunnel this chunnel is wrapping.
     type ChunnelType;
+
     fn context(&self) -> &Self::ChunnelType;
     fn context_mut(&mut self) -> &mut Self::ChunnelType;
 }
@@ -24,82 +23,282 @@ pub trait InheritChunnel<CxConn: ChunnelConnection>: Context {
     fn make_connection(cx: CxConn, cfg: Self::Config) -> Self::Connection;
 }
 
-impl<C> ChunnelListener for C
+#[macro_export]
+macro_rules! inherit_listener (
+    ($tname:ident, $innerdata:ident, $cntype: ident, $chdata:ty) => {
+impl<Inner, $innerdata> $crate::ChunnelListener<$chdata> for $tname<Inner>
 where
-    C: Context,
-    <C as Context>::ChunnelType: ChunnelListener,
-    <<C as Context>::ChunnelType as ChunnelListener>::Connection: 'static,
-    C: InheritChunnel<<<C as Context>::ChunnelType as ChunnelListener>::Connection>,
-    <C as InheritChunnel<<<C as Context>::ChunnelType as ChunnelListener>::Connection>>::Connection:
-        'static,
+    Inner: $crate::ChunnelListener<$innerdata>,
+    Inner::Connection: ChunnelConnection<Data = $innerdata> + Send + Sync + 'static,
+    Self: InheritChunnel<Inner::Connection, Connection = $cntype<Inner::Connection>>,
+    Self: Context<ChunnelType = Inner>,
 {
-    type Addr = <<C as Context>::ChunnelType as ChunnelListener>::Addr;
-    type Connection = C::Connection;
-    type Error = <<C as Context>::ChunnelType as ChunnelListener>::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Addr = Inner::Addr;
+    type Connection = $cntype<Inner::Connection>;
+    type Error = Inner::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>,
+    >;
+    type Stream = Pin<
+        Box<
+            dyn futures_util::stream::Stream<Item = Result<Self::Connection, Self::Error>>
+                + Send
+                + 'static,
+        >,
+    >;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         use futures_util::StreamExt;
-
         let f = self.context_mut().listen(a);
         let cfg = self.get_config();
         Box::pin(async move {
             let cfg = cfg;
             let conn_stream = f.await?;
-            Ok(Box::pin(conn_stream.map(move |conn| {
-                let cfg = cfg.clone();
-                Ok(C::make_connection(conn?, cfg))
-            })) as _)
+            Ok(
+                Box::pin(conn_stream.map(move |conn: Result<Inner::Connection, _>| {
+                    Ok(Self::make_connection(conn?, cfg.clone()))
+                })) as _,
+            )
         })
     }
 
-    fn scope() -> Scope {
-        <C as Context>::ChunnelType::scope()
+    fn scope() -> crate::Scope {
+        Inner::scope()
     }
 
-    fn endedness() -> Endedness {
-        <C as Context>::ChunnelType::endedness()
+    fn endedness() -> crate::Endedness {
+        Inner::endedness()
     }
 
     fn implementation_priority() -> usize {
-        <C as Context>::ChunnelType::implementation_priority()
+        Inner::implementation_priority()
     }
-    // fn resource_requirements(&self) -> ?;
 }
-
-impl<C> ChunnelConnector for C
+    };
+    ($tname:ident, $innerdata:ty, $cntype: ident, $chdata:ident) => {
+impl<Inner, $chdata> $crate::ChunnelListener<$chdata> for $tname<Inner>
 where
-    C: Context,
-    <C as Context>::ChunnelType: ChunnelConnector,
-    <<C as Context>::ChunnelType as ChunnelConnector>::Connection: 'static,
-    C: InheritChunnel<<<C as Context>::ChunnelType as ChunnelConnector>::Connection>,
-    <C as InheritChunnel<<<C as Context>::ChunnelType as ChunnelConnector>::Connection>>::Connection:
-        'static,
+    Inner: $crate::ChunnelListener<$innerdata>,
+    Inner::Connection: ChunnelConnection<Data = $innerdata> + Send + Sync + 'static,
+    Self: InheritChunnel<Inner::Connection, Connection = $cntype<Inner::Connection>>,
+    Self: Context<ChunnelType = Inner>,
 {
-    type Addr = <<C as Context>::ChunnelType as ChunnelConnector>::Addr;
-    type Connection = C::Connection;
-    type Error = <<C as Context>::ChunnelType as ChunnelConnector>::Error;
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Addr = Inner::Addr;
+    type Connection = $cntype<Inner::Connection>;
+    type Error = Inner::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>,
+    >;
+    type Stream = Pin<
+        Box<
+            dyn futures_util::stream::Stream<Item = Result<Self::Connection, Self::Error>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
+        use futures_util::StreamExt;
+        let f = self.context_mut().listen(a);
+        let cfg = self.get_config();
+        Box::pin(async move {
+            let cfg = cfg;
+            let conn_stream = f.await?;
+            Ok(
+                Box::pin(conn_stream.map(move |conn: Result<Inner::Connection, _>| {
+                    Ok(Self::make_connection(conn?, cfg.clone()))
+                })) as _,
+            )
+        })
+    }
+
+    fn scope() -> crate::Scope {
+        Inner::scope()
+    }
+
+    fn endedness() -> crate::Endedness {
+        Inner::endedness()
+    }
+
+    fn implementation_priority() -> usize {
+        Inner::implementation_priority()
+    }
+}
+    };
+    ($tname:ident, $innerdata:ty, $cntype: ident, $chdata:ty) => {
+impl<Inner> $crate::ChunnelListener<$chdata> for $tname<Inner>
+where
+    Inner: $crate::ChunnelListener<$innerdata>,
+    Inner::Connection: ChunnelConnection<Data = $innerdata> + Send + Sync + 'static,
+    Self: InheritChunnel<Inner::Connection, Connection = $cntype<Inner::Connection>>,
+    Self: Context<ChunnelType = Inner>,
+{
+    type Addr = Inner::Addr;
+    type Connection = $cntype<Inner::Connection>;
+    type Error = Inner::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>,
+    >;
+    type Stream = Pin<
+        Box<
+            dyn futures_util::stream::Stream<Item = Result<Self::Connection, Self::Error>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
+        use futures_util::StreamExt;
+        let f = self.context_mut().listen(a);
+        let cfg = self.get_config();
+        Box::pin(async move {
+            let cfg = cfg;
+            let conn_stream = f.await?;
+            Ok(
+                Box::pin(conn_stream.map(move |conn: Result<Inner::Connection, _>| {
+                    Ok(Self::make_connection(conn?, cfg.clone()))
+                })) as _,
+            )
+        })
+    }
+
+    fn scope() -> crate::Scope {
+        Inner::scope()
+    }
+
+    fn endedness() -> crate::Endedness {
+        Inner::endedness()
+    }
+
+    fn implementation_priority() -> usize {
+        Inner::implementation_priority()
+    }
+}
+    };
+);
+
+#[macro_export]
+macro_rules! inherit_connector (
+    ($tname:ident, $innerdata:ident, $cntype: ident, $chdata:ty) => {
+impl<Inner, $innerdata> $crate::ChunnelConnector<$chdata> for $tname<Inner>
+where
+    Inner: $crate::ChunnelConnector<$innerdata>,
+    Inner::Connection: $crate::ChunnelConnection<Data = $innerdata> + Send + Sync + 'static,
+    Self: InheritChunnel<Inner::Connection, Connection = $cntype<Inner::Connection>>,
+    Self: Context<ChunnelType = Inner>,
+{
+    type Addr = Inner::Addr;
+    type Connection = $cntype<Inner::Connection>;
+    type Error = Inner::Error;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Self::Connection, Self::Error>>
+                + Send
+                + 'static,
+        >,
+    >;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
         let f = self.context_mut().connect(a);
         let cfg = self.get_config();
-        Box::pin(async move { Ok(C::make_connection(f.await?, cfg)) })
+        Box::pin(async move { Ok(Self::make_connection(f.await?, cfg)) })
     }
 
-    fn scope() -> Scope {
-        <C as Context>::ChunnelType::scope()
+    fn scope() -> crate::Scope {
+        Inner::scope()
     }
 
-    fn endedness() -> Endedness {
-        <C as Context>::ChunnelType::endedness()
+    fn endedness() -> crate::Endedness {
+        Inner::endedness()
     }
 
     fn implementation_priority() -> usize {
-        <C as Context>::ChunnelType::implementation_priority()
+        Inner::implementation_priority()
     }
-    // fn resource_requirements(&self) -> ?;
+}
+    };
+    ($tname:ident, $innerdata:ty, $cntype: ident, $chdata:ident) => {
+impl<Inner, $chdata> $crate::ChunnelConnector<$chdata> for $tname<Inner>
+where
+    Inner: $crate::ChunnelConnector<$innerdata>,
+    Inner::Connection: $crate::ChunnelConnection<Data = $innerdata> + Send + Sync + 'static,
+    Self: InheritChunnel<Inner::Connection, Connection = $cntype<Inner::Connection>>,
+    Self: Context<ChunnelType = Inner>,
+{
+    type Addr = Inner::Addr;
+    type Connection = $cntype<Inner::Connection>;
+    type Error = Inner::Error;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Self::Connection, Self::Error>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
+        let f = self.context_mut().connect(a);
+        let cfg = self.get_config();
+        Box::pin(async move { Ok(Self::make_connection(f.await?, cfg)) })
+    }
+
+    fn scope() -> crate::Scope {
+        Inner::scope()
+    }
+
+    fn endedness() -> crate::Endedness {
+        Inner::endedness()
+    }
+
+    fn implementation_priority() -> usize {
+        Inner::implementation_priority()
+    }
+}
+    };
+    ($tname:ident, $innerdata:ty, $cntype: ident, $chdata:ty) => {
+impl<Inner> $crate::ChunnelConnector<$chdata> for $tname<Inner>
+where
+    Inner: $crate::ChunnelConnector<$innerdata>,
+    Inner::Connection: $crate::ChunnelConnection<Data = $innerdata> + Send + Sync + 'static,
+    Self: InheritChunnel<Inner::Connection, Connection = $cntype<Inner::Connection>>,
+    Self: Context<ChunnelType = Inner>,
+{
+    type Addr = Inner::Addr;
+    type Connection = $cntype<Inner::Connection>;
+    type Error = Inner::Error;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Self::Connection, Self::Error>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
+        let f = self.context_mut().connect(a);
+        let cfg = self.get_config();
+        Box::pin(async move { Ok(Self::make_connection(f.await?, cfg)) })
+    }
+
+    fn scope() -> crate::Scope {
+        Inner::scope()
+    }
+
+    fn endedness() -> crate::Endedness {
+        Inner::endedness()
+    }
+
+    fn implementation_priority() -> usize {
+        Inner::implementation_priority()
+    }
+}
+    };
+);
+
+// blanket implementation across all functionality for Context types - might need to reverse this later.
+impl<C, T> crate::Negotiate<T> for C
+where
+    C: Context,
+    T: crate::CapabilitySet + crate::NegotiateDummy,
+{
 }

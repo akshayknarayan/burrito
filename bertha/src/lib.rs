@@ -21,10 +21,10 @@ pub use negotiate::*;
 use util::*;
 
 /// `ChunnelListener`s are used to get a stream of incoming connections.
-pub trait ChunnelListener {
+pub trait ChunnelListener<D> {
     type Future: Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static;
     type Addr;
-    type Connection: ChunnelConnection + 'static;
+    type Connection: ChunnelConnection<Data = D> + 'static;
     type Error: Send + Sync + 'static;
     type Stream: Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static;
 
@@ -37,10 +37,10 @@ pub trait ChunnelListener {
 }
 
 /// `ChunnelConnector`s connect to a single remote Chunnel endpoint and return one connection.
-pub trait ChunnelConnector {
+pub trait ChunnelConnector<D> {
     type Future: Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static;
     type Addr;
-    type Connection: ChunnelConnection + 'static;
+    type Connection: ChunnelConnection<Data = D> + 'static;
     type Error: Send + Sync + 'static;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future;

@@ -54,7 +54,15 @@ impl<A, D, S> Clone for RendezvousChannel<A, D, S> {
     }
 }
 
-impl<A, D> ChunnelListener for RendezvousChannel<A, D, Srv>
+impl<A, D, T, S> crate::Negotiate<S> for RendezvousChannel<A, D, T>
+where
+    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+    S: crate::CapabilitySet + crate::NegotiateDummy,
+{
+}
+
+impl<A, D> ChunnelListener<Option<D>> for RendezvousChannel<A, D, Srv>
 where
     A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
@@ -97,7 +105,7 @@ where
     }
 }
 
-impl<A, D> ChunnelConnector for RendezvousChannel<A, D, Cln>
+impl<A, D> ChunnelConnector<D> for RendezvousChannel<A, D, Cln>
 where
     A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
@@ -193,7 +201,14 @@ impl<T, U> Chan<T, U> {
     }
 }
 
-impl<D> ChunnelListener for Chan<D, Srv>
+impl<D, T, S> crate::Negotiate<S> for Chan<D, T>
+where
+    D: Send + Sync + 'static,
+    S: crate::CapabilitySet + crate::NegotiateDummy,
+{
+}
+
+impl<D> ChunnelListener<D> for Chan<D, Srv>
 where
     D: Send + Sync + 'static,
 {
@@ -226,7 +241,7 @@ where
     }
 }
 
-impl<D> ChunnelConnector for Chan<D, Cln>
+impl<D> ChunnelConnector<D> for Chan<D, Cln>
 where
     D: Send + Sync + 'static,
 {

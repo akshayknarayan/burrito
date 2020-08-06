@@ -61,6 +61,9 @@ where
     }
 }
 
+crate::inherit_listener!(TaggerChunnel, (u32, Vec<u8>), Tagger, Vec<u8>);
+crate::inherit_connector!(TaggerChunnel, (u32, Vec<u8>), Tagger, Vec<u8>);
+
 /// Assigns an sequential tag to data segments and ignores the tag otherwise.
 #[derive(Default, Debug)]
 pub struct Tagger<C> {
@@ -205,6 +208,9 @@ where
     }
 }
 
+crate::inherit_listener!(OrderedChunnel, (u32, Vec<u8>), Ordered, Vec<u8>);
+crate::inherit_connector!(OrderedChunnel, (u32, Vec<u8>), Ordered, Vec<u8>);
+
 #[derive(Debug, Default)]
 struct OrderedState {
     snd_nxt: u32,
@@ -347,6 +353,9 @@ where
     }
 }
 
+crate::inherit_listener!(SeqUnreliableChunnel, Vec<u8>, SeqUnreliable, (u32, Vec<u8>));
+crate::inherit_connector!(SeqUnreliableChunnel, Vec<u8>, SeqUnreliable, (u32, Vec<u8>));
+
 /// `SeqUnreliable` accepts (u32, Vec<u8>) pairs as Data for transmission.
 #[derive(Default, Debug, Clone)]
 pub struct SeqUnreliable<C> {
@@ -358,18 +367,6 @@ impl<Cx> From<Cx> for SeqUnreliable<Cx> {
         SeqUnreliable {
             inner: Arc::new(cx),
         }
-    }
-}
-
-impl<C> Context for SeqUnreliable<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.inner
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.inner).unwrap()
     }
 }
 

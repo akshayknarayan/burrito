@@ -30,7 +30,9 @@ use tokio::sync::{mpsc, Mutex};
 #[derive(Default, Clone, Debug)]
 pub struct UdpSkChunnel {}
 
-impl ChunnelListener for UdpSkChunnel {
+impl<S> crate::Negotiate<S> for UdpSkChunnel where S: crate::CapabilitySet + crate::NegotiateDummy {}
+
+impl ChunnelListener<(SocketAddr, Vec<u8>)> for UdpSkChunnel {
     type Addr = SocketAddr;
     type Connection = UdpSk;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
@@ -63,7 +65,7 @@ impl ChunnelListener for UdpSkChunnel {
     }
 }
 
-impl ChunnelConnector for UdpSkChunnel {
+impl ChunnelConnector<(SocketAddr, Vec<u8>)> for UdpSkChunnel {
     type Addr = ();
     type Connection = UdpSk;
     type Future =
@@ -136,7 +138,9 @@ impl ChunnelConnection for UdpSk {
 #[derive(Default, Clone, Copy, Debug)]
 pub struct UdpReqChunnel {}
 
-impl ChunnelListener for UdpReqChunnel {
+impl<S> crate::Negotiate<S> for UdpReqChunnel where S: crate::CapabilitySet + crate::NegotiateDummy {}
+
+impl ChunnelListener<Vec<u8>> for UdpReqChunnel {
     type Addr = SocketAddr;
     type Connection = UdpConn;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;

@@ -19,7 +19,9 @@ use tracing_futures::Instrument;
 #[derive(Default, Clone, Debug)]
 pub struct UnixSkChunnel {}
 
-impl ChunnelListener for UnixSkChunnel {
+impl<S> crate::Negotiate<S> for UnixSkChunnel where S: crate::CapabilitySet + crate::NegotiateDummy {}
+
+impl ChunnelListener<(PathBuf, Vec<u8>)> for UnixSkChunnel {
     type Addr = PathBuf;
     type Connection = UnixSk;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
@@ -50,7 +52,7 @@ impl ChunnelListener for UnixSkChunnel {
     }
 }
 
-impl ChunnelConnector for UnixSkChunnel {
+impl ChunnelConnector<(PathBuf, Vec<u8>)> for UnixSkChunnel {
     type Addr = ();
     type Connection = UnixSk;
     type Future =
@@ -138,7 +140,9 @@ impl Drop for UnixSk {
 #[derive(Default, Clone, Copy, Debug)]
 pub struct UnixReqChunnel {}
 
-impl ChunnelListener for UnixReqChunnel {
+impl<S> crate::Negotiate<S> for UnixReqChunnel where S: crate::CapabilitySet + crate::NegotiateDummy {}
+
+impl ChunnelListener<Vec<u8>> for UnixReqChunnel {
     type Addr = PathBuf;
     type Connection = UnixConn;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;

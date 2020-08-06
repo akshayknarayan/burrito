@@ -73,9 +73,9 @@ impl<C> Context for OptionWrap<C> {
     }
 }
 
-impl<B, C, D> InheritChunnel<C> for OptionWrap<B>
+impl<B, C> InheritChunnel<C> for OptionWrap<B>
 where
-    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    C: ChunnelConnection + Send + Sync + 'static,
 {
     type Connection = OptionWrapCn<C>;
     type Config = ();
@@ -86,6 +86,9 @@ where
         OptionWrapCn::new(cx)
     }
 }
+
+crate::inherit_listener!(OptionWrap, D, OptionWrapCn, Option<D>);
+crate::inherit_connector!(OptionWrap, D, OptionWrapCn, Option<D>);
 
 #[derive(Debug, Clone)]
 pub struct OptionWrapCn<C>(Arc<C>);
@@ -175,6 +178,9 @@ where
     }
 }
 
+crate::inherit_listener!(OptionUnwrap, Option<D>, OptionUnwrapCn, D);
+crate::inherit_connector!(OptionUnwrap, Option<D>, OptionUnwrapCn, D);
+
 #[derive(Clone, Debug)]
 pub struct OptionUnwrapCn<C>(Arc<C>);
 
@@ -214,38 +220,40 @@ where
 /// Start with Address = (), Data = (Address, Data), produce Address = Address, Data = Data: by remembering the Address
 /// via connect().
 #[derive(Debug)]
-pub struct AddrWrap<C>(C);
-impl<C> AddrWrap<C> {
+pub struct AddrWrap<A, C>(C, std::marker::PhantomData<A>);
+
+impl<A, C> AddrWrap<A, C> {
     pub fn new(inner: C) -> Self {
-        Self(inner)
+        Self(inner, Default::default())
     }
 }
 
-impl<C> From<C> for AddrWrap<C> {
-    fn from(f: C) -> AddrWrap<C> {
+impl<A, C> From<C> for AddrWrap<A, C> {
+    fn from(f: C) -> Self {
         AddrWrap::new(f)
     }
 }
 
-impl<C: Clone> Clone for AddrWrap<C> {
+impl<A, C: Clone> Clone for AddrWrap<A, C> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        self.0.clone().into()
     }
 }
 
-impl<A, C, E, N, D> ChunnelConnector for AddrWrap<C>
+impl<A, C, D> ChunnelConnector<D> for AddrWrap<A, C>
 where
     A: Clone + Send + 'static,
-    C: ChunnelConnector<Addr = (), Connection = N, Error = E> + Clone + Send + Sync + 'static,
-    N: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
     D: Send + 'static,
-    E: Send + Sync + 'static,
+    C: ChunnelConnector<(A, D), Addr = ()> + Clone + Send + Sync + 'static,
+    <C as ChunnelConnector<(A, D)>>::Connection:
+        ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
+    <C as ChunnelConnector<(A, D)>>::Error: Send + Sync + 'static,
 {
     type Addr = A;
-    type Connection = AddrWrapCn<A, N>;
+    type Connection = AddrWrapCn<A, <C as ChunnelConnector<(A, D)>>::Connection>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = E;
+    type Error = <C as ChunnelConnector<(A, D)>>::Error;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
         let mut c = self.0.clone();
@@ -345,6 +353,9 @@ where
         NeverCn::new(cx)
     }
 }
+
+crate::inherit_listener!(Never, D, NeverCn, D);
+crate::inherit_connector!(Never, D, NeverCn, D);
 
 #[derive(Clone, Debug)]
 pub struct NeverCn<C>(Arc<C>);
