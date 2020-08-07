@@ -13,6 +13,15 @@ pub enum Either<A, B> {
     Right(#[pin] B),
 }
 
+impl<A, B> Either<A, B> {
+    pub fn flip(self) -> Either<B, A> {
+        match self {
+            Either::Left(a) => Either::Right(a),
+            Either::Right(a) => Either::Left(a),
+        }
+    }
+}
+
 impl<A, B, O> Future for Either<A, B>
 where
     A: Future<Output = O>,

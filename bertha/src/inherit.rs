@@ -1,6 +1,6 @@
 //! Helper traits to avoid re-writing common Chunnel implementation code for simple Chunnels.
 
-use super::ChunnelConnection;
+use crate::ChunnelConnection;
 
 /// A standard way to access the downstream chunnel.
 ///

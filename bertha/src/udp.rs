@@ -11,7 +11,9 @@
 //! further `recv()`s will only be from the same address, and further sends will send to the same
 //! address as the original recv_from.
 
-use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope};
+use crate::{
+    util::AddrWrap, Address, ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope,
+};
 use eyre::WrapErr;
 use futures_util::{
     future::FutureExt,
@@ -97,6 +99,20 @@ impl ChunnelConnector<(SocketAddr, Vec<u8>)> for UdpSkChunnel {
 
     fn implementation_priority() -> usize {
         1
+    }
+}
+
+impl Address<(SocketAddr, Vec<u8>)> for () {
+    type Connector = UdpSkChunnel;
+    fn connector(&self) -> Self::Connector {
+        UdpSkChunnel::default()
+    }
+}
+
+impl Address<Vec<u8>> for SocketAddr {
+    type Connector = AddrWrap<SocketAddr, UdpSkChunnel>;
+    fn connector(&self) -> Self::Connector {
+        AddrWrap::from(UdpSkChunnel::default())
     }
 }
 

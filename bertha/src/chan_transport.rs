@@ -1,6 +1,8 @@
 //! Channel-based Chunnel which acts as a transport.
 
-use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Once, Scope};
+use crate::{
+    Address, ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Once, Scope,
+};
 use futures_util::stream::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
@@ -41,6 +43,26 @@ impl<A, D> RendezvousChannel<A, D, ()> {
                 side: Default::default(),
             },
         )
+    }
+}
+
+/// Type implementing the `Address` trait for `RendezvousChannel`.
+pub struct RendezvousChannelAddr<A, D>(A, RendezvousChannel<A, D, Cln>);
+
+impl<A, D> From<(A, RendezvousChannel<A, D, Cln>)> for RendezvousChannelAddr<A, D> {
+    fn from(from: (A, RendezvousChannel<A, D, Cln>)) -> Self {
+        Self(from.0, from.1)
+    }
+}
+
+impl<A, D> Address<D> for RendezvousChannelAddr<A, D>
+where
+    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Connector = RendezvousChannel<A, D, Cln>;
+    fn connector(&self) -> Self::Connector {
+        self.1.clone()
     }
 }
 
@@ -110,14 +132,14 @@ where
     A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    type Addr = A;
+    type Addr = RendezvousChannelAddr<A, D>;
     type Connection = ChanChunnel<D>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = eyre::Report;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
-        let addr = a.clone();
+        let addr = a.0.clone();
         let m = Arc::clone(&self.map);
         Box::pin(async move {
             let s = m.lock().await.remove(&addr);
@@ -327,5 +349,13 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let r = Arc::clone(&self.rcv);
         Box::pin(async move { Ok(r.lock().await.recv().await.unwrap()) })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn rendezvous() {
+        // TODO
     }
 }

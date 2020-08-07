@@ -1,6 +1,8 @@
 //! Unix datagram/socket chunnel.
 
-use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope};
+use crate::{
+    util::AddrWrap, Address, ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope,
+};
 use eyre::{eyre, WrapErr};
 use futures_util::stream::{Stream, StreamExt};
 use std::collections::HashMap;
@@ -90,6 +92,19 @@ impl ChunnelConnector<(PathBuf, Vec<u8>)> for UnixSkChunnel {
     }
 }
 
+impl Address<(PathBuf, Vec<u8>)> for () {
+    type Connector = UnixSkChunnel;
+    fn connector(&self) -> Self::Connector {
+        UnixSkChunnel::default()
+    }
+}
+
+impl Address<Vec<u8>> for PathBuf {
+    type Connector = AddrWrap<PathBuf, UnixSkChunnel>;
+    fn connector(&self) -> Self::Connector {
+        AddrWrap::from(UnixSkChunnel::default())
+    }
+}
 #[derive(Debug, Clone)]
 pub struct UnixSk {
     // TODO when new version of tokio is released, use split()

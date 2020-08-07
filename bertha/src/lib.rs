@@ -51,6 +51,12 @@ pub trait ChunnelConnector<D> {
     // fn resource_requirements(&self) -> ?;
 }
 
+/// Relates an Address type with a way to connect to it with the given data semantics.
+pub trait Address<D>: Sized {
+    type Connector: ChunnelConnector<D, Addr = Self>;
+    fn connector(&self) -> Self::Connector;
+}
+
 /// A connection with the semantics of the Chunnel type's functionality.
 pub trait ChunnelConnection {
     type Data;
