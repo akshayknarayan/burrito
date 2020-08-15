@@ -1,7 +1,10 @@
 //! Helper Chunnel types to transform Data types, etc.
 
-use super::{ChunnelConnection, ChunnelConnector, Context, Endedness, InheritChunnel, Scope};
+use super::{ChunnelConnection, ChunnelConnector, Client, Serve};
 use eyre::eyre;
+use futures_util::future::{ready, Ready};
+use futures_util::stream::Stream;
+use futures_util::stream::TryStreamExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,49 +49,39 @@ where
 
 /// Chunnel type transposing the Data type of the underlying connection
 /// to be `Option`-wrapped.
-#[derive(Debug, Clone)]
-pub struct OptionWrap<C>(Arc<C>);
+#[derive(Debug, Clone, Default)]
+pub struct OptionWrap;
 
-impl<C> OptionWrap<C> {
-    pub fn new(inner: C) -> Self {
-        Self(Arc::new(inner))
-    }
-}
-
-impl<C> From<C> for OptionWrap<C> {
-    fn from(f: C) -> OptionWrap<C> {
-        OptionWrap::new(f)
-    }
-}
-
-impl<C> Context for OptionWrap<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.0
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.0).unwrap()
-    }
-}
-
-impl<B, C> InheritChunnel<C> for OptionWrap<B>
+impl<InS, InC, InE> Serve<InS> for OptionWrap
 where
-    C: ChunnelConnection + Send + Sync + 'static,
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
 {
-    type Connection = OptionWrapCn<C>;
-    type Config = ();
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = OptionWrapCn<InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
-    fn get_config(&mut self) -> Self::Config {}
-
-    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
-        OptionWrapCn::new(cx)
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(Box::pin(inner.map_ok(|cn| OptionWrapCn::new(cn))) as _))
     }
 }
 
-crate::inherit_listener!(OptionWrap, D, OptionWrapCn, Option<D>);
-crate::inherit_connector!(OptionWrap, D, OptionWrapCn, Option<D>);
+impl<D, InC> Client<InC> for OptionWrap
+where
+    InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = OptionWrapCn<InC>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(OptionWrapCn::new(cn)))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OptionWrapCn<C>(Arc<C>);
@@ -130,56 +123,39 @@ where
 /// Chunnel combinator for working with Option types.
 ///
 /// Deals with inner chunnel that has Data = Option<T> by transforming None into an error.
-#[derive(Debug)]
-pub struct OptionUnwrap<C>(Arc<C>);
+#[derive(Debug, Default, Clone)]
+pub struct OptionUnwrap;
 
-impl<C> OptionUnwrap<C> {
-    pub fn new(inner: C) -> Self {
-        Self(Arc::new(inner))
-    }
-}
-
-impl<C> From<C> for OptionUnwrap<C> {
-    fn from(f: C) -> OptionUnwrap<C> {
-        OptionUnwrap::new(f)
-    }
-}
-
-impl<C: Clone> Clone for OptionUnwrap<C> {
-    fn clone(&self) -> Self {
-        Self(Arc::new(self.0.as_ref().clone()))
-    }
-}
-
-impl<C> Context for OptionUnwrap<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.0
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        // this is ok because we never clone the Arc. The Clone impl does a deep-clone instead.
-        Arc::get_mut(&mut self.0).unwrap()
-    }
-}
-
-impl<B, C, D> InheritChunnel<C> for OptionUnwrap<B>
+impl<D, InS, InC, InE> Serve<InS> for OptionUnwrap
 where
-    C: ChunnelConnection<Data = Option<D>> + Send + Sync + 'static,
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = Option<D>> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
 {
-    type Connection = OptionUnwrapCn<C>;
-    type Config = ();
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = OptionUnwrapCn<InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
-    fn get_config(&mut self) -> Self::Config {}
-
-    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
-        OptionUnwrapCn::new(cx)
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(Box::pin(inner.map_ok(|cn| OptionUnwrapCn::new(cn))) as _))
     }
 }
 
-crate::inherit_listener!(OptionUnwrap, Option<D>, OptionUnwrapCn, D);
-crate::inherit_connector!(OptionUnwrap, Option<D>, OptionUnwrapCn, D);
+impl<D, InC> Client<InC> for OptionUnwrap
+where
+    InC: ChunnelConnection<Data = Option<D>> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = OptionUnwrapCn<InC>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(OptionUnwrapCn::new(cn)))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct OptionUnwrapCn<C>(Arc<C>);
@@ -240,20 +216,18 @@ impl<A, C: Clone> Clone for AddrWrap<A, C> {
     }
 }
 
-impl<A, C, D> ChunnelConnector<D> for AddrWrap<A, C>
+impl<A, C, D> ChunnelConnector for AddrWrap<A, C>
 where
     A: Clone + Send + 'static,
-    D: Send + 'static,
-    C: ChunnelConnector<(A, D), Addr = ()> + Clone + Send + Sync + 'static,
-    <C as ChunnelConnector<(A, D)>>::Connection:
-        ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
-    <C as ChunnelConnector<(A, D)>>::Error: Send + Sync + 'static,
+    C: ChunnelConnector<Addr = ()> + Clone + Send + Sync + 'static,
+    <C as ChunnelConnector>::Connection: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
+    <C as ChunnelConnector>::Error: Send + Sync + 'static,
 {
     type Addr = A;
-    type Connection = AddrWrapCn<A, <C as ChunnelConnector<(A, D)>>::Connection>;
+    type Connection = AddrWrapCn<A, <C as ChunnelConnector>::Connection>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = <C as ChunnelConnector<(A, D)>>::Error;
+    type Error = <C as ChunnelConnector>::Error;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
         let mut c = self.0.clone();
@@ -261,16 +235,6 @@ where
             let cn = c.connect(()).await?;
             Ok(AddrWrapCn::new(a, cn))
         })
-    }
-
-    fn scope() -> Scope {
-        C::scope()
-    }
-    fn endedness() -> Endedness {
-        C::endedness()
-    }
-    fn implementation_priority() -> usize {
-        C::implementation_priority()
     }
 }
 
@@ -307,55 +271,39 @@ where
 
 /// For testing-assertion purposes, a chunnel that errors if send() is called or inner.recv()
 /// returns data.
-#[derive(Debug)]
-pub struct Never<C>(Arc<C>);
+#[derive(Debug, Clone, Default)]
+pub struct Never;
 
-impl<C> Never<C> {
-    pub fn new(inner: C) -> Self {
-        Self(Arc::new(inner))
-    }
-}
-
-impl<C> From<C> for Never<C> {
-    fn from(f: C) -> Never<C> {
-        Never::new(f)
-    }
-}
-
-impl<C: Clone> Clone for Never<C> {
-    fn clone(&self) -> Self {
-        Self(Arc::new(self.0.as_ref().clone()))
-    }
-}
-
-impl<C> Context for Never<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.0
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.0).unwrap()
-    }
-}
-
-impl<B, C, D> InheritChunnel<C> for Never<B>
+impl<InS, InC, InE> Serve<InS> for Never
 where
-    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
 {
-    type Connection = NeverCn<C>;
-    type Config = ();
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = NeverCn<InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
-    fn get_config(&mut self) -> Self::Config {}
-
-    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
-        NeverCn::new(cx)
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(Box::pin(inner.map_ok(|cn| NeverCn::new(cn))) as _))
     }
 }
 
-crate::inherit_listener!(Never, D, NeverCn, D);
-crate::inherit_connector!(Never, D, NeverCn, D);
+impl<D, InC> Client<InC> for Never
+where
+    InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = NeverCn<InC>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(NeverCn::new(cn)))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NeverCn<C>(Arc<C>);

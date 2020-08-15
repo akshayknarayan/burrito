@@ -12,7 +12,8 @@
 //! address as the original recv_from.
 
 use crate::{
-    util::AddrWrap, Address, ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope,
+    util::AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress,
+    Endedness, Scope,
 };
 use eyre::WrapErr;
 use futures_util::{
@@ -54,17 +55,6 @@ impl ChunnelListener<(SocketAddr, Vec<u8>)> for UdpSkChunnel {
             Ok(Box::pin(futures_util::stream::once(sk)) as _)
         })
     }
-
-    fn scope() -> Scope {
-        Scope::Global
-    }
-    fn endedness() -> Endedness {
-        Endedness::Both
-    }
-
-    fn implementation_priority() -> usize {
-        1
-    }
 }
 
 impl ChunnelConnector<(SocketAddr, Vec<u8>)> for UdpSkChunnel {
@@ -89,27 +79,16 @@ impl ChunnelConnector<(SocketAddr, Vec<u8>)> for UdpSkChunnel {
             })
         })
     }
-
-    fn scope() -> Scope {
-        Scope::Global
-    }
-    fn endedness() -> Endedness {
-        Endedness::Both
-    }
-
-    fn implementation_priority() -> usize {
-        1
-    }
 }
 
-impl Address<(SocketAddr, Vec<u8>)> for () {
+impl ConnectAddress<(SocketAddr, Vec<u8>)> for () {
     type Connector = UdpSkChunnel;
     fn connector(&self) -> Self::Connector {
         UdpSkChunnel::default()
     }
 }
 
-impl Address<Vec<u8>> for SocketAddr {
+impl ConnectAddress<Vec<u8>> for SocketAddr {
     type Connector = AddrWrap<SocketAddr, UdpSkChunnel>;
     fn connector(&self) -> Self::Connector {
         AddrWrap::from(UdpSkChunnel::default())

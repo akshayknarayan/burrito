@@ -1,150 +1,47 @@
 //! Serialization chunnel with bincode.
 
-use crate::{ChunnelConnection, Context, InheritChunnel};
+use crate::{ChunnelConnection, Client, Serve};
+use futures_util::future::{ready, Ready};
+use futures_util::stream::Stream;
+use futures_util::stream::TryStreamExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-#[derive(Debug)]
-pub struct SerializeChunnel<C, D> {
-    inner: Arc<C>,
+#[derive(Debug, Clone, Default)]
+pub struct SerializeChunnel<D> {
     _data: std::marker::PhantomData<D>,
 }
 
-impl<Cx, D> From<Cx> for SerializeChunnel<Cx, D> {
-    fn from(cx: Cx) -> SerializeChunnel<Cx, D> {
-        SerializeChunnel {
-            inner: Arc::new(cx),
-            _data: Default::default(),
-        }
-    }
-}
-
-impl<C, D> Clone for SerializeChunnel<C, D>
+impl<D, InS, InC, InE> Serve<InS> for SerializeChunnel<D>
 where
-    C: Clone,
-{
-    fn clone(&self) -> Self {
-        let inner: C = self.inner.as_ref().clone();
-        Self {
-            inner: Arc::new(inner),
-            _data: Default::default(),
-        }
-    }
-}
-
-impl<C, D> Context for SerializeChunnel<C, D> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.inner
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.inner).unwrap()
-    }
-}
-
-impl<B, C, D> InheritChunnel<C> for SerializeChunnel<B, D>
-where
-    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    type Connection = Serialize<C, D>;
-    type Config = ();
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = Serialize<InC, D>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
-    fn get_config(&mut self) -> Self::Config {}
-
-    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
-        Serialize::from(cx)
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(Box::pin(inner.map_ok(|cn| Serialize::from(cn))) as _))
     }
 }
 
-impl<Inner, D> crate::ChunnelListener<D> for SerializeChunnel<Inner, D>
+impl<D, InC> Client<InC> for SerializeChunnel<D>
 where
-    Inner: crate::ChunnelListener<Vec<u8>>,
-    Inner::Connection: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
-    Self: InheritChunnel<Inner::Connection, Connection = Serialize<Inner::Connection, D>>,
-    Self: Context<ChunnelType = Inner>,
+    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    type Addr = Inner::Addr;
-    type Connection = Serialize<Inner::Connection, D>;
-    type Error = Inner::Error;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>,
-    >;
-    type Stream = Pin<
-        Box<
-            dyn futures_util::stream::Stream<Item = Result<Self::Connection, Self::Error>>
-                + Send
-                + 'static,
-        >,
-    >;
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = Serialize<InC, D>;
+    type Error = std::convert::Infallible;
 
-    fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        use futures_util::StreamExt;
-        let f = self.context_mut().listen(a);
-        let cfg = self.get_config();
-        Box::pin(async move {
-            let cfg = cfg;
-            let conn_stream = f.await?;
-            Ok(
-                Box::pin(conn_stream.map(move |conn: Result<Inner::Connection, _>| {
-                    Ok(Self::make_connection(conn?, cfg.clone()))
-                })) as _,
-            )
-        })
-    }
-
-    fn scope() -> crate::Scope {
-        Inner::scope()
-    }
-
-    fn endedness() -> crate::Endedness {
-        Inner::endedness()
-    }
-
-    fn implementation_priority() -> usize {
-        Inner::implementation_priority()
-    }
-}
-
-impl<Inner, D> crate::ChunnelConnector<D> for SerializeChunnel<Inner, D>
-where
-    Inner: crate::ChunnelConnector<Vec<u8>>,
-    Inner::Connection: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
-    Self: InheritChunnel<Inner::Connection, Connection = Serialize<Inner::Connection, D>>,
-    Self: Context<ChunnelType = Inner>,
-    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
-{
-    type Addr = Inner::Addr;
-    type Connection = Serialize<Inner::Connection, D>;
-    type Error = Inner::Error;
-    type Future = std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Self::Connection, Self::Error>>
-                + Send
-                + 'static,
-        >,
-    >;
-
-    fn connect(&mut self, a: Self::Addr) -> Self::Future {
-        let f = self.context_mut().connect(a);
-        let cfg = self.get_config();
-        Box::pin(async move { Ok(Self::make_connection(f.await?, cfg)) })
-    }
-
-    fn scope() -> crate::Scope {
-        Inner::scope()
-    }
-
-    fn endedness() -> crate::Endedness {
-        Inner::endedness()
-    }
-
-    fn implementation_priority() -> usize {
-        Inner::implementation_priority()
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(Serialize::from(cn)))
     }
 }
 
@@ -152,18 +49,6 @@ where
 pub struct Serialize<C, D> {
     inner: Arc<C>,
     _data: std::marker::PhantomData<D>,
-}
-
-impl<C, D> Context for Serialize<C, D> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.inner
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.inner).unwrap()
-    }
 }
 
 impl<Cx, D> From<Cx> for Serialize<Cx, D> {
@@ -209,8 +94,11 @@ where
 #[cfg(test)]
 mod test {
     use super::SerializeChunnel;
-    use crate::chan_transport::Chan;
-    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
+    use crate::chan_transport::{Chan, ChanAddr};
+    use crate::{
+        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList,
+        ListenAddress, Serve,
+    };
     use futures_util::StreamExt;
     use tracing::trace;
     use tracing_futures::Instrument;
@@ -240,6 +128,7 @@ mod test {
     #[test]
     fn send_u32() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
             .enable_time()
@@ -247,14 +136,19 @@ mod test {
             .unwrap();
         rt.block_on(
             async move {
-                let (srv, cln) = Chan::default().split();
+                let a: ChanAddr<Vec<u8>> = Chan::default().into();
 
-                let mut rcv = SerializeChunnel::from(srv);
-                let mut rcv = rcv.listen(()).await.unwrap();
-                let rcv = rcv.next().await.unwrap().unwrap();
+                let mut srv = a.listener();
+                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let mut rcv_st = CxList::from(SerializeChunnel::default())
+                    .serve(rcv_st)
+                    .await
+                    .unwrap();
+                let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut snd = SerializeChunnel::from(cln);
-                let snd = snd.connect(()).await.unwrap();
+                let mut cln = a.connector();
+                let cln = cln.connect(a).await.unwrap();
+                let snd = SerializeChunnel::default().connect_wrap(cln).await.unwrap();
 
                 send_thingy(snd, rcv, 42u32).await;
             }
@@ -265,6 +159,7 @@ mod test {
     #[test]
     fn send_struct() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
             .enable_time()
@@ -280,14 +175,16 @@ mod test {
 
         rt.block_on(
             async move {
-                let (srv, cln) = Chan::default().split();
+                let a: ChanAddr<Vec<u8>> = Chan::default().into();
 
-                let mut rcv = SerializeChunnel::from(srv);
-                let mut rcv = rcv.listen(()).await.unwrap();
-                let rcv = rcv.next().await.unwrap().unwrap();
+                let mut srv = a.listener();
+                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let mut rcv_st = SerializeChunnel::default().serve(rcv_st).await.unwrap();
+                let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut snd = SerializeChunnel::from(cln);
-                let snd = snd.connect(()).await.unwrap();
+                let mut cln = a.connector();
+                let cln = cln.connect(a).await.unwrap();
+                let snd = SerializeChunnel::default().connect_wrap(cln).await.unwrap();
 
                 send_thingy(
                     snd,

@@ -1,4 +1,6 @@
-use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener, Either, IpPort};
+use bertha::{
+    enumerate_enum, ChunnelConnection, ChunnelConnector, ChunnelListener, Either, IpPort, Negotiate,
+};
 use color_eyre::eyre;
 use eyre::{eyre, Error, WrapErr};
 use futures_util::stream::{Stream, StreamExt};
@@ -70,6 +72,8 @@ where
 const FNV1_64_INIT: u64 = 0xcbf29ce484222325u64;
 const FNV_64_PRIME: u64 = 0x100000001b3u64;
 
+enumerate_enum!(pub ShardFns, Sharding);
+
 /// A chunnel managing a sharded service.
 ///
 /// Listens on an external connection, then forwards messages to one of the internal
@@ -95,6 +99,31 @@ impl<C, S> ShardCanonicalServer<C, S> {
             shards_inner: Arc::new(Mutex::new(shards)),
             redis_listen_connection,
         })
+    }
+}
+
+impl<C, A, S, D, E1, E2> Negotiate<ShardFns> for ShardCanonicalServer<C, S>
+where
+    C: ChunnelListener<Addr = A, Error = E1> + Send + Sync + 'static,
+    C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    S: ChunnelConnector<Addr = A, Error = E2> + Send + Sync + 'static,
+    S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    D: Kv + Send + Sync + 'static,
+    <D as Kv>::Key: AsRef<str>,
+    E1: Into<Error> + Send + Sync + 'static,
+    E2: Into<Error> + Send + Sync + 'static,
+    A: IpPort
+        + Clone
+        + std::fmt::Debug
+        + std::fmt::Display
+        + Send
+        + Sync
+        + 'static
+        + Serialize
+        + DeserializeOwned,
+{
+    fn capabilities() -> Vec<ShardFns> {
+        vec![ShardFns::Sharding]
     }
 }
 
@@ -304,6 +333,12 @@ impl ShardServer<(), ()> {
     }
 }
 
+impl<C, S> Negotiate<ShardFns> for ShardServer<C, S> {
+    fn capabilities() -> Vec<ShardFns> {
+        vec![]
+    }
+}
+
 impl<C, A, S, D, E1, E2> ChunnelListener for ShardServer<C, S>
 where
     C: ChunnelListener<Addr = A, Error = E1> + Send + Sync + 'static,
@@ -387,6 +422,12 @@ impl<C> ClientShardChunnelClient<C> {
             inner: Arc::new(Mutex::new(inner)),
             redis_listen_connection,
         })
+    }
+}
+
+impl<C> Negotiate<ShardFns> for ClientShardChunnelClient<C> {
+    fn capabilities() -> Vec<ShardFns> {
+        vec![]
     }
 }
 
@@ -585,9 +626,9 @@ pub use ebpf::ShardCanonicalServerEbpf;
 mod ebpf {
     use super::eyre::Error;
     use super::eyre::{Report, WrapErr};
-    use super::ShardCanonicalServerConnection;
+    use super::{ShardCanonicalServerConnection, ShardFns};
     use crate::{Kv, ShardInfo};
-    use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener, IpPort};
+    use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener, IpPort, Negotiate};
     use futures_util::stream::{Stream, StreamExt};
     use serde::{de::DeserializeOwned, Serialize};
     use std::collections::HashMap;
@@ -636,6 +677,31 @@ mod ebpf {
                 .instrument(tracing::info_span!("read-shard-stats"))
                 .await
                 .expect("read_shard_stats")
+        }
+    }
+
+    impl<C, A, S, D, E1, E2> Negotiate<ShardFns> for ShardCanonicalServerEbpf<C, S>
+    where
+        C: ChunnelListener<Addr = A, Error = E1> + Send + Sync + 'static,
+        C::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
+        S: ChunnelConnector<Addr = A, Error = E2> + Send + Sync + 'static,
+        S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
+        D: Kv + Send + Sync + 'static,
+        <D as Kv>::Key: AsRef<str>,
+        E1: Into<Error> + Send + Sync + 'static,
+        E2: Into<Error> + Send + Sync + 'static,
+        A: IpPort
+            + Clone
+            + std::fmt::Debug
+            + std::fmt::Display
+            + Send
+            + Sync
+            + 'static
+            + Serialize
+            + DeserializeOwned,
+    {
+        fn capabilities() -> Vec<ShardFns> {
+            vec![ShardFns::Sharding]
         }
     }
 

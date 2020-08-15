@@ -4,11 +4,10 @@ version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
-[features]
-chunnels = ["bertha", "burrito-shard-ctl/chunnels"]
-
 [dependencies]
-bertha = { path = "../bertha", optional = true }
+bertha = { path = "../bertha" }
+burrito-shard-ctl = {path = "../burrito-shard-ctl"}
+burrito-util = {path = "../burrito-util"}
 bincode = "1"
 ctrlc = "3"
 serde  = { version = "1", features = ["derive"]}
@@ -21,8 +20,6 @@ tokio = {version = "0.2.11", features = ["full"]}
 slog = "2"
 slog-term = "2"
 structopt = "0.3"
-burrito-shard-ctl = {path = "../burrito-shard-ctl"}
-burrito-util = {path = "../burrito-util"}
 tracing = "0.1"
 tracing-futures = "0.2"
 tracing-timing  = "0.3"
@@ -32,7 +29,3 @@ hyper-unix-connector = "0.1"
 hashbrown = "0.7"
 tower-buffer = "0.3"
 incoming = "0.1"
-
-[[bin]]
-name = "chunnel-kvserver"
-required-features = ["bertha"]

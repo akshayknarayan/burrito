@@ -1,13 +1,16 @@
 //! Channel-based Chunnel which acts as a transport.
 
 use crate::{
-    Address, ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Once, Scope,
+    ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress, Endedness, ListenAddress,
+    Once, Scope,
 };
 use futures_util::stream::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::DerefMut;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
 
@@ -47,6 +50,7 @@ impl<A, D> RendezvousChannel<A, D, ()> {
 }
 
 /// Type implementing the `Address` trait for `RendezvousChannel`.
+#[derive(Clone)]
 pub struct RendezvousChannelAddr<A, D>(A, RendezvousChannel<A, D, Cln>);
 
 impl<A, D> From<(A, RendezvousChannel<A, D, Cln>)> for RendezvousChannelAddr<A, D> {
@@ -55,7 +59,7 @@ impl<A, D> From<(A, RendezvousChannel<A, D, Cln>)> for RendezvousChannelAddr<A, 
     }
 }
 
-impl<A, D> Address<D> for RendezvousChannelAddr<A, D>
+impl<A, D> ConnectAddress for RendezvousChannelAddr<A, D>
 where
     A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
@@ -76,15 +80,7 @@ impl<A, D, S> Clone for RendezvousChannel<A, D, S> {
     }
 }
 
-impl<A, D, T, S> crate::Negotiate<S> for RendezvousChannel<A, D, T>
-where
-    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-    S: crate::CapabilitySet + crate::NegotiateDummy,
-{
-}
-
-impl<A, D> ChunnelListener<Option<D>> for RendezvousChannel<A, D, Srv>
+impl<A, D> ChunnelListener for RendezvousChannel<A, D, Srv>
 where
     A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
@@ -108,26 +104,16 @@ where
                 .insert(a, ChanChunnel::new(s, r1, Arc::new(|x| x)));
             // `r.map` maps over the messages in the receive channel stream.
             Ok(Box::pin(r.map(move |d| {
-                // Once will not call recv() on the inner C, so pass a dummy receiver.
+                // `Once` will not call recv() on the inner C, so pass a dummy receiver.
                 let (_, r2) = mpsc::channel(1);
                 let resp_chunnel = ChanChunnel::new(s1.clone(), r2, Arc::new(|x| x));
                 Ok(Once::new(Arc::new(resp_chunnel), d))
             })) as _)
         })
     }
-
-    fn scope() -> Scope {
-        crate::Scope::Application
-    }
-    fn endedness() -> Endedness {
-        crate::Endedness::Both
-    }
-    fn implementation_priority() -> usize {
-        1
-    }
 }
 
-impl<A, D> ChunnelConnector<D> for RendezvousChannel<A, D, Cln>
+impl<A, D> ChunnelConnector for RendezvousChannel<A, D, Cln>
 where
     A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
@@ -146,19 +132,15 @@ where
             if let Some(s) = s {
                 Ok(s)
             } else {
-                Err(eyre::eyre!("Address not found: {:?}", addr))
+                let mp = m.lock().await;
+                let keys: Vec<_> = mp.keys().collect();
+                Err(eyre::eyre!(
+                    "Address not found: {:?}: not in {:?}",
+                    addr,
+                    keys
+                ))
             }
         })
-    }
-
-    fn scope() -> Scope {
-        crate::Scope::Application
-    }
-    fn endedness() -> Endedness {
-        crate::Endedness::Both
-    }
-    fn implementation_priority() -> usize {
-        1
     }
 }
 
@@ -223,18 +205,71 @@ impl<T, U> Chan<T, U> {
     }
 }
 
-impl<D, T, S> crate::Negotiate<S> for Chan<D, T>
-where
-    D: Send + Sync + 'static,
-    S: crate::CapabilitySet + crate::NegotiateDummy,
-{
+enum ChanAddrInner<D> {
+    Both(Chan<D, ()>),
+    SrvTaken(Chan<D, Cln>),
+    ClnTaken(Chan<D, Srv>),
+    Done,
 }
 
-impl<D> ChunnelListener<D> for Chan<D, Srv>
+#[derive(Clone)]
+pub struct ChanAddr<D>(Arc<StdMutex<ChanAddrInner<D>>>);
+
+impl<D> From<Chan<D, ()>> for ChanAddr<D> {
+    fn from(f: Chan<D, ()>) -> Self {
+        ChanAddr(Arc::new(StdMutex::new(ChanAddrInner::Both(f))))
+    }
+}
+
+impl<D> ListenAddress for ChanAddr<D>
 where
     D: Send + Sync + 'static,
 {
-    type Addr = ();
+    type Listener = Chan<D, Srv>;
+    fn listener(&self) -> Self::Listener {
+        let mut this = self.0.lock().unwrap();
+        let c = std::mem::replace(this.deref_mut(), ChanAddrInner::Done);
+        let (new, ret) = match c {
+            ChanAddrInner::Both(c) => {
+                let (srv, cln) = c.split();
+                (srv, ChanAddrInner::SrvTaken(cln))
+            }
+            ChanAddrInner::ClnTaken(c) => (c, ChanAddrInner::Done),
+            _ => unreachable!(),
+        };
+
+        let _ = std::mem::replace(this.deref_mut(), ret);
+        new
+    }
+}
+
+impl<D> ConnectAddress for ChanAddr<D>
+where
+    D: Send + Sync + 'static,
+{
+    type Connector = Chan<D, Cln>;
+    fn connector(&self) -> Self::Connector {
+        let mut this = self.0.lock().unwrap();
+        let c = std::mem::replace(this.deref_mut(), ChanAddrInner::Done);
+        let (new, ret) = match c {
+            ChanAddrInner::Both(c) => {
+                let (srv, cln) = c.split();
+                (cln, ChanAddrInner::ClnTaken(srv))
+            }
+            ChanAddrInner::SrvTaken(c) => (c, ChanAddrInner::Done),
+            _ => unreachable!(),
+        };
+
+        let _ = std::mem::replace(this.deref_mut(), ret);
+        new
+    }
+}
+
+impl<D> ChunnelListener for Chan<D, Srv>
+where
+    D: Send + Sync + 'static,
+{
+    type Addr = ChanAddr<D>;
     type Connection = ChanChunnel<D>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
@@ -249,25 +284,13 @@ where
         );
         Box::pin(async move { Ok(Box::pin(futures_util::stream::once(async { Ok(r) })) as _) })
     }
-
-    fn scope() -> Scope {
-        Scope::Application
-    }
-
-    fn endedness() -> Endedness {
-        Endedness::Both
-    }
-
-    fn implementation_priority() -> usize {
-        1
-    }
 }
 
-impl<D> ChunnelConnector<D> for Chan<D, Cln>
+impl<D> ChunnelConnector for Chan<D, Cln>
 where
     D: Send + Sync + 'static,
 {
-    type Addr = ();
+    type Addr = ChanAddr<D>;
     type Connection = ChanChunnel<D>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -280,18 +303,6 @@ where
             Arc::clone(&self.link),
         );
         Box::pin(async { Ok(r) })
-    }
-
-    fn scope() -> Scope {
-        Scope::Application
-    }
-
-    fn endedness() -> Endedness {
-        Endedness::Both
-    }
-
-    fn implementation_priority() -> usize {
-        1
     }
 }
 
@@ -354,8 +365,51 @@ where
 
 #[cfg(test)]
 mod test {
+    use super::{Chan, ChanAddr};
+    use crate::{
+        ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress, ListenAddress,
+    };
+    use futures_util::stream::StreamExt;
+    use tracing_futures::Instrument;
+
     #[test]
-    fn rendezvous() {
-        // TODO
+    fn chan() {
+        let _guard = tracing_subscriber::fmt::try_init();
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+
+                let (s, r) = tokio::sync::oneshot::channel();
+
+                let mut srv = a.listener();
+                let addr = a.clone();
+                tokio::spawn(async move {
+                    let mut st = srv.listen(addr).await.unwrap();
+                    s.send(()).unwrap();
+                    let cn = st.next().await.unwrap().unwrap();
+                    let d = cn.recv().await.unwrap();
+                    cn.send(d).await.unwrap();
+                });
+
+                r.await?;
+                let mut cln = a.connector();
+                let cn = cln.connect(a).await?;
+
+                cn.send(vec![1u8; 8]).await?;
+                let d = cn.recv().await?;
+
+                assert_eq!(d, vec![1u8; 8]);
+                Ok::<_, eyre::Report>(())
+            }
+            .instrument(tracing::info_span!("chan_test")),
+        )
+        .unwrap();
     }
 }

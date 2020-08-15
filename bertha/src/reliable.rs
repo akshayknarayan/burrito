@@ -3,7 +3,10 @@
 //! Takes as Data a `(u32, Vec<u8>)`, where the `u32` is a unique tag corresponding to a data
 //! segment, the `Vec<u8>`.
 
-use crate::{ChunnelConnection, Context, InheritChunnel};
+use crate::{ChunnelConnection, Client, Serve};
+use futures_util::future::{ready, Ready};
+use futures_util::stream::Stream;
+use futures_util::stream::TryStreamExt;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -17,73 +20,52 @@ use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
-#[derive(Debug)]
-pub struct ReliabilityChunnel<C> {
-    inner: Arc<C>,
+#[derive(Clone, Debug, Default)]
+pub struct ReliabilityChunnel {
     timeout: Duration,
 }
 
-impl<Cx> From<Cx> for ReliabilityChunnel<Cx> {
-    fn from(cx: Cx) -> ReliabilityChunnel<Cx> {
-        ReliabilityChunnel {
-            inner: Arc::new(cx),
-            timeout: Duration::from_millis(100),
-        }
-    }
-}
-
-impl<Cx> ReliabilityChunnel<Cx> {
+impl ReliabilityChunnel {
     pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
         self.timeout = to;
         self
     }
 }
 
-impl<C> Clone for ReliabilityChunnel<C>
+impl<InS, InC, InE> Serve<InS> for ReliabilityChunnel
 where
-    C: Clone,
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
 {
-    fn clone(&self) -> Self {
-        let inner: C = self.inner.as_ref().clone();
-        Self {
-            inner: Arc::new(inner),
-            timeout: self.timeout,
-        }
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = Reliability<InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        let cfg = self.timeout;
+        ready(Ok(Box::pin(inner.map_ok(move |cn| {
+            let mut r = Reliability::from(cn);
+            r.set_timeout(cfg);
+            r
+        })) as _))
     }
 }
 
-impl<C> Context for ReliabilityChunnel<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.inner
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.inner).unwrap()
-    }
-}
-
-impl<C, D> InheritChunnel<C> for ReliabilityChunnel<D>
+impl<InC> Client<InC> for ReliabilityChunnel
 where
-    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
 {
-    type Connection = Reliability<C>;
-    type Config = Duration;
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = Reliability<InC>;
+    type Error = std::convert::Infallible;
 
-    fn get_config(&mut self) -> Self::Config {
-        self.timeout
-    }
-
-    fn make_connection(cx: C, cfg: Self::Config) -> Self::Connection {
-        let mut c = Reliability::from(cx);
-        c.set_timeout(cfg);
-        c
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(Reliability::from(cn)))
     }
 }
-
-crate::inherit_listener!(ReliabilityChunnel, Vec<u8>, Reliability, (u32, Vec<u8>));
-crate::inherit_connector!(ReliabilityChunnel, Vec<u8>, Reliability, (u32, Vec<u8>));
 
 #[derive(Debug, Default)]
 struct ReliabilityState {
@@ -134,18 +116,6 @@ impl<C> Clone for Reliability<C> {
             inner: Arc::clone(&self.inner),
             state: Arc::clone(&self.state),
         }
-    }
-}
-
-impl<C> Context for Reliability<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.inner
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.inner).unwrap()
     }
 }
 
@@ -328,8 +298,11 @@ where
 #[cfg(test)]
 mod test {
     use super::{Reliability, ReliabilityChunnel};
-    use crate::chan_transport::Chan;
-    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
+    use crate::chan_transport::{Chan, ChanAddr};
+    use crate::{
+        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress,
+        ListenAddress, Serve,
+    };
     use futures_util::StreamExt;
     use tracing::{debug, info};
     use tracing_futures::Instrument;
@@ -368,6 +341,7 @@ mod test {
     #[test]
     fn no_drops() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
         let msgs = vec![(0, vec![0u8; 10]), (1, vec![1u8; 10]), (2, vec![2u8; 10])];
 
         let mut rt = tokio::runtime::Builder::new()
@@ -378,14 +352,19 @@ mod test {
 
         rt.block_on(
             async move {
-                let (srv, cln) = Chan::default().split();
+                let a: ChanAddr<Vec<u8>> = Chan::default().into();
 
-                let mut rcv = ReliabilityChunnel::from(srv);
-                let mut rcv = rcv.listen(()).await.unwrap();
-                let rcv = rcv.next().await.unwrap().unwrap();
+                let mut srv = a.listener();
+                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let mut rcv_st = ReliabilityChunnel::default().serve(rcv_st).await.unwrap();
+                let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut snd = ReliabilityChunnel::from(cln);
-                let snd = snd.connect(()).await.unwrap();
+                let mut cln = a.connector();
+                let cln = cln.connect(a).await.unwrap();
+                let snd = ReliabilityChunnel::default()
+                    .connect_wrap(cln)
+                    .await
+                    .unwrap();
 
                 do_transmit(snd, rcv, msgs).await;
             }
@@ -396,6 +375,7 @@ mod test {
     #[test]
     fn drop_2() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
         let msgs = vec![(0, vec![0u8; 10]), (1, vec![1u8; 10]), (2, vec![2u8; 10])];
 
         let mut rt = tokio::runtime::Builder::new()
@@ -418,16 +398,97 @@ mod test {
                         None
                     }
                 });
-                let (srv, cln) = t.split();
 
-                let mut rcv = ReliabilityChunnel::from(srv);
-                let mut rcv = rcv.listen(()).await.unwrap();
-                let rcv = rcv.next().await.unwrap().unwrap();
+                let a: ChanAddr<Vec<u8>> = t.into();
 
-                let mut snd = ReliabilityChunnel::from(cln);
-                let snd = snd.connect(()).await.unwrap();
+                let mut srv = a.listener();
+                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let mut rcv_st = ReliabilityChunnel::default().serve(rcv_st).await.unwrap();
+                let rcv = rcv_st.next().await.unwrap().unwrap();
+
+                let mut cln = a.connector();
+                let cln = cln.connect(a).await.unwrap();
+                let snd = ReliabilityChunnel::default()
+                    .connect_wrap(cln)
+                    .await
+                    .unwrap();
 
                 do_transmit(snd, rcv, msgs).await;
+            }
+            .instrument(tracing::info_span!("drop_2")),
+        );
+    }
+
+    async fn do_transmit_tagged(
+        snd_ch: impl ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+        rcv_ch: impl ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+        msgs: Vec<Vec<u8>>,
+    ) {
+        // recv side
+        tokio::spawn(
+            async move {
+                info!("starting receiver");
+                loop {
+                    let m = rcv_ch.recv().await.unwrap();
+                    debug!(m = ?m, "rcvd");
+                }
+            }
+            .instrument(tracing::debug_span!("receiver")),
+        );
+
+        futures_util::future::join_all(msgs.into_iter().map(|m| {
+            debug!(m = ?m, "sending");
+            snd_ch.send(m)
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<(), _>>()
+        .unwrap();
+
+        info!("done");
+    }
+    #[test]
+    fn drop_2_tagged() {
+        use crate::{tagger::TaggerChunnel, CxList};
+
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
+        let msgs = vec![vec![0u8; 10], vec![1u8; 10], vec![2u8; 10]];
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        use std::sync::{atomic::AtomicUsize, Arc};
+
+        rt.block_on(
+            async move {
+                let mut t = Chan::default();
+                let ctr: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+                t.link_conditions(move |x| {
+                    let c = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if c != 2 {
+                        x
+                    } else {
+                        None
+                    }
+                });
+
+                let a: ChanAddr<Vec<u8>> = t.into();
+                let mut stack = CxList::from(TaggerChunnel).wrap(ReliabilityChunnel::default());
+
+                let mut srv = a.listener();
+                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let mut rcv_st = stack.serve(rcv_st).await.unwrap();
+                let rcv = rcv_st.next().await.unwrap().unwrap();
+
+                let mut cln = a.connector();
+                let cln = cln.connect(a).await.unwrap();
+                let snd = stack.connect_wrap(cln).await.unwrap();
+
+                do_transmit_tagged(snd, rcv, msgs).await;
             }
             .instrument(tracing::info_span!("drop_2")),
         );

@@ -1,7 +1,8 @@
 //! Unix datagram/socket chunnel.
 
 use crate::{
-    util::AddrWrap, Address, ChunnelConnection, ChunnelConnector, ChunnelListener, Endedness, Scope,
+    util::AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress,
+    Endedness, Scope,
 };
 use eyre::{eyre, WrapErr};
 use futures_util::stream::{Stream, StreamExt};
@@ -92,14 +93,14 @@ impl ChunnelConnector<(PathBuf, Vec<u8>)> for UnixSkChunnel {
     }
 }
 
-impl Address<(PathBuf, Vec<u8>)> for () {
+impl ConnectAddress<(PathBuf, Vec<u8>)> for () {
     type Connector = UnixSkChunnel;
     fn connector(&self) -> Self::Connector {
         UnixSkChunnel::default()
     }
 }
 
-impl Address<Vec<u8>> for PathBuf {
+impl ConnectAddress<Vec<u8>> for PathBuf {
     type Connector = AddrWrap<PathBuf, UnixSkChunnel>;
     fn connector(&self) -> Self::Connector {
         AddrWrap::from(UnixSkChunnel::default())

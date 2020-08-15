@@ -1,6 +1,9 @@
 //! Chunnel which tags Data to provide at-most-once delivery.
 
-use crate::{ChunnelConnection, Context, InheritChunnel};
+use crate::{ChunnelConnection, Client, Serve};
+use futures_util::future::{ready, Ready};
+use futures_util::stream::Stream;
+use futures_util::stream::TryStreamExt;
 use std::collections::BinaryHeap;
 use std::convert::TryInto;
 use std::future::Future;
@@ -10,59 +13,40 @@ use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
-#[derive(Debug)]
-pub struct TaggerChunnel<C> {
-    inner: Arc<C>,
-}
+#[derive(Clone, Debug, Default)]
+pub struct TaggerChunnel;
 
-impl<Cx> From<Cx> for TaggerChunnel<Cx> {
-    fn from(cx: Cx) -> TaggerChunnel<Cx> {
-        TaggerChunnel {
-            inner: Arc::new(cx),
-        }
-    }
-}
-
-impl<C> Clone for TaggerChunnel<C>
+impl<D, InS, InC, InE> Serve<InS> for TaggerChunnel
 where
-    C: Clone,
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
-    fn clone(&self) -> Self {
-        let inner: C = self.inner.as_ref().clone();
-        Self {
-            inner: Arc::new(inner),
-        }
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = Tagger<InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(Box::pin(inner.map_ok(|cn| Tagger::from(cn))) as _))
     }
 }
 
-impl<C> Context for TaggerChunnel<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.inner
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.inner).unwrap()
-    }
-}
-
-impl<B, C> InheritChunnel<C> for TaggerChunnel<B>
+impl<D, InC> Client<InC> for TaggerChunnel
 where
-    C: ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
-    type Connection = Tagger<C>;
-    type Config = ();
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = Tagger<InC>;
+    type Error = std::convert::Infallible;
 
-    fn get_config(&mut self) -> Self::Config {}
-
-    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
-        Tagger::from(cx)
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(Tagger::from(cn)))
     }
 }
-
-crate::inherit_listener!(TaggerChunnel, (u32, Vec<u8>), Tagger, Vec<u8>);
-crate::inherit_connector!(TaggerChunnel, (u32, Vec<u8>), Tagger, Vec<u8>);
 
 /// Assigns an sequential tag to data segments and ignores the tag otherwise.
 #[derive(Default, Debug)]
@@ -93,11 +77,12 @@ where
     }
 }
 
-impl<C> ChunnelConnection for Tagger<C>
+impl<C, D> ChunnelConnection for Tagger<C>
 where
-    C: ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
-    type Data = Vec<u8>;
+    type Data = D;
 
     fn send(
         &self,
@@ -132,107 +117,137 @@ where
     }
 }
 
-#[derive(Debug)]
-pub struct OrderedChunnel<C> {
-    inner: Arc<C>,
+#[derive(Clone, Debug)]
+pub struct OrderedChunnel {
     hole_thresh: usize,
 }
 
-impl<Cx> OrderedChunnel<Cx> {
+impl OrderedChunnel {
     pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
         self.hole_thresh = thresh;
         self
     }
 }
 
-impl<C> Clone for OrderedChunnel<C>
-where
-    C: Clone,
-{
-    fn clone(&self) -> Self {
-        let inner: C = self.inner.as_ref().clone();
-        Self {
-            inner: Arc::new(inner),
-            hole_thresh: self.hole_thresh,
-        }
-    }
-}
-
-impl<C: Default> Default for OrderedChunnel<C> {
+impl Default for OrderedChunnel {
     fn default() -> Self {
-        Self {
-            hole_thresh: 5,
-            inner: Default::default(),
-        }
+        Self { hole_thresh: 5 }
     }
 }
 
-impl<Cx> From<Cx> for OrderedChunnel<Cx> {
-    fn from(cx: Cx) -> OrderedChunnel<Cx> {
-        OrderedChunnel {
-            inner: Arc::new(cx),
-            hole_thresh: 5,
-        }
-    }
-}
-
-impl<C> Context for OrderedChunnel<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.inner
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.inner).unwrap()
-    }
-}
-
-impl<B, C> InheritChunnel<C> for OrderedChunnel<B>
+impl<D, InS, InC, InE> Serve<InS> for OrderedChunnel
 where
-    C: ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
-    type Connection = Ordered<C>;
-    type Config = usize;
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = Ordered<InC, D>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
-    fn get_config(&mut self) -> Self::Config {
-        self.hole_thresh
-    }
-
-    fn make_connection(cx: C, cfg: Self::Config) -> Self::Connection {
-        Ordered {
-            inner: Arc::new(cx),
-            hole_thresh: cfg,
-            state: Default::default(),
-        }
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        let cfg = self.hole_thresh;
+        ready(Ok(
+            Box::pin(inner.map_ok(move |cn| Ordered::new(cn, cfg))) as _
+        ))
     }
 }
 
-crate::inherit_listener!(OrderedChunnel, (u32, Vec<u8>), Ordered, Vec<u8>);
-crate::inherit_connector!(OrderedChunnel, (u32, Vec<u8>), Ordered, Vec<u8>);
+impl<D, InC> Client<InC> for OrderedChunnel
+where
+    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = Ordered<InC, D>;
+    type Error = std::convert::Infallible;
 
-#[derive(Debug, Default)]
-struct OrderedState {
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(Ordered::new(cn, self.hole_thresh)))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DataPair<D>(u32, D);
+
+impl<D> Into<(u32, D)> for DataPair<D> {
+    fn into(self) -> (u32, D) {
+        (self.0, self.1)
+    }
+}
+
+impl<D> From<(u32, D)> for DataPair<D> {
+    fn from(f: (u32, D)) -> Self {
+        DataPair(f.0, f.1)
+    }
+}
+
+impl<D> PartialEq for DataPair<D> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<D> Eq for DataPair<D> {}
+
+impl<D> PartialOrd for DataPair<D> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl<D> Ord for DataPair<D> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+#[derive(Debug)]
+struct OrderedState<D> {
     snd_nxt: u32,
     expected_recv: u32,
-    recvd: BinaryHeap<(u32, Vec<u8>)>, // list of out-of-order received seqs
+    recvd: BinaryHeap<DataPair<D>>, // list of out-of-order received seqs
+}
+
+impl<D> Default for OrderedState<D> {
+    fn default() -> Self {
+        OrderedState {
+            snd_nxt: 0,
+            expected_recv: 0,
+            recvd: BinaryHeap::new(),
+        }
+    }
 }
 
 /// `Ordered` takes in `Vec<u8>` Data segments and tags them for use with `(u32, Vec<u8>)` Chunnels.
 ///
 /// It returns data segments in the order they were sent.
 #[derive(Clone, Debug)]
-pub struct Ordered<C> {
+pub struct Ordered<C, D> {
     inner: Arc<C>,
     hole_thresh: usize,
-    state: Arc<RwLock<OrderedState>>,
+    state: Arc<RwLock<OrderedState<D>>>,
 }
 
-impl<C> ChunnelConnection for Ordered<C>
+impl<C, D> Ordered<C, D> {
+    pub fn new(inner: C, hole_thresh: usize) -> Self {
+        Ordered {
+            inner: Arc::new(inner),
+            hole_thresh,
+            state: Default::default(),
+        }
+    }
+}
+
+impl<C, D> ChunnelConnection for Ordered<C, D>
 where
-    C: ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
-    type Data = Vec<u8>;
+    type Data = D;
 
     fn send(
         &self,
@@ -271,7 +286,7 @@ where
                     {
                         let mut st = state.write().await;
                         let mut pop = false;
-                        if let Some((seq, _)) = st.recvd.peek() {
+                        if let Some(DataPair(seq, _)) = st.recvd.peek() {
                             pop = *seq == expected || st.recvd.len() > hole_thresh;
                             if pop {
                                 trace!(seq = ?seq, next_expected = ?expected, pileup = ?st.recvd.len(), "returning ordered packet");
@@ -291,7 +306,7 @@ where
                         return Ok(d);
                     } else if seq > expected {
                         let mut st = state.write().await;
-                        st.recvd.push((seq, d));
+                        st.recvd.push((seq, d).into());
                     } else {
                         debug!(seq = ?seq, "dropping segment");
                     }
@@ -302,59 +317,38 @@ where
     }
 }
 
-#[derive(Debug)]
-pub struct SeqUnreliableChunnel<C> {
-    inner: Arc<C>,
-}
+#[derive(Debug, Clone)]
+pub struct SeqUnreliableChunnel;
 
-impl<Cx> From<Cx> for SeqUnreliableChunnel<Cx> {
-    fn from(cx: Cx) -> SeqUnreliableChunnel<Cx> {
-        SeqUnreliableChunnel {
-            inner: Arc::new(cx),
-        }
-    }
-}
-
-impl<C> Clone for SeqUnreliableChunnel<C>
+impl<InS, InC, InE> Serve<InS> for SeqUnreliableChunnel
 where
-    C: Clone,
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
 {
-    fn clone(&self) -> Self {
-        let inner: C = self.inner.as_ref().clone();
-        Self {
-            inner: Arc::new(inner),
-        }
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = SeqUnreliable<InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(Box::pin(inner.map_ok(|cn| SeqUnreliable::from(cn))) as _))
     }
 }
 
-impl<C> Context for SeqUnreliableChunnel<C> {
-    type ChunnelType = C;
-
-    fn context(&self) -> &Self::ChunnelType {
-        &self.inner
-    }
-
-    fn context_mut(&mut self) -> &mut Self::ChunnelType {
-        Arc::get_mut(&mut self.inner).unwrap()
-    }
-}
-
-impl<B, C> InheritChunnel<C> for SeqUnreliableChunnel<B>
+impl<InC> Client<InC> for SeqUnreliableChunnel
 where
-    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
 {
-    type Connection = SeqUnreliable<C>;
-    type Config = ();
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = SeqUnreliable<InC>;
+    type Error = std::convert::Infallible;
 
-    fn get_config(&mut self) -> Self::Config {}
-
-    fn make_connection(cx: C, _cfg: Self::Config) -> Self::Connection {
-        SeqUnreliable::from(cx)
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(SeqUnreliable::from(cn)))
     }
 }
-
-crate::inherit_listener!(SeqUnreliableChunnel, Vec<u8>, SeqUnreliable, (u32, Vec<u8>));
-crate::inherit_connector!(SeqUnreliableChunnel, Vec<u8>, SeqUnreliable, (u32, Vec<u8>));
 
 /// `SeqUnreliable` accepts (u32, Vec<u8>) pairs as Data for transmission.
 #[derive(Default, Debug, Clone)]
@@ -413,8 +407,12 @@ where
 #[cfg(test)]
 mod test {
     use super::{OrderedChunnel, SeqUnreliableChunnel, TaggerChunnel};
-    use crate::chan_transport::Chan;
-    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
+    use crate::chan_transport::{Chan, ChanAddr};
+    use crate::{
+        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList,
+        ListenAddress, Serve,
+    };
+    use color_eyre::Report;
     use futures_util::StreamExt;
     use tracing::{debug, info, trace};
     use tracing_futures::Instrument;
@@ -422,6 +420,7 @@ mod test {
     #[test]
     fn tag_only() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
@@ -431,19 +430,25 @@ mod test {
 
         rt.block_on(
             async move {
-                let (srv, cln) = Chan::default().split();
+                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let mut stack = CxList::from(TaggerChunnel).wrap(SeqUnreliableChunnel);
 
-                let mut rcv = TaggerChunnel::from(SeqUnreliableChunnel::from(srv));
-                let mut rcv = rcv.listen(()).await.unwrap();
-                let rcv = rcv.next().await.unwrap().unwrap();
+                let mut srv = a.listener();
+                let rcv_st = srv.listen(a.clone()).await?;
+                let mut rcv_st = stack.serve(rcv_st).await?;
+                let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut snd = TaggerChunnel::from(SeqUnreliableChunnel::from(cln));
-                let snd = snd.connect(()).await.unwrap();
+                let mut cln = a.connector();
+                let cln = cln.connect(a).await?;
+                let snd = stack.connect_wrap(cln).await?;
 
                 do_transmit(snd, rcv).await;
+
+                Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("tag_only")),
-        );
+        )
+        .unwrap();
     }
 
     async fn do_transmit<C>(snd_ch: C, rcv_ch: C)
@@ -493,6 +498,7 @@ mod test {
     #[test]
     fn no_drops() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
@@ -502,24 +508,31 @@ mod test {
 
         rt.block_on(
             async move {
-                let (srv, cln) = Chan::default().split();
+                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
 
-                let mut rcv = OrderedChunnel::from(SeqUnreliableChunnel::from(srv));
-                let mut rcv = rcv.listen(()).await.unwrap();
-                let rcv = rcv.next().await.unwrap().unwrap();
+                let mut srv = a.listener();
+                let rcv_st = srv.listen(a.clone()).await?;
+                let mut rcv_st = stack.serve(rcv_st).await?;
+                let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut snd = OrderedChunnel::from(SeqUnreliableChunnel::from(cln));
-                let snd = snd.connect(()).await.unwrap();
+                let mut cln = a.connector();
+                let cln = cln.connect(a).await?;
+                let snd = stack.connect_wrap(cln).await?;
 
                 do_transmit(snd, rcv).await;
+
+                Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("no_drops")),
-        );
+        )
+        .unwrap();
     }
 
     #[test]
     fn reorder() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
@@ -553,18 +566,24 @@ mod test {
                         }
                     }
                 });
+                let a: ChanAddr<Vec<u8>> = t.into();
 
-                let (srv, cln) = t.split();
-                let mut rcv = OrderedChunnel::from(SeqUnreliableChunnel::from(srv));
-                let mut rcv = rcv.listen(()).await.unwrap();
-                let rcv = rcv.next().await.unwrap().unwrap();
+                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
 
-                let mut snd = OrderedChunnel::from(SeqUnreliableChunnel::from(cln));
-                let snd = snd.connect(()).await.unwrap();
+                let mut srv = a.listener();
+                let rcv_st = srv.listen(a.clone()).await?;
+                let mut rcv_st = stack.serve(rcv_st).await?;
+                let rcv = rcv_st.next().await.unwrap().unwrap();
+
+                let mut cln = a.connector();
+                let cln = cln.connect(a).await?;
+                let snd = stack.connect_wrap(cln).await?;
 
                 do_transmit(snd, rcv).await;
+                Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("reorder")),
-        );
+        )
+        .unwrap();
     }
 }

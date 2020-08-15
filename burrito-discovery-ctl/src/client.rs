@@ -1,4 +1,4 @@
-use anyhow::Error;
+use eyre::{eyre, Error};
 use std::path::Path;
 use std::pin::Pin;
 use tracing::trace;
@@ -50,11 +50,11 @@ impl DiscoveryClient {
         match self.uc.next().await {
             Some(Ok(proto::Reply::Register(r))) => {
                 let r: Result<_, _> = r.into();
-                let r = r.map_err(|e| anyhow::anyhow!(e));
+                let r = r.map_err(|e| eyre!(e));
                 Ok(r?)
             }
-            Some(Err(e)) => Err(anyhow::Error::from(e)),
-            None => Err(anyhow::anyhow!("Stream done")),
+            Some(Err(e)) => Err(Error::from(e)),
+            None => Err(eyre!("Stream done")),
             Some(Ok(proto::Reply::Query(_))) => unreachable!(),
         }
     }
@@ -88,12 +88,88 @@ impl DiscoveryClient {
         match self.uc.next().await {
             Some(Ok(proto::Reply::Query(r))) => {
                 let r: Result<_, _> = r.into();
-                let r = r.map_err(|e| anyhow::anyhow!(e));
+                let r = r.map_err(|e| eyre!(e));
                 Ok(r?)
             }
-            Some(Err(e)) => Err(anyhow::Error::from(e)),
-            None => Err(anyhow::anyhow!("Stream done")),
+            Some(Err(e)) => Err(Error::from(e)),
+            None => Err(eyre!("Stream done")),
             Some(Ok(proto::Reply::Register(_))) => unreachable!(),
         }
+    }
+}
+
+#[cfg(feature = "chunnels")]
+pub use chunnels::*;
+
+#[cfg(feature = "chunnels")]
+mod chunnels {
+    use super::DiscoveryClient;
+    use crate::proto::Addr;
+    use bertha::ChunnelListener;
+    use eyre::WrapErr;
+    use futures_util::stream::Stream;
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    /// Naming chunnel: translates proto::Addr into a SocketAddr in connect/listen.
+    pub struct Naming<C> {
+        burrito_root: PathBuf,
+        inner: Arc<C>,
+    }
+
+    impl<C> ChunnelListener for Naming<C>
+    where
+        C: ChunnelListener,
+    {
+        type Addr = Addr;
+        type Connection = C::Connection;
+
+        fn listen(
+            &mut self,
+            a: Self::Addr,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                    Output = Pin<Box<dyn Stream<Item = Result<Self::Connection, eyre::Report>>>>,
+                >,
+            >,
+        > {
+            let root = self.burrito_root.clone();
+            Box::pin(async move {
+                let cl = DiscoveryClient::new(root).await;
+
+                if let Err(e) = cl {
+                    return Box::pin(futures_util::stream::once(async {
+                        Err(e).wrap_err("Could not connect to burrito_discovery_ctl")
+                    })) as _;
+                }
+
+                let cl = cl.unwrap();
+                let r = cl.query(a).await;
+
+                if let Err(e) = r {
+                    return Box::pin(futures_util::stream::once(async {
+                        Err(e).wrap_err("Could not connect to burrito_discovery_ctl")
+                    })) as _;
+                }
+
+                let r = r.unwrap();
+
+                unimplemented!()
+            })
+        }
+
+        fn scope(&self) -> bertha::Scope {
+            bertha::Scope::Global
+        }
+        fn endedness(&self) -> bertha::Endedness {
+            bertha::Endedness::Either
+        }
+        fn implementation_priority(&self) -> usize {
+            1
+        }
+        // fn resource_requirements(&self) -> ?;
     }
 }
