@@ -1,8 +1,7 @@
 //! Channel-based Chunnel which acts as a transport.
 
 use crate::{
-    ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress, Endedness, ListenAddress,
-    Once, Scope,
+    ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress, ListenAddress, Once,
 };
 use futures_util::stream::{Stream, StreamExt};
 use std::collections::HashMap;
