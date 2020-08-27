@@ -64,29 +64,9 @@ pub trait NegotiateDummy {}
 /// ```
 #[macro_export]
 macro_rules! enumerate_enum {
-    (pub $name:ident, $guid:expr, $($variant:ident),+) => {
+    ($v:vis $name:ident, $guid:expr, $($variant:ident),+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-        pub enum $name {
-            $(
-                $variant
-            ),+
-        }
-
-        impl $crate::negotiate::CapabilitySet for $name {
-            fn universe() -> Vec<Self> {
-                vec![
-                    $($name::$variant),+
-                ]
-            }
-
-            fn guid() -> u64 {
-                $guid
-            }
-        }
-    };
-    ($(keyw:ident)* $name:ident, $guid:expr, $($variant:ident),+) => {
-        #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-        enum $name {
+        $v enum $name {
             $(
                 $variant
             ),+
@@ -369,9 +349,9 @@ where
         <<A as ListenAddress>::Listener as ChunnelListener>::Stream,
         <<A as ListenAddress>::Listener as ChunnelListener>::Error,
     > = listener.listen(a).await;
-    let st = st.map_err(|e| e.into())?; // stream of incoming Vec<u8> conns.
+    let st = st.map_err(Into::into)?; // stream of incoming Vec<u8> conns.
 
-    Ok(st.map_err(|e| e.into()).and_then(move |cn| {
+    Ok(st.map_err(Into::into).and_then(move |cn| {
         debug!("new connection");
         let stack = stack.clone();
         async move {
@@ -400,11 +380,11 @@ where
 
             // 5. new_stack.serve(vec_u8_stream)
             let cn_st = futures_util::stream::once(futures_util::future::ready(Ok(cn)));
-            let mut new_st = new_stack.serve(cn_st).await.map_err(|e| e.into())?;
+            let mut new_st = new_stack.serve(cn_st).await.map_err(Into::into)?;
             let new_cn = new_st
                 .try_next()
                 .await // -> Result<Option<T>, E>
-                .map_err(|e| e.into())?
+                .map_err(Into::into)?
                 .ok_or_else(|| eyre!("No connection returned"))?;
 
             debug!("returning connection");
@@ -512,31 +492,37 @@ where
     CxList<H, T>: GetOffers,
 {
     // 1. get Vec<u8> connection.
-    let cn = a.connector().connect(a).await.map_err(|e| e.into())?;
+    let cn = a.connector().connect(a).await.map_err(Into::into)?;
+    debug!("got negotiation connection");
 
     // 2. send Vec<Vec<Offer>>
     let offers = stack.offers();
     let buf = bincode::serialize(&offers)?;
+    debug!(offers = ?&offers, "sending offers");
     cn.send(buf).await?;
 
     // 3. receive Vec<Offer>
     let buf = cn.recv().await?;
     let picked: Vec<Offer> = bincode::deserialize(&buf)?;
+    debug!(picked = ?&picked, "received picked impls");
 
     // 4. monomorphize `stack`, picking received choices
     let mut new_stack = stack.apply(picked)?;
 
     // 5. return new_stack.connect_wrap(vec_u8_conn)
-    new_stack.connect_wrap(cn).await.map_err(|e| e.into())
+    new_stack.connect_wrap(cn).await.map_err(Into::into)
 }
 
 #[allow(non_upper_case_globals)]
 #[cfg(test)]
 mod test {
-    use super::{negotiate_server, CapabilitySet, GetOffers, Negotiate, Offer, Select};
+    use super::{
+        negotiate_client, negotiate_server, CapabilitySet, GetOffers, Negotiate, Offer, Select,
+    };
     use crate::{
         chan_transport::{Chan, ChanAddr},
-        ChunnelConnection, ChunnelConnector, ConnectAddress, CxList, Serve,
+        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList,
+        ListenAddress, Serve,
     };
     use color_eyre::eyre::{eyre, Report};
     use futures_util::{
@@ -573,6 +559,20 @@ mod test {
                 type Stream = InS;
 
                 fn serve(&mut self, inner: InS) -> Self::Future {
+                    ready(Ok(inner))
+                }
+            }
+
+            impl<D, InC> Client<InC> for $name
+            where
+                InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
+                D: Send + Sync + 'static,
+            {
+                type Future = Ready<Result<Self::Connection, Self::Error>>;
+                type Connection = InC;
+                type Error = Report;
+
+                fn connect_wrap(&mut self, inner: InC) -> Self::Future {
                     ready(Ok(inner))
                 }
             }
@@ -686,6 +686,20 @@ mod test {
                 }
             }
 
+            impl<D, InC> Client<InC> for [< $name Alt >]
+            where
+                InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
+                D: Send + Sync + 'static,
+            {
+                type Future = Ready<Result<Self::Connection, Self::Error>>;
+                type Connection = InC;
+                type Error = Report;
+
+                fn connect_wrap(&mut self, inner: InC) -> Self::Future {
+                    ready(Ok(inner))
+                }
+            }
+
             impl Negotiate for [< $name Alt >] {
                 type Capability = [<$name Cap>];
                 fn capabilities() -> Vec<Self::Capability> {
@@ -786,6 +800,125 @@ mod test {
                 Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("serve_select")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn client_select() {
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                info!("starting");
+                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let cl_a = a.clone();
+                let stack = CxList::from(ChunnelA)
+                    .wrap(Select(ChunnelB, ChunnelBAlt))
+                    .wrap(ChunnelC);
+
+                let (s, r) = tokio::sync::oneshot::channel();
+                tokio::spawn(
+                    async move {
+                        info!("starting");
+                        let mut st = a.listener().listen(a).await?;
+                        s.send(()).unwrap();
+
+                        let cn = st.next().await.unwrap()?;
+                        let buf = cn.recv().await?;
+                        let offers: Vec<Vec<Offer>> = bincode::deserialize(&buf)?;
+
+                        // Pick something fake, the first idx for each of them
+                        let picked: Vec<Offer> = offers
+                            .into_iter()
+                            .map(|v| v.into_iter().next().unwrap())
+                            .collect();
+
+                        let buf = bincode::serialize(&picked)?;
+                        cn.send(buf).await?;
+
+                        Ok::<_, Report>(())
+                    }
+                    .instrument(tracing::debug_span!("server")),
+                );
+
+                r.await.unwrap();
+
+                let _cn = negotiate_client(stack, cl_a)
+                    .instrument(tracing::info_span!("negotiate_client"))
+                    .await?;
+
+                info!("done");
+
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::info_span!("client_select")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn both_select() {
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                info!("starting");
+                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let cl_a = a.clone();
+                let stack = CxList::from(ChunnelA)
+                    .wrap(Select(ChunnelB, ChunnelBAlt))
+                    .wrap(ChunnelC);
+                let srv_stack = stack.clone();
+
+                let (s, r) = tokio::sync::oneshot::channel();
+                tokio::spawn(
+                    async move {
+                        info!("starting");
+                        let srv_stream = negotiate_server(srv_stack, a).await?;
+                        s.send(()).unwrap();
+                        tokio::pin!(srv_stream);
+                        let cn = srv_stream
+                            .next()
+                            .await
+                            .ok_or_else(|| eyre!("srv_stream returned none"))??;
+                        let buf = cn.recv().await?;
+                        cn.send(buf).await?;
+                        Ok::<_, Report>(())
+                    }
+                    .instrument(tracing::debug_span!("server")),
+                );
+
+                r.await.unwrap();
+
+                let cn = negotiate_client(stack, cl_a)
+                    .instrument(tracing::info_span!("negotiate_client"))
+                    .await?;
+
+                cn.send(vec![1u8; 10]).await?;
+                let buf = cn.recv().await?;
+
+                assert_eq!(buf, vec![1u8; 10]);
+
+                info!("done");
+
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::info_span!("both_select")),
         )
         .unwrap();
     }

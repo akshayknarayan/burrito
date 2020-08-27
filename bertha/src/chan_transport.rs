@@ -211,7 +211,18 @@ enum ChanAddrInner<D> {
     Done,
 }
 
-#[derive(Clone)]
+impl<D> std::fmt::Debug for ChanAddrInner<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChanAddrInner::Both(_) => f.debug_struct("ChanAddr::Both").finish(),
+            ChanAddrInner::SrvTaken(_) => f.debug_struct("ChanAddr::SrvTaken").finish(),
+            ChanAddrInner::ClnTaken(_) => f.debug_struct("ChanAddr::ClnTaken").finish(),
+            ChanAddrInner::Done => f.debug_struct("ChanAddr::Done").finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ChanAddr<D>(Arc<StdMutex<ChanAddrInner<D>>>);
 
 impl<D> From<Chan<D, ()>> for ChanAddr<D> {

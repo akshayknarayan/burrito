@@ -1,9 +1,12 @@
 //! The `Either` type implements traits where both variants implement the trait with the same
 //! output type.
 
-use super::{ChunnelConnection, Serve};
+use super::{ChunnelConnection, Client, Serve};
 use color_eyre::eyre::Report;
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::{
+    future::FutureExt,
+    stream::{Stream, StreamExt},
+};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -109,8 +112,8 @@ where
                 Box::pin(async move {
                     Ok(Box::pin(
                         fut.await
-                            .map_err(|e| e.into())?
-                            .map(|cn| Ok(Either::Left(cn.map_err(|e| e.into())?))),
+                            .map_err(Into::into)?
+                            .map(|cn| Ok(Either::Left(cn.map_err(Into::into)?))),
                     ) as _)
                 })
             }
@@ -119,10 +122,47 @@ where
                 Box::pin(async move {
                     Ok(Box::pin(
                         fut.await
-                            .map_err(|e| e.into())?
-                            .map(|cn| Ok(Either::Right(cn.map_err(|e| e.into())?))),
+                            .map_err(Into::into)?
+                            .map(|cn| Ok(Either::Right(cn.map_err(Into::into)?))),
                     ) as _)
                 })
+            }
+        }
+    }
+}
+
+impl<A, B, C, D> Client<C> for Either<A, B>
+where
+    C: ChunnelConnection<Data = D>,
+    D: Send + Sync + 'static,
+    A: Client<C> + Send + 'static,
+    B: Client<C> + Send + 'static,
+    <A as Client<C>>::Connection: ChunnelConnection<Data = D>,
+    <B as Client<C>>::Connection: ChunnelConnection<Data = D>,
+    <A as Client<C>>::Error: Into<Report> + Send + Sync + 'static,
+    <B as Client<C>>::Error: Into<Report> + Send + Sync + 'static,
+{
+    // have to box - the Either strategy doesn't work.
+    // future::Map type that goes in the Either includes the closures, which are different
+    // could box the clousures, but why bother at that point
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = Either<A::Connection, B::Connection>;
+    type Error = Report;
+
+    fn connect_wrap(&mut self, inner: C) -> Self::Future {
+        match self {
+            Either::Left(a) => {
+                let fut = a
+                    .connect_wrap(inner)
+                    .map(|out| Ok(Either::Left(out.map_err(Into::into)?)));
+                Box::pin(fut) as _
+            }
+            Either::Right(b) => {
+                let fut = b
+                    .connect_wrap(inner)
+                    .map(|out| Ok(Either::Right(out.map_err(Into::into)?)));
+                Box::pin(fut) as _
             }
         }
     }
