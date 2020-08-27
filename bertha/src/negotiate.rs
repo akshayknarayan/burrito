@@ -1,6 +1,9 @@
 //! Chunnel wrapper types to negotiate between multiple implementations.
 
-use crate::{ChunnelConnection, ChunnelListener, CxList, CxNil, Either, ListenAddress, Serve};
+use crate::{
+    ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList, CxNil,
+    Either, ListenAddress, Serve,
+};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
     future::Ready,
@@ -62,7 +65,7 @@ pub trait NegotiateDummy {}
 #[macro_export]
 macro_rules! enumerate_enum {
     (pub $name:ident, $guid:expr, $($variant:ident),+) => {
-        #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
         pub enum $name {
             $(
                 $variant
@@ -80,8 +83,6 @@ macro_rules! enumerate_enum {
                 $guid
             }
         }
-
-        impl $crate::negotiate::NegotiateDummy for $name {}
     };
     ($(keyw:ident)* $name:ident, $guid:expr, $($variant:ident),+) => {
         #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -102,8 +103,6 @@ macro_rules! enumerate_enum {
                 $guid
             }
         }
-
-        impl $crate::negotiate::NegotiateDummy for $name {}
     };
 }
 
@@ -334,16 +333,20 @@ where
 }
 
 macro_rules! addr_conntype {
-    ($a:ty) => {
+    (srv, $a:ty) => {
         Once<Ready<Result<<<$a as ListenAddress>::Listener as ChunnelListener>::Connection, Report>>>
+    };
+    (cln, $a:ty) => {
+        <<$a as ConnectAddress>::Connector as ChunnelConnector>::Connection
     };
 }
 
+/// Return a stream of connections with `stack`'s semantics, listening on `a`.
 pub async fn negotiate_server<H, T, A>(
     stack: CxList<H, T>,
     a: A,
 ) -> Result<
-    impl Stream<Item = Result<<<CxList<H, T> as Pick<addr_conntype!(A)>>::Picked as Serve<addr_conntype!(A)>>::Connection, Report>>,
+    impl Stream<Item = Result<<<CxList<H, T> as Pick<addr_conntype!(srv, A)>>::Picked as Serve<addr_conntype!(srv, A)>>::Connection, Report>>,
     Report,
 >
 where
@@ -352,11 +355,11 @@ where
         ChunnelConnection<Data = Vec<u8>>,
     <<A as ListenAddress>::Listener as ChunnelListener>::Error:
         Into<Report> + Send + Sync + 'static,
-    CxList<H, T>: Pick<addr_conntype!(A)> + Clone + 'static,
-    <CxList<H, T> as Pick<addr_conntype!(A)>>::Picked: Serve<addr_conntype!(A)> + Clone,
-    <<CxList<H, T> as Pick<addr_conntype!(A)>>::Picked as Serve<addr_conntype!(A)>>::Error:
+    CxList<H, T>: Pick<addr_conntype!(srv, A)> + Clone + 'static,
+    <CxList<H, T> as Pick<addr_conntype!(srv, A)>>::Picked: Serve<addr_conntype!(srv, A)> + Clone,
+    <<CxList<H, T> as Pick<addr_conntype!(srv, A)>>::Picked as Serve<addr_conntype!(srv, A)>>::Error:
         Into<Report> + Send + Sync + 'static,
-    <<CxList<H, T> as Pick<addr_conntype!(A)>>::Picked as Serve<addr_conntype!(A)>>::Stream:
+    <<CxList<H, T> as Pick<addr_conntype!(srv, A)>>::Picked as Serve<addr_conntype!(srv, A)>>::Stream:
         Unpin + Send  + 'static,
     CxList<H, T>: GetOffers,
 {
@@ -410,7 +413,122 @@ where
     }))
 }
 
-//pub fn negotiate_client<H, T>(stack: CxList<H, T>, a: impl ConnectAddress) {}
+pub trait Apply<I> {
+    type Applied;
+    fn apply(self, offers: Vec<Offer>) -> Result<Self::Applied, Report>;
+}
+
+impl<N, I> Apply<I> for N
+where
+    N: Negotiate,
+    <N as Negotiate>::Capability: DeserializeOwned + Ord,
+{
+    type Applied = Self;
+    fn apply(self, o: Vec<Offer>) -> Result<Self::Applied, Report> {
+        if o.is_empty() {
+            return Err(eyre!("Not enough offers for stack"));
+        }
+
+        let o = o.into_iter().next().unwrap();
+        if o.capability_guid != N::Capability::guid() {
+            return Err(eyre!(
+                "Capability mismatch: offer={}, this={}",
+                o.capability_guid,
+                N::Capability::guid()
+            ));
+        }
+
+        let mut cs: Vec<N::Capability> = bincode::deserialize(&o.available)
+            .wrap_err(eyre!("Failed deserializing offer capabilities"))?;
+        cs.sort();
+        let mut this = N::capabilities();
+        this.sort();
+        if cs != this {
+            return Err(eyre!(
+                "Capability mismatch: offer={:?}, this={:?}",
+                cs,
+                this
+            ));
+        }
+
+        Ok(self)
+    }
+}
+
+impl<H, T, I> Apply<I> for CxList<H, T>
+where
+    H: Apply<I>,
+    T: Apply<I>,
+{
+    type Applied = CxList<H::Applied, T::Applied>;
+    fn apply(self, offers: Vec<Offer>) -> Result<Self::Applied, Report> {
+        if offers.is_empty() {
+            return Err(eyre!("Not enough offers for stack"));
+        }
+
+        let mut offers_iter = offers.into_iter();
+        let head_pick = self.head.apply(vec![offers_iter.next().unwrap()])?;
+        let tail_pick = self.tail.apply(offers_iter.collect())?;
+        Ok(CxList {
+            head: head_pick,
+            tail: tail_pick,
+        })
+    }
+}
+
+impl<I, D, T1, T2> Apply<I> for Select<T1, T2>
+where
+    T1: Apply<I>,
+    T2: Apply<I>,
+    <T1 as Apply<I>>::Applied: Client<I>,
+    <T2 as Apply<I>>::Applied: Client<I>,
+    <<T1 as Apply<I>>::Applied as Client<I>>::Connection: ChunnelConnection<Data = D>,
+    <<T2 as Apply<I>>::Applied as Client<I>>::Connection: ChunnelConnection<Data = D>,
+{
+    type Applied = Either<<T1 as Apply<I>>::Applied, <T2 as Apply<I>>::Applied>;
+    fn apply(self, offers: Vec<Offer>) -> Result<Self::Applied, Report> {
+        match self.0.apply(offers.clone()) {
+            Ok(t1_applied) => Ok(Either::Left(t1_applied)),
+            Err(e) => {
+                debug!(t1 = std::any::type_name::<T1>(), err = ?e, "Select::T1 mismatched");
+                Ok(Either::Right(self.1.apply(offers)?))
+            }
+        }
+    }
+}
+
+/// Return a connection with `stack`'s semantics, connecting to `a`.
+pub async fn negotiate_client<H, T, A>(stack: CxList<H, T>, a: A) -> Result<<<CxList<H, T> as Apply<addr_conntype!(cln, A)>>::Applied as Client<addr_conntype!(cln, A)>>::Connection, Report>
+where
+    A: ConnectAddress,
+    <<A as ConnectAddress>::Connector as ChunnelConnector>::Connection:
+        ChunnelConnection<Data = Vec<u8>>,
+    <<A as ConnectAddress>::Connector as ChunnelConnector>::Error:
+        Into<Report> + Send + Sync + 'static,
+    CxList<H, T>: Apply<addr_conntype!(cln, A)> + Clone + 'static,
+    <CxList<H, T> as Apply<addr_conntype!(cln, A)>>::Applied: Client<addr_conntype!(cln, A)> + Clone,
+    <<CxList<H, T> as Apply<addr_conntype!(cln, A)>>::Applied as Client<addr_conntype!(cln, A)>>::Error:
+        Into<Report> + Send + Sync + 'static,
+    CxList<H, T>: GetOffers,
+{
+    // 1. get Vec<u8> connection.
+    let cn = a.connector().connect(a).await.map_err(|e| e.into())?;
+
+    // 2. send Vec<Vec<Offer>>
+    let offers = stack.offers();
+    let buf = bincode::serialize(&offers)?;
+    cn.send(buf).await?;
+
+    // 3. receive Vec<Offer>
+    let buf = cn.recv().await?;
+    let picked: Vec<Offer> = bincode::deserialize(&buf)?;
+
+    // 4. monomorphize `stack`, picking received choices
+    let mut new_stack = stack.apply(picked)?;
+
+    // 5. return new_stack.connect_wrap(vec_u8_conn)
+    new_stack.connect_wrap(cn).await.map_err(|e| e.into())
+}
 
 #[allow(non_upper_case_globals)]
 #[cfg(test)]
