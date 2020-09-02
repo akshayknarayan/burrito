@@ -13,7 +13,7 @@
 
 use crate::{
     util::AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress,
-    Endedness, Scope,
+    ListenAddress,
 };
 use eyre::WrapErr;
 use futures_util::{
@@ -31,35 +31,31 @@ use tokio::sync::{mpsc, Mutex};
 ///
 /// Carries no state.
 #[derive(Default, Clone, Debug)]
-pub struct UdpSkChunnel {}
+pub struct UdpSkChunnel;
 
-impl<S> crate::Negotiate<S> for UdpSkChunnel where S: crate::CapabilitySet + crate::NegotiateDummy {}
-
-impl ChunnelListener<(SocketAddr, Vec<u8>)> for UdpSkChunnel {
-    type Addr = SocketAddr;
-    type Connection = UdpSk;
+impl ChunnelListener for UdpSkChunnel {
+    type Addr = UdpSocketAddr;
+    type Connection = UdpSk<UdpSocketAddr>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = eyre::Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
+        let a: SocketAddr = a.into();
         Box::pin(async move {
             let sk = tokio::net::UdpSocket::bind(a).map(|sk| {
                 let (recv, send) = sk?.split();
-                Ok(UdpSk {
-                    send: Arc::new(Mutex::new(send)),
-                    recv: Arc::new(Mutex::new(recv)),
-                })
+                Ok(UdpSk::new(send, recv))
             });
             Ok(Box::pin(futures_util::stream::once(sk)) as _)
         })
     }
 }
 
-impl ChunnelConnector<(SocketAddr, Vec<u8>)> for UdpSkChunnel {
+impl ChunnelConnector for UdpSkChunnel {
     type Addr = ();
-    type Connection = UdpSk;
+    type Connection = UdpSk<UdpSocketAddr>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = eyre::Report;
@@ -73,36 +69,77 @@ impl ChunnelConnector<(SocketAddr, Vec<u8>)> for UdpSkChunnel {
             .await
             .unwrap()
             .split();
-            Ok(UdpSk {
-                send: Arc::new(Mutex::new(send)),
-                recv: Arc::new(Mutex::new(recv)),
-            })
+            Ok(UdpSk::new(send, recv))
         })
     }
 }
 
-impl ConnectAddress<(SocketAddr, Vec<u8>)> for () {
-    type Connector = UdpSkChunnel;
-    fn connector(&self) -> Self::Connector {
-        UdpSkChunnel::default()
+/// Newtype SocketAddr to avoid hogging the impl of `ConnectAddress`/`ListenAddress` on that type.
+#[derive(Clone, Debug)]
+pub struct UdpSocketAddr(pub SocketAddr);
+
+impl std::fmt::Display for UdpSocketAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
-impl ConnectAddress<Vec<u8>> for SocketAddr {
-    type Connector = AddrWrap<SocketAddr, UdpSkChunnel>;
+impl From<SocketAddr> for UdpSocketAddr {
+    fn from(f: SocketAddr) -> Self {
+        Self(f)
+    }
+}
+
+impl Into<SocketAddr> for UdpSocketAddr {
+    fn into(self) -> SocketAddr {
+        self.0
+    }
+}
+
+impl std::ops::Deref for UdpSocketAddr {
+    type Target = SocketAddr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ConnectAddress for UdpSocketAddr {
+    type Connector = AddrWrap<UdpSocketAddr, UdpSkChunnel>;
     fn connector(&self) -> Self::Connector {
         AddrWrap::from(UdpSkChunnel::default())
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct UdpSk {
-    send: Arc<Mutex<tokio::net::udp::SendHalf>>,
-    recv: Arc<Mutex<tokio::net::udp::RecvHalf>>,
+impl ListenAddress for UdpSocketAddr {
+    type Listener = UdpSkChunnel;
+    fn listener(&self) -> Self::Listener {
+        UdpSkChunnel::default()
+    }
 }
 
-impl ChunnelConnection for UdpSk {
-    type Data = (SocketAddr, Vec<u8>);
+#[derive(Debug, Clone)]
+pub struct UdpSk<A> {
+    send: Arc<Mutex<tokio::net::udp::SendHalf>>,
+    recv: Arc<Mutex<tokio::net::udp::RecvHalf>>,
+    _phantom: std::marker::PhantomData<A>,
+}
+
+impl<A> UdpSk<A> {
+    fn new(send: tokio::net::udp::SendHalf, recv: tokio::net::udp::RecvHalf) -> Self {
+        Self {
+            send: Arc::new(Mutex::new(send)),
+            recv: Arc::new(Mutex::new(recv)),
+            _phantom: Default::default(),
+        }
+    }
+}
+
+impl<A> ChunnelConnection for UdpSk<A>
+where
+    A: Into<SocketAddr> + From<SocketAddr> + Send + 'static,
+{
+    type Data = (A, Vec<u8>);
 
     fn send(
         &self,
@@ -111,6 +148,7 @@ impl ChunnelConnection for UdpSk {
         let sk = Arc::clone(&self.send);
         Box::pin(async move {
             let (addr, data) = data;
+            let addr = addr.into();
             sk.lock().await.send_to(&data, &addr).await?;
             Ok(())
         })
@@ -125,18 +163,16 @@ impl ChunnelConnection for UdpSk {
         Box::pin(async move {
             let (len, from) = sk.lock().await.recv_from(&mut buf).await?;
             let data = buf[0..len].to_vec();
-            Ok((from, data))
+            Ok((from.into(), data))
         })
     }
 }
 
 #[derive(Default, Clone, Copy, Debug)]
-pub struct UdpReqChunnel {}
+pub struct UdpReqChunnel;
 
-impl<S> crate::Negotiate<S> for UdpReqChunnel where S: crate::CapabilitySet + crate::NegotiateDummy {}
-
-impl ChunnelListener<Vec<u8>> for UdpReqChunnel {
-    type Addr = SocketAddr;
+impl ChunnelListener for UdpReqChunnel {
+    type Addr = UdpReqAddr;
     type Connection = UdpConn;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
@@ -144,6 +180,7 @@ impl ChunnelListener<Vec<u8>> for UdpReqChunnel {
     type Error = eyre::Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
+        let a = a.0;
         Box::pin(async move {
             let sk = tokio::net::UdpSocket::bind(a)
                 .await
@@ -198,16 +235,35 @@ impl ChunnelListener<Vec<u8>> for UdpReqChunnel {
             )) as _)
         })
     }
+}
 
-    fn scope() -> Scope {
-        Scope::Local
-    }
-    fn endedness() -> Endedness {
-        Endedness::Both
-    }
+#[derive(Clone, Copy, Debug)]
+pub struct UdpReqAddr(pub SocketAddr);
 
-    fn implementation_priority() -> usize {
-        1
+impl From<SocketAddr> for UdpReqAddr {
+    fn from(f: SocketAddr) -> Self {
+        Self(f)
+    }
+}
+
+impl Into<SocketAddr> for UdpReqAddr {
+    fn into(self) -> SocketAddr {
+        self.0
+    }
+}
+
+impl std::ops::Deref for UdpReqAddr {
+    type Target = SocketAddr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ListenAddress for UdpReqAddr {
+    type Listener = UdpReqChunnel;
+    fn listener(&self) -> Self::Listener {
+        UdpReqChunnel
     }
 }
 
@@ -246,10 +302,10 @@ impl ChunnelConnection for UdpConn {
 
 #[cfg(test)]
 mod test {
-    use super::UdpSkChunnel;
-    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-    use futures_util::StreamExt;
-    use std::net::ToSocketAddrs;
+    use super::{UdpReqAddr, UdpSkChunnel};
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, ListenAddress};
+    use futures_util::{StreamExt, TryStreamExt};
+    use std::net::{SocketAddr, ToSocketAddrs};
     use tracing_futures::Instrument;
 
     #[test]
@@ -268,7 +324,7 @@ mod test {
             async move {
                 let addr = "127.0.0.1:35133".to_socket_addrs().unwrap().next().unwrap();
                 let srv = UdpSkChunnel::default()
-                    .listen(addr)
+                    .listen(addr.into())
                     .await
                     .unwrap()
                     .next()
@@ -285,9 +341,52 @@ mod test {
                     }
                 });
 
-                cli.send((addr, vec![1u8; 12])).await.unwrap();
+                cli.send((addr.into(), vec![1u8; 12])).await.unwrap();
                 let (from, data) = cli.recv().await.unwrap();
 
+                let from: SocketAddr = from.into();
+                let addr: SocketAddr = addr.into();
+                assert_eq!(from, addr);
+                assert_eq!(data, vec![1u8; 12]);
+            }
+            .instrument(tracing::info_span!("udp::echo")),
+        );
+    }
+
+    #[test]
+    fn rendezvous() {
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let addr = "127.0.0.1:35134".to_socket_addrs().unwrap().next().unwrap();
+                let laddr = UdpReqAddr::from(addr);
+
+                tokio::spawn(async move {
+                    let srv = laddr.listener().listen(laddr).await.unwrap();
+                    srv.try_for_each_concurrent(None, |cn| async move {
+                        let data = cn.recv().await?;
+                        cn.send(data).await?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                });
+
+                let cli = UdpSkChunnel::default().connect(()).await.unwrap();
+                cli.send((addr.into(), vec![1u8; 12])).await.unwrap();
+                let (from, data) = cli.recv().await.unwrap();
+
+                let from: SocketAddr = from.into();
+                let addr: SocketAddr = addr.into();
                 assert_eq!(from, addr);
                 assert_eq!(data, vec![1u8; 12]);
             }
