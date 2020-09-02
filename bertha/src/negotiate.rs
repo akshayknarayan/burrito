@@ -56,10 +56,12 @@ pub trait NegotiateDummy {}
 /// # use bertha::enumerate_enum;
 /// enumerate_enum!(pub Foo, 0xe1e3ca44a5ece5bb, A, B, C);
 /// enumerate_enum!(Bar, 0x829233ff7c2ab87a, A, B, C);
+/// enumerate_enum!(pub Baz, 0xe2cab072f664d381, A);
 /// fn main() {
 ///     let f = Foo::B;
 ///     let b = Bar::C;
-///     println!("{:?}, {:?}", f, b);
+///     let z = Baz::A;
+///     println!("{:?}, {:?}, {:?}", f, b, z);
 /// }
 /// ```
 #[macro_export]
