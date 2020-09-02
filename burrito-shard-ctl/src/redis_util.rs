@@ -1,0 +1,81 @@
+use super::ShardInfo;
+use color_eyre::eyre;
+use eyre::{eyre, Error};
+use serde::{de::DeserializeOwned, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{trace, warn};
+
+fn redis_key<A>(a: &A) -> String
+where
+    A: std::fmt::Display,
+{
+    format!("shard:{}", a)
+}
+
+#[tracing::instrument(level = "trace", err, skip(conn))]
+pub async fn redis_insert<A>(
+    conn: Arc<Mutex<redis::aio::Connection>>,
+    serv: &ShardInfo<A>,
+) -> Result<(), Error>
+where
+    A: std::fmt::Display + std::fmt::Debug + Serialize + DeserializeOwned,
+{
+    let name = redis_key(&serv.canonical_addr);
+    let mut r = redis::pipe();
+    r.atomic()
+        .cmd("SADD")
+        .arg("shard-services")
+        .arg(&name)
+        .ignore();
+
+    let shard_blob = bincode::serialize(serv)?;
+    r.set(&name, shard_blob).ignore();
+
+    trace!("adding");
+    r.query_async(&mut *conn.lock().await).await?;
+    Ok(())
+}
+
+#[tracing::instrument(level = "trace", err, skip(con))]
+pub async fn redis_query<A>(
+    canonical_addr: &A,
+    mut con: impl std::ops::DerefMut<Target = redis::aio::Connection>,
+) -> Result<Option<ShardInfo<A>>, Error>
+where
+    A: Serialize
+        + DeserializeOwned
+        + std::cmp::PartialEq
+        + std::fmt::Display
+        + std::fmt::Debug
+        + Sync
+        + 'static,
+{
+    use redis::AsyncCommands;
+
+    let a = redis_key(canonical_addr);
+    trace!("sending request");
+    let sh_info_blob: Vec<u8> = con.get::<_, Vec<u8>>(&a).await?;
+    if sh_info_blob.is_empty() {
+        trace!("got empty response");
+        return Ok(None);
+    }
+
+    trace!("got non-empty response");
+    let sh_info: ShardInfo<A> = bincode::deserialize(&sh_info_blob)?;
+    if canonical_addr != &sh_info.canonical_addr {
+        warn!(
+            canonical_addr = %canonical_addr,
+            shardinfo_addr = %sh_info.canonical_addr,
+            "Mismatch error with redis key <-> ShardInfo",
+        );
+
+        return Err(eyre!(
+            "redis key mismatched: {} != {}",
+            canonical_addr,
+            sh_info.canonical_addr
+        ));
+    }
+
+    Ok(Some(sh_info))
+}

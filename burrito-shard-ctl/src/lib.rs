@@ -1,6 +1,6 @@
 use bertha::{
-    enumerate_enum, udp::UdpSocketAddr, ChunnelConnection, ChunnelConnector, Client,
-    ConnectAddress, Either, IpPort, ListenAddress, Negotiate, Serve,
+    enumerate_enum, ChunnelConnection, ChunnelConnector, Client, ConnectAddress, Either, IpPort,
+    Negotiate, Serve,
 };
 use color_eyre::eyre;
 use eyre::{eyre, Error, WrapErr};
@@ -10,61 +10,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
 pub const CONTROLLER_ADDRESS: &str = "shard-ctl";
 
-async fn redis_insert<A>(
-    conn: Arc<Mutex<redis::aio::Connection>>,
-    serv: &ShardInfo<A>,
-) -> Result<(), Error>
-where
-    A: std::fmt::Display + Serialize + DeserializeOwned,
-{
-    let name = format!("shard:{}", serv.canonical_addr);
-    let mut r = redis::pipe();
-    r.atomic()
-        .cmd("SADD")
-        .arg("shard-services")
-        .arg(&name)
-        .ignore();
-
-    let shard_blob = bincode::serialize(serv)?;
-    r.cmd("SET").arg(&name).arg(shard_blob).ignore();
-
-    r.query_async(&mut *conn.lock().await).await?;
-    Ok(())
-}
-
-async fn redis_query<A>(
-    canonical_addr: &A,
-    mut con: impl std::ops::DerefMut<Target = redis::aio::Connection>,
-) -> Result<Option<ShardInfo<A>>, Error>
-where
-    A: Serialize + DeserializeOwned + std::cmp::PartialEq + std::fmt::Display + Sync + 'static,
-{
-    use redis::AsyncCommands;
-
-    let a = canonical_addr.to_string();
-    let sh_info_blob: Vec<u8> = con.get::<_, Vec<u8>>(&a).await?;
-    if sh_info_blob.is_empty() {
-        return Ok(None);
-    }
-
-    let sh_info: ShardInfo<A> = bincode::deserialize(&sh_info_blob)?;
-    if canonical_addr != &sh_info.canonical_addr {
-        warn!(
-            canonical_addr = %canonical_addr,
-            shardinfo_addr = %sh_info.canonical_addr,
-            "Mismatch error with redis key <-> ShardInfo",
-        );
-
-        return Err(eyre!("redis key mismatched"));
-    }
-
-    Ok(Some(sh_info))
-}
+mod redis_util;
 
 /// Request type for servers registering.
 ///
@@ -200,11 +151,6 @@ where
         Into<Error> + Send + Sync + 'static,
     <<A2 as ConnectAddress>::Connector as ChunnelConnector>::Connection: Send + 'static,
     S: ChunnelConnector<Addr = A2, Error = E> + Clone + Send + Sync + 'static,
-    //S: Client<<<A2 as ConnectAddress>::Connector as ChunnelConnector>::Connection, Error = E>
-    //    + Clone
-    //    + Send
-    //    + Sync
-    //    + 'static,
     S::Connection: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
     <D as Kv>::Key: AsRef<str>,
@@ -224,7 +170,7 @@ where
         Box::pin(
             async move {
                 // redis insert
-                redis_insert(redis_conn, &addr)
+                redis_util::redis_insert(redis_conn, &addr)
                     .await
                     .wrap_err("Could not register shard info")?;
 
@@ -235,7 +181,6 @@ where
                 let conns: Vec<Arc<S::Connection>> =
                     futures_util::future::join_all(addrs.into_iter().map(|a| async {
                         let a2 = (a, shards_inner.clone()).into();
-                        //let cn = a2.connector().connect(a2).await.map_err(Into::into)?;
                         let cn = shards_inner.clone().connect(a2).await.map_err(Into::into)?;
                         Ok::<_, Error>(Arc::new(cn))
                     }))
@@ -243,6 +188,8 @@ where
                     .into_iter()
                     .collect::<Result<_, Error>>()
                     .wrap_err("Could not connect to shards")?;
+
+                trace!("connected to shards");
 
                 // serve canonical address
                 // we are only responsible for the canonical address here.
@@ -312,29 +259,34 @@ where
         let inner = Arc::clone(&self.inner);
         let shard_fn = Arc::clone(&self.shard_fn);
         let shard_conns = self.shards.clone();
-        Box::pin(async move {
-            // received a packet on the canonical_addr.
-            // need to
-            // 1. evaluate the hash fn
-            // 2. forward to the right shard,
-            //    preserving the src addr so the response goes back to the client
+        Box::pin(
+            async move {
+                // received a packet on the canonical_addr.
+                // need to
+                // 1. evaluate the hash fn
+                // 2. forward to the right shard,
+                //    preserving the src addr so the response goes back to the client
 
-            // 0. receive the packet.
-            let data = inner.recv().await?;
+                // 0. receive the packet.
+                let data = inner.recv().await?;
 
-            // 1. evaluate the hash fn to determine where to forward to.
-            let shard_idx = (shard_fn)(&data);
-            let conn = shard_conns[shard_idx].clone();
+                // 1. evaluate the hash fn to determine where to forward to.
+                let shard_idx = (shard_fn)(&data);
+                let conn = shard_conns[shard_idx].clone();
+                trace!(shard_idx, "got packet");
 
-            // 2. Forward to the shard.
-            conn.send(data).await?;
+                // 2. Forward to the shard.
+                conn.send(data).await?;
 
-            // 3. Get response from the shard, and send back to client.
-            let resp = conn.recv().await?;
-            inner.send(resp).await?;
+                // 3. Get response from the shard, and send back to client.
+                let resp = conn.recv().await?;
+                trace!(shard_idx, "got shard response");
+                inner.send(resp).await?;
 
-            Ok(())
-        })
+                Ok(())
+            }
+            .instrument(tracing::trace_span!("server-shard-recv")),
+        )
     }
 
     fn send(
@@ -476,14 +428,15 @@ where
     // 1. ignore the connection (to the canonical_addr) to establish our own, to the shards.
     // 2. force the connection to have (addr, data) semantics, so we can do routing without
     //    establishing our own connections
+    //
+    //  -> pick #2
     fn connect_wrap(&mut self, inner: I) -> Self::Future {
         let a = self.addr.clone();
         let redis_conn = Arc::clone(&self.redis_listen_connection);
         Box::pin(
             async move {
                 // query redis for si
-                trace!(addr = ?&a, "querying redis");
-                let si = redis_query(&a, redis_conn.lock().await)
+                let si = redis_util::redis_query(&a, redis_conn.lock().await)
                     .await
                     .wrap_err("redis query failed")?;
 
@@ -502,6 +455,9 @@ where
                     inner: Arc::new(inner),
                     shard_addrs: addrs,
                     shard_fn: Arc::new(move |d| {
+                        if num_shards == 0 {
+                            return 0;
+                        }
                         /* xdp_shard version of FNV: take the first 4 bytes of the key
                         * u64 hash = FNV1_64_INIT;
                         * // ...
@@ -939,8 +895,8 @@ mod test {
         chan_transport::{RendezvousChannel, RendezvousChannelAddr},
         reliable::{ReliabilityChunnel, ReliabilityProjChunnel},
         tagger::{TaggerChunnel, TaggerProjChunnel},
-        udp::{UdpReqAddr, UdpReqChunnel, UdpSkChunnel, UdpSocketAddr},
-        util::{AddrWrap, OptionUnwrap},
+        udp::{UdpReqAddr, UdpSkChunnel, UdpSocketAddr},
+        util::OptionUnwrap,
         ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList,
         ListenAddress, Serve,
     };
@@ -1089,8 +1045,102 @@ mod test {
         );
     }
 
+    async fn shard_setup(redis_port: u16, srv_port: u16) -> (test_util::Redis, SocketAddr) {
+        // 1. start redis.
+        let redis_addr = format!("redis://127.0.0.1:{}", redis_port);
+        info!(port = ?redis_port, "start redis");
+        let redis_guard = test_util::start_redis(redis_port);
+
+        let shard1_port = srv_port + 1;
+        let shard2_port = srv_port + 2;
+        // 2. Define addr.
+        let si: ShardInfo<SocketAddr> = ShardInfo {
+            canonical_addr: format!("127.0.0.1:{}", srv_port).parse().unwrap(),
+            shard_addrs: vec![
+                format!("127.0.0.1:{}", shard1_port).parse().unwrap(),
+                format!("127.0.0.1:{}", shard2_port).parse().unwrap(),
+            ],
+            shard_info: super::SimpleShardPolicy {
+                packet_data_offset: 18,
+                packet_data_length: 4,
+            },
+        };
+
+        // 3. start shard serv
+        let (internal_srv, internal_cli) =
+            RendezvousChannel::<SocketAddr, Msg, _>::new(100).split();
+
+        let rdy = futures_util::stream::FuturesUnordered::new();
+
+        for a in si.clone().shard_addrs {
+            info!(addr = ?&a, "start shard");
+
+            let (s, r) = tokio::sync::oneshot::channel();
+
+            let int_srv = internal_srv.clone();
+            tokio::spawn(async move {
+                let mut internal_srv = int_srv;
+                let internal_st = internal_srv.listen(a).await.unwrap();
+                let internal_st = OptionUnwrap.serve(internal_st).await.unwrap();
+                let i = ShardServer::new(internal_st);
+                let mut external = CxList::from(i)
+                    .wrap(TaggerChunnel)
+                    .wrap(ReliabilityChunnel::default())
+                    .wrap(SerializeChunnel::default());
+                info!(addr = ?&a, "listening");
+
+                let addr: UdpReqAddr = a.into();
+                let st = addr.listener().listen(addr).await.unwrap();
+                let st = external.serve(st).await.unwrap();
+                s.send(()).unwrap();
+
+                match st
+                    .try_for_each_concurrent(None, |once| async move {
+                        let msg = once.recv().await?;
+                        // just echo.
+                        once.send(msg).await?;
+                        Ok(())
+                    })
+                    .await
+                {
+                    Err(e) => debug!(err = ?e, shard_addr = ?a,  "Shard errorred"),
+                    Ok(_) => (),
+                }
+            });
+
+            rdy.push(r);
+        }
+
+        let _: Vec<()> = rdy.try_collect().await.unwrap();
+
+        // 4. start canonical server
+        let cnsrv = ShardCanonicalServer::new(si.clone(), internal_cli, &redis_addr)
+            .await
+            .unwrap();
+        let mut external = CxList::from(cnsrv)
+            .wrap(TaggerChunnel)
+            .wrap(ReliabilityChunnel::default())
+            .wrap(SerializeChunnel::default());
+        info!(shard_info = ?&si, "start canonical server");
+        let a: UdpReqAddr = si.canonical_addr.into();
+        let st = a.listener().listen(a).await.unwrap();
+
+        let st = external.serve(st).await.unwrap();
+
+        tokio::spawn(async move {
+            st.try_for_each_concurrent(None, |r| async move {
+                r.recv().await?; // ShardCanonicalServerConnection is recv-only
+                Ok(())
+            })
+            .await
+            .unwrap()
+        });
+
+        (redis_guard, si.canonical_addr)
+    }
+
     #[test]
-    fn shard_test() {
+    fn shard_test_shardclient() {
         let _guard = tracing_subscriber::fmt::try_init();
         color_eyre::install().unwrap_or_else(|_| ());
 
@@ -1104,115 +1154,72 @@ mod test {
 
         rt.block_on(
             async move {
-                // 1. start redis.
-                let redis_port = 15215;
-                let redis_addr = format!("redis://127.0.0.1:{}", redis_port);
-                info!(port = ?redis_port, "start redis");
-                let _redis = test_util::start_redis(redis_port);
-
-                // 2. Define addr.
-                let si: ShardInfo<SocketAddr> = ShardInfo {
-                    canonical_addr: "127.0.0.1:21421".parse().unwrap(),
-                    shard_addrs: vec![
-                        "127.0.0.1:21422".parse().unwrap(),
-                        "127.0.0.1:21423".parse().unwrap(),
-                    ],
-                    shard_info: super::SimpleShardPolicy {
-                        packet_data_offset: 18,
-                        packet_data_length: 4,
-                    },
-                };
-
-                // 3. start shard serv
-                let (internal_srv, internal_cli) =
-                    RendezvousChannel::<SocketAddr, Msg, _>::new(100).split();
-
-                let rdy = futures_util::stream::FuturesUnordered::new();
-
-                for a in si.clone().shard_addrs {
-                    info!(addr = ?&a, "start shard");
-
-                    let (s, r) = tokio::sync::oneshot::channel();
-
-                    let int_srv = internal_srv.clone();
-                    tokio::spawn(async move {
-                        let mut internal_srv = int_srv;
-                        let internal_st = internal_srv.listen(a).await.unwrap();
-                        let internal_st = OptionUnwrap.serve(internal_st).await.unwrap();
-                        let i = ShardServer::new(internal_st);
-                        let mut external = CxList::from(i)
-                            .wrap(TaggerChunnel)
-                            .wrap(ReliabilityChunnel::default())
-                            .wrap(SerializeChunnel::default());
-                        info!(addr = ?&a, "listening");
-
-                        let addr: UdpReqAddr = a.into();
-                        let st = addr.listener().listen(addr).await.unwrap();
-                        let st = external.serve(st).await.unwrap();
-                        s.send(()).unwrap();
-
-                        match st
-                            .try_for_each_concurrent(None, |once| async move {
-                                let msg = once.recv().await?;
-                                // just echo.
-                                once.send(msg).await?;
-                                Ok(())
-                            })
-                            .await
-                        {
-                            Err(e) => debug!(err = ?e, shard_addr = ?a,  "Shard errorred"),
-                            Ok(_) => (),
-                        }
-                    });
-
-                    rdy.push(r);
-                }
-
-                let _: Vec<()> = rdy.try_collect().await.unwrap();
-
-                // 4. start canonical server
-                let cnsrv = ShardCanonicalServer::new(si.clone(), internal_cli, &redis_addr)
-                    .await
-                    .unwrap();
-                let mut external = CxList::from(cnsrv)
-                    .wrap(TaggerChunnel)
-                    .wrap(ReliabilityChunnel::default())
-                    .wrap(SerializeChunnel::default());
-                info!(shard_info = ?&si, "start canonical server");
-                let a: UdpReqAddr = si.canonical_addr.into();
-                let st = a.listener().listen(a).await.unwrap();
-
-                let st = external.serve(st).await.unwrap();
-
-                tokio::spawn(async move {
-                    st.try_for_each_concurrent(None, |r| async move {
-                        r.recv().await?; // ShardCanonicalServerConnection is recv-only
-                        Ok(())
-                    })
-                    .await
-                    .unwrap()
-                });
+                // 0-4. make shard servers and shard canonical server
+                let (redis_h, canonical_addr) = shard_setup(15215, 21421).await;
+                let redis_addr = redis_h.get_addr();
 
                 // 5. make client
-                let mut cl = ClientShardChunnelClient::new(si.canonical_addr, &redis_addr)
-                    .await
-                    .unwrap();
-                //let external = CxList::from(ReliabilityChunnel::default())
-                //    .wrap(TaggerChunnel)
-                //    .wrap(SerializeChunnel::default())
-                //    .wrap(cl);
                 info!("make client");
+                let cl = ClientShardChunnelClient::new(canonical_addr, &redis_addr)
+                    .await
+                    .unwrap();
                 let cn = UdpSkChunnel::default().connect(()).await.unwrap(); // above: (A, Vec<u8>)
-                let cn = SerializeChunnelProject::default() // above: (A, D), below: (A, Vec<u8>)
-                    .connect_wrap(cn)
+                let mut stack = CxList::from(cl) // D = (u32, Option<D>), above: D, below: (A, D)
+                    .wrap(TaggerProjChunnel) // above: D, below: (u32, D)
+                    .wrap(ReliabilityProjChunnel::default()) //  above: (u32, D), below: (u32, Option<D>)
+                    .wrap(SerializeChunnelProject::default()); // above: (A, D), below: (A, Vec<u8>)
+                let cn = stack.connect_wrap(cn).await.unwrap();
+
+                // 6. issue a request
+                info!("send request");
+                cn.send(Msg {
+                    k: "aaaaaaaa".to_owned(),
+                    v: "bbbbbbbb".to_owned(),
+                })
+                .await
+                .unwrap();
+
+                info!("await response");
+                let m = cn.recv().await.unwrap();
+                use super::Kv;
+                assert_eq!(m.key(), "aaaaaaaa");
+                assert_eq!(m.val(), "bbbbbbbb");
+            }
+            .instrument(tracing::debug_span!("shard_test")),
+        );
+    }
+
+    #[test]
+    fn shard_test_canonicalclient() {
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        // 0. Make rt.
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                // 0-4. make shard servers and shard canonical server
+                let (_redis_h, canonical_addr) = shard_setup(25215, 31421).await;
+
+                // 5. make client
+                info!("make client");
+                let mut stack = CxList::from(TaggerChunnel)
+                    .wrap(ReliabilityChunnel::default())
+                    .wrap(SerializeChunnel::default());
+                let a = UdpSocketAddr::from(canonical_addr);
+                let cn = a
+                    .connector()
+                    .connect(a)
                     .await
+                    .wrap_err(eyre!("client connect"))
                     .unwrap();
-                let cn = ReliabilityProjChunnel::default() //  above: (u32, D), below: (u32, Option<D>)
-                    .connect_wrap(cn)
-                    .await
-                    .unwrap();
-                let cn = TaggerProjChunnel.connect_wrap(cn).await.unwrap(); // above: D, below: (u32, D)
-                let cn = cl.connect_wrap(cn).await.unwrap(); // D = (u32, Option<D>), above: D, below: (A, D)
+                let cn = stack.connect_wrap(cn).await.unwrap();
 
                 // 6. issue a request
                 info!("send request");
