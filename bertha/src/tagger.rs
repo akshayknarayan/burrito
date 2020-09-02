@@ -117,6 +117,114 @@ where
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct TaggerProjChunnel;
+
+impl<A, D, InS, InC, InE> Serve<InS> for TaggerProjChunnel
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = TaggerProj<InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(Box::pin(inner.map_ok(|cn| TaggerProj::from(cn))) as _))
+    }
+}
+
+impl<A, D, InC> Client<InC> for TaggerProjChunnel
+where
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = TaggerProj<InC>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(TaggerProj::from(cn)))
+    }
+}
+
+/// Assigns an sequential tag to data segments and ignores the tag otherwise.
+#[derive(Default, Debug)]
+pub struct TaggerProj<C> {
+    inner: Arc<C>,
+    snd_nxt: Arc<AtomicUsize>,
+}
+
+impl<Cx> From<Cx> for TaggerProj<Cx> {
+    fn from(cx: Cx) -> TaggerProj<Cx> {
+        TaggerProj {
+            inner: Arc::new(cx),
+            snd_nxt: Default::default(),
+        }
+    }
+}
+
+impl<C> Clone for TaggerProj<C>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        let inner: C = self.inner.as_ref().clone();
+        Self {
+            inner: Arc::new(inner),
+            snd_nxt: self.snd_nxt.clone(),
+        }
+    }
+}
+
+impl<A, C, D> ChunnelConnection for TaggerProj<C>
+where
+    C: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Data = (A, D);
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        let inner = Arc::clone(&self.inner);
+        let snd_nxt = Arc::clone(&self.snd_nxt);
+        Box::pin(
+            async move {
+                let seq = snd_nxt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u32;
+                trace!(seq = ?seq, "sending");
+                let (addr, data) = data;
+                inner.send((addr, (seq, data))).await?;
+                trace!(seq = ?seq, "sent");
+                Ok(())
+            }
+            .instrument(tracing::trace_span!("tagger_send")),
+        )
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(
+            async move {
+                let (addr, (seq, d)) = inner.recv().await?;
+                trace!(seq = ?seq, "received");
+                return Ok((addr, d));
+            }
+            .instrument(tracing::trace_span!("tagger_recv")),
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OrderedChunnel {
     hole_thresh: usize,

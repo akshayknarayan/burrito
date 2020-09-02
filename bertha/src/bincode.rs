@@ -91,6 +91,102 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SerializeChunnelProject<A, D> {
+    _data: std::marker::PhantomData<(A, D)>,
+}
+
+impl<A, D> Default for SerializeChunnelProject<A, D> {
+    fn default() -> Self {
+        SerializeChunnelProject {
+            _data: Default::default(),
+        }
+    }
+}
+
+impl<A, D, InS, InC, InE> Serve<InS> for SerializeChunnelProject<A, D>
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = SerializeProject<InC, A, D>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(
+            Box::pin(inner.map_ok(|cn| SerializeProject::from(cn))) as _
+        ))
+    }
+}
+
+impl<A, D, InC> Client<InC> for SerializeChunnelProject<A, D>
+where
+    InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = SerializeProject<InC, A, D>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(SerializeProject::from(cn)))
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct SerializeProject<C, A, D> {
+    inner: Arc<C>,
+    _data: std::marker::PhantomData<(A, D)>,
+}
+
+impl<Cx, A, D> From<Cx> for SerializeProject<Cx, A, D> {
+    fn from(cx: Cx) -> SerializeProject<Cx, A, D> {
+        SerializeProject {
+            inner: Arc::new(cx),
+            _data: Default::default(),
+        }
+    }
+}
+
+impl<A, C, D> ChunnelConnection for SerializeProject<C, A, D>
+where
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Data = (A, D);
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let buf = bincode::serialize(&data.1)?;
+            inner.send((data.0, buf)).await?;
+            Ok(())
+        })
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let (a, buf) = inner.recv().await?;
+            let data = bincode::deserialize(&buf[..])?;
+            Ok((a, data))
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::SerializeChunnel;

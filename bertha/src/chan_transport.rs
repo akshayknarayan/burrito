@@ -48,7 +48,7 @@ impl<A, D> RendezvousChannel<A, D, ()> {
     }
 }
 
-/// Type implementing the `Address` trait for `RendezvousChannel`.
+/// Type implementing the `ConnectAddress` trait for `RendezvousChannel`.
 #[derive(Clone)]
 pub struct RendezvousChannelAddr<A, D>(A, RendezvousChannel<A, D, Cln>);
 
