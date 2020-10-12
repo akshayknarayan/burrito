@@ -77,7 +77,7 @@ impl ChunnelConnector for UdpSkChunnel {
 }
 
 /// Newtype SocketAddr to avoid hogging the impl of `ConnectAddress`/`ListenAddress` on that type.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UdpSocketAddr(pub SocketAddr);
 
 impl std::fmt::Display for UdpSocketAddr {
@@ -244,7 +244,7 @@ impl ChunnelListener for UdpReqChunnel {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UdpReqAddr(pub SocketAddr);
 
 impl From<SocketAddr> for UdpReqAddr {

@@ -133,10 +133,19 @@ impl<A, A2, S, C> ShardCanonicalServer<A, A2, S, C> {
     }
 }
 
+impl<A, A2, A3, S, C> ShardCanonicalServer<A, A2, S, C>
+where
+    A: Into<A3> + Clone + std::fmt::Debug + Send + Sync + 'static,
+    A3: Send + PartialEq,
+    C: ChunnelConnection<Data = (A3, Vec<u8>)> + Send + Sync + 'static,
+{
+    pub fn foo(&self) {}
+}
+
 impl<A, A2, A3, S, C> Negotiate for ShardCanonicalServer<A, A2, S, C>
 where
     A: Into<A3> + Clone + std::fmt::Debug + Send + Sync + 'static,
-    A3: Send,
+    A3: Send + PartialEq,
     C: ChunnelConnection<Data = (A3, Vec<u8>)> + Send + Sync + 'static,
 {
     type Capability = ShardFns;
@@ -162,6 +171,7 @@ where
             }
             Ok(m) => m,
         };
+
         let msg = match msg {
             bertha::negotiate::NegotiateMsg::ServerNonce { addr, .. } => {
                 bertha::negotiate::NegotiateMsg::ServerNonce {
@@ -184,11 +194,34 @@ where
         };
 
         Box::pin(async move {
-            for shard in addrs.into_iter() {
+            futures_util::future::join_all(addrs.into_iter().map(|shard| {
+                let buf = buf.clone();
+                let cn = Arc::clone(&cn);
+                async move {
                 if let Err(e) = cn.send((shard.clone().into(), buf.clone())).await {
                     warn!(shard = ?&shard, err = ?e, "failed sending negotiation nonce to shard");
                 }
-            }
+
+                // TODO wait for ack
+                match cn.recv().await {
+                    Ok((a, buf)) => match bincode::deserialize(&buf) {
+                        Ok(bertha::negotiate::NegotiateMsg::ServerNonceAck) => {
+                            if a != shard.clone().into() {
+                                warn!(shard = ?&shard, "received from unexpected address");
+                            }
+                        }
+                        Ok(m) => {
+                            warn!(shard = ?&shard, msg = ?m, "got unexpected response to nonce");
+                        }
+                        Err(e) => {
+                            warn!(shard = ?&shard, err = ?e, "failed deserializing nonce ack");
+                        }
+                    },
+                    Err(e) => {
+                        warn!(shard = ?&shard, err = ?e, "failed waiting for nonce ack");
+                    }
+                }
+            }})).await;
         })
     }
 }
@@ -1668,6 +1701,7 @@ mod test {
                 )
                 .await
                 .unwrap();
+                cnsrv.foo();
                 let shards_extern = UdpSkChunnel.connect(()).await.unwrap();
                 let esrv: ShardCanonicalServerEbpf<
                     _,

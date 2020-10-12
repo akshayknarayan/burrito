@@ -409,6 +409,7 @@ pub enum NegotiateMsg {
     ClientOffer(Vec<Vec<Offer>>),
     ServerReply(Vec<Offer>),
     ServerNonce { addr: Vec<u8>, picked: Vec<Offer> },
+    ServerNonceAck,
 }
 
 use crate::and_then_concurrent::TryStreamExtExt;
@@ -466,8 +467,8 @@ where
                     let (a, buf): (_, Vec<u8>) = cn.recv().await?;
                     trace!("got offer pkt");
 
-                    // if `a` is in pending_negotiated_connections, this is a post-negotiation message
-                    // and we should return the applied connection.
+                    // if `a` is in pending_negotiated_connections, this is a post-negotiation
+                    // message and we should return the applied connection.
                     let opt_picked = {
                         let guard = pending_negotiated_connections.lock().unwrap();
                         guard.get(&a).map(Clone::clone)
@@ -501,6 +502,10 @@ where
                     use NegotiateMsg::*;
                     match negotiate_msg {
                         ServerNonce { addr, picked } => {
+                            // send ack
+                            let ack = bincode::serialize(&NegotiateMsg::ServerNonceAck).unwrap();
+                            cn.send((a, ack)).await?;
+
                             let addr: A =
                                 bincode::deserialize(&addr).wrap_err("mismatched addr types")?;
                             debug!(client_addr = ?&addr, nonce = ?&picked, "got nonce");
@@ -519,8 +524,8 @@ where
                             //    unimplemented!();
                             //}
 
-                            // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve, impl
-                            //    Serve>> into a CxList<impl Serve>
+                            // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve,
+                            //    impl Serve>> into a CxList<impl Serve>
                             let (picked_offers, mut new_stack) = stack
                                 .pick(client_offers)
                                 .wrap_err(eyre!("error monomorphizing stack",))?;
