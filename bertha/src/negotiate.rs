@@ -15,6 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
+use tracing_futures::Instrument;
 
 /// A type that can list out the `universe()` of possible values it can have.
 pub trait CapabilitySet: core::fmt::Debug + PartialEq + Sized {
@@ -505,6 +506,7 @@ where
                             // send ack
                             let ack = bincode::serialize(&NegotiateMsg::ServerNonceAck).unwrap();
                             cn.send((a, ack)).await?;
+                            debug!("sent nonce ack");
 
                             let addr: A =
                                 bincode::deserialize(&addr).wrap_err("mismatched addr types")?;
@@ -537,7 +539,10 @@ where
                             };
                             let nonce_buf = bincode::serialize(&nonce)
                                 .wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
-                            new_stack.call_negotiate_picked(&nonce_buf).await;
+                            new_stack
+                                .call_negotiate_picked(&nonce_buf)
+                                .instrument(tracing::debug_span!("call_negotiate_picked"))
+                                .await;
 
                             // 4. Respond to client with offer choice
                             let buf = bincode::serialize(&picked_offers)?;

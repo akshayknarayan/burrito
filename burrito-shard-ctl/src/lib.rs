@@ -133,15 +133,6 @@ impl<A, A2, S, C> ShardCanonicalServer<A, A2, S, C> {
     }
 }
 
-impl<A, A2, A3, S, C> ShardCanonicalServer<A, A2, S, C>
-where
-    A: Into<A3> + Clone + std::fmt::Debug + Send + Sync + 'static,
-    A3: Send + PartialEq,
-    C: ChunnelConnection<Data = (A3, Vec<u8>)> + Send + Sync + 'static,
-{
-    pub fn foo(&self) {}
-}
-
 impl<A, A2, A3, S, C> Negotiate for ShardCanonicalServer<A, A2, S, C>
 where
     A: Into<A3> + Clone + std::fmt::Debug + Send + Sync + 'static,
@@ -154,7 +145,6 @@ where
         vec![ShardFns::Sharding]
     }
 
-    // TODO client has to ack to prevent race
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
         let addrs = self.addr.shard_addrs.clone();
         let cn = Arc::clone(&self.shards_extern);
@@ -202,13 +192,14 @@ where
                     warn!(shard = ?&shard, err = ?e, "failed sending negotiation nonce to shard");
                 }
 
-                // TODO wait for ack
                 match cn.recv().await {
                     Ok((a, buf)) => match bincode::deserialize(&buf) {
                         Ok(bertha::negotiate::NegotiateMsg::ServerNonceAck) => {
                             if a != shard.clone().into() {
                                 warn!(shard = ?&shard, "received from unexpected address");
                             }
+
+                            debug!(shard = ?&shard, "got nonce ack");
                         }
                         Ok(m) => {
                             warn!(shard = ?&shard, msg = ?m, "got unexpected response to nonce");
@@ -1682,7 +1673,10 @@ mod test {
                     info!(addr = ?&a, "start shard");
                     let (s, r) = tokio::sync::oneshot::channel();
                     let int_srv = internal_srv.clone();
-                    tokio::spawn(start_shard_negotiate(a, int_srv, s));
+                    tokio::spawn(
+                        start_shard_negotiate(a, int_srv, s)
+                            .instrument(tracing::info_span!("shard", addr = ?&a)),
+                    );
 
                     rdy.push(r);
                 }
@@ -1701,7 +1695,6 @@ mod test {
                 )
                 .await
                 .unwrap();
-                cnsrv.foo();
                 let shards_extern = UdpSkChunnel.connect(()).await.unwrap();
                 let esrv: ShardCanonicalServerEbpf<
                     _,

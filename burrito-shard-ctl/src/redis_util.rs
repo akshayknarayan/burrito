@@ -54,14 +54,20 @@ where
     use redis::AsyncCommands;
 
     let a = redis_key(canonical_addr);
-    trace!("sending request");
-    let sh_info_blob: Vec<u8> = con.get::<_, Vec<u8>>(&a).await?;
-    if sh_info_blob.is_empty() {
-        trace!("got empty response");
-        return Ok(None);
-    }
+    // there is a race between the negotiation ack and the redis write.
+    // as a result, if this is empty we must retry.
+    let sh_info_blob = loop {
+        trace!(key = ?&a, "sending request");
+        let sh_info_blob: Vec<u8> = con.get::<_, Vec<u8>>(&a).await?;
+        if sh_info_blob.is_empty() {
+            trace!(key = ?&a, "got empty response");
+            continue;
+        }
 
-    trace!("got non-empty response");
+        break sh_info_blob;
+    };
+
+    trace!(key = ?&a, "got non-empty response");
     let sh_info: ShardInfo<A> = bincode::deserialize(&sh_info_blob)?;
     if canonical_addr != &sh_info.canonical_addr {
         warn!(
