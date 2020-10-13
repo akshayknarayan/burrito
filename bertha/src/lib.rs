@@ -12,7 +12,7 @@ pub mod negotiate;
 pub mod reliable;
 pub mod tagger;
 pub mod udp;
-//pub mod uds;
+pub mod uds;
 pub mod util;
 
 pub use either::*;
