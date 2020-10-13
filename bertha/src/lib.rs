@@ -16,7 +16,6 @@ pub mod udp;
 pub mod util;
 
 pub use either::*;
-//use inherit::*;
 pub use negotiate::*;
 use util::*;
 
