@@ -1,6 +1,6 @@
 //! Chunnel which tags Data to provide at-most-once delivery.
 
-use crate::{ChunnelConnection, Client, Serve};
+use crate::{ChunnelConnection, Client, Negotiate, Serve};
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
@@ -15,6 +15,13 @@ use tracing_futures::Instrument;
 
 #[derive(Clone, Debug, Default)]
 pub struct TaggerChunnel;
+
+impl Negotiate for TaggerChunnel {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
+}
 
 impl<D, InS, InC, InE> Serve<InS> for TaggerChunnel
 where
@@ -119,6 +126,13 @@ where
 
 #[derive(Clone, Debug, Default)]
 pub struct TaggerProjChunnel;
+
+impl Negotiate for TaggerProjChunnel {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
+}
 
 impl<A, D, InS, InC, InE> Serve<InS> for TaggerProjChunnel
 where
@@ -517,8 +531,8 @@ mod test {
     use super::{OrderedChunnel, SeqUnreliableChunnel, TaggerChunnel};
     use crate::chan_transport::{Chan, ChanAddr};
     use crate::{
-        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList,
-        ListenAddress, Serve,
+        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
+        ConnectAddress, CxList, ListenAddress, Serve,
     };
     use color_eyre::Report;
     use futures_util::StreamExt;
@@ -538,8 +552,10 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
-                let mut stack = CxList::from(TaggerChunnel).wrap(SeqUnreliableChunnel);
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let mut stack = CxList::from(TaggerChunnel)
+                    .wrap(SeqUnreliableChunnel)
+                    .wrap(ProjectLeft::from(()));
 
                 let mut srv = a.listener();
                 let rcv_st = srv.listen(a.clone()).await?;
@@ -616,8 +632,10 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
-                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let mut stack = CxList::from(OrderedChunnel::default())
+                    .wrap(SeqUnreliableChunnel)
+                    .wrap(ProjectLeft::from(()));
 
                 let mut srv = a.listener();
                 let rcv_st = srv.listen(a.clone()).await?;
@@ -654,7 +672,7 @@ mod test {
             async move {
                 let mut t = Chan::default();
                 let ctr: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
-                let staged: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+                let staged: Arc<Mutex<Vec<((), Vec<u8>)>>> = Default::default();
                 t.link_conditions(move |x| {
                     let c = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let mut s = staged.lock().unwrap();
@@ -674,9 +692,11 @@ mod test {
                         }
                     }
                 });
-                let a: ChanAddr<Vec<u8>> = t.into();
+                let a: ChanAddr<((), Vec<u8>)> = t.into();
 
-                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
+                let mut stack = CxList::from(OrderedChunnel::default())
+                    .wrap(SeqUnreliableChunnel)
+                    .wrap(ProjectLeft::from(()));
 
                 let mut srv = a.listener();
                 let rcv_st = srv.listen(a.clone()).await?;

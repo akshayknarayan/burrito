@@ -22,7 +22,7 @@ use tracing_futures::Instrument;
 #[derive(Default, Clone, Debug)]
 pub struct UnixSkChunnel {}
 
-impl<S> crate::Negotiate<S> for UnixSkChunnel where S: crate::CapabilitySet + crate::NegotiateDummy {}
+impl<S> crate::Negotiate<S> for UnixSkChunnel where S: crate::CapabilitySet {}
 
 impl ChunnelListener<(PathBuf, Vec<u8>)> for UnixSkChunnel {
     type Addr = PathBuf;
@@ -156,7 +156,7 @@ impl Drop for UnixSk {
 #[derive(Default, Clone, Copy, Debug)]
 pub struct UnixReqChunnel {}
 
-impl<S> crate::Negotiate<S> for UnixReqChunnel where S: crate::CapabilitySet + crate::NegotiateDummy {}
+impl<S> crate::Negotiate<S> for UnixReqChunnel where S: crate::CapabilitySet {}
 
 impl ChunnelListener<Vec<u8>> for UnixReqChunnel {
     type Addr = PathBuf;

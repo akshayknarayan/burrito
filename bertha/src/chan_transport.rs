@@ -3,6 +3,7 @@
 use crate::{
     ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress, ListenAddress, Once,
 };
+use eyre::eyre;
 use futures_util::stream::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
@@ -19,7 +20,7 @@ pub struct Cln;
 /// Channel connector where server registers on listen(), and client grabs client on connect().
 pub struct RendezvousChannel<Addr, Data, Side> {
     channel_size: usize,
-    map: Arc<Mutex<HashMap<Addr, ChanChunnel<Data>>>>,
+    map: Arc<Mutex<HashMap<Addr, ChanChunnel<(Addr, Data)>>>>,
     side: std::marker::PhantomData<Side>,
 }
 
@@ -85,7 +86,7 @@ where
     D: Send + Sync + 'static,
 {
     type Addr = A;
-    type Connection = Once<ChanChunnel<D>, D>;
+    type Connection = Once<ChanChunnel<(A, D)>, D, A>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -94,7 +95,7 @@ where
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         let channel_size = self.channel_size;
         let (s, r) = mpsc::channel(channel_size);
-        let (s1, r1) = mpsc::channel(channel_size);
+        let (s1, r1) = mpsc::channel::<(A, D)>(channel_size);
         let m = Arc::clone(&self.map);
         Box::pin(async move {
             debug!(addr = ?&a, "RendezvousChannel listening");
@@ -102,10 +103,10 @@ where
                 .await
                 .insert(a, ChanChunnel::new(s, r1, Arc::new(|x| x)));
             // `r.map` maps over the messages in the receive channel stream.
-            Ok(Box::pin(r.map(move |d| {
+            Ok(Box::pin(r.map(move |d: (A, D)| {
                 // `Once` will not call recv() on the inner C, so pass a dummy receiver.
                 let (_, r2) = mpsc::channel(1);
-                let resp_chunnel = ChanChunnel::new(s1.clone(), r2, Arc::new(|x| x));
+                let resp_chunnel = ChanChunnel::<(A, D)>::new(s1.clone(), r2, Arc::new(|x| x));
                 Ok(Once::new(Arc::new(resp_chunnel), d))
             })) as _)
         })
@@ -118,7 +119,7 @@ where
     D: Send + Sync + 'static,
 {
     type Addr = RendezvousChannelAddr<A, D>;
-    type Connection = ChanChunnel<D>;
+    type Connection = ChanChunnel<(A, D)>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = eyre::Report;
@@ -152,7 +153,7 @@ pub struct Chan<Data, Side> {
     _side: std::marker::PhantomData<Side>,
 }
 
-impl Default for Chan<Vec<u8>, ()> {
+impl Default for Chan<((), Vec<u8>), ()> {
     fn default() -> Self {
         let (s1, r1) = mpsc::channel(100);
         let (s2, r2) = mpsc::channel(100);
@@ -351,14 +352,22 @@ where
 
         Box::pin(async move {
             if let Some(data) = link(Some(data)) {
-                s.lock().await.send(data).await.map_err(|_| ()).unwrap();
+                s.lock()
+                    .await
+                    .send(data)
+                    .await
+                    .map_err(|_| eyre!("receiver channel dropped"))?;
             } else {
                 debug!("dropping send");
             }
 
             while let Some(d) = link(None) {
                 debug!("sending deferred segment");
-                s.lock().await.send(d).await.map_err(|_| ()).unwrap();
+                s.lock()
+                    .await
+                    .send(d)
+                    .await
+                    .map_err(|_| eyre!("receiver channel dropped"))?;
             }
 
             Ok(())
@@ -369,7 +378,13 @@ where
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let r = Arc::clone(&self.rcv);
-        Box::pin(async move { Ok(r.lock().await.recv().await.unwrap()) })
+        Box::pin(async move {
+            Ok(r.lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| eyre!("All senders dropped"))?)
+        })
     }
 }
 
@@ -394,7 +409,7 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
 
                 let (s, r) = tokio::sync::oneshot::channel();
 
@@ -409,11 +424,10 @@ mod test {
                 });
 
                 r.await?;
-                let mut cln = a.connector();
-                let cn = cln.connect(a).await?;
+                let cn = a.connector().connect(a).await?;
 
-                cn.send(vec![1u8; 8]).await?;
-                let d = cn.recv().await?;
+                cn.send(((), vec![1u8; 8])).await?;
+                let (_, d) = cn.recv().await?;
 
                 assert_eq!(d, vec![1u8; 8]);
                 Ok::<_, eyre::Report>(())

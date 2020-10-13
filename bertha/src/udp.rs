@@ -15,17 +15,19 @@ use crate::{
     util::AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress,
     ListenAddress,
 };
-use eyre::WrapErr;
+use eyre::{eyre, WrapErr};
 use futures_util::{
     future::FutureExt,
     stream::{Stream, StreamExt},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use tracing::trace;
 
 /// UDP Chunnel connector.
 ///
@@ -75,7 +77,7 @@ impl ChunnelConnector for UdpSkChunnel {
 }
 
 /// Newtype SocketAddr to avoid hogging the impl of `ConnectAddress`/`ListenAddress` on that type.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UdpSocketAddr(pub SocketAddr);
 
 impl std::fmt::Display for UdpSocketAddr {
@@ -149,6 +151,7 @@ where
         Box::pin(async move {
             let (addr, data) = data;
             let addr = addr.into();
+            trace!(to = ?&addr, "send");
             sk.lock().await.send_to(&data, &addr).await?;
             Ok(())
         })
@@ -162,6 +165,7 @@ where
 
         Box::pin(async move {
             let (len, from) = sk.lock().await.recv_from(&mut buf).await?;
+            trace!(from = ?&from, "recv");
             let data = buf[0..len].to_vec();
             Ok((from.into(), data))
         })
@@ -193,13 +197,21 @@ impl ChunnelListener for UdpReqChunnel {
                     recv,
                     Arc::new(Mutex::new(send)),
                     sends,
-                    HashMap::<_, mpsc::Sender<Vec<u8>>>::new(),
+                    HashMap::<_, mpsc::Sender<(SocketAddr, Vec<u8>)>>::new(),
                 ),
                 |(mut r, s, mut sends, mut map)| async move {
                     let mut buf = [0u8; 1024];
                     loop {
+                        // careful: potential deadlocks since .recv on returned connection blocks
+                        // on .listen
                         tokio::select!(
+                            Some((from, res)) = sends.next() => {
+                                if let Err(_) = res  {
+                                    map.remove(&from);
+                                }
+                            }
                             Ok((len, from)) = r.recv_from(&mut buf) => {
+                                trace!(from = ?&from, "received pkt");
                                 let data = buf[0..len].to_vec();
 
                                 let mut done = None;
@@ -216,17 +228,12 @@ impl ChunnelListener for UdpReqChunnel {
 
                                 let mut c = c.clone();
                                 sends.push(async move {
-                                    let res = c.send(data).await;
+                                    let res = c.send((from, data)).await;
                                     (from, res)
                                 });
 
                                 if let Some(d) = done {
                                     return Ok(Some((d, (r, s, sends,  map))));
-                                }
-                            }
-                            Some((from, res)) = sends.next() => {
-                                if let Err(_) = res  {
-                                    map.remove(&from);
                                 }
                             }
                         )
@@ -270,12 +277,12 @@ impl ListenAddress for UdpReqAddr {
 #[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
-    recv: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    recv: Arc<Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>>,
     send: Arc<Mutex<tokio::net::udp::SendHalf>>,
 }
 
 impl ChunnelConnection for UdpConn {
-    type Data = Vec<u8>;
+    type Data = (SocketAddr, Vec<u8>);
 
     fn send(
         &self,
@@ -283,6 +290,7 @@ impl ChunnelConnection for UdpConn {
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let sk = Arc::clone(&self.send);
         let addr = self.resp_addr;
+        let (_, data) = data;
         Box::pin(async move {
             sk.lock().await.send_to(&data, &addr).await?;
             Ok(())
@@ -295,7 +303,7 @@ impl ChunnelConnection for UdpConn {
         let r = Arc::clone(&self.recv);
         Box::pin(async move {
             let d = r.lock().await.recv().await;
-            d.ok_or_else(|| eyre::eyre!("Nothing more to receive"))
+            d.ok_or_else(|| eyre!("Nothing more to receive"))
         }) as _
     }
 }
@@ -390,7 +398,7 @@ mod test {
                 assert_eq!(from, addr);
                 assert_eq!(data, vec![1u8; 12]);
             }
-            .instrument(tracing::info_span!("udp::echo")),
+            .instrument(tracing::info_span!("udp::rendezvous")),
         );
     }
 }

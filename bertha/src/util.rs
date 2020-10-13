@@ -2,7 +2,9 @@
 
 use super::{ChunnelConnection, ChunnelConnector, Client, Serve};
 use eyre::eyre;
-use futures_util::future::{ready, Ready};
+use futures_util::future::{
+    TryFutureExt, {ready, Ready},
+};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
 use std::future::Future;
@@ -13,27 +15,27 @@ use tokio::sync::Mutex;
 /// Dummy connection type for non-connection-oriented chunnels.
 ///
 /// Exposes each message in the stream as a "connection". Sends via the C chunnel type.
-pub struct Once<C, D>(Arc<Mutex<Option<D>>>, Arc<C>);
+pub struct Once<C, D, A>(Arc<Mutex<Option<(A, D)>>>, Arc<C>);
 
-impl<C, D> Once<C, D> {
-    pub fn new(send: Arc<C>, d: D) -> Self {
+impl<C, D, A> Once<C, D, A> {
+    pub fn new(send: Arc<C>, d: (A, D)) -> Self {
         Self(Arc::new(Mutex::new(Some(d))), send)
     }
 }
 
-impl<C, D> ChunnelConnection for Once<C, D>
+impl<A, C, D> ChunnelConnection for Once<C, D, A>
 where
-    C: ChunnelConnection<Data = D>,
-    D: Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, D)>,
+    (A, D): Send + Sync + 'static,
 {
-    type Data = Option<D>;
+    type Data = (A, Option<D>);
 
     fn send(
         &self,
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-        if let Some(d) = data {
-            self.1.send(d)
+        if let (a, Some(d)) = data {
+            self.1.send((a, d))
         } else {
             Box::pin(futures_util::future::ready(Err(eyre!("Can't send None")))) as _
         }
@@ -43,7 +45,101 @@ where
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let d = Arc::clone(&self.0);
-        Box::pin(async move { Ok(d.lock().await.take()) })
+        Box::pin(async move {
+            let data = d.lock().await.take();
+            if let Some((a, d)) = data {
+                Ok((a, Some(d)))
+            } else {
+                Err(eyre!("Tried to recv None"))
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProjectLeft<A, N = ()>(A, std::marker::PhantomData<N>);
+
+impl<A> From<A> for ProjectLeft<A> {
+    fn from(a: A) -> Self {
+        ProjectLeft(a, Default::default())
+    }
+}
+
+impl<A, N> crate::negotiate::Negotiate for ProjectLeft<A, N>
+where
+    N: crate::negotiate::CapabilitySet,
+{
+    type Capability = N;
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
+}
+
+impl<N, A, D, InS, InC, InE> Serve<InS> for ProjectLeft<A, N>
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    A: Clone + Send + 'static,
+    D: 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = ProjectLeftCn<A, InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        let a = self.0.clone();
+        ready(Ok(
+            Box::pin(inner.map_ok(move |cn| ProjectLeftCn::new(a.clone(), cn))) as _,
+        ))
+    }
+}
+
+impl<A, D, InC> Client<InC> for ProjectLeft<A>
+where
+    InC: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
+    A: Clone + Send + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = ProjectLeftCn<A, InC>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        let a = self.0.clone();
+        ready(Ok(ProjectLeftCn::new(a, cn)))
+    }
+}
+
+pub struct ProjectLeftCn<A, C>(A, C);
+
+impl<A, C> ProjectLeftCn<A, C> {
+    pub fn new(a: A, c: C) -> Self {
+        ProjectLeftCn(a, c)
+    }
+}
+
+impl<A, C, D> ChunnelConnection for ProjectLeftCn<A, C>
+where
+    A: Clone + Send + 'static,
+    D: 'static,
+    C: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
+{
+    type Data = D;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        Box::pin(self.1.send((self.0.clone(), data))) as _
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        Box::pin(self.1.recv().map_ok(|d| d.1)) as _
     }
 }
 
@@ -125,6 +221,13 @@ where
 /// Deals with inner chunnel that has Data = Option<T> by transforming None into an error.
 #[derive(Debug, Default, Clone)]
 pub struct OptionUnwrap;
+
+impl crate::negotiate::Negotiate for OptionUnwrap {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
+}
 
 impl<D, InS, InC, InE> Serve<InS> for OptionUnwrap
 where

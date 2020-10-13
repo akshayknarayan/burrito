@@ -4,6 +4,7 @@ use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
 
+mod and_then_concurrent;
 pub mod bincode;
 pub mod chan_transport;
 pub mod either;
@@ -251,7 +252,7 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
                 let stack = CxList::from(CxNil);
                 let mut stack = stack.wrap(CxNil);
 
@@ -264,8 +265,8 @@ mod test {
                 let cln = cln.connect(a).await?;
                 let snd = stack.connect_wrap(cln).await?;
 
-                snd.send(vec![1u8; 1]).await?;
-                let buf = rcv.recv().await?;
+                snd.send(((), vec![1u8; 1])).await?;
+                let (_, buf) = rcv.recv().await?;
                 assert_eq!(buf, vec![1u8; 1]);
 
                 Ok::<_, Report>(())

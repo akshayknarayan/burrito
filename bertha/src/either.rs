@@ -86,16 +86,17 @@ where
     }
 }
 
-impl<A, B, I, C, E, D> Serve<I> for Either<A, B>
+impl<A, B, I, C, E, Din, Dout> Serve<I> for Either<A, B>
 where
+    Din: Send + Sync + 'static,
+    Dout: Send + Sync + 'static,
     I: Stream<Item = Result<C, E>> + Send + 'static,
-    C: ChunnelConnection<Data = D>,
+    C: ChunnelConnection<Data = Din>,
     E: Into<Report> + Send + Sync + 'static,
-    D: Send + Sync + 'static,
     A: Serve<I> + Send + 'static,
     B: Serve<I> + Send + 'static,
-    <A as Serve<I>>::Connection: ChunnelConnection<Data = D>,
-    <B as Serve<I>>::Connection: ChunnelConnection<Data = D>,
+    <A as Serve<I>>::Connection: ChunnelConnection<Data = Dout>,
+    <B as Serve<I>>::Connection: ChunnelConnection<Data = Dout>,
     <A as Serve<I>>::Error: Into<Report> + Send + Sync + 'static,
     <B as Serve<I>>::Error: Into<Report> + Send + Sync + 'static,
 {
@@ -131,14 +132,15 @@ where
     }
 }
 
-impl<A, B, C, D> Client<C> for Either<A, B>
+impl<A, B, C, Din, Dout> Client<C> for Either<A, B>
 where
-    C: ChunnelConnection<Data = D>,
-    D: Send + Sync + 'static,
+    Din: Send + Sync + 'static,
+    Dout: Send + Sync + 'static,
+    C: ChunnelConnection<Data = Din>,
     A: Client<C> + Send + 'static,
     B: Client<C> + Send + 'static,
-    <A as Client<C>>::Connection: ChunnelConnection<Data = D>,
-    <B as Client<C>>::Connection: ChunnelConnection<Data = D>,
+    <A as Client<C>>::Connection: ChunnelConnection<Data = Dout>,
+    <B as Client<C>>::Connection: ChunnelConnection<Data = Dout>,
     <A as Client<C>>::Error: Into<Report> + Send + Sync + 'static,
     <B as Client<C>>::Error: Into<Report> + Send + Sync + 'static,
 {

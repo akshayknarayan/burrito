@@ -3,7 +3,7 @@
 //! Takes as Data a `(u32, Vec<u8>)`, where the `u32` is a unique tag corresponding to a data
 //! segment, the `Vec<u8>`.
 
-use crate::{ChunnelConnection, Client, Serve};
+use crate::{ChunnelConnection, Client, Negotiate, Serve};
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
@@ -23,6 +23,13 @@ use tracing_futures::Instrument;
 pub struct ReliabilityChunnel<D> {
     timeout: Duration,
     _data: std::marker::PhantomData<D>,
+}
+
+impl<D> Negotiate for ReliabilityChunnel<D> {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
 }
 
 impl<D> Default for ReliabilityChunnel<D> {
@@ -326,6 +333,13 @@ pub struct ReliabilityProjChunnel<A, D> {
     _data: std::marker::PhantomData<(A, D)>,
 }
 
+impl<A, D> Negotiate for ReliabilityProjChunnel<A, D> {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
+}
+
 impl<A, D> Default for ReliabilityProjChunnel<A, D> {
     fn default() -> Self {
         ReliabilityProjChunnel {
@@ -351,7 +365,7 @@ where
     D: Clone + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ReliabilityProj<A, InC, D>;
+    type Connection = ReliabilityProj<A, D, InC>;
     type Error = InE;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -373,7 +387,7 @@ where
     D: Clone + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = ReliabilityProj<A, InC, D>;
+    type Connection = ReliabilityProj<A, D, InC>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
@@ -382,21 +396,21 @@ where
 }
 
 #[derive(Debug)]
-pub struct ReliabilityProj<A, C, D> {
+pub struct ReliabilityProj<A, D, C> {
     timeout: Duration,
     inner: Arc<C>,
     state: Arc<RwLock<ReliabilityState<(A, D)>>>,
 }
 
-impl<A, C, D> ReliabilityProj<A, C, D> {
+impl<A, C, D> ReliabilityProj<A, D, C> {
     pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
         self.timeout = to;
         self
     }
 }
 
-impl<Cx, A, D> From<Cx> for ReliabilityProj<A, Cx, D> {
-    fn from(cx: Cx) -> ReliabilityProj<A, Cx, D> {
+impl<Cx, A, D> From<Cx> for ReliabilityProj<A, D, Cx> {
+    fn from(cx: Cx) -> ReliabilityProj<A, D, Cx> {
         ReliabilityProj {
             inner: Arc::new(cx),
             timeout: Duration::from_millis(100),
@@ -405,7 +419,7 @@ impl<Cx, A, D> From<Cx> for ReliabilityProj<A, Cx, D> {
     }
 }
 
-impl<A, C, D> Clone for ReliabilityProj<A, C, D> {
+impl<A, C, D> Clone for ReliabilityProj<A, D, C> {
     fn clone(&self) -> Self {
         ReliabilityProj {
             timeout: self.timeout,
@@ -415,7 +429,7 @@ impl<A, C, D> Clone for ReliabilityProj<A, C, D> {
     }
 }
 
-impl<A, C, D> ChunnelConnection for ReliabilityProj<A, C, D>
+impl<A, C, D> ChunnelConnection for ReliabilityProj<A, D, C>
 where
     A: Clone + Send + Sync + 'static,
     C: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
@@ -613,8 +627,8 @@ mod test {
     use super::{Reliability, ReliabilityChunnel};
     use crate::chan_transport::{Chan, ChanAddr};
     use crate::{
-        bincode::SerializeChunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
-        ConnectAddress, CxList, ListenAddress, Serve,
+        bincode::SerializeChunnel, util::ProjectLeft, ChunnelConnection, ChunnelConnector,
+        ChunnelListener, Client, ConnectAddress, CxList, ListenAddress, Serve,
     };
     use futures_util::StreamExt;
     use tracing::{debug, info};
@@ -665,9 +679,10 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
-                let mut l =
-                    CxList::from(ReliabilityChunnel::default()).wrap(SerializeChunnel::default());
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let mut l = CxList::from(ReliabilityChunnel::default())
+                    .wrap(SerializeChunnel::default())
+                    .wrap(ProjectLeft::from(()));
 
                 let mut srv = a.listener();
                 let rcv_st = srv.listen(a.clone()).await.unwrap();
@@ -711,9 +726,10 @@ mod test {
                     }
                 });
 
-                let a: ChanAddr<Vec<u8>> = t.into();
-                let mut l =
-                    CxList::from(ReliabilityChunnel::default()).wrap(SerializeChunnel::default());
+                let a: ChanAddr<((), Vec<u8>)> = t.into();
+                let mut l = CxList::from(ReliabilityChunnel::default())
+                    .wrap(SerializeChunnel::default())
+                    .wrap(ProjectLeft::from(()));
 
                 let mut srv = a.listener();
                 let rcv_st = srv.listen(a.clone()).await.unwrap();
@@ -787,10 +803,11 @@ mod test {
                     }
                 });
 
-                let a: ChanAddr<Vec<u8>> = t.into();
+                let a: ChanAddr<((), Vec<u8>)> = t.into();
                 let mut stack = CxList::from(TaggerChunnel)
                     .wrap(ReliabilityChunnel::default())
-                    .wrap(SerializeChunnel::default());
+                    .wrap(SerializeChunnel::default())
+                    .wrap(ProjectLeft::from(()));
 
                 let mut srv = a.listener();
                 let rcv_st = srv.listen(a.clone()).await.unwrap();

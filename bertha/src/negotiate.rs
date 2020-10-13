@@ -1,16 +1,20 @@
 //! Chunnel wrapper types to negotiate between multiple implementations.
 
-use crate::{
-    ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList, CxNil,
-    Either, ListenAddress, Serve,
+use crate::{ChunnelConnection, Client, CxList, CxNil, Either, Serve};
+use color_eyre::{
+    eyre::{eyre, Report, WrapErr},
+    Section,
 };
-use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
     future::Ready,
     stream::{Once, Stream, TryStreamExt},
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tracing::debug;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use tracing::{debug, trace};
 
 /// A type that can list out the `universe()` of possible values it can have.
 pub trait CapabilitySet: core::fmt::Debug + PartialEq + Sized {
@@ -44,8 +48,6 @@ where
         T::guid() + U::guid()
     }
 }
-
-pub trait NegotiateDummy {}
 
 /// Define an enum that implements the `CapabilitySet` trait.
 ///
@@ -99,12 +101,72 @@ pub trait Negotiate {
     fn capabilities() -> Vec<Self::Capability> {
         vec![]
     }
+
+    /// Callback after this implementation is picked, but *before* `serve`/`connect_wrap`.
+    ///
+    /// Implementors can pass the nonce to other instances of `negotiate_server` to pick the same
+    /// stack.
+    fn picked<'s>(&mut self, _nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        Box::pin(futures_util::future::ready(()))
+    }
 }
 
 impl Negotiate for CxNil {
     type Capability = ();
     fn capabilities() -> Vec<Self::Capability> {
-        vec![()]
+        vec![]
+    }
+}
+
+impl<T1, T2, C> Negotiate for Either<T1, T2>
+where
+    T1: Negotiate<Capability = C>,
+    T2: Negotiate<Capability = C>,
+    C: CapabilitySet,
+{
+    type Capability = C;
+    fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        match self {
+            Either::Left(a) => a.picked(nonce),
+            Either::Right(a) => a.picked(nonce),
+        }
+    }
+}
+
+pub trait NegotiatePicked {
+    fn call_negotiate_picked<'s>(
+        &mut self,
+        nonce: &'s [u8],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 's>>;
+}
+
+impl<N> NegotiatePicked for N
+where
+    N: Negotiate,
+{
+    fn call_negotiate_picked<'s>(
+        &mut self,
+        nonce: &'s [u8],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        self.picked(nonce)
+    }
+}
+
+impl<H, T> NegotiatePicked for CxList<H, T>
+where
+    H: NegotiatePicked,
+    T: NegotiatePicked,
+{
+    fn call_negotiate_picked<'s>(
+        &mut self,
+        nonce: &'s [u8],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        let head_fut = self.head.call_negotiate_picked(nonce);
+        let tail_fut = self.tail.call_negotiate_picked(nonce);
+        Box::pin(async move {
+            head_fut.await;
+            tail_fut.await;
+        })
     }
 }
 
@@ -164,13 +226,13 @@ where
     }
 }
 
-/// Trait to monomorphize a CxList with possible `Select`s into something that impls Serve or Client.
-pub trait Pick<I> {
+/// Trait to monomorphize a CxList with possible `Select`s into something that impls Serve
+pub trait Pick {
     type Picked;
     fn pick(self, client_offers: Vec<Vec<Offer>>) -> Result<(Vec<Offer>, Self::Picked), Report>;
 }
 
-impl<N, I> Pick<I> for N
+impl<N> Pick for N
 where
     N: Negotiate,
 {
@@ -194,6 +256,7 @@ where
     T2: GetOffers,
 {
     fn offers(&self) -> Vec<Vec<Offer>> {
+        // TODO won't work with nested select
         let mut t1 = self.0.offers()[0].clone();
         let t2 = self.1.offers()[0].clone();
         t1.extend(t2);
@@ -206,7 +269,27 @@ fn check_offers(offers: &[Vec<Offer>]) -> Result<(), Report> {
         let id = l[0].capability_guid;
         l.iter().all(|o| o.capability_guid == id)
     }) {
-        return Err(eyre!("Capability guid mismatch"));
+        return Err(eyre!("Capability guid mismatch")).wrap_err_with(|| {
+            let mut idx = 0;
+            let mut ok = true;
+            for offer_set in offers.iter() {
+                let id = offer_set[0].capability_guid;
+                for o in offer_set.iter() {
+                    if o.capability_guid != id {
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if !ok {
+                    return eyre!("layer {}: {:?}", idx, offer_set);
+                }
+
+                idx += 1;
+            }
+
+            unreachable!()
+        });
     }
 
     Ok(())
@@ -216,13 +299,11 @@ fn lacking<T: PartialEq>(a: &[T], univ: Vec<T>) -> Vec<T> {
     univ.into_iter().filter(|x| !a.contains(x)).collect()
 }
 
-impl<T1, T2, I, D, C> Pick<I> for Select<T1, T2>
+impl<T1, T2, C> Pick for Select<T1, T2>
 where
-    T1: Serve<I> + Negotiate<Capability = C>,
-    T2: Serve<I> + Negotiate<Capability = C>,
+    T1: Negotiate<Capability = C>,
+    T2: Negotiate<Capability = C>,
     C: CapabilitySet + Serialize + DeserializeOwned + Clone,
-    <T1 as Serve<I>>::Connection: ChunnelConnection<Data = D>,
-    <T2 as Serve<I>>::Connection: ChunnelConnection<Data = D>,
 {
     type Picked = Either<T1, T2>;
     fn pick(self, offers: Vec<Vec<Offer>>) -> Result<(Vec<Offer>, Self::Picked), Report> {
@@ -235,11 +316,20 @@ where
             return Err(eyre!("Capability type mismatch"));
         }
 
+        debug!(
+            cap_type = std::any::type_name::<C>(),
+            offer = ?&offer,
+            "deserializing offers"
+        );
+
         let caps: Result<Vec<Vec<C>>, Report> = offer
             .iter()
             .map(|o| {
-                let c: Vec<C> = bincode::deserialize(&o.available)
-                    .wrap_err(eyre!("Deserializing capability set"))?;
+                let c: Vec<C> = bincode::deserialize(&o.available).wrap_err(eyre!(
+                    "Could not deserialize capability set: {:?} to type {:?}",
+                    o,
+                    std::any::type_name::<C>()
+                ))?;
                 Ok(c)
             })
             .collect();
@@ -289,10 +379,10 @@ where
     }
 }
 
-impl<H, T, I> Pick<I> for CxList<H, T>
+impl<H, T> Pick for CxList<H, T>
 where
-    H: Pick<I>,
-    T: Pick<I>,
+    H: Pick,
+    T: Pick,
 {
     type Picked = CxList<H::Picked, T::Picked>;
     fn pick(self, offers: Vec<Vec<Offer>>) -> Result<(Vec<Offer>, Self::Picked), Report> {
@@ -314,93 +404,169 @@ where
     }
 }
 
-macro_rules! addr_conntype {
-    (srv, $a:ty) => {
-        Once<Ready<Result<<<$a as ListenAddress>::Listener as ChunnelListener>::Connection, Report>>>
-    };
-    (cln, $a:ty) => {
-        <<$a as ConnectAddress>::Connector as ChunnelConnector>::Connection
-    };
+#[derive(Debug, Serialize, Deserialize)]
+pub enum NegotiateMsg {
+    ClientOffer(Vec<Vec<Offer>>),
+    ServerReply(Vec<Offer>),
+    ServerNonce { addr: Vec<u8>, picked: Vec<Offer> },
 }
 
-/// Return a stream of connections with `stack`'s semantics, listening on `a`.
-pub async fn negotiate_server<H, T, A>(
+use crate::and_then_concurrent::TryStreamExtExt;
+
+/// Return a stream of connections with `stack`'s semantics, listening on `raw_cn_st`.
+pub fn negotiate_server<H, T, Sc, Se, C, A>(
     stack: CxList<H, T>,
-    a: A,
-) -> Result<
-    impl Stream<Item = Result<<<CxList<H, T> as Pick<addr_conntype!(srv, A)>>::Picked as Serve<addr_conntype!(srv, A)>>::Connection, Report>>,
+    raw_cn_st: Sc,
+) -> impl Future<Output = Result<
+    impl Stream<
+        Item = Result<
+            Either<
+                <<CxList<H, T> as Pick>::Picked as Serve<Once<Ready<Result<C, Report>>>>>::Connection,
+                <<CxList<H, T> as Apply>::Applied as Serve<Once<Ready<Result<C, Report>>>>>::Connection,
+            >,
+            Report,
+        >
+    >  + Send + 'static,
     Report,
->
+>> + Send + 'static
 where
-    A: ListenAddress,
-    <<A as ListenAddress>::Listener as ChunnelListener>::Connection:
-        ChunnelConnection<Data = Vec<u8>>,
-    <<A as ListenAddress>::Listener as ChunnelListener>::Error:
+    Sc: Stream<Item = Result<C, Se>> + Send + 'static,
+    Se: Into<Report> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    CxList<H, T>: Pick + Apply + GetOffers + Clone + Send + 'static,
+    <CxList<H, T> as Pick>::Picked: NegotiatePicked + Serve<Once<Ready<Result<C, Report>>>> + Clone + Send + 'static,
+    <<CxList<H, T> as Pick>::Picked as Serve<Once<Ready<Result<C, Report>>>>>::Connection:
+        Send + Sync + 'static,
+    <<CxList<H, T> as Pick>::Picked as Serve<Once<Ready<Result<C, Report>>>>>::Error:
         Into<Report> + Send + Sync + 'static,
-    CxList<H, T>: Pick<addr_conntype!(srv, A)> + Clone + 'static,
-    <CxList<H, T> as Pick<addr_conntype!(srv, A)>>::Picked: Serve<addr_conntype!(srv, A)> + Clone,
-    <<CxList<H, T> as Pick<addr_conntype!(srv, A)>>::Picked as Serve<addr_conntype!(srv, A)>>::Error:
+    <<CxList<H, T> as Pick>::Picked as Serve<Once<Ready<Result<C, Report>>>>>::Stream:
+        Unpin + Send + 'static,
+    <CxList<H, T> as Apply>::Applied: Serve<Once<Ready<Result<C, Report>>>> + Clone + Send + 'static,
+    <<CxList<H, T> as Apply>::Applied as Serve<Once<Ready<Result<C, Report>>>>>::Connection:
+        Send + Sync + 'static,
+    <<CxList<H, T> as Apply>::Applied as Serve<Once<Ready<Result<C, Report>>>>>::Error:
         Into<Report> + Send + Sync + 'static,
-    <<CxList<H, T> as Pick<addr_conntype!(srv, A)>>::Picked as Serve<addr_conntype!(srv, A)>>::Stream:
-        Unpin + Send  + 'static,
-    CxList<H, T>: GetOffers,
+    <<CxList<H, T> as Apply>::Applied as Serve<Once<Ready<Result<C, Report>>>>>::Stream:
+        Unpin + Send + 'static,
+    A: Serialize + DeserializeOwned + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
 {
-    // 1. serve Vec<u8> connections.
-    let mut listener = a.listener();
-    let st: Result<
-        <<A as ListenAddress>::Listener as ChunnelListener>::Stream,
-        <<A as ListenAddress>::Listener as ChunnelListener>::Error,
-    > = listener.listen(a).await;
-    let st = st.map_err(Into::into)?; // stream of incoming Vec<u8> conns.
+    async move {
+        // 1. serve (A, Vec<u8>) connections.
+        let st = raw_cn_st.map_err(Into::into); // stream of incoming Vec<u8> conns.
+        let pending_negotiated_connections: Arc<Mutex<HashMap<A, Vec<Offer>>>> = Default::default();
+        Ok(st
+            .map_err(Into::into)
+            .and_then_concurrent(move |cn| {
+                debug!("new connection");
+                let stack = stack.clone();
+                let pending_negotiated_connections = Arc::clone(&pending_negotiated_connections);
+                async move {
+                    // 2. on new connection, read off Vec<Vec<Offer>> from
+                    //    client
+                    let (a, buf): (_, Vec<u8>) = cn.recv().await?;
+                    trace!("got offer pkt");
 
-    Ok(st.map_err(Into::into).and_then(move |cn| {
-        debug!("new connection");
-        let stack = stack.clone();
-        async move {
-            // 2. on new connection, read off Vec<Vec<Offer>> from
-            //    client
-            let buf: Vec<u8> = cn.recv().await?;
-            let client_offers: Vec<Vec<Offer>> = bincode::deserialize(&buf)?;
-            debug!(client_offers = ?&client_offers, "received offer");
+                    // if `a` is in pending_negotiated_connections, this is a post-negotiation message
+                    // and we should return the applied connection.
+                    let opt_picked = {
+                        let guard = pending_negotiated_connections.lock().unwrap();
+                        guard.get(&a).map(Clone::clone)
+                    };
+                    if let Some(picked) = opt_picked {
+                        let ofs = stack.offers();
+                        let p = picked.clone();
+                        let mut stack = stack
+                            .apply(picked)
+                            .wrap_err("failed to apply semantics to client connection")
+                            .note(format!("tried to apply: {:?}", p))
+                            .note(format!("onto the stack: {:?}", ofs))?;
+                        let cn_st = futures_util::stream::once(futures_util::future::ready(Ok(cn)));
+                        let mut new_st = stack.serve(cn_st).await.map_err(Into::into)?;
+                        let new_cn = new_st
+                            .try_next()
+                            .await // -> Result<Option<T>, E>
+                            .map_err(Into::into)?
+                            .ok_or_else(|| eyre!("No connection returned"))?;
 
-            if let Err(e) = check_offers(&client_offers) {
-                debug!(err = ?e, "Received invalid offer set from client");
-                // TODO send error response
-                unimplemented!();
-            }
+                        debug!("returning connection");
+                        return Ok(Some(Either::Right(new_cn)));
+                    }
 
-            // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve, impl Serve>>
-            // into a CxList<impl Serve>
-            let (picked_offers, mut new_stack) = stack.pick(client_offers)?;
-            debug!(picked_client_offers = ?&picked_offers, "monomorphized stack");
+                    debug!(client_addr = ?&a, "address not already negotiated, doing negotiation");
 
-            // 4. Respond to client with offer choice
-            let buf = bincode::serialize(&picked_offers)?;
-            cn.send(buf).await?;
+                    // else, do negotiation
+                    let negotiate_msg: NegotiateMsg =
+                        bincode::deserialize(&buf).wrap_err("offer deserialize failed")?;
 
-            debug!("negotiation handshake done");
+                    use NegotiateMsg::*;
+                    match negotiate_msg {
+                        ServerNonce { addr, picked } => {
+                            let addr: A =
+                                bincode::deserialize(&addr).wrap_err("mismatched addr types")?;
+                            debug!(client_addr = ?&addr, nonce = ?&picked, "got nonce");
+                            pending_negotiated_connections
+                                .lock()
+                                .unwrap()
+                                .insert(addr, picked.clone());
+                            return Ok(None);
+                        }
+                        ClientOffer(client_offers) => {
+                            debug!(client_offers = ?&client_offers, from = ?&a, "received offer");
 
-            // 5. new_stack.serve(vec_u8_stream)
-            let cn_st = futures_util::stream::once(futures_util::future::ready(Ok(cn)));
-            let mut new_st = new_stack.serve(cn_st).await.map_err(Into::into)?;
-            let new_cn = new_st
-                .try_next()
-                .await // -> Result<Option<T>, E>
-                .map_err(Into::into)?
-                .ok_or_else(|| eyre!("No connection returned"))?;
+                            //if let Err(e) = check_offers(&client_offers) {
+                            //    warn!(err = ?e, "Received invalid offer set from client");
+                            //    // TODO send error response
+                            //    unimplemented!();
+                            //}
 
-            debug!("returning connection");
-            Ok(new_cn)
-        }
-    }))
+                            // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve, impl
+                            //    Serve>> into a CxList<impl Serve>
+                            let (picked_offers, mut new_stack) = stack
+                                .pick(client_offers)
+                                .wrap_err(eyre!("error monomorphizing stack",))?;
+                            debug!(picked_client_offers = ?&picked_offers, "monomorphized stack");
+                            // tell all the stack elements about the nonce = (client addr, chosen stack)
+                            let nonce = NegotiateMsg::ServerNonce {
+                                addr: bincode::serialize(&a)?,
+                                picked: picked_offers.clone(),
+                            };
+                            let nonce_buf = bincode::serialize(&nonce)
+                                .wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
+                            new_stack.call_negotiate_picked(&nonce_buf).await;
+
+                            // 4. Respond to client with offer choice
+                            let buf = bincode::serialize(&picked_offers)?;
+                            cn.send((a, buf)).await?;
+
+                            debug!("negotiation handshake done");
+
+                            // 5. new_stack.serve(vec_u8_stream)
+                            let cn_st =
+                                futures_util::stream::once(futures_util::future::ready(Ok(cn)));
+                            let mut new_st = new_stack.serve(cn_st).await.map_err(Into::into)?;
+                            let new_cn = new_st
+                                .try_next()
+                                .await // -> Result<Option<T>, E>
+                                .map_err(Into::into)?
+                                .ok_or_else(|| eyre!("No connection returned"))?;
+
+                            debug!("returning connection");
+                            Ok(Some(Either::Left(new_cn)))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            })
+            .try_filter_map(|v| futures_util::future::ready(Ok(v))))
+    }
 }
 
-pub trait Apply<I> {
+pub trait Apply {
     type Applied;
     fn apply(self, offers: Vec<Offer>) -> Result<Self::Applied, Report>;
 }
 
-impl<N, I> Apply<I> for N
+impl<N> Apply for N
 where
     N: Negotiate,
     <N as Negotiate>::Capability: DeserializeOwned + Ord,
@@ -414,7 +580,7 @@ where
         let o = o.into_iter().next().unwrap();
         if o.capability_guid != N::Capability::guid() {
             return Err(eyre!(
-                "Capability mismatch: offer={}, this={}",
+                "Capability guid mismatch: offer={}, this={}",
                 o.capability_guid,
                 N::Capability::guid()
             ));
@@ -427,7 +593,7 @@ where
         this.sort();
         if cs != this {
             return Err(eyre!(
-                "Capability mismatch: offer={:?}, this={:?}",
+                "Capability offers mismatch: offer={:?}, this={:?}",
                 cs,
                 this
             ));
@@ -437,10 +603,10 @@ where
     }
 }
 
-impl<H, T, I> Apply<I> for CxList<H, T>
+impl<H, T> Apply for CxList<H, T>
 where
-    H: Apply<I>,
-    T: Apply<I>,
+    H: Apply,
+    T: Apply,
 {
     type Applied = CxList<H::Applied, T::Applied>;
     fn apply(self, offers: Vec<Offer>) -> Result<Self::Applied, Report> {
@@ -458,16 +624,12 @@ where
     }
 }
 
-impl<I, D, T1, T2> Apply<I> for Select<T1, T2>
+impl<T1, T2> Apply for Select<T1, T2>
 where
-    T1: Apply<I>,
-    T2: Apply<I>,
-    <T1 as Apply<I>>::Applied: Client<I>,
-    <T2 as Apply<I>>::Applied: Client<I>,
-    <<T1 as Apply<I>>::Applied as Client<I>>::Connection: ChunnelConnection<Data = D>,
-    <<T2 as Apply<I>>::Applied as Client<I>>::Connection: ChunnelConnection<Data = D>,
+    T1: Apply,
+    T2: Apply,
 {
-    type Applied = Either<<T1 as Apply<I>>::Applied, <T2 as Apply<I>>::Applied>;
+    type Applied = Either<<T1 as Apply>::Applied, <T2 as Apply>::Applied>;
     fn apply(self, offers: Vec<Offer>) -> Result<Self::Applied, Report> {
         match self.0.apply(offers.clone()) {
             Ok(t1_applied) => Ok(Either::Left(t1_applied)),
@@ -480,53 +642,63 @@ where
 }
 
 /// Return a connection with `stack`'s semantics, connecting to `a`.
-pub async fn negotiate_client<H, T, A>(stack: CxList<H, T>, a: A) -> Result<<<CxList<H, T> as Apply<addr_conntype!(cln, A)>>::Applied as Client<addr_conntype!(cln, A)>>::Connection, Report>
+pub fn negotiate_client<H, T, C, A>(
+    stack: CxList<H, T>,
+    cn: C,
+    addr: A,
+) -> impl Future<Output = Result<<<CxList<H, T> as Apply>::Applied as Client<C>>::Connection, Report>>
+       + Send
+       + 'static
 where
-    A: ConnectAddress,
-    <<A as ConnectAddress>::Connector as ChunnelConnector>::Connection:
-        ChunnelConnection<Data = Vec<u8>>,
-    <<A as ConnectAddress>::Connector as ChunnelConnector>::Error:
-        Into<Report> + Send + Sync + 'static,
-    CxList<H, T>: Apply<addr_conntype!(cln, A)> + Clone + 'static,
-    <CxList<H, T> as Apply<addr_conntype!(cln, A)>>::Applied: Client<addr_conntype!(cln, A)> + Clone,
-    <<CxList<H, T> as Apply<addr_conntype!(cln, A)>>::Applied as Client<addr_conntype!(cln, A)>>::Error:
-        Into<Report> + Send + Sync + 'static,
-    CxList<H, T>: GetOffers,
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    CxList<H, T>: Apply + GetOffers + Clone + Send + 'static,
+    <CxList<H, T> as Apply>::Applied: Client<C> + Clone + std::fmt::Debug + Send + 'static,
+    <<CxList<H, T> as Apply>::Applied as Client<C>>::Error: Into<Report> + Send + Sync + 'static,
+    A: Send + Sync + 'static,
 {
-    // 1. get Vec<u8> connection.
-    let cn = a.connector().connect(a).await.map_err(Into::into)?;
-    debug!("got negotiation connection");
+    async move {
+        // 1. get Vec<u8> connection.
+        debug!("got negotiation connection");
 
-    // 2. send Vec<Vec<Offer>>
-    let offers = stack.offers();
-    let buf = bincode::serialize(&offers)?;
-    debug!(offers = ?&offers, "sending offers");
-    cn.send(buf).await?;
+        // 2. send Vec<Vec<Offer>>
+        let offers = NegotiateMsg::ClientOffer(stack.offers());
+        let buf = bincode::serialize(&offers)?;
+        debug!(offers = ?&offers, "sending offers");
+        cn.send((addr, buf)).await?;
 
-    // 3. receive Vec<Offer>
-    let buf = cn.recv().await?;
-    let picked: Vec<Offer> = bincode::deserialize(&buf)?;
-    debug!(picked = ?&picked, "received picked impls");
+        // 3. receive Vec<Offer>
+        let (_, buf) = cn.recv().await?;
+        let picked: Vec<Offer> = bincode::deserialize(&buf)?;
+        debug!(picked = ?&picked, "received picked impls");
 
-    // 4. monomorphize `stack`, picking received choices
-    let mut new_stack = stack.apply(picked)?;
+        // 4. monomorphize `stack`, picking received choices
+        let p = picked.clone();
+        let s = stack.clone();
+        let mut new_stack = stack.apply(picked).wrap_err(eyre!(
+            "Could not apply received impls to stack: picked = {:?}, stack = {:?}",
+            &p,
+            &s.offers()
+        ))?;
+        debug!(applied = ?&new_stack, "applied to stack");
 
-    // 5. return new_stack.connect_wrap(vec_u8_conn)
-    new_stack.connect_wrap(cn).await.map_err(Into::into)
+        // 5. return new_stack.connect_wrap(vec_u8_conn)
+        new_stack.connect_wrap(cn).await.map_err(Into::into)
+    }
 }
 
 #[allow(non_upper_case_globals)]
 #[cfg(test)]
 mod test {
     use super::{
-        negotiate_client, negotiate_server, CapabilitySet, GetOffers, Negotiate, Offer, Select,
+        negotiate_client, negotiate_server, CapabilitySet, GetOffers, Negotiate, NegotiateMsg,
+        Offer, Select,
     };
     use crate::{
         chan_transport::{Chan, ChanAddr},
         ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList,
         ListenAddress, Serve,
     };
-    use color_eyre::eyre::{eyre, Report};
+    use color_eyre::eyre::{eyre, Report, WrapErr};
     use futures_util::{
         future::{ready, Ready},
         stream::{Stream, StreamExt},
@@ -608,7 +780,7 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
                 let cl_a = a.clone();
                 let stack = CxList::from(ChunnelA).wrap(ChunnelB).wrap(ChunnelC);
                 let srv_stack = stack.clone();
@@ -617,7 +789,8 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let mut srv_stream = negotiate_server(srv_stack, a).await?;
+                        let raw_st = a.listener().listen(a).await?;
+                        let mut srv_stream = negotiate_server(srv_stack, raw_st).await?;
                         s.send(()).unwrap();
                         // shadow the original variable so it can't accidentally be used after the pin,
                         // making this safe
@@ -640,23 +813,25 @@ mod test {
 
                 // send the raw Vec<Vec<Offer>>
                 // [ [Offer{guid: A, vec:[]}], [Offer{guid: B, vec:[]}], [Offer{guid: C, vec:[]}] ]
-                let offers: Vec<Vec<Offer>> = stack.offers();
+                let offers = NegotiateMsg::ClientOffer(stack.offers());
                 debug!(offers = ?&offers, "starting negotiation handshake");
                 let buf = bincode::serialize(&offers)?;
-                cn.send(buf).await?;
+                cn.send(((), buf)).await?;
 
-                let resp = cn.recv().await?;
+                let (_, resp) = cn.recv().await?;
                 let resp: Vec<Offer> = bincode::deserialize(&resp)?;
                 debug!(resp = ?&resp, "got negotiation response");
 
-                let expected: Vec<Offer> = offers
-                    .into_iter()
-                    .map(|o| o.into_iter().next().unwrap())
-                    .collect();
+                let expected: Vec<Offer> = match offers {
+                    NegotiateMsg::ClientOffer(os) => os
+                        .into_iter()
+                        .map(|o| o.into_iter().next().unwrap())
+                        .collect(),
+                    _ => unreachable!(),
+                };
+
                 assert_eq!(resp, expected);
-
                 info!("done");
-
                 Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("serve_no_select")),
@@ -746,7 +921,7 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
                 let cl_a = a.clone();
                 let stack = CxList::from(ChunnelA)
                     .wrap(Select(ChunnelB, ChunnelBAlt))
@@ -757,7 +932,10 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let srv_stream = negotiate_server(srv_stack, a).await?;
+                        let raw_st = a.listener().listen(a).await?;
+                        let srv_stream = negotiate_server(srv_stack, raw_st)
+                            .await
+                            .wrap_err("negotiate_server failed")?;
                         s.send(()).unwrap();
                         // shadow the original variable so it can't accidentally be used after the pin,
                         // making this safe
@@ -768,7 +946,9 @@ mod test {
                         srv_stream
                             .next()
                             .await
-                            .ok_or_else(|| eyre!("srv_stream returned none"))??;
+                            .ok_or_else(|| eyre!("srv_stream returned none"))?
+                            .wrap_err("negotiation failed")?;
+                        info!("done");
                         Ok::<_, Report>(())
                     }
                     .instrument(tracing::debug_span!("server")),
@@ -782,23 +962,25 @@ mod test {
 
                 // send the raw Vec<Vec<Offer>>
                 // [ [Offer{guid: A, vec:[]}], [Offer{guid: B, vec:[]}], [Offer{guid: C, vec:[]}] ]
-                let offers: Vec<Vec<Offer>> = stack.offers();
+                let offers = NegotiateMsg::ClientOffer(stack.offers());
                 info!(offers = ?&offers, "starting negotiation handshake");
                 let buf = bincode::serialize(&offers)?;
-                cn.send(buf).await?;
+                cn.send(((), buf)).await?;
 
-                let resp = cn.recv().await?;
+                let (_, resp) = cn.recv().await?;
                 let resp: Vec<Offer> = bincode::deserialize(&resp)?;
                 info!(resp = ?&resp, "got negotiation response");
 
-                let expected: Vec<Offer> = offers
-                    .into_iter()
-                    .map(|o| o.into_iter().next().unwrap())
-                    .collect();
+                let expected: Vec<Offer> = match offers {
+                    NegotiateMsg::ClientOffer(os) => os
+                        .into_iter()
+                        .map(|o| o.into_iter().next().unwrap())
+                        .collect(),
+                    _ => unreachable!(),
+                };
+
                 assert_eq!(resp, expected);
-
                 info!("done");
-
                 Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("serve_select")),
@@ -820,7 +1002,7 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
                 let cl_a = a.clone();
                 let stack = CxList::from(ChunnelA)
                     .wrap(Select(ChunnelB, ChunnelBAlt))
@@ -834,17 +1016,20 @@ mod test {
                         s.send(()).unwrap();
 
                         let cn = st.next().await.unwrap()?;
-                        let buf = cn.recv().await?;
-                        let offers: Vec<Vec<Offer>> = bincode::deserialize(&buf)?;
+                        let (_, buf) = cn.recv().await?;
+                        let offers = bincode::deserialize(&buf)?;
 
                         // Pick something fake, the first idx for each of them
-                        let picked: Vec<Offer> = offers
-                            .into_iter()
-                            .map(|v| v.into_iter().next().unwrap())
-                            .collect();
+                        let picked: Vec<Offer> = match offers {
+                            NegotiateMsg::ClientOffer(os) => os
+                                .into_iter()
+                                .map(|o| o.into_iter().next().unwrap())
+                                .collect(),
+                            _ => unreachable!(),
+                        };
 
                         let buf = bincode::serialize(&picked)?;
-                        cn.send(buf).await?;
+                        cn.send(((), buf)).await?;
 
                         Ok::<_, Report>(())
                     }
@@ -853,7 +1038,8 @@ mod test {
 
                 r.await.unwrap();
 
-                let _cn = negotiate_client(stack, cl_a)
+                let raw_cn = cl_a.connector().connect(cl_a).await?;
+                let _cn = negotiate_client(stack, raw_cn, ())
                     .instrument(tracing::info_span!("negotiate_client"))
                     .await?;
 
@@ -880,7 +1066,7 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
                 let cl_a = a.clone();
                 let stack = CxList::from(ChunnelA)
                     .wrap(Select(ChunnelB, ChunnelBAlt))
@@ -891,7 +1077,8 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let srv_stream = negotiate_server(srv_stack, a).await?;
+                        let raw_st = a.listener().listen(a).await?;
+                        let srv_stream = negotiate_server(srv_stack, raw_st).await?;
                         s.send(()).unwrap();
                         tokio::pin!(srv_stream);
                         let cn = srv_stream
@@ -907,12 +1094,13 @@ mod test {
 
                 r.await.unwrap();
 
-                let cn = negotiate_client(stack, cl_a)
+                let raw_cn = cl_a.connector().connect(cl_a).await?;
+                let cn = negotiate_client(stack, raw_cn, ())
                     .instrument(tracing::info_span!("negotiate_client"))
                     .await?;
 
-                cn.send(vec![1u8; 10]).await?;
-                let buf = cn.recv().await?;
+                cn.send(((), vec![1u8; 10])).await?;
+                let (_, buf) = cn.recv().await?;
 
                 assert_eq!(buf, vec![1u8; 10]);
 

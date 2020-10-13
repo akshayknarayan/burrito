@@ -1,16 +1,25 @@
 //! Serialization chunnel with bincode.
 
-use crate::{ChunnelConnection, Client, Serve};
+use crate::{ChunnelConnection, Client, Negotiate, Serve};
+use eyre::{eyre, WrapErr};
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::trace;
 
 #[derive(Debug, Clone, Default)]
 pub struct SerializeChunnel<D> {
     _data: std::marker::PhantomData<D>,
+}
+
+impl<D> Negotiate for SerializeChunnel<D> {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
 }
 
 impl<D, InS, InC, InE> Serve<InS> for SerializeChunnel<D>
@@ -73,7 +82,8 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
-            let buf = bincode::serialize(&data)?;
+            let buf = bincode::serialize(&data).wrap_err("serialize failed")?;
+            trace!(data = ?std::any::type_name::<D>(), buf = ?&buf, "serialized");
             inner.send(buf).await?;
             Ok(())
         })
@@ -85,7 +95,12 @@ where
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let buf = inner.recv().await?;
-            let data = bincode::deserialize(&buf[..])?;
+            let data = bincode::deserialize(&buf[..]).wrap_err(eyre!(
+                "deserialize failed: {:?} -> {:?}",
+                buf,
+                std::any::type_name::<D>()
+            ))?;
+            trace!(data = ?std::any::type_name::<D>(), buf = ?&buf, "deserialized");
             Ok(data)
         })
     }
@@ -94,6 +109,13 @@ where
 #[derive(Debug, Clone)]
 pub struct SerializeChunnelProject<A, D> {
     _data: std::marker::PhantomData<(A, D)>,
+}
+
+impl<A, D> Negotiate for SerializeChunnelProject<A, D> {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
 }
 
 impl<A, D> Default for SerializeChunnelProject<A, D> {
@@ -113,7 +135,7 @@ where
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = SerializeProject<InC, A, D>;
+    type Connection = SerializeProject<A, D, InC>;
     type Error = InE;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -132,7 +154,7 @@ where
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = SerializeProject<InC, A, D>;
+    type Connection = SerializeProject<A, D, InC>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
@@ -141,13 +163,13 @@ where
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct SerializeProject<C, A, D> {
+pub struct SerializeProject<A, D, C> {
     inner: Arc<C>,
     _data: std::marker::PhantomData<(A, D)>,
 }
 
-impl<Cx, A, D> From<Cx> for SerializeProject<Cx, A, D> {
-    fn from(cx: Cx) -> SerializeProject<Cx, A, D> {
+impl<Cx, A, D> From<Cx> for SerializeProject<A, D, Cx> {
+    fn from(cx: Cx) -> SerializeProject<A, D, Cx> {
         SerializeProject {
             inner: Arc::new(cx),
             _data: Default::default(),
@@ -155,7 +177,7 @@ impl<Cx, A, D> From<Cx> for SerializeProject<Cx, A, D> {
     }
 }
 
-impl<A, C, D> ChunnelConnection for SerializeProject<C, A, D>
+impl<A, C, D> ChunnelConnection for SerializeProject<A, D, C>
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     A: Send + Sync + 'static,
@@ -169,7 +191,8 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
-            let buf = bincode::serialize(&data.1)?;
+            let buf = bincode::serialize(&data.1).wrap_err("serialize failed")?;
+            trace!(data = ?std::any::type_name::<D>(), buf = ?&buf, "serialized");
             inner.send((data.0, buf)).await?;
             Ok(())
         })
@@ -181,7 +204,12 @@ where
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let (a, buf) = inner.recv().await?;
-            let data = bincode::deserialize(&buf[..])?;
+            let data = bincode::deserialize(&buf[..]).wrap_err(eyre!(
+                "deserialize failed: {:?} -> {:?}",
+                buf,
+                std::any::type_name::<D>()
+            ))?;
+            trace!(data = ?std::any::type_name::<D>(), buf = ?&buf, "deserialized");
             Ok((a, data))
         })
     }
@@ -192,8 +220,8 @@ mod test {
     use super::SerializeChunnel;
     use crate::chan_transport::{Chan, ChanAddr};
     use crate::{
-        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList,
-        ListenAddress, Serve,
+        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
+        ConnectAddress, CxList, ListenAddress, Serve,
     };
     use futures_util::StreamExt;
     use tracing::trace;
@@ -232,19 +260,19 @@ mod test {
             .unwrap();
         rt.block_on(
             async move {
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
 
                 let mut srv = a.listener();
                 let rcv_st = srv.listen(a.clone()).await.unwrap();
-                let mut rcv_st = CxList::from(SerializeChunnel::default())
-                    .serve(rcv_st)
-                    .await
-                    .unwrap();
+                let mut stack =
+                    CxList::from(SerializeChunnel::default()).wrap(ProjectLeft::from(()));
+
+                let mut rcv_st = stack.serve(rcv_st).await.unwrap();
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
                 let mut cln = a.connector();
                 let cln = cln.connect(a).await.unwrap();
-                let snd = SerializeChunnel::default().connect_wrap(cln).await.unwrap();
+                let snd = stack.connect_wrap(cln).await.unwrap();
 
                 send_thingy(snd, rcv, 42u32).await;
             }
@@ -271,16 +299,18 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<Vec<u8>> = Chan::default().into();
+                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let mut stack =
+                    CxList::from(SerializeChunnel::default()).wrap(ProjectLeft::from(()));
 
                 let mut srv = a.listener();
                 let rcv_st = srv.listen(a.clone()).await.unwrap();
-                let mut rcv_st = SerializeChunnel::default().serve(rcv_st).await.unwrap();
+                let mut rcv_st = stack.serve(rcv_st).await.unwrap();
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
                 let mut cln = a.connector();
                 let cln = cln.connect(a).await.unwrap();
-                let snd = SerializeChunnel::default().connect_wrap(cln).await.unwrap();
+                let snd = stack.connect_wrap(cln).await.unwrap();
 
                 send_thingy(
                     snd,
