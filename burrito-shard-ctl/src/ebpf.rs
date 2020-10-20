@@ -17,12 +17,12 @@ use tracing_futures::Instrument;
 /// evaluating the sharding function. Also registers with shard-ctl, which will perform other setup
 /// (loading XDP program, answering client queries, etc).
 #[derive(Clone)]
-pub struct ShardCanonicalServerEbpf<A, A2, S, C> {
-    inner: ShardCanonicalServer<A, A2, S, C>,
+pub struct ShardCanonicalServerEbpf<A, S, C> {
+    inner: ShardCanonicalServer<A, S, C>,
     handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
 }
 
-impl<A, A2, S, C> ShardCanonicalServerEbpf<A, A2, S, C> {
+impl<A, S, C> ShardCanonicalServerEbpf<A, S, C> {
     /// Inner is a chunnel for the external connection.
     /// Shards is a chunnel for an internal connection to the shards.
     pub async fn new(
@@ -59,15 +59,15 @@ impl<A, A2, S, C> ShardCanonicalServerEbpf<A, A2, S, C> {
     }
 }
 
-impl<A, A2, S, C, Cap> Negotiate for ShardCanonicalServerEbpf<A, A2, S, C>
+impl<A, S, C, Cap> Negotiate for ShardCanonicalServerEbpf<A, S, C>
 where
     Cap: bertha::negotiate::CapabilitySet,
-    ShardCanonicalServer<A, A2, S, C>: Negotiate<Capability = Cap>,
+    ShardCanonicalServer<A, S, C>: Negotiate<Capability = Cap>,
 {
     type Capability = Cap;
 
     fn capabilities() -> Vec<Cap> {
-        ShardCanonicalServer::<A, A2, S, C>::capabilities()
+        ShardCanonicalServer::<A, S, C>::capabilities()
     }
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
@@ -75,10 +75,10 @@ where
     }
 }
 
-impl<I, A, A2, S, C, Ic, Ie> Serve<I> for ShardCanonicalServerEbpf<A, A2, S, C>
+impl<I, A, S, C, Ic, Ie> Serve<I> for ShardCanonicalServerEbpf<A, S, C>
 where
     A: Clone + IpPort + Sync + Send + 'static,
-    ShardCanonicalServer<A, A2, S, C>: Serve<
+    ShardCanonicalServer<A, S, C>: Serve<
         I,
         Connection = Ic,
         Error = Ie,

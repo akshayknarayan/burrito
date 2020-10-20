@@ -11,16 +11,12 @@
 //! further `recv()`s will only be from the same address, and further sends will send to the same
 //! address as the original recv_from.
 
-use crate::{
-    util::AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress,
-    ListenAddress,
-};
+use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, ListenAddress};
 use eyre::{eyre, WrapErr};
 use futures_util::{
     future::FutureExt,
     stream::{Stream, StreamExt},
 };
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -36,8 +32,8 @@ use tracing::trace;
 pub struct UdpSkChunnel;
 
 impl ChunnelListener for UdpSkChunnel {
-    type Addr = UdpSocketAddr;
-    type Connection = UdpSk<UdpSocketAddr>;
+    type Addr = SocketAddr;
+    type Connection = UdpSk<SocketAddr>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -57,7 +53,7 @@ impl ChunnelListener for UdpSkChunnel {
 
 impl ChunnelConnector for UdpSkChunnel {
     type Addr = ();
-    type Connection = UdpSk<UdpSocketAddr>;
+    type Connection = UdpSk<SocketAddr>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = eyre::Report;
@@ -73,50 +69,6 @@ impl ChunnelConnector for UdpSkChunnel {
             .split();
             Ok(UdpSk::new(send, recv))
         })
-    }
-}
-
-/// Newtype SocketAddr to avoid hogging the impl of `ConnectAddress`/`ListenAddress` on that type.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UdpSocketAddr(pub SocketAddr);
-
-impl std::fmt::Display for UdpSocketAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl From<SocketAddr> for UdpSocketAddr {
-    fn from(f: SocketAddr) -> Self {
-        Self(f)
-    }
-}
-
-impl Into<SocketAddr> for UdpSocketAddr {
-    fn into(self) -> SocketAddr {
-        self.0
-    }
-}
-
-impl std::ops::Deref for UdpSocketAddr {
-    type Target = SocketAddr;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl ConnectAddress for UdpSocketAddr {
-    type Connector = AddrWrap<UdpSocketAddr, UdpSkChunnel>;
-    fn connector(&self) -> Self::Connector {
-        AddrWrap::from(UdpSkChunnel::default())
-    }
-}
-
-impl ListenAddress for UdpSocketAddr {
-    type Listener = UdpSkChunnel;
-    fn listener(&self) -> Self::Listener {
-        UdpSkChunnel::default()
     }
 }
 

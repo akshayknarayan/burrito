@@ -49,27 +49,6 @@ impl<A, D> RendezvousChannel<A, D, ()> {
     }
 }
 
-/// Type implementing the `ConnectAddress` trait for `RendezvousChannel`.
-#[derive(Clone)]
-pub struct RendezvousChannelAddr<A, D>(A, RendezvousChannel<A, D, Cln>);
-
-impl<A, D> From<(A, RendezvousChannel<A, D, Cln>)> for RendezvousChannelAddr<A, D> {
-    fn from(from: (A, RendezvousChannel<A, D, Cln>)) -> Self {
-        Self(from.0, from.1)
-    }
-}
-
-impl<A, D> ConnectAddress for RendezvousChannelAddr<A, D>
-where
-    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Connector = RendezvousChannel<A, D, Cln>;
-    fn connector(&self) -> Self::Connector {
-        self.1.clone()
-    }
-}
-
 impl<A, D, S> Clone for RendezvousChannel<A, D, S> {
     fn clone(&self) -> Self {
         Self {
@@ -118,14 +97,14 @@ where
     A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    type Addr = RendezvousChannelAddr<A, D>;
+    type Addr = A;
     type Connection = ChanChunnel<(A, D)>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = eyre::Report;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
-        let addr = a.0.clone();
+        let addr = a.clone();
         let m = Arc::clone(&self.map);
         Box::pin(async move {
             let s = m.lock().await.remove(&addr);
