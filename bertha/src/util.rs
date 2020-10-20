@@ -294,6 +294,86 @@ where
     }
 }
 
+/// Chunnel combinator for working with Option types.
+///
+/// Deals with inner chunnel that has Data = Option<T> by transforming None into an error.
+#[derive(Debug, Default, Clone)]
+pub struct OptionUnwrapProj;
+
+impl crate::negotiate::Negotiate for OptionUnwrapProj {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
+}
+
+impl<A, D, InS, InC, InE> Serve<InS> for OptionUnwrapProj
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (A, Option<D>)> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = OptionUnwrapProjCn<InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(
+            Box::pin(inner.map_ok(|cn| OptionUnwrapProjCn::new(cn))) as _
+        ))
+    }
+}
+
+impl<A, D, InC> Client<InC> for OptionUnwrapProj
+where
+    InC: ChunnelConnection<Data = (A, Option<D>)> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = OptionUnwrapProjCn<InC>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(OptionUnwrapProjCn::new(cn)))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OptionUnwrapProjCn<C>(Arc<C>);
+
+impl<C> OptionUnwrapProjCn<C> {
+    pub fn new(inner: C) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+impl<A, C, D> ChunnelConnection for OptionUnwrapProjCn<C>
+where
+    C: ChunnelConnection<Data = (A, Option<D>)> + Send + Sync + 'static,
+{
+    type Data = (A, D);
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        let (addr, data) = data;
+        self.0.send((addr, Some(data)))
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        let c = Arc::clone(&self.0);
+        Box::pin(async move {
+            let (addr, data) = c.recv().await?;
+            Ok((addr, data.ok_or_else(|| eyre!("Received None value"))?))
+        })
+    }
+}
+
 /// Chunnel translating between passing Address with Data and passing address in `connect()`.
 ///
 /// Start with Address = (), Data = (Address, Data), produce Address = Address, Data = Data: by
