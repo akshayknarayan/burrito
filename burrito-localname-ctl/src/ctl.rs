@@ -218,3 +218,87 @@ fn get_addr() -> String {
         .collect();
     listen_addr
 }
+
+#[cfg(test)]
+mod test {
+    use crate::ctl::serve_ctl;
+    use crate::{LocalNameCln, LocalNameSrv};
+    use bertha::{
+        chan_transport::RendezvousChannel,
+        udp::{UdpReqAddr, UdpReqChunnel, UdpSkChunnel},
+        util::OptionUnwrapProj,
+        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxNil, Serve,
+    };
+    use eyre::Error;
+    use futures_util::stream::TryStreamExt;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use tracing::{debug, info, trace};
+    use tracing_futures::Instrument;
+
+    #[test]
+    fn local_name() {
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap();
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+        rt.block_on(
+            async move {
+                let root = PathBuf::from(r"./tmp-test-local-name");
+
+                std::fs::remove_dir_all(&root).unwrap_or_else(|_| ());
+                trace!(dir = ?&root, "create dir");
+                std::fs::create_dir(&root)?;
+                debug!(dir = ?&root, "start ctl");
+                let r1 = root.clone();
+                tokio::spawn(
+                    async move { serve_ctl(Some(r1), false).await.unwrap() }
+                        .instrument(tracing::info_span!("localname-ctl")),
+                );
+
+                tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
+
+                let (rsrv, cln) = RendezvousChannel::new(10).split();
+                // udp |> localnamesrv server
+                let udp_addr: SocketAddr = "127.0.0.1:21987".parse()?;
+                let mut srv =
+                    LocalNameSrv::new(root.clone(), udp_addr, rsrv, OptionUnwrapProj).await?;
+                let raw_st = UdpReqChunnel::default()
+                    .listen(UdpReqAddr(udp_addr))
+                    .await?;
+                let st = srv.serve(raw_st).await?;
+
+                tokio::spawn(
+                    async move {
+                        st.try_for_each_concurrent(None, |cn| async move {
+                            let m = cn.recv().await?;
+                            cn.send(m).await?;
+                            Ok(())
+                        })
+                        .await
+                    }
+                    .instrument(tracing::debug_span!("server")),
+                );
+
+                // udp |> localnamecln client
+                let mut cln = LocalNameCln::new(root.clone(), cln, CxNil).await?;
+                info!("connecting client");
+                let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                let cn = cln.connect_wrap(raw_cn).await?;
+
+                cn.send((udp_addr, vec![1u8; 8])).await?;
+                let (_, d) = cn.recv().await?;
+                assert_eq!(d, vec![1u8; 8]);
+
+                Ok::<_, Error>(())
+            }
+            .instrument(tracing::info_span!("local_name")),
+        )
+        .unwrap();
+    }
+}

@@ -16,9 +16,10 @@ pub mod ctl;
 #[cfg(feature = "docker")]
 pub mod docker_proxy;
 
-use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener, Either};
-use eyre::Error;
+use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener, Client, Either, Serve};
+use eyre::{ensure, eyre, Error};
 use futures_util::stream::{Stream, StreamExt};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -31,220 +32,345 @@ use tokio::sync::Mutex;
 /// On addr a of type SocketAddr from the inner chunnel,
 /// registers with local-name-ctl to get a local address u, and
 /// returns connection that listens on select(listen(a), listen(u))
-pub struct LocalNameSrv<C, L> {
+#[derive(Debug, Clone)]
+pub struct LocalNameSrv<L, Ls> {
     cl: Arc<Mutex<client::LocalNameClient>>,
-    pub_inner: Arc<Mutex<C>>,
     local_inner: Arc<Mutex<L>>,
+    local_serve: Ls,
+    extern_addr: SocketAddr,
 }
 
-impl<C, L> LocalNameSrv<C, L> {
-    pub async fn new(root: impl AsRef<Path>, pub_inner: C, local_inner: L) -> Result<Self, Error> {
+impl<L, Ls> LocalNameSrv<L, Ls> {
+    pub async fn new(
+        root: impl AsRef<Path>,
+        extern_addr: SocketAddr,
+        local_listen: L,
+        local_serve: Ls,
+    ) -> Result<Self, Error> {
         let cl = client::LocalNameClient::new(root.as_ref()).await?;
         Ok(LocalNameSrv {
             cl: Arc::new(Mutex::new(cl)),
-            pub_inner: Arc::new(Mutex::new(pub_inner)),
-            local_inner: Arc::new(Mutex::new(local_inner)),
+            local_inner: Arc::new(Mutex::new(local_listen)),
+            local_serve,
+            extern_addr,
         })
     }
 }
 
-impl<C, Cn, L, Ln, D> ChunnelListener for LocalNameSrv<C, L>
+impl<L, Ls, Lrc, Lc, Le, I, Ic, Ie, D> Serve<I> for LocalNameSrv<L, Ls>
 where
-    C: ChunnelListener<Addr = SocketAddr, Connection = Cn, Error = Error> + Send + 'static,
-    L: ChunnelListener<Addr = PathBuf, Connection = Ln, Error = Error> + Send + 'static,
-    Cn: ChunnelConnection<Data = D> + 'static,
-    Ln: ChunnelConnection<Data = D> + 'static,
+    I: Stream<Item = Result<Ic, Ie>> + Send + 'static,
+    Ic: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
+    L: ChunnelListener<Addr = PathBuf, Connection = Lrc, Error = Le> + Send + 'static,
+    Ls: Serve<L::Stream, Connection = Lc> + Clone + Send + 'static,
+    <Ls as Serve<L::Stream>>::Error: Into<Error> + Send + Sync + 'static,
+    Lrc: ChunnelConnection + Send + 'static,
+    Lc: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
+    Le: Into<Error> + Send + Sync + 'static,
+    Ie: Into<Error> + Send + Sync + 'static,
+    D: Send + 'static,
 {
-    type Addr = SocketAddr;
-    type Connection = Either<Cn, Ln>;
+    type Connection = LocalNameSrvCn<Ic, Lc>;
+    type Error = Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = Error;
 
-    fn listen(&mut self, a: Self::Addr) -> Self::Future {
+    fn serve(&mut self, inner: I) -> Self::Future {
         let cl = Arc::clone(&self.cl);
-        let pub_inner = Arc::clone(&self.pub_inner);
         let local_inner = Arc::clone(&self.local_inner);
+        let mut local_serve = self.local_serve.clone();
+        let extern_addr = self.extern_addr;
         Box::pin(async move {
             // call client.register
-            let local_addr = cl.lock().await.register(a).await?;
+            let local_addr = cl.lock().await.register(extern_addr).await?;
 
-            // listen selects on returned addr and inner.listen(addr)
-            let ext_str = pub_inner
-                .lock()
-                .await
-                .listen(a)
-                .await?
-                .map(|conn| Ok(Either::Left(conn?)));
-            let int_str = local_inner
+            let ext_str =
+                inner.map(|conn| Ok::<_, Error>(LocalNameSrvCn::Ext(conn.map_err(Into::into)?)));
+
+            // need to listen on the returned addr
+            let local_raw_cn = local_inner
                 .lock()
                 .await
                 .listen(local_addr)
-                .await?
-                .map(|conn| Ok(Either::Right(conn?)));
+                .await
+                .map_err(Into::into)?;
+            let int_str = local_serve
+                .serve(local_raw_cn)
+                .await
+                .map_err(Into::into)?
+                .map(|conn| Ok(LocalNameSrvCn::Loc(conn.map_err(Into::into)?)));
 
             Ok(Box::pin(futures_util::stream::select(ext_str, int_str)) as _)
         })
     }
+}
 
-    fn scope() -> bertha::Scope {
-        bertha::Scope::Local
+pub enum LocalNameSrvCn<P, L> {
+    Ext(P),
+    Loc(L),
+}
+
+impl<P, L, D> ChunnelConnection for LocalNameSrvCn<P, L>
+where
+    P: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
+    L: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
+    D: Send + 'static,
+{
+    type Data = (Either<SocketAddr, PathBuf>, D);
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        match self {
+            Self::Ext(cn) => {
+                let fut = cn.recv();
+                Box::pin(async move {
+                    let (a, d) = fut.await?;
+                    Ok((Either::Left(a), d))
+                }) as _
+            }
+            Self::Loc(cn) => {
+                let fut = cn.recv();
+                Box::pin(async move {
+                    let (a, d) = fut.await?;
+                    Ok((Either::Right(a), d))
+                }) as _
+            }
+        }
     }
-    fn endedness() -> bertha::Endedness {
-        bertha::Endedness::Either
-    }
-    fn implementation_priority() -> usize {
-        1
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        let (addr, data) = data;
+        match self {
+            Self::Ext(cn) => {
+                let fut = match addr {
+                    Either::Left(sk) => Ok(cn.send((sk, data))),
+                    _ => Err(eyre!("Incorrect address type for connection")),
+                };
+
+                Box::pin(async move {
+                    fut?.await?;
+                    Ok(())
+                }) as _
+            }
+            Self::Loc(cn) => {
+                let fut = match addr {
+                    Either::Right(sk) => Ok(cn.send((sk, data))),
+                    _ => Err(eyre!("Incorrect address type for connection")),
+                };
+
+                Box::pin(async move {
+                    fut?.await?;
+                    Ok(())
+                }) as _
+            }
+        }
     }
 }
 
-/// `LocalNameCln` is a `ChuunelConnector`.
-///
-/// on addr a of type SocketAddr, it queries local-name-ctl.
-/// if local address u is found, it returns a local connection to it.
-/// otherwise it connects to a and returns that connection.
-pub struct LocalNameCln<C, L> {
+/// `LocalNameCln` decides which inner connection to send on based on the address.
+pub struct LocalNameCln<L, W> {
     cl: Arc<Mutex<client::LocalNameClient>>,
-    pub_inner: Arc<Mutex<C>>,
-    local_inner: Arc<Mutex<L>>,
+    local_inner: L,
+    local_stack: W,
 }
 
-impl<C, L> LocalNameCln<C, L> {
-    pub async fn new(root: impl AsRef<Path>, pub_inner: C, local_inner: L) -> Result<Self, Error> {
+impl<L, W> LocalNameCln<L, W> {
+    pub async fn new(
+        root: impl AsRef<Path>,
+        local_inner: L,
+        local_stack: W,
+    ) -> Result<Self, Error> {
         let cl = client::LocalNameClient::new(root.as_ref()).await?;
         Ok(LocalNameCln {
             cl: Arc::new(Mutex::new(cl)),
-            pub_inner: Arc::new(Mutex::new(pub_inner)),
-            local_inner: Arc::new(Mutex::new(local_inner)),
+            local_inner,
+            local_stack,
         })
     }
 }
 
-impl<C, L, Cn, Ln, D> ChunnelConnector for LocalNameCln<C, L>
+impl<L, W, Wc, I, D> Client<I> for LocalNameCln<L, W>
 where
-    C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = Error> + Send + 'static,
-    L: ChunnelConnector<Addr = PathBuf, Connection = Ln, Error = Error> + Send + 'static,
-    Cn: ChunnelConnection<Data = D> + 'static,
-    Ln: ChunnelConnection<Data = D> + 'static,
+    I: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
+    L: ChunnelConnector<Addr = PathBuf> + Clone + Send + 'static,
+    L::Error: Into<Error>,
+    L::Connection: Send + 'static,
+    W: Client<L::Connection, Connection = Wc> + Clone + Send + 'static,
+    Wc: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
+    W::Error: Into<Error>,
+    D: Send + Sync + 'static,
 {
-    type Addr = SocketAddr;
-    type Connection = Either<C::Connection, L::Connection>;
+    type Connection = LocalNameCn<I, L, W>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Error;
 
-    fn connect(&mut self, a: Self::Addr) -> Self::Future {
+    // `inner` is the extern connection with (A, D) semantics
+    // also make a local connection
+    fn connect_wrap(&mut self, inner: I) -> Self::Future {
         let cl = Arc::clone(&self.cl);
-        let ext = Arc::clone(&self.pub_inner);
-        let inn = Arc::clone(&self.local_inner);
-        Box::pin(async move {
-            let addr = cl.lock().await.query(a).await?;
-            Ok(if let Some(loc) = addr {
-                Either::Right(inn.lock().await.connect(loc).await?)
-            } else {
-                Either::Left(ext.lock().await.connect(a).await?)
-            })
-        })
-    }
-
-    fn scope() -> bertha::Scope {
-        bertha::Scope::Local
-    }
-    fn endedness() -> bertha::Endedness {
-        bertha::Endedness::Either
-    }
-    fn implementation_priority() -> usize {
-        1
+        let local_inner = self.local_inner.clone();
+        let local_stack = self.local_stack.clone();
+        Box::pin(async move { Ok(LocalNameCn::new(inner, cl, local_inner, local_stack)) })
     }
 }
 
-#[cfg(feature = "ctl")]
-#[cfg(test)]
-mod test {
-    use super::{LocalNameCln, LocalNameSrv};
-    use crate::ctl::serve_ctl;
-    use bertha::{
-        chan_transport::RendezvousChannel,
-        udp::{UdpReqChunnel, UdpSkChunnel},
-        util::{AddrWrap, Never, OptionUnwrap},
-        ChunnelConnection, ChunnelConnector, ChunnelListener,
-    };
-    use eyre::Error;
-    use futures_util::stream::TryStreamExt;
-    use std::net::SocketAddr;
-    use std::path::PathBuf;
-    use tracing::{debug, info, trace};
-    use tracing_futures::Instrument;
+#[derive(Debug, Clone)]
+enum LocalConnsState<C> {
+    Conn(PathBuf, C),
+    Checked(std::time::Instant),
+}
 
-    #[test]
-    fn local_name() {
-        let _guard = tracing_subscriber::fmt::try_init();
-        color_eyre::install().unwrap();
+impl<C> LocalConnsState<C> {
+    fn unwrap_conn(&self) -> &C {
+        match self {
+            LocalConnsState::Conn(_, c) => c,
+            _ => unreachable!(),
+        }
+    }
+}
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
-            .enable_time()
-            .enable_io()
-            .build()
-            .unwrap();
-        rt.block_on(
-            async move {
-                let root = PathBuf::from(r"./tmp-test-local-name");
+pub struct LocalNameCn<C, L: ChunnelConnector, W: Client<L::Connection>> {
+    cl: Arc<Mutex<client::LocalNameClient>>,
+    extern_conn: Arc<Mutex<C>>,
+    local_connector: L,
+    local_stack: W,
+    // local cache of SocketAddr to local connection.
+    local_conns: Arc<Mutex<HashMap<SocketAddr, LocalConnsState<W::Connection>>>>,
+    // local cache to remember which original SocketAddr the peer is.
+    local_addrs: Arc<Mutex<HashMap<PathBuf, SocketAddr>>>,
+}
 
-                std::fs::remove_dir_all(&root).unwrap_or_else(|_| ());
-                trace!(dir = ?&root, "create dir");
-                std::fs::create_dir(&root)?;
-                debug!(dir = ?&root, "start ctl");
-                let r1 = root.clone();
-                tokio::spawn(
-                    async move { serve_ctl(Some(r1), false).await.unwrap() }
-                        .instrument(tracing::info_span!("localname-ctl")),
-                );
+impl<C, L, W> LocalNameCn<C, L, W>
+where
+    L: ChunnelConnector,
+    W: Client<L::Connection>,
+{
+    pub fn new(
+        cn: C,
+        cl: Arc<Mutex<client::LocalNameClient>>,
+        local_connector: L,
+        local_stack: W,
+    ) -> Self {
+        LocalNameCn {
+            cl,
+            extern_conn: Arc::new(Mutex::new(cn)),
+            local_connector,
+            local_stack,
+            local_conns: Default::default(),
+            local_addrs: Default::default(),
+        }
+    }
+}
 
-                tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
+impl<C, L, W, Wc, D> ChunnelConnection for LocalNameCn<C, L, W>
+where
+    C: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
+    L: ChunnelConnector<Addr = PathBuf> + Clone + Send + 'static,
+    L::Connection: Send + 'static,
+    L::Error: Into<Error>,
+    W: Client<L::Connection, Connection = Wc> + Clone + Send + 'static,
+    Wc: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
+    W::Error: Into<Error>,
+    D: Send + Sync + 'static,
+{
+    type Data = (SocketAddr, D);
 
-                let (srv, cln) = RendezvousChannel::new(10).split();
-                // udp |> localnamesrv server
-                let udp_addr: SocketAddr = "127.0.0.1:21987".parse()?;
-                let mut srv = LocalNameSrv::new(
-                    root.clone(),
-                    Never::from(UdpReqChunnel::default()),
-                    OptionUnwrap::from(srv),
-                )
-                .await?;
-
-                tokio::spawn(
-                    async move {
-                        let st = srv.listen(udp_addr).await.unwrap();
-                        st.try_for_each_concurrent(None, |cn| async move {
-                            let m = cn.recv().await?;
-                            cn.send(m).await?;
-                            Ok(())
-                        })
-                        .await
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        use LocalConnsState::*;
+        let (addr, data) = data;
+        let extern_cn = Arc::clone(&self.extern_conn);
+        let mut local_connector = self.local_connector.clone();
+        let mut local_stack = self.local_stack.clone();
+        let local_conns = Arc::clone(&self.local_conns);
+        let local_addrs = Arc::clone(&self.local_addrs);
+        let cl = Arc::clone(&self.cl);
+        Box::pin(async move {
+            let mut local_conns_g = local_conns.lock().await;
+            let mut local_addrs_g = local_addrs.lock().await;
+            match local_conns_g.get(&addr) {
+                Some(Conn(local_addr, cn)) => cn.send((local_addr.clone(), data)).await,
+                Some(Checked(then)) if then.elapsed() > std::time::Duration::from_millis(100) => {
+                    // not in local connections cache, ask localname-ctl
+                    if let Some(local_addr) = cl.lock().await.query(addr).await? {
+                        local_addrs_g.insert(local_addr.clone(), addr);
+                        let raw_cn = local_connector
+                            .connect(local_addr.clone())
+                            .await
+                            .map_err(Into::into)?;
+                        let cn = local_stack.connect_wrap(raw_cn).await.map_err(Into::into)?;
+                        local_conns_g.insert(addr, Conn(local_addr.clone(), cn));
+                        local_conns_g
+                            .get(&addr)
+                            .unwrap()
+                            .unwrap_conn()
+                            .send((local_addr, data))
+                            .await
+                    } else {
+                        let entry = local_conns_g.get_mut(&addr).unwrap();
+                        *entry = Checked(std::time::Instant::now());
+                        extern_cn.lock().await.send((addr, data)).await
                     }
-                    .instrument(tracing::debug_span!("server")),
-                );
-
-                // udp |> localnamecln client
-                let mut cln = LocalNameCln::new(
-                    root.clone(),
-                    Never::from(AddrWrap::from(UdpSkChunnel::default())),
-                    cln,
-                )
-                .await?;
-                info!("connecting client");
-                let cn = cln.connect(udp_addr).await?;
-
-                cn.send(vec![1u8; 8]).await?;
-                let d = cn.recv().await?;
-                assert_eq!(d, vec![1u8; 8]);
-
-                Ok::<_, Error>(())
+                }
+                Some(Checked(_)) => extern_cn.lock().await.send((addr, data)).await,
+                None => {
+                    local_conns_g.insert(addr, Checked(std::time::Instant::now()));
+                    extern_cn.lock().await.send((addr, data)).await
+                }
             }
-            .instrument(tracing::info_span!("local_name")),
-        )
-        .unwrap();
+        })
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        let local_conns = Arc::clone(&self.local_conns);
+        let local_addrs = Arc::clone(&self.local_addrs);
+        let extern_conn = Arc::clone(&self.extern_conn);
+        Box::pin(async move {
+            let local_addrs = Arc::clone(&local_addrs);
+            let local_conns_g = local_conns.lock().await;
+            let mut recv_futs: Vec<_> = local_conns_g
+                .values()
+                .filter_map(move |v| {
+                    let local_addrs = Arc::clone(&local_addrs);
+                    match v {
+                        LocalConnsState::Conn(path, cn) => Some(Box::pin(async move {
+                            let (rpath, data) = cn.recv().await?;
+                            ensure!(
+                                &rpath == path,
+                                "Client connection address (path) mismatch: {:?} != {:?}",
+                                rpath,
+                                path
+                            );
+
+                            let local_addrs_g = local_addrs.lock().await;
+                            let sk = local_addrs_g.get(&rpath).expect(
+                                "local_addrs has same keys as local_conns, which we already queried",
+                            );
+                            Ok((*sk, data))
+                        })
+                            as Pin<Box<dyn Future<Output = _> + Send>>),
+                        _ => None,
+                    }
+                })
+                .collect();
+
+            recv_futs.push(Box::pin(async move {
+                let extern_conn_g = extern_conn.lock().await;
+                extern_conn_g.recv().await
+            }) as _);
+
+            let (rep, _) = futures_util::future::select_ok(recv_futs).await?;
+            Ok(rep)
+        })
     }
 }
