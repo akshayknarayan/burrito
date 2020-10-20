@@ -296,8 +296,8 @@ where
 
 /// Chunnel translating between passing Address with Data and passing address in `connect()`.
 ///
-/// Start with Address = (), Data = (Address, Data), produce Address = Address, Data = Data: by remembering the Address
-/// via connect().
+/// Start with Address = (), Data = (Address, Data), produce Address = Address, Data = Data: by
+/// remembering the Address via connect().
 #[derive(Debug)]
 pub struct AddrWrap<A, C>(C, std::marker::PhantomData<A>);
 
