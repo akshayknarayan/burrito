@@ -4,7 +4,7 @@ use eyre::{eyre, Error};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 fn redis_key<A>(a: &A) -> String
 where
@@ -56,11 +56,16 @@ where
     let a = redis_key(canonical_addr);
     // there is a race between the negotiation ack and the redis write.
     // as a result, if this is empty we must retry.
+    let start = tokio::time::Instant::now();
     let sh_info_blob = loop {
         trace!(key = ?&a, "sending request");
         let sh_info_blob: Vec<u8> = con.get::<_, Vec<u8>>(&a).await?;
         if sh_info_blob.is_empty() {
             trace!(key = ?&a, "got empty response");
+            if start.elapsed() > tokio::time::Duration::from_secs(1) {
+                debug!(key = ?&a, "giving up on finding key");
+                return Ok(None);
+            }
             continue;
         }
 

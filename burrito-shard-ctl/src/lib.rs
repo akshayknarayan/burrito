@@ -528,6 +528,7 @@ where
         let redis_conn = Arc::clone(&self.redis_listen_connection);
         Box::pin(
             async move {
+                debug!("query redis");
                 // query redis for si
                 let si = redis_util::redis_query(&a, redis_conn.lock().await)
                     .await
@@ -573,7 +574,7 @@ where
                     (hash as usize % num_shards) + 1
                 }))
             }
-            .instrument(tracing::debug_span!("connect")),
+            .instrument(tracing::debug_span!("ClientShardChunnelClient::connect")),
         )
     }
 }
