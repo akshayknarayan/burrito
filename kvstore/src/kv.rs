@@ -1,8 +1,13 @@
 //use std::collections::HashMap;
+use super::msg::{Msg, Op};
+use core::task::{Context, Poll};
+use futures_util::future::Ready;
 use hashbrown::HashMap;
+use std::convert::Infallible;
+use tower_service::Service;
 
 #[derive(Debug, Default, Clone)]
-pub struct Kv {
+struct Kv {
     inner: HashMap<String, String>,
 }
 
@@ -23,5 +28,41 @@ impl Kv {
         } else {
             self.inner.remove(k)
         }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Store {
+    inner: Kv,
+}
+
+impl From<Kv> for Store {
+    fn from(inner: Kv) -> Self {
+        Self { inner }
+    }
+}
+
+impl Service<Msg> for Store {
+    type Response = Msg;
+    type Error = Infallible;
+    type Future = Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Msg) -> Self::Future {
+        let resp = match req.op() {
+            Op::Get => {
+                let val = self.inner.get(req.key()).map(str::to_string);
+                req.resp(val)
+            }
+            Op::Put => {
+                let old = self.inner.put(req.key(), req.val());
+                req.resp(old)
+            }
+        };
+
+        futures_util::future::ready(Ok(resp))
     }
 }

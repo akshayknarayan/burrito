@@ -4,28 +4,32 @@ version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
+[features]
+default = []
+bin = ["tracing-subscriber", "tracing-timing", "structopt", "tokio/macros", "tokio/rt-core"]
+
 [dependencies]
 bertha = { path = "../bertha" }
-burrito-shard-ctl = {path = "../burrito-shard-ctl"}
-burrito-util = {path = "../burrito-util"}
-bincode = "1"
-ctrlc = "3"
-serde  = { version = "1", features = ["derive"]}
-rand = "0.7"
-async-bincode = "0.5"
-tokio-tower = "=0.3.5"
-tower-service = "0.3"
+burrito-shard-ctl = { path = "../burrito-shard-ctl" }
+color-eyre = "0.5"
 futures-util = "0.3"
-tokio = {version = "0.2.11", features = ["full"]}
-slog = "2"
-slog-term = "2"
-structopt = "0.3"
+hashbrown = "0.7"
+rand = "0.7"
+serde  = { version = "1", features = ["derive"]}
+tower-buffer = "0.3"
+tower-service = "0.3"
+tokio = {version = "0.2", features = ["rt-core", "sync"]}
 tracing = "0.1"
 tracing-futures = "0.2"
-tracing-timing  = "0.3"
+structopt = { version = "0.3", optional = true }
+tracing-subscriber = { version = "0.2", optional = true }
+tracing-timing  = { version = "0.3", optional = true }
+
+[dev-dependencies]
+test-util = { path = "../test-util" }
 tracing-subscriber = "0.2"
-hyper = {version = "0.13", features = ["stream"]}
-hyper-unix-connector = "0.1"
-hashbrown = "0.7"
-tower-buffer = "0.3"
-incoming = "0.1"
+bincode = "1"
+
+[[bin]]
+name = "kvserver"
+required-features = ["bin"]

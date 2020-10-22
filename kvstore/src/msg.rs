@@ -12,10 +12,10 @@ pub enum Op {
 ///
 /// Get:
 /// - requests will have val = None
-/// - responses val = Some and rest copied.
+/// - responses val = Some if present and rest copied.
 /// Put:
 /// - requests will have val = Some() (or None for deletion)
-/// - responses, val = Some if update and rest copied.
+/// - responses, val = Some if update (the old value) and rest copied.
 // bincode serialization:
 // bytes 0-8 : id (u64)
 // bytes 9-12: op (u32)
