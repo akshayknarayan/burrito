@@ -2,7 +2,6 @@
 
 members = [
     "bertha",
-    "burrito-addr",
     "burrito-discovery-ctl",
     "burrito-localname-ctl",
     "burrito-shard-ctl",
@@ -10,7 +9,7 @@ members = [
     "burrito-util",
     "kvstore",
     "kvstore-ycsb",
-    "rpcbench",
+#    "rpcbench",
     "test-util",
     "xdp-shard",
 #    "ycsb-shenango",
