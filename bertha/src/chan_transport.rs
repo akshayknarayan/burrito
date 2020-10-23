@@ -3,7 +3,7 @@
 use crate::{
     ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress, ListenAddress, Once,
 };
-use eyre::eyre;
+use color_eyre::eyre::{eyre, Report};
 use futures_util::stream::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
@@ -69,7 +69,7 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = eyre::Report;
+    type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         let channel_size = self.channel_size;
@@ -101,7 +101,7 @@ where
     type Connection = ChanChunnel<(A, D)>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = eyre::Report;
+    type Error = Report;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
         let addr = a.clone();
@@ -113,11 +113,7 @@ where
             } else {
                 let mp = m.lock().await;
                 let keys: Vec<_> = mp.keys().collect();
-                Err(eyre::eyre!(
-                    "Address not found: {:?}: not in {:?}",
-                    addr,
-                    keys
-                ))
+                Err(eyre!("Address not found: {:?}: not in {:?}", addr, keys))
             }
         })
     }
@@ -264,7 +260,7 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = eyre::Report;
+    type Error = Report;
 
     fn listen(&mut self, _a: Self::Addr) -> Self::Future {
         let r = ChanChunnel::new(
@@ -284,7 +280,7 @@ where
     type Connection = ChanChunnel<D>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = eyre::Report;
+    type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         let r = ChanChunnel::new(
@@ -325,7 +321,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let s = Arc::clone(&self.snd);
         let link = Arc::clone(&self.link);
 
@@ -353,9 +349,7 @@ where
         })
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let r = Arc::clone(&self.rcv);
         Box::pin(async move {
             Ok(r.lock()
@@ -409,7 +403,7 @@ mod test {
                 let (_, d) = cn.recv().await?;
 
                 assert_eq!(d, vec![1u8; 8]);
-                Ok::<_, eyre::Report>(())
+                Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("chan_test")),
         )

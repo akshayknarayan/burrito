@@ -1,7 +1,7 @@
 //! Serialization chunnel with bincode.
 
 use crate::{ChunnelConnection, Client, Negotiate, Serve};
-use eyre::{eyre, WrapErr};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
@@ -79,7 +79,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let buf = bincode::serialize(&data).wrap_err("serialize failed")?;
@@ -89,9 +89,7 @@ where
         })
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let buf = inner.recv().await?;
@@ -188,7 +186,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let buf = bincode::serialize(&data.1).wrap_err("serialize failed")?;
@@ -198,9 +196,7 @@ where
         })
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let (a, buf) = inner.recv().await?;

@@ -1,5 +1,6 @@
 //! Tools for working with Chunnels.
 
+use color_eyre::eyre;
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;

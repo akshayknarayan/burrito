@@ -1,7 +1,7 @@
 //! Helper Chunnel types to transform Data types, etc.
 
 use super::{ChunnelConnection, ChunnelConnector, Client, Serve};
-use eyre::eyre;
+use color_eyre::eyre::{eyre, Report};
 use futures_util::future::{
     TryFutureExt, {ready, Ready},
 };
@@ -33,7 +33,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         if let (a, Some(d)) = data {
             self.1.send((a, d))
         } else {
@@ -41,9 +41,7 @@ where
         }
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let d = Arc::clone(&self.0);
         Box::pin(async move {
             let data = d.lock().await.take();
@@ -132,13 +130,11 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         Box::pin(self.1.send((self.0.clone(), data))) as _
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         Box::pin(self.1.recv().map_ok(|d| d.1)) as _
     }
 }
@@ -197,7 +193,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         if let Some(d) = data {
             self.0.send(d)
         } else {
@@ -205,9 +201,7 @@ where
         }
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let c = Arc::clone(&self.0);
         Box::pin(async move {
             let d = c.recv().await;
@@ -278,13 +272,11 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         self.0.send(Some(data))
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let c = Arc::clone(&self.0);
         Box::pin(async move {
             Ok(c.recv()
@@ -358,14 +350,12 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let (addr, data) = data;
         self.0.send((addr, Some(data)))
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let c = Arc::clone(&self.0);
         Box::pin(async move {
             let (addr, data) = c.recv().await?;
@@ -440,13 +430,11 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         self.1.send((self.0.clone(), data))
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let c = Arc::clone(&self.1);
         Box::pin(async move { Ok(c.recv().await?.1) })
     }
@@ -506,13 +494,11 @@ where
     fn send(
         &self,
         _: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         Box::pin(async move { Err(eyre!("No sends allowed on Never Chunnel")) })
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let c = Arc::clone(&self.0);
         Box::pin(async move {
             let _ = c.recv().await?;

@@ -4,6 +4,7 @@
 //! segment, the `Vec<u8>`.
 
 use crate::{ChunnelConnection, Client, Negotiate, Serve};
+use color_eyre::eyre;
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;

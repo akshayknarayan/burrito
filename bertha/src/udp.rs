@@ -12,7 +12,7 @@
 //! address as the original recv_from.
 
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, ListenAddress};
-use eyre::{eyre, WrapErr};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
     future::FutureExt,
     stream::{Stream, StreamExt},
@@ -37,7 +37,7 @@ impl ChunnelListener for UdpSkChunnel {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = eyre::Report;
+    type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         let a: SocketAddr = a.into();
@@ -56,7 +56,7 @@ impl ChunnelConnector for UdpSkChunnel {
     type Connection = UdpSk<SocketAddr>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = eyre::Report;
+    type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         Box::pin(async move {
@@ -98,7 +98,7 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let sk = Arc::clone(&self.send);
         Box::pin(async move {
             let (addr, data) = data;
@@ -109,9 +109,7 @@ where
         })
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let mut buf = [0u8; 1024];
         let sk = Arc::clone(&self.recv);
 
@@ -133,7 +131,7 @@ impl ChunnelListener for UdpReqChunnel {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Error = eyre::Report;
+    type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         let a = a.0;
@@ -239,7 +237,7 @@ impl ChunnelConnection for UdpConn {
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let sk = Arc::clone(&self.send);
         let addr = self.resp_addr;
         let (_, data) = data;
@@ -249,9 +247,7 @@ impl ChunnelConnection for UdpConn {
         })
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let r = Arc::clone(&self.recv);
         Box::pin(async move {
             let d = r.lock().await.recv().await;

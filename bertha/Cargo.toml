@@ -4,19 +4,16 @@ version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-futures-util = "0.3"
 tokio = { version = "0.2", features = ["sync", "time", "macros", "tcp", "stream", "udp", "uds"] }
 color-eyre = "0.5"
-eyre = "0.6"
+futures-util = "0.3"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 tracing-futures = "0.2"
 rand = "0.7"
 serde = "1"
 bincode = "1"
-pin-project = "0.4"
+pin-project = "1"
 paste = "1"
 lazy_static = "1.4"
 

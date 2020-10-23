@@ -69,16 +69,14 @@ where
     fn send(
         &self,
         data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         match self {
             Either::Left(a) => a.send(data),
             Either::Right(b) => b.send(data),
         }
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         match self {
             Either::Left(a) => a.recv(),
             Either::Right(b) => b.recv(),
