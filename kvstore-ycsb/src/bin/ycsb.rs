@@ -1,26 +1,23 @@
-use core::task::{Context, Poll};
+use color_eyre::eyre::{Report, WrapErr};
+use kvstore::KvClient;
 use kvstore_ycsb::{ops, Op};
 use std::collections::HashMap;
-use std::error::Error;
-use std::pin::Pin;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 use structopt::StructOpt;
-use tracing::{debug, info, trace};
-
-type StdError = Box<dyn Error + Send + Sync + 'static>;
-
-const FNV1_64_INIT: u64 = 0xcbf29ce484222325u64;
-const FNV_64_PRIME: u64 = 0x100000001b3u64;
+use tracing::{debug, info, info_span, trace};
+use tracing_futures::Instrument;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "kvclient")]
 struct Opt {
-    #[structopt(short, long)]
-    burrito_root: Option<String>,
-    #[structopt(long, default_value = "flatbuf")]
-    burrito_proto: String,
+    #[structopt(long)]
+    addr: SocketAddr,
 
     #[structopt(long)]
-    addr: String,
+    redis_addr: SocketAddr,
 
     #[structopt(short, long)]
     num_shards_thresh: Option<usize>,
@@ -28,168 +25,165 @@ struct Opt {
     #[structopt(short, long)]
     connections_per_client: bool,
 
-    #[structopt(long)]
-    accesses: std::path::PathBuf,
-
-    #[structopt(short, long)]
-    out_file: Option<std::path::PathBuf>,
-
     #[structopt(short, long)]
     interarrival_client_micros: usize,
-}
 
-fn sk_shard_addrs(num_shards: usize, base_addr: String) -> Vec<std::net::SocketAddr> {
-    use std::net::ToSocketAddrs;
-    let parts: Vec<&str> = base_addr.split(":").collect();
-    assert_eq!(parts.len(), 2);
-    let base_port: u16 = parts[1].parse().expect("invalid port number");
-    (0..num_shards + 1)
-        .map(|i| format!("{}:{}", parts[0], base_port + (i as u16)))
-        .map(|s| s.to_socket_addrs().expect("valid sockaddr").next().unwrap())
-        .collect()
+    #[structopt(long)]
+    accesses: PathBuf,
+
+    #[structopt(short, long)]
+    burrito_root: Option<String>,
+
+    #[structopt(short, long)]
+    out_file: Option<PathBuf>,
 }
 
 #[tokio::main(core_threads = 8, max_threads = 8)]
-async fn main() -> Result<(), StdError> {
+async fn main() -> Result<(), Report> {
+    tracing_subscriber::fmt::init();
+    color_eyre::install()?;
     let opt = Opt::from_args();
 
-    tracing_subscriber::fmt::init();
-
-    debug!("reading workload");
+    info!("reading workload");
     let loads = ops(opt.accesses.with_extension("load"))?;
     let accesses = ops(opt.accesses)?;
-    debug!(num_ops = ?accesses.len(), "done reading workload");
+    info!(num_ops = ?accesses.len(), "done reading workload");
 
-    let cls = if let Some(root) = opt.burrito_root {
-        debug!(root = ?&root, "Burrito mode");
-
-        let mut shardctl = match burrito_shard_ctl::ShardCtlClient::new(&root).await {
-            Ok(s) => s,
-            Err(e) => Err(format!("Could not contact ShardCtl: err = {}", e))?,
-        };
-        let si =
-            if let Ok(mut dcl) = burrito_discovery_ctl::client::DiscoveryClient::new(&root).await {
-                shardctl
-                    .query_recursive(&mut dcl, opt.addr.parse()?)
-                    .await?
-            } else {
-                debug!("Could not contact discovery-ctl");
-                shardctl.query_shard(opt.addr.parse()?).await?
-            };
-
-        debug!(info = ?&si, "Queried shard");
-
-        use burrito_shard_ctl::Shard;
-        let addrs = match si {
-            Shard::Addr(a) => vec![a],
-            Shard::Sharded(si) => {
-                let mut addrs = vec![si.canonical_addr];
-
-                // decide managed_sharding or not.
-                // Some(0): client-always
-                // Some(x): server until x, after that client
-                // None: server-always
-                match opt.num_shards_thresh {
-                    Some(thresh) if thresh < si.shard_addrs.len() => {
-                        // we will manage the sharding ourselves
-                        addrs.extend(
-                            si.shard_addrs
-                                .into_iter()
-                                .map(|s| match s {
-                                    Shard::Addr(a) => a,
-                                    Shard::Sharded(c) => c.canonical_addr,
-                                })
-                                .into_iter(),
-                        );
-                    }
-                    _ => (),
-                };
-
-                addrs
-            }
-        };
-
-        debug!(addrs = ?&addrs, "Decided sharding plan");
-
-        // make clients
-        let mut cls = Vec::with_capacity(addrs.len());
-        for a in addrs {
-            cls.push(match a {
-                burrito_shard_ctl::proto::Addr::Udp(sa) => {
-                    let sk = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
-                    kvstore::Client::from(kvstore::UdpClientService::new(sk, sa).await?)
-                }
-                _ => unimplemented!(),
-            });
-        }
-
-        cls
-    } else {
-        // there is no shardctl
-        // "guess" that the ports are sequential
-        let addrs = sk_shard_addrs(opt.num_shards_thresh.unwrap(), opt.addr);
-        // make clients
-        let mut cls = Vec::with_capacity(addrs.len());
-        for sa in addrs {
-            cls.push(kvstore::Client::from({
-                let sk = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
-                kvstore::UdpClientService::new(sk, sa).await?
-            }));
-        }
-
-        cls
-    };
-
-    let (mut durs, time) = do_exp(
-        cls,
-        opt.connections_per_client,
-        opt.interarrival_client_micros,
-        loads,
-        accesses,
-    )
-    .await?;
-
-    // done
-    durs.sort();
-    let len = durs.len() as f64;
-    let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
-    let quantiles: Vec<_> = quantile_idxs
-        .iter()
-        .map(|q| (len * q) as usize)
-        .map(|i| durs[i])
-        .collect();
-    info!(
-        num = ?&durs.len(), elapsed = ?time, min = ?durs[0],
-        p25 = ?quantiles[0], p50 = ?quantiles[1], p75 = ?quantiles[2],
-        p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
-        "Did accesses"
-    );
-
-    if let Some(f) = opt.out_file {
-        let mut f = std::fs::File::create(f).expect("Open out file");
-        use std::io::Write;
-        write!(&mut f, "Interarrival_us NumOps Completion_ms Latency_us\n").expect("write");
-        let len = durs.len();
-        for d in durs {
-            write!(
-                &mut f,
-                "{} {} {} {}\n",
-                opt.interarrival_client_micros,
-                len,
-                time.as_millis(),
-                d.as_micros()
-            )
-            .expect("write");
-        }
+    info!("make clients");
+    let mut access_by_client = HashMap::default();
+    for (cid, ops) in group_by_client(accesses).into_iter() {
+        let client = KvClient::new_shardclient(opt.redis_addr, opt.addr)
+            .instrument(info_span!("make kvclient"))
+            .await
+            .wrap_err("make KvClient")?;
+        access_by_client.insert(cid, (client, ops));
     }
 
+    let mut basic_client = KvClient::new_basicclient(opt.addr)
+        .instrument(info_span!("make kvclient"))
+        .await?;
+    do_loads(&mut basic_client, loads).await?;
+    let (durs, time) = do_requests(access_by_client, opt.interarrival_client_micros as _).await?;
+
+    // done
+    write_results(durs, time, opt.interarrival_client_micros, opt.out_file);
     Ok(())
 }
 
-async fn do_loads<S>(cl: &mut kvstore::Client<S>, loads: Vec<Op>) -> Result<(), StdError>
+/// Issue a workload of requests, divided by client worker.
+///
+/// Each client issues its requests open-loop. So we get one future per client, resolving to a
+/// Result<Vec<durations, _>>.
+/// Terminate once the first client finishes, since the load characteristics would change
+/// otherwise.
+///
+/// Have to measure from the time the request leaves the queue.
+async fn do_requests<S>(
+    access_by_client: HashMap<usize, (KvClient<S>, Vec<Op>)>,
+    interarrival_micros: u64,
+) -> Result<(Vec<Duration>, Duration), Report>
 where
-    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>,
-    S::Future: 'static,
+    S: bertha::ChunnelConnection<Data = kvstore::Msg> + 'static,
+{
+    fn time_req(
+        cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + 'static>,
+        op: Op,
+    ) -> impl Future<Output = Result<Duration, Report>> {
+        async move {
+            let now = tokio::time::Instant::now();
+            let _ycsb_result = op.exec(&cl).await?;
+            Ok::<_, Report>(now.elapsed())
+        }
+    }
+
+    fn req_loop(
+        cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + 'static>,
+        mut ops: impl futures_util::stream::Stream<Item = (usize, Op)> + Unpin + 'static,
+        done: tokio::sync::watch::Receiver<bool>,
+        client_id: usize,
+    ) -> impl Future<Output = Result<Vec<Duration>, Report>> {
+        let mut durs = vec![];
+        let mut inflight = FuturesOrdered::new();
+
+        async move {
+            debug!(id = client_id, "starting");
+            loop {
+                tokio::select!(
+                    Some((remaining_cnt, o)) = ops.next() => {
+                        inflight.push(time_req(cl.clone(), o));
+                        trace!(id = client_id, remaining_cnt, inflight = inflight.len(), "new request");
+                    }
+                    Some(Ok(d)) = inflight.next() => {
+                        trace!(id = client_id, inflight = inflight.len(), "request done");
+                        durs.push(d);
+                    }
+                    else => {
+                        info!(id = client_id, completed = durs.len(), "finished requests");
+                        break;
+                    }
+                );
+
+                // This can't be inside the select because then the else clause would never be
+                // triggered.
+                if *done.borrow() {
+                    debug!(id = client_id, completed = durs.len(), "stopping");
+                    break; // the first client finished. stop.
+                }
+            }
+
+            Ok::<_, Report>(durs)
+        }
+    }
+
+    use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
+    let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
+    let mut reqs: FuturesUnordered<_> = access_by_client
+        .into_iter()
+        .map(move |(client_id, (cl, ops))| {
+            assert!(!ops.is_empty());
+            let ops = paced_ops_stream(ops, interarrival_micros, client_id);
+            req_loop(cl, ops, done_rx.clone(), client_id)
+        })
+        .collect();
+
+    let access_start = tokio::time::Instant::now();
+    // do the accesses until the first client is done.
+    let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
+    assert!(!durs.is_empty());
+    let access_end = access_start.elapsed();
+    info!("broadcasting done");
+    done_tx.broadcast(true)?;
+
+    // collect all the requests that have completed.
+    let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
+    assert!(!rest_durs.is_empty());
+    info!("all clients reported");
+    durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
+    Ok((durs, access_end))
+}
+
+fn paced_ops_stream(
+    ops: Vec<Op>,
+    interarrival_micros: u64,
+    client_id: usize,
+) -> impl futures_util::stream::Stream<Item = (usize, Op)> {
+    let len = ops.len();
+    use futures_util::stream::StreamExt;
+    //let mut ops = tokio::time::interval(Duration::from_micros(interarrival_micros as u64))
+    //use async_timer as hrtimer;
+    //let tkr = hrtimer::interval(Duration::from_micros(interarrival_micros as u64));
+    let tkr = poisson_ticker::SpinTicker::new_with_log_id(
+        Duration::from_micros(interarrival_micros as u64),
+        client_id,
+    )
+    .zip(futures_util::stream::iter((0..len).rev()));
+    tkr.zip(futures_util::stream::iter(ops))
+        .map(|((_, i), o)| (i, o))
+}
+
+async fn do_loads<C>(cl: &mut KvClient<C>, loads: Vec<Op>) -> Result<(), Report>
+where
+    C: bertha::ChunnelConnection<Data = kvstore::Msg> + 'static,
 {
     // don't need to time the loads.
     for o in loads {
@@ -216,318 +210,42 @@ fn group_by_client(accesses: Vec<Op>) -> HashMap<usize, Vec<Op>> {
     access_by_client
 }
 
-fn paced_ops_stream(
-    ops: Vec<Op>,
-    interarrival_micros: u64,
-    client_id: usize,
-) -> impl futures_util::stream::Stream<Item = (usize, Op)> {
-    let len = ops.len();
-    use futures_util::stream::StreamExt;
-    //let mut ops = tokio::time::interval(std::time::Duration::from_micros(interarrival_micros as u64))
-    //use async_timer as hrtimer;
-    //let tkr = hrtimer::interval(std::time::Duration::from_micros(interarrival_micros as u64));
-    let tkr = poisson_ticker::SpinTicker::new_with_log_id(
-        std::time::Duration::from_micros(interarrival_micros as u64),
-        client_id,
-    )
-    .zip(futures_util::stream::iter((0..len).rev()));
-    tkr.zip(futures_util::stream::iter(ops))
-        .map(|((_, i), o)| (i, o))
-}
-
-// Uncommenting the following causes:
-// error: reached the type-length limit while instantiating
-//     `std::pin::Pin::<&mut std::future...}[1]::poll[0]::{{closure}}[0])]>`
-//     |
-//     = note: consider adding a `#![type_length_limit="1606073"]` attribute to your crate
-//#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
-async fn managed_sharding<S>(
-    mut cl: kvstore::Client<S>,
-    interarrival_micros: usize,
-    loads: Vec<Op>,
-    accesses: Vec<Op>,
-) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
-where
-    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>
-        + Clone
-        + Unpin,
-    S::Future: 'static + Unpin,
-{
-    do_loads(&mut cl, loads).await?;
-
-    // now, measure the accesses.
-    let access_by_client = group_by_client(accesses)
-        .into_iter()
-        .map(move |(id, ops)| (id, (vec![cl.clone()], ops)))
+fn write_results(
+    mut durs: Vec<Duration>,
+    time: Duration,
+    interarrival_client_micros: usize,
+    out_file: Option<PathBuf>,
+) {
+    durs.sort();
+    let len = durs.len() as f64;
+    let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
+    let quantiles: Vec<_> = quantile_idxs
+        .iter()
+        .map(|q| (len * q) as usize)
+        .map(|i| durs[i])
         .collect();
-    do_requests(access_by_client, interarrival_micros as u64, |_| 0).await
-}
+    info!(
+        num = ?&durs.len(), elapsed = ?time, min = ?durs[0],
+        p25 = ?quantiles[0], p50 = ?quantiles[1], p75 = ?quantiles[2],
+        p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
+        "Did accesses"
+    );
 
-//#[tracing::instrument(level = "debug", skip(resolver, loads, accesses))]
-async fn do_exp<S>(
-    mut cls: Vec<kvstore::Client<S>>,
-    connections_per_client: bool,
-    interarrival_micros: usize,
-    loads: Vec<Op>,
-    accesses: Vec<Op>,
-) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
-where
-    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>
-        + Clone
-        + Unpin,
-    S::Future: 'static + Unpin,
-{
-    if cls.is_empty() {
-        Err(String::from("Need at least one client."))?;
-    } else if cls.len() < 3 {
-        // passing only one address means no sharding, which is equivalent to server sharding.
-        // two addresses is a sharder and one shard, which is the same thing.
-        return managed_sharding(cls.swap_remove(0), interarrival_micros, loads, accesses).await;
-    };
-
-    do_loads(&mut cls[0], loads).await?;
-
-    // take off the canonical address
-    let cls = cls[1..].to_vec();
-
-    // now, measure the accesses.
-    let num_shards = cls.len();
-    let shard_fn = move |o: &Op| {
-        /* xdp_shard version of FNV: take the first 4 bytes of the key
-        * u64 hash = FNV1_64_INIT;
-        * // ...
-        * // value start
-        * pkt_val = ((u8*) app_data) + offset;
-
-        * // compute FNV hash
-        * #pragma clang loop unroll(full)
-        * for (i = 0; i < 4; i++) {
-        *     hash = hash ^ ((u64) pkt_val[i]);
-        *     hash *= FNV_64_PRIME;
-        * }
-
-        * // map to a shard and assign to that port.
-        * idx = hash % shards->num;
-        */
-        let mut hash = FNV1_64_INIT;
-        for b in o.key().as_bytes()[0..4].iter() {
-            hash = hash ^ (*b as u64);
-            hash = u64::wrapping_mul(hash, FNV_64_PRIME);
-        }
-
-        hash as usize % num_shards
-    };
-
-    if !connections_per_client {
-        // one connection per shard
-        let access_by_client = group_by_client(accesses)
-            .into_iter()
-            .map(|(id, ops)| (id, (cls.clone(), ops)))
-            .collect();
-        do_requests(access_by_client, interarrival_micros as u64, shard_fn).await
-    } else {
-        // one conenction per shard per client
-        // accesses group_by client
-        let mut access_by_client: HashMap<usize, (Vec<kvstore::Client<_>>, Vec<Op>)> =
-            Default::default();
-        for o in accesses {
-            let k = o.client_id();
-            if !access_by_client.contains_key(&k) {
-                access_by_client.insert(k, (cls.clone(), vec![o]));
-            } else {
-                let v = access_by_client.get_mut(&k).unwrap();
-                v.1.push(o);
-            }
-        }
-
-        do_requests(access_by_client, interarrival_micros as u64, shard_fn).await
-    }
-}
-
-use std::collections::VecDeque;
-
-/// As clients become ready, send return futures which will make requests on them.
-///
-/// Have to poll only the clients with pending requests. Otherwise, we could
-/// end up repeatedly calling poll_ready on a client with no requests.
-#[pin_project::pin_project]
-struct PendingServices<S> {
-    cls: Vec<kvstore::Client<S>>,
-    pending: Vec<VecDeque<(tokio::time::Instant, Op)>>,
-    pending_now: Vec<usize>,
-}
-
-impl<S> PendingServices<S>
-where
-    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>,
-    S::Future: 'static,
-{
-    fn new(cls: Vec<kvstore::Client<S>>) -> Self {
-        let pending = cls.iter().map(|_| Default::default()).collect();
-        Self {
-            cls,
-            pending,
-            pending_now: vec![],
+    if let Some(f) = out_file {
+        let mut f = std::fs::File::create(f).expect("Open out file");
+        use std::io::Write;
+        write!(&mut f, "Interarrival_us NumOps Completion_ms Latency_us\n").expect("write");
+        let len = durs.len();
+        for d in durs {
+            write!(
+                &mut f,
+                "{} {} {} {}\n",
+                interarrival_client_micros,
+                len,
+                time.as_millis(),
+                d.as_micros()
+            )
+            .expect("write");
         }
     }
-
-    fn push(&mut self, idx: usize, o: Op) {
-        if self.pending[idx].is_empty() {
-            self.pending_now.push(idx);
-        }
-
-        self.pending[idx].push_back((tokio::time::Instant::now(), o));
-    }
-
-    fn len(&self, idx: usize) -> usize {
-        self.pending[idx].len()
-    }
-}
-
-impl<S> futures_util::stream::Stream for PendingServices<S>
-where
-    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError>,
-    S::Future: 'static,
-{
-    type Item = Result<
-        (
-            tokio::time::Instant,
-            Pin<Box<dyn std::future::Future<Output = Result<Option<String>, StdError>>>>,
-        ),
-        StdError,
-    >;
-
-    #[pin_project::project]
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        // project to split the borrow
-        let mut this = self.project();
-        let pending: &mut _ = &mut this.pending;
-        let pending_now: &mut _ = &mut this.pending_now;
-        let cls: &mut _ = &mut this.cls;
-
-        if pending_now.is_empty() {
-            return Poll::Ready(None);
-        }
-
-        // rotate for poll fairness
-        pending_now.rotate_left(1);
-        // see if any of them are ready
-        let mut ready_now: Option<usize> = None;
-        let mut ready_now_idx = 0;
-        for i in 0..pending_now.len() {
-            let idx = pending_now[i];
-            match cls[idx].poll_ready(cx) {
-                Poll::Pending => continue,
-                Poll::Ready(Ok(())) => {
-                    ready_now.replace(idx);
-                    ready_now_idx = i;
-                    break;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
-            }
-        }
-
-        match ready_now {
-            None => return Poll::Pending, // there are waiting requests, but all of the clients are pending.
-            Some(idx) => {
-                // cls[idx] is ready.
-                let cl = &mut cls[idx];
-                let (then, o) = pending[idx].pop_front().expect("only polled active conns");
-                let fut = match o {
-                    Op::Get(_, k) => cl.get_fut(k),
-                    Op::Update(_, k, v) => cl.update_fut(k, v),
-                };
-
-                if pending[idx].is_empty() {
-                    // no more messages, yank from pending_now
-                    pending_now.remove(ready_now_idx);
-                }
-
-                Poll::Ready(Some(Ok((then, fut))))
-            }
-        }
-    }
-}
-
-/// Issue a workload of requests, divided by client worker.
-///
-/// Each client issues its requests open-loop. So we get one future per client, resolving to a
-/// Result<Vec<durations, _>>.
-/// Terminate once the first client finishes, since the load characteristics would change
-/// otherwise.
-///
-/// Have to measure from the time the request leaves the queue.
-async fn do_requests<S>(
-    access_by_client: HashMap<usize, (Vec<kvstore::Client<S>>, Vec<Op>)>,
-    interarrival_micros: u64,
-    shard_fn: impl Fn(&Op) -> usize,
-) -> Result<(Vec<std::time::Duration>, std::time::Duration), StdError>
-where
-    S: tower_service::Service<kvstore::Msg, Response = kvstore::Msg, Error = StdError> + Unpin,
-    S::Future: 'static + Unpin,
-{
-    use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
-    let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
-    let mut reqs: FuturesUnordered<_> = access_by_client
-        .into_iter()
-        .map(|(client_id, (cls, ops))| {
-            let mut inflight = FuturesOrdered::new();
-            let mut durs = vec![];
-            let done = done_rx.clone();
-            assert!(!ops.is_empty());
-            let mut ops = paced_ops_stream(ops, interarrival_micros, client_id);
-            let mut pending = PendingServices::new(cls);
-            let shard_fn = &shard_fn;
-            async move {
-                debug!(id = client_id, "starting");
-                loop {
-                    tokio::select!(
-                        Some((remaining_cnt, o)) = ops.next() => {
-                            let shard = shard_fn(&o);
-                            pending.push(shard, o);
-                            trace!(id = client_id, remaining_cnt, inflight = inflight.len(), shard_id = shard, pending = pending.len(shard), "new request");
-                        }
-                        Some(Ok((then, fut))) = pending.next() => {
-                            inflight.push(async move {
-                                fut.await?;
-                                Ok::<_, StdError>(then.elapsed())
-                            });
-                        }
-                        Some(Ok(d)) = inflight.next() => {
-                            trace!(id = client_id, inflight = inflight.len(), "request done");
-                            durs.push(d);
-                        }
-                        else => {
-                            info!(id = client_id, completed = durs.len(), "finished requests");
-                            break;
-                        }
-                    );
-
-                    // This can't be inside the select because then else would never be
-                    // triggered.
-                    if *done.borrow() {
-                        debug!(id = client_id, completed = durs.len(), "stopping");
-                        break; // the first client finished. stop.
-                    }
-                }
-
-                Ok::<_, StdError>(durs)
-            }
-        })
-        .collect();
-
-    let access_start = tokio::time::Instant::now();
-    // do the accesses until the first client is done.
-    let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
-    assert!(!durs.is_empty());
-    let access_end = access_start.elapsed();
-    info!("broadcasting done");
-    done_tx.broadcast(true)?;
-
-    // collect all the requests that have completed.
-    let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
-    assert!(!rest_durs.is_empty());
-    info!("all clients reported");
-    durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
-    Ok((durs, access_end))
 }

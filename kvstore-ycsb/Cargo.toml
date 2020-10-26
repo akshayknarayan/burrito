@@ -4,20 +4,14 @@ version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
+bertha = { path = "../bertha" } 
 burrito-shard-ctl = {path = "../burrito-shard-ctl"}
-burrito-discovery-ctl = {path = "../burrito-discovery-ctl"}
-futures-util = "0.3"
-hyper-unix-connector = "0.1.4"
-hyper = {version = "0.13", features = ["stream"]}
-incoming = "0.1"
 kvstore = {path = "../kvstore"}
-pin-project = "0.4"
+futures-util = "0.3"
+pin-project = "1"
 structopt = "0.3"
-tokio = {version = "0.2.20", features = ["full"]}
-async-timer = { version = "0.7", features = ["stream", "tokio_on"] }
+tokio = {version = "0.2.20", features = ["rt-core", "rt-threaded"]}
 poisson-ticker = { git = "https://github.com/akshayknarayan/poisson-ticker", branch="debug" }
 tower-buffer = "0.3"
 tower-service = "0.3"
@@ -25,17 +19,9 @@ tracing = "0.1"
 tracing-futures = "0.2"
 tracing-subscriber = "0.2"
 tracing-timing  = "=0.3.0"
-#ahash = "0.3"
 rand = "0.7"
 rand_distr = "0.2"
 crossbeam = "0.7"
 bincode = "1"
-anyhow = "1"
-
-[dev-dependencies]
-criterion = "0.3"
-bincode = "1"
-
-[[bench]]
-name = "ycsb"
-harness = false
+color-eyre = "0.5"
+#ahash = "0.3"

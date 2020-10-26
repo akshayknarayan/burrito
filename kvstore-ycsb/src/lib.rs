@@ -1,4 +1,56 @@
-type StdError = anyhow::Error;
+use color_eyre::eyre::{eyre, Report};
+
+#[derive(Debug, Clone)]
+pub enum Op {
+    Get(usize, String),
+    Update(usize, String, String),
+}
+
+impl Op {
+    pub fn client_id(&self) -> usize {
+        match self {
+            Op::Get(i, _) | Op::Update(i, _, _) => *i,
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        match self {
+            Op::Get(_, k) | Op::Update(_, k, _) => k,
+        }
+    }
+
+    pub async fn exec(
+        self,
+        cl: &kvstore::KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + 'static>,
+    ) -> Result<Option<String>, Report> {
+        match self {
+            Op::Get(_, k) => cl.get(k).await,
+            Op::Update(_, k, v) => cl.update(k, v).await,
+        }
+    }
+}
+
+impl std::str::FromStr for Op {
+    type Err = Report;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let sp: Vec<&str> = s.split_whitespace().collect();
+        Ok(if sp.len() == 3 && sp[1] == "GET" {
+            Op::Get(sp[0].parse()?, sp[2].into())
+        } else if sp.len() == 4 && sp[1] == "UPDATE" {
+            Op::Update(sp[0].parse()?, sp[2].into(), sp[3].into())
+        } else {
+            Err(eyre!("Invalid line: {:?}", s))?
+        })
+    }
+}
+
+pub fn ops(f: std::path::PathBuf) -> Result<Vec<Op>, Report> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(f)?;
+    let f = std::io::BufReader::new(f);
+    Ok(f.lines().filter_map(|l| l.ok()?.parse().ok()).collect())
+}
 
 // TODO invoke ycsbc-mock
 //pub fn generate(specfile: impl AsRef<std::path::Path>) {
@@ -15,47 +67,3 @@ type StdError = anyhow::Error;
 //        .output()
 //        .unwrap();
 //}
-
-#[derive(Debug, Clone)]
-pub enum Op {
-    Get(usize, String),
-    Update(usize, String, String),
-}
-
-impl Op {
-    pub fn client_id(&self) -> usize {
-        match self {
-            Op::Get(i, _) => *i,
-            Op::Update(i, _, _) => *i,
-        }
-    }
-
-    pub fn key(&self) -> &str {
-        match self {
-            Op::Get(_, k) => k,
-            Op::Update(_, k, _) => k,
-        }
-    }
-}
-
-impl std::str::FromStr for Op {
-    type Err = StdError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let sp: Vec<&str> = s.split_whitespace().collect();
-        Ok(if sp.len() == 3 && sp[1] == "GET" {
-            Op::Get(sp[0].parse()?, sp[2].into())
-        } else if sp.len() == 4 && sp[1] == "UPDATE" {
-            Op::Update(sp[0].parse()?, sp[2].into(), sp[3].into())
-        } else {
-            Err(anyhow::anyhow!("Invalid line: {:?}", s))?
-        })
-    }
-}
-
-pub fn ops(f: std::path::PathBuf) -> Result<Vec<Op>, StdError> {
-    use std::io::BufRead;
-    let f = std::fs::File::open(f)?;
-    let f = std::io::BufReader::new(f);
-    Ok(f.lines().filter_map(|l| l.ok()?.parse().ok()).collect())
-}
