@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, trace};
+use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
 
 /// A type that can list out the `universe()` of possible values it can have.
@@ -541,7 +541,7 @@ where
                                 .wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
                             new_stack
                                 .call_negotiate_picked(&nonce_buf)
-                                .instrument(tracing::debug_span!("call_negotiate_picked"))
+                                .instrument(debug_span!("call_negotiate_picked"))
                                 .await;
 
                             // 4. Respond to client with offer choice
@@ -712,7 +712,7 @@ mod test {
         future::{ready, Ready},
         stream::{Stream, StreamExt},
     };
-    use tracing::{debug, info};
+    use tracing::{debug, debug_span, info, info_span};
     use tracing_futures::Instrument;
 
     #[allow(non_upper_case_globals)]
@@ -810,7 +810,7 @@ mod test {
                             .ok_or_else(|| eyre!("srv_stream returned none"))??;
                         Ok::<_, Report>(())
                     }
-                    .instrument(tracing::debug_span!("server")),
+                    .instrument(debug_span!("server")),
                 );
 
                 r.await.unwrap();
@@ -841,7 +841,7 @@ mod test {
                 info!("done");
                 Ok::<_, Report>(())
             }
-            .instrument(tracing::info_span!("serve_no_select")),
+            .instrument(info_span!("serve_no_select")),
         )
         .unwrap();
     }
@@ -957,7 +957,7 @@ mod test {
                         info!("done");
                         Ok::<_, Report>(())
                     }
-                    .instrument(tracing::debug_span!("server")),
+                    .instrument(debug_span!("server")),
                 );
 
                 r.await.unwrap();
@@ -988,7 +988,7 @@ mod test {
                 info!("done");
                 Ok::<_, Report>(())
             }
-            .instrument(tracing::info_span!("serve_select")),
+            .instrument(info_span!("serve_select")),
         )
         .unwrap();
     }
@@ -1037,21 +1037,21 @@ mod test {
 
                         Ok::<_, Report>(())
                     }
-                    .instrument(tracing::debug_span!("server")),
+                    .instrument(debug_span!("server")),
                 );
 
                 r.await.unwrap();
 
                 let raw_cn = cln.connect(()).await?;
                 let _cn = negotiate_client(stack, raw_cn, ())
-                    .instrument(tracing::info_span!("negotiate_client"))
+                    .instrument(info_span!("negotiate_client"))
                     .await?;
 
                 info!("done");
 
                 Ok::<_, Report>(())
             }
-            .instrument(tracing::info_span!("client_select")),
+            .instrument(info_span!("client_select")),
         )
         .unwrap();
     }
@@ -1092,14 +1092,14 @@ mod test {
                         cn.send(buf).await?;
                         Ok::<_, Report>(())
                     }
-                    .instrument(tracing::debug_span!("server")),
+                    .instrument(debug_span!("server")),
                 );
 
                 r.await.unwrap();
 
                 let raw_cn = cln.connect(()).await?;
                 let cn = negotiate_client(stack, raw_cn, ())
-                    .instrument(tracing::info_span!("negotiate_client"))
+                    .instrument(info_span!("negotiate_client"))
                     .await?;
 
                 cn.send(((), vec![1u8; 10])).await?;
@@ -1111,7 +1111,83 @@ mod test {
 
                 Ok::<_, Report>(())
             }
-            .instrument(tracing::info_span!("both_select")),
+            .instrument(info_span!("both_select")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn multiclient() {
+        use crate::udp::{UdpReqChunnel, UdpSkChunnel};
+        use futures_util::TryStreamExt;
+        use std::net::ToSocketAddrs;
+
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                info!("starting");
+                let stack = CxList::from(ChunnelA)
+                    .wrap(Select(ChunnelB, ChunnelBAlt))
+                    .wrap(ChunnelC);
+                let srv_stack = stack.clone();
+                let addr = "127.0.0.1:42184".to_socket_addrs().unwrap().next().unwrap();
+                let (s, r) = tokio::sync::oneshot::channel();
+                tokio::spawn(
+                    async move {
+                        info!("starting");
+                        let raw_st = UdpReqChunnel::default().listen(addr).await?;
+                        let srv_stream = negotiate_server(srv_stack, raw_st).await?;
+                        s.send(()).unwrap();
+                        srv_stream
+                            .try_for_each_concurrent(None, |cn| async move {
+                                info!("got connection");
+                                loop {
+                                    let buf = cn.recv().await?;
+                                    cn.send(buf).await?;
+                                    debug!("echoed");
+                                }
+                            })
+                            .instrument(info_span!("server"))
+                            .await
+                            .unwrap();
+                        Ok::<_, Report>(())
+                    }
+                    .instrument(info_span!("server")),
+                );
+
+                r.await.unwrap();
+                info!("starting client");
+                let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                let cn1 = negotiate_client(stack.clone(), raw_cn, addr)
+                    .instrument(info_span!("negotiate_client"))
+                    .await?;
+
+                let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                let cn2 = negotiate_client(stack, raw_cn, addr)
+                    .instrument(info_span!("negotiate_client"))
+                    .await?;
+
+                for _ in 0..10 {
+                    debug!("sending");
+                    cn1.send((addr, vec![1u8; 10])).await?;
+                    cn2.send((addr, vec![2u8; 10])).await?;
+                    let (_, buf1) = cn1.recv().await?;
+                    let (_, buf2) = cn2.recv().await?;
+                    assert_eq!(buf1, vec![1u8; 10]);
+                    assert_eq!(buf2, vec![2u8; 10]);
+                }
+                info!("done");
+                Ok::<_, Report>(())
+            }
+            .instrument(info_span!("negotiate::multiclient")),
         )
         .unwrap();
     }

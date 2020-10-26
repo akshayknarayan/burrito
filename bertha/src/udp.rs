@@ -337,26 +337,39 @@ mod test {
                 tokio::spawn(async move {
                     let srv = UdpReqChunnel::default().listen(addr).await.unwrap();
                     srv.try_for_each_concurrent(None, |cn| async move {
-                        let data = cn.recv().await?;
-                        cn.send(data).await?;
-                        Ok(())
+                        loop {
+                            let data = cn.recv().await?;
+                            cn.send(data).await?;
+                        }
                     })
+                    .instrument(tracing::info_span!("echo-srv"))
                     .await
                     .unwrap();
                 });
 
-                for i in 0..3 {
-                    let cli = UdpSkChunnel::default().connect(()).await.unwrap();
-                    cli.send((addr.into(), vec![1u8; 12])).await.unwrap();
-                    let (from, data) = cli.recv().await.unwrap();
+                let cli1 = UdpSkChunnel::default().connect(()).await.unwrap();
+                let cli2 = UdpSkChunnel::default().connect(()).await.unwrap();
 
-                    let from: SocketAddr = from.into();
+                for i in 0..10 {
+                    cli1.send((addr.into(), vec![i as u8; 12])).await.unwrap();
+
+                    cli2.send((addr.into(), vec![i + 1 as u8; 12]))
+                        .await
+                        .unwrap();
+
+                    let (from1, data1) = cli1.recv().await.unwrap();
+                    let (from2, data2) = cli2.recv().await.unwrap();
+
                     let addr: SocketAddr = addr.into();
-                    assert_eq!(from, addr);
-                    assert_eq!(data, vec![i as u8; 12]);
+                    let from1: SocketAddr = from1.into();
+                    let from2: SocketAddr = from2.into();
+                    assert_eq!(from1, addr);
+                    assert_eq!(data1, vec![i as u8; 12]);
+                    assert_eq!(from2, addr);
+                    assert_eq!(data2, vec![i + 1 as u8; 12]);
                 }
             }
-            .instrument(tracing::info_span!("udp::rendezvous")),
+            .instrument(tracing::info_span!("udp::rendezvous_multiclient")),
         );
     }
 }
