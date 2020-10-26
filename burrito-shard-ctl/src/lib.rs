@@ -650,9 +650,9 @@ mod test {
         chan_transport::RendezvousChannel,
         reliable::{ReliabilityChunnel, ReliabilityProjChunnel},
         tagger::{TaggerChunnel, TaggerProjChunnel},
-        udp::{UdpReqAddr, UdpSkChunnel},
+        udp::{UdpReqChunnel, UdpSkChunnel},
         util::{AddrWrap, OptionUnwrap, ProjectLeft},
-        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList, ListenAddress, Serve,
+        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList, Serve,
     };
     use color_eyre::eyre;
     use eyre::{eyre, WrapErr};
@@ -723,8 +723,7 @@ mod test {
             .wrap(ProjectLeft::from(addr));
         let stack = external.clone();
         info!(addr = ?&addr, "listening");
-        let addr: UdpReqAddr = addr.into();
-        let st = addr.listener().listen(addr).await.unwrap();
+        let st = UdpReqChunnel::default().listen(addr).await.unwrap();
         debug!("got raw connection");
         let st = external.serve(st).await.unwrap();
         use bertha::GetOffers;
@@ -897,8 +896,10 @@ mod test {
             .wrap(ReliabilityProjChunnel::<_, Msg>::default())
             .wrap(SerializeChunnelProject::<_, (u32, Option<Msg>)>::default());
         info!(shard_info = ?&si, "start canonical server");
-        let a: UdpReqAddr = si.canonical_addr.into();
-        let st = a.listener().listen(a).await.unwrap();
+        let st = UdpReqChunnel::default()
+            .listen(si.canonical_addr)
+            .await
+            .unwrap();
         let st = external.serve(st).await.unwrap();
 
         tokio::spawn(async move {
@@ -1059,8 +1060,7 @@ mod test {
             .wrap(ProjectLeft::from(addr));
         let stack = external.clone();
         info!(addr = ?&addr, "listening");
-        let addr: UdpReqAddr = addr.into();
-        let st = addr.listener().listen(addr).await.unwrap();
+        let st = UdpReqChunnel::default().listen(addr).await.unwrap();
         debug!("got raw connection");
         let st = bertha::negotiate::negotiate_server(external, st)
             .await
@@ -1155,8 +1155,10 @@ mod test {
             .wrap(ReliabilityProjChunnel::<_, Msg>::default())
             .wrap(SerializeChunnelProject::<_, (u32, Option<Msg>)>::default());
         info!(shard_info = ?&si, "start canonical server");
-        let a: UdpReqAddr = si.canonical_addr.into();
-        let st = a.listener().listen(a).await.unwrap();
+        let st = UdpReqChunnel::default()
+            .listen(si.canonical_addr)
+            .await
+            .unwrap();
         let st = bertha::negotiate::negotiate_server(external, st)
             .instrument(tracing::info_span!("negotiate_server"))
             .await
