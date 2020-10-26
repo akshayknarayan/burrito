@@ -704,9 +704,8 @@ mod test {
         Offer, Select,
     };
     use crate::{
-        chan_transport::{Chan, ChanAddr},
-        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList,
-        ListenAddress, Serve,
+        chan_transport::Chan, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList,
+        Serve,
     };
     use color_eyre::eyre::{eyre, Report, WrapErr};
     use futures_util::{
@@ -790,8 +789,7 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
-                let cl_a = a.clone();
+                let (mut srv, mut cln) = Chan::default().split();
                 let stack = CxList::from(ChunnelA).wrap(ChunnelB).wrap(ChunnelC);
                 let srv_stack = stack.clone();
 
@@ -799,7 +797,7 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let raw_st = a.listener().listen(a).await?;
+                        let raw_st = srv.listen(()).await?;
                         let mut srv_stream = negotiate_server(srv_stack, raw_st).await?;
                         s.send(()).unwrap();
                         // shadow the original variable so it can't accidentally be used after the pin,
@@ -818,8 +816,7 @@ mod test {
                 r.await.unwrap();
 
                 // make a Vec<u8> client
-                let a = cl_a;
-                let cn = a.connector().connect(a).await?;
+                let cn = cln.connect(()).await?;
 
                 // send the raw Vec<Vec<Offer>>
                 // [ [Offer{guid: A, vec:[]}], [Offer{guid: B, vec:[]}], [Offer{guid: C, vec:[]}] ]
@@ -931,8 +928,7 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
-                let cl_a = a.clone();
+                let (mut srv, mut cln) = Chan::default().split();
                 let stack = CxList::from(ChunnelA)
                     .wrap(Select(ChunnelB, ChunnelBAlt))
                     .wrap(ChunnelC);
@@ -942,7 +938,7 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let raw_st = a.listener().listen(a).await?;
+                        let raw_st = srv.listen(()).await?;
                         let srv_stream = negotiate_server(srv_stack, raw_st)
                             .await
                             .wrap_err("negotiate_server failed")?;
@@ -967,8 +963,7 @@ mod test {
                 r.await.unwrap();
 
                 // make a Vec<u8> client
-                let a = cl_a;
-                let cn = a.connector().connect(a).await?;
+                let cn = cln.connect(()).await?;
 
                 // send the raw Vec<Vec<Offer>>
                 // [ [Offer{guid: A, vec:[]}], [Offer{guid: B, vec:[]}], [Offer{guid: C, vec:[]}] ]
@@ -1012,8 +1007,7 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
-                let cl_a = a.clone();
+                let (mut srv, mut cln) = Chan::default().split();
                 let stack = CxList::from(ChunnelA)
                     .wrap(Select(ChunnelB, ChunnelBAlt))
                     .wrap(ChunnelC);
@@ -1022,7 +1016,7 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let mut st = a.listener().listen(a).await?;
+                        let mut st = srv.listen(()).await?;
                         s.send(()).unwrap();
 
                         let cn = st.next().await.unwrap()?;
@@ -1048,7 +1042,7 @@ mod test {
 
                 r.await.unwrap();
 
-                let raw_cn = cl_a.connector().connect(cl_a).await?;
+                let raw_cn = cln.connect(()).await?;
                 let _cn = negotiate_client(stack, raw_cn, ())
                     .instrument(tracing::info_span!("negotiate_client"))
                     .await?;
@@ -1076,8 +1070,7 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
-                let cl_a = a.clone();
+                let (mut srv, mut cln) = Chan::default().split();
                 let stack = CxList::from(ChunnelA)
                     .wrap(Select(ChunnelB, ChunnelBAlt))
                     .wrap(ChunnelC);
@@ -1087,7 +1080,7 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let raw_st = a.listener().listen(a).await?;
+                        let raw_st = srv.listen(()).await?;
                         let srv_stream = negotiate_server(srv_stack, raw_st).await?;
                         s.send(()).unwrap();
                         tokio::pin!(srv_stream);
@@ -1104,7 +1097,7 @@ mod test {
 
                 r.await.unwrap();
 
-                let raw_cn = cl_a.connector().connect(cl_a).await?;
+                let raw_cn = cln.connect(()).await?;
                 let cn = negotiate_client(stack, raw_cn, ())
                     .instrument(tracing::info_span!("negotiate_client"))
                     .await?;

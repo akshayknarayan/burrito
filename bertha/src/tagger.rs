@@ -697,10 +697,10 @@ where
 #[cfg(test)]
 mod test {
     use super::{OrderedChunnel, SeqUnreliableChunnel, TaggerChunnel};
-    use crate::chan_transport::{Chan, ChanAddr};
+    use crate::chan_transport::Chan;
     use crate::{
-        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
-        ConnectAddress, CxList, ListenAddress, Serve,
+        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList,
+        Serve,
     };
     use color_eyre::Report;
     use futures_util::StreamExt;
@@ -720,18 +720,16 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let (mut srv, mut cln) = Chan::default().split();
                 let mut stack = CxList::from(TaggerChunnel)
                     .wrap(SeqUnreliableChunnel)
                     .wrap(ProjectLeft::from(()));
 
-                let mut srv = a.listener();
-                let rcv_st = srv.listen(a.clone()).await?;
+                let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut cln = a.connector();
-                let cln = cln.connect(a).await?;
+                let cln = cln.connect(()).await?;
                 let snd = stack.connect_wrap(cln).await?;
 
                 do_transmit(snd, rcv).await;
@@ -800,18 +798,16 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let (mut srv, mut cln) = Chan::default().split();
                 let mut stack = CxList::from(OrderedChunnel::default())
                     .wrap(SeqUnreliableChunnel)
                     .wrap(ProjectLeft::from(()));
 
-                let mut srv = a.listener();
-                let rcv_st = srv.listen(a.clone()).await?;
+                let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut cln = a.connector();
-                let cln = cln.connect(a).await?;
+                let cln = cln.connect(()).await?;
                 let snd = stack.connect_wrap(cln).await?;
 
                 do_transmit(snd, rcv).await;
@@ -860,19 +856,18 @@ mod test {
                         }
                     }
                 });
-                let a: ChanAddr<((), Vec<u8>)> = t.into();
+
+                let (mut srv, mut cln) = t.split();
 
                 let mut stack = CxList::from(OrderedChunnel::default())
                     .wrap(SeqUnreliableChunnel)
                     .wrap(ProjectLeft::from(()));
 
-                let mut srv = a.listener();
-                let rcv_st = srv.listen(a.clone()).await?;
+                let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut cln = a.connector();
-                let cln = cln.connect(a).await?;
+                let cln = cln.connect(()).await?;
                 let snd = stack.connect_wrap(cln).await?;
 
                 do_transmit(snd, rcv).await;

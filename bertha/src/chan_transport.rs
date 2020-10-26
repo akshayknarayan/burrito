@@ -1,16 +1,12 @@
 //! Channel-based Chunnel which acts as a transport.
 
-use crate::{
-    ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress, ListenAddress, Once,
-};
+use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Once};
 use color_eyre::eyre::{eyre, Report};
 use futures_util::stream::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
-use std::ops::DerefMut;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
 
@@ -180,82 +176,11 @@ impl<T, U> Chan<T, U> {
     }
 }
 
-enum ChanAddrInner<D> {
-    Both(Chan<D, ()>),
-    SrvTaken(Chan<D, Cln>),
-    ClnTaken(Chan<D, Srv>),
-    Done,
-}
-
-impl<D> std::fmt::Debug for ChanAddrInner<D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ChanAddrInner::Both(_) => f.debug_struct("ChanAddr::Both").finish(),
-            ChanAddrInner::SrvTaken(_) => f.debug_struct("ChanAddr::SrvTaken").finish(),
-            ChanAddrInner::ClnTaken(_) => f.debug_struct("ChanAddr::ClnTaken").finish(),
-            ChanAddrInner::Done => f.debug_struct("ChanAddr::Done").finish(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ChanAddr<D>(Arc<StdMutex<ChanAddrInner<D>>>);
-
-impl<D> From<Chan<D, ()>> for ChanAddr<D> {
-    fn from(f: Chan<D, ()>) -> Self {
-        ChanAddr(Arc::new(StdMutex::new(ChanAddrInner::Both(f))))
-    }
-}
-
-impl<D> ListenAddress for ChanAddr<D>
-where
-    D: Send + Sync + 'static,
-{
-    type Listener = Chan<D, Srv>;
-    fn listener(&self) -> Self::Listener {
-        let mut this = self.0.lock().unwrap();
-        let c = std::mem::replace(this.deref_mut(), ChanAddrInner::Done);
-        let (new, ret) = match c {
-            ChanAddrInner::Both(c) => {
-                let (srv, cln) = c.split();
-                (srv, ChanAddrInner::SrvTaken(cln))
-            }
-            ChanAddrInner::ClnTaken(c) => (c, ChanAddrInner::Done),
-            _ => unreachable!(),
-        };
-
-        let _ = std::mem::replace(this.deref_mut(), ret);
-        new
-    }
-}
-
-impl<D> ConnectAddress for ChanAddr<D>
-where
-    D: Send + Sync + 'static,
-{
-    type Connector = Chan<D, Cln>;
-    fn connector(&self) -> Self::Connector {
-        let mut this = self.0.lock().unwrap();
-        let c = std::mem::replace(this.deref_mut(), ChanAddrInner::Done);
-        let (new, ret) = match c {
-            ChanAddrInner::Both(c) => {
-                let (srv, cln) = c.split();
-                (cln, ChanAddrInner::ClnTaken(srv))
-            }
-            ChanAddrInner::SrvTaken(c) => (c, ChanAddrInner::Done),
-            _ => unreachable!(),
-        };
-
-        let _ = std::mem::replace(this.deref_mut(), ret);
-        new
-    }
-}
-
 impl<D> ChunnelListener for Chan<D, Srv>
 where
     D: Send + Sync + 'static,
 {
-    type Addr = ChanAddr<D>;
+    type Addr = ();
     type Connection = ChanChunnel<D>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
@@ -276,7 +201,7 @@ impl<D> ChunnelConnector for Chan<D, Cln>
 where
     D: Send + Sync + 'static,
 {
-    type Addr = ChanAddr<D>;
+    type Addr = ();
     type Connection = ChanChunnel<D>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -363,10 +288,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::{Chan, ChanAddr};
-    use crate::{
-        ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress, ListenAddress,
-    };
+    use super::Chan;
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
+    use color_eyre::eyre::Report;
     use futures_util::stream::StreamExt;
     use tracing_futures::Instrument;
 
@@ -382,14 +306,12 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let (mut srv, mut cln) = Chan::default().split();
 
                 let (s, r) = tokio::sync::oneshot::channel();
 
-                let mut srv = a.listener();
-                let addr = a.clone();
                 tokio::spawn(async move {
-                    let mut st = srv.listen(addr).await.unwrap();
+                    let mut st = srv.listen(()).await.unwrap();
                     s.send(()).unwrap();
                     let cn = st.next().await.unwrap().unwrap();
                     let d = cn.recv().await.unwrap();
@@ -397,8 +319,7 @@ mod test {
                 });
 
                 r.await?;
-                let cn = a.connector().connect(a).await?;
-
+                let cn = cln.connect(()).await?;
                 cn.send(((), vec![1u8; 8])).await?;
                 let (_, d) = cn.recv().await?;
 

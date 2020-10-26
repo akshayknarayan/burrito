@@ -626,10 +626,10 @@ where
 #[cfg(test)]
 mod test {
     use super::{Reliability, ReliabilityChunnel};
-    use crate::chan_transport::{Chan, ChanAddr};
+    use crate::chan_transport::Chan;
     use crate::{
         bincode::SerializeChunnel, util::ProjectLeft, ChunnelConnection, ChunnelConnector,
-        ChunnelListener, Client, ConnectAddress, CxList, ListenAddress, Serve,
+        ChunnelListener, Client, CxList, Serve,
     };
     use futures_util::StreamExt;
     use tracing::{debug, info};
@@ -680,18 +680,16 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let (mut srv, mut cln) = Chan::default().split();
                 let mut l = CxList::from(ReliabilityChunnel::default())
                     .wrap(SerializeChunnel::default())
                     .wrap(ProjectLeft::from(()));
 
-                let mut srv = a.listener();
-                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let rcv_st = srv.listen(()).await.unwrap();
                 let mut rcv_st = l.serve(rcv_st).await.unwrap();
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut cln = a.connector();
-                let cln = cln.connect(a).await.unwrap();
+                let cln = cln.connect(()).await.unwrap();
                 let snd = l.connect_wrap(cln).await.unwrap();
 
                 do_transmit(snd, rcv, msgs).await;
@@ -727,18 +725,16 @@ mod test {
                     }
                 });
 
-                let a: ChanAddr<((), Vec<u8>)> = t.into();
+                let (mut srv, mut cln) = t.split();
                 let mut l = CxList::from(ReliabilityChunnel::default())
                     .wrap(SerializeChunnel::default())
                     .wrap(ProjectLeft::from(()));
 
-                let mut srv = a.listener();
-                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let rcv_st = srv.listen(()).await.unwrap();
                 let mut rcv_st = l.serve(rcv_st).await.unwrap();
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut cln = a.connector();
-                let cln = cln.connect(a).await.unwrap();
+                let cln = cln.connect(()).await.unwrap();
                 let snd = l.connect_wrap(cln).await.unwrap();
 
                 do_transmit(snd, rcv, msgs).await;
@@ -804,19 +800,17 @@ mod test {
                     }
                 });
 
-                let a: ChanAddr<((), Vec<u8>)> = t.into();
+                let (mut srv, mut cln) = t.split();
                 let mut stack = CxList::from(TaggerChunnel)
                     .wrap(ReliabilityChunnel::default())
                     .wrap(SerializeChunnel::default())
                     .wrap(ProjectLeft::from(()));
 
-                let mut srv = a.listener();
-                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let rcv_st = srv.listen(()).await.unwrap();
                 let mut rcv_st = stack.serve(rcv_st).await.unwrap();
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut cln = a.connector();
-                let cln = cln.connect(a).await.unwrap();
+                let cln = cln.connect(()).await.unwrap();
                 let snd = stack.connect_wrap(cln).await.unwrap();
 
                 do_transmit_tagged(snd, rcv, msgs).await;

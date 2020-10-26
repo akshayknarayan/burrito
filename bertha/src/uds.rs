@@ -2,17 +2,12 @@
 
 // TODO UnixDatagram has a split() impl merged, but not released yet.
 
-use crate::{
-    util::AddrWrap, ChunnelConnection, ChunnelConnector, ChunnelListener, ConnectAddress,
-    ListenAddress,
-};
+use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report};
 use futures_util::stream::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
-use std::os::unix::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,15 +21,14 @@ use tracing::trace;
 pub struct UnixSkChunnel;
 
 impl ChunnelListener for UnixSkChunnel {
-    type Addr = UnixSocketAddr;
-    type Connection = UnixSk<UnixSocketAddr>;
+    type Addr = PathBuf;
+    type Connection = UnixSk;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        let a: PathBuf = a.into();
         Box::pin(async move {
             let recv = std::os::unix::net::UnixDatagram::bind(a)?;
             let send = recv.try_clone()?;
@@ -51,7 +45,7 @@ impl ChunnelListener for UnixSkChunnel {
 
 impl ChunnelConnector for UnixSkChunnel {
     type Addr = ();
-    type Connection = UnixSk<UnixSocketAddr>;
+    type Connection = UnixSk;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Report;
@@ -75,78 +69,23 @@ impl ChunnelConnector for UnixSkChunnel {
     }
 }
 
-/// Newtype SocketAddr to avoid hogging the impl of `ConnectAddress`/`ListenAddress` on that type.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UnixSocketAddr(pub PathBuf);
-
-impl std::fmt::Display for UnixSocketAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl From<SocketAddr> for UnixSocketAddr {
-    fn from(f: SocketAddr) -> Self {
-        f.as_pathname().unwrap().to_path_buf().into()
-    }
-}
-
-impl From<PathBuf> for UnixSocketAddr {
-    fn from(f: PathBuf) -> Self {
-        Self(f)
-    }
-}
-
-impl Into<PathBuf> for UnixSocketAddr {
-    fn into(self) -> PathBuf {
-        self.0
-    }
-}
-
-impl std::ops::Deref for UnixSocketAddr {
-    type Target = PathBuf;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl ConnectAddress for UnixSocketAddr {
-    type Connector = AddrWrap<UnixSocketAddr, UnixSkChunnel>;
-    fn connector(&self) -> Self::Connector {
-        AddrWrap::from(UnixSkChunnel::default())
-    }
-}
-
-impl ListenAddress for UnixSocketAddr {
-    type Listener = UnixSkChunnel;
-    fn listener(&self) -> Self::Listener {
-        UnixSkChunnel::default()
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct UnixSk<A> {
+pub struct UnixSk {
     send: Arc<Mutex<tokio::net::UnixDatagram>>,
     recv: Arc<Mutex<tokio::net::UnixDatagram>>,
-    _phantom: std::marker::PhantomData<A>,
 }
 
-impl<A> UnixSk<A> {
+impl UnixSk {
     fn new(send: tokio::net::UnixDatagram, recv: tokio::net::UnixDatagram) -> Self {
         Self {
             send: Arc::new(Mutex::new(send)),
             recv: Arc::new(Mutex::new(recv)),
-            _phantom: Default::default(),
         }
     }
 }
 
-impl<A> ChunnelConnection for UnixSk<A>
-where
-    A: Into<PathBuf> + From<SocketAddr> + From<PathBuf> + Send + 'static,
-{
-    type Data = (A, Vec<u8>);
+impl ChunnelConnection for UnixSk {
+    type Data = (PathBuf, Vec<u8>);
 
     fn send(
         &self,
@@ -155,7 +94,6 @@ where
         let sk = Arc::clone(&self.send);
         Box::pin(async move {
             let (addr, data) = data;
-            let addr = addr.into();
             trace!(to = ?&addr, "send");
             sk.lock().await.send_to(&data, &addr).await?;
             Ok(())
@@ -170,7 +108,12 @@ where
             let (len, from) = sk.lock().await.recv_from(&mut buf).await?;
             trace!(from = ?&from, "recv");
             let data = buf[0..len].to_vec();
-            Ok((from.into(), data))
+            Ok((
+                from.as_pathname()
+                    .ok_or_else(|| eyre!("received from unnamed socket"))?
+                    .to_path_buf(),
+                data,
+            ))
         })
     }
 }
@@ -179,7 +122,7 @@ where
 pub struct UnixReqChunnel;
 
 impl ChunnelListener for UnixReqChunnel {
-    type Addr = UnixReqAddr;
+    type Addr = PathBuf;
     type Connection = UnixConn;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
@@ -187,7 +130,6 @@ impl ChunnelListener for UnixReqChunnel {
     type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        let a = a.0;
         Box::pin(async move {
             let recv = std::os::unix::net::UnixDatagram::bind(a)?;
             let send = recv.try_clone()?;
@@ -216,8 +158,10 @@ impl ChunnelListener for UnixReqChunnel {
                             Ok((len, from)) = r.recv_from(&mut buf) => {
                                 trace!(from = ?&from, "received pkt");
                                 let data = buf[0..len].to_vec();
-                                let from: UnixSocketAddr = from.into();
-                                let from: PathBuf = from.into();
+
+                                let from = from.as_pathname()
+                                    .ok_or_else(|| eyre!("received from unnamed socket"))?
+                                    .to_path_buf();
 
                                 let mut done = None;
                                 let c = map.entry(from.clone()).or_insert_with(|| {
@@ -246,36 +190,6 @@ impl ChunnelListener for UnixReqChunnel {
                 },
             )) as _)
         })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct UnixReqAddr(pub PathBuf);
-
-impl From<PathBuf> for UnixReqAddr {
-    fn from(f: PathBuf) -> Self {
-        Self(f)
-    }
-}
-
-impl Into<PathBuf> for UnixReqAddr {
-    fn into(self) -> PathBuf {
-        self.0
-    }
-}
-
-impl std::ops::Deref for UnixReqAddr {
-    type Target = PathBuf;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl ListenAddress for UnixReqAddr {
-    type Listener = UnixReqChunnel;
-    fn listener(&self) -> Self::Listener {
-        UnixReqChunnel
     }
 }
 
@@ -313,8 +227,8 @@ impl ChunnelConnection for UnixConn {
 
 #[cfg(test)]
 mod test {
-    use super::{UnixReqAddr, UnixSkChunnel};
-    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, ListenAddress};
+    use super::{UnixReqChunnel, UnixSkChunnel};
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::{StreamExt, TryStreamExt};
     use std::path::PathBuf;
     use tracing_futures::Instrument;
@@ -386,10 +300,9 @@ mod test {
         rt.block_on(
             async move {
                 let addr = PathBuf::from(path);
-                let laddr = UnixReqAddr::from(addr.clone());
-
+                let saddr = addr.clone();
                 tokio::spawn(async move {
-                    let srv = laddr.listener().listen(laddr).await.unwrap();
+                    let srv = UnixReqChunnel::default().listen(saddr).await.unwrap();
                     srv.try_for_each_concurrent(None, |cn| async move {
                         let data = cn.recv().await?;
                         cn.send(data).await?;

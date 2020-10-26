@@ -214,10 +214,10 @@ where
 #[cfg(test)]
 mod test {
     use super::SerializeChunnel;
-    use crate::chan_transport::{Chan, ChanAddr};
+    use crate::chan_transport::Chan;
     use crate::{
-        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
-        ConnectAddress, CxList, ListenAddress, Serve,
+        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList,
+        Serve,
     };
     use futures_util::StreamExt;
     use tracing::trace;
@@ -256,18 +256,16 @@ mod test {
             .unwrap();
         rt.block_on(
             async move {
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let (mut srv, mut cln) = Chan::default().split();
 
-                let mut srv = a.listener();
-                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let rcv_st = srv.listen(()).await.unwrap();
                 let mut stack =
                     CxList::from(SerializeChunnel::default()).wrap(ProjectLeft::from(()));
 
                 let mut rcv_st = stack.serve(rcv_st).await.unwrap();
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut cln = a.connector();
-                let cln = cln.connect(a).await.unwrap();
+                let cln = cln.connect(()).await.unwrap();
                 let snd = stack.connect_wrap(cln).await.unwrap();
 
                 send_thingy(snd, rcv, 42u32).await;
@@ -295,17 +293,15 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let (mut srv, mut cln) = Chan::default().split();
                 let mut stack =
                     CxList::from(SerializeChunnel::default()).wrap(ProjectLeft::from(()));
 
-                let mut srv = a.listener();
-                let rcv_st = srv.listen(a.clone()).await.unwrap();
+                let rcv_st = srv.listen(()).await.unwrap();
                 let mut rcv_st = stack.serve(rcv_st).await.unwrap();
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut cln = a.connector();
-                let cln = cln.connect(a).await.unwrap();
+                let cln = cln.connect(()).await.unwrap();
                 let snd = stack.connect_wrap(cln).await.unwrap();
 
                 send_thingy(

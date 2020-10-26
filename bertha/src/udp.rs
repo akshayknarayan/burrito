@@ -11,7 +11,7 @@
 //! further `recv()`s will only be from the same address, and further sends will send to the same
 //! address as the original recv_from.
 
-use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, ListenAddress};
+use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
     future::FutureExt,
@@ -126,7 +126,7 @@ where
 pub struct UdpReqChunnel;
 
 impl ChunnelListener for UdpReqChunnel {
-    type Addr = UdpReqAddr;
+    type Addr = SocketAddr;
     type Connection = UdpConn;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
@@ -134,7 +134,6 @@ impl ChunnelListener for UdpReqChunnel {
     type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        let a = a.0;
         Box::pin(async move {
             let sk = tokio::net::UdpSocket::bind(a)
                 .await
@@ -194,36 +193,6 @@ impl ChunnelListener for UdpReqChunnel {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct UdpReqAddr(pub SocketAddr);
-
-impl From<SocketAddr> for UdpReqAddr {
-    fn from(f: SocketAddr) -> Self {
-        Self(f)
-    }
-}
-
-impl Into<SocketAddr> for UdpReqAddr {
-    fn into(self) -> SocketAddr {
-        self.0
-    }
-}
-
-impl std::ops::Deref for UdpReqAddr {
-    type Target = SocketAddr;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl ListenAddress for UdpReqAddr {
-    type Listener = UdpReqChunnel;
-    fn listener(&self) -> Self::Listener {
-        UdpReqChunnel
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
@@ -258,8 +227,8 @@ impl ChunnelConnection for UdpConn {
 
 #[cfg(test)]
 mod test {
-    use super::{UdpReqAddr, UdpSkChunnel};
-    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, ListenAddress};
+    use super::{UdpReqChunnel, UdpSkChunnel};
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::{StreamExt, TryStreamExt};
     use std::net::{SocketAddr, ToSocketAddrs};
     use tracing_futures::Instrument;
@@ -324,10 +293,9 @@ mod test {
         rt.block_on(
             async move {
                 let addr = "127.0.0.1:35134".to_socket_addrs().unwrap().next().unwrap();
-                let laddr = UdpReqAddr::from(addr);
 
                 tokio::spawn(async move {
-                    let srv = laddr.listener().listen(laddr).await.unwrap();
+                    let srv = UdpReqChunnel::default().listen(addr).await.unwrap();
                     srv.try_for_each_concurrent(None, |cn| async move {
                         let data = cn.recv().await?;
                         cn.send(data).await?;

@@ -154,11 +154,6 @@ pub trait ChunnelListener {
     fn listen(&mut self, a: Self::Addr) -> Self::Future;
 }
 
-pub trait ListenAddress: Sized {
-    type Listener: ChunnelListener<Addr = Self>;
-    fn listener(&self) -> Self::Listener;
-}
-
 /// `ChunnelConnector`s connect to a single remote Chunnel endpoint and return one connection.
 pub trait ChunnelConnector {
     type Future: Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static;
@@ -167,12 +162,6 @@ pub trait ChunnelConnector {
     type Error: Send + Sync + 'static;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future;
-}
-
-/// Relates an Address type with a way to connect to or listen on it with the given data semantics.
-pub trait ConnectAddress: Sized {
-    type Connector: ChunnelConnector<Addr = Self>;
-    fn connector(&self) -> Self::Connector;
 }
 
 /// A connection with the semantics of the Chunnel type's functionality.
@@ -230,10 +219,9 @@ pub enum Endedness {
 
 #[cfg(test)]
 mod test {
-    use crate::chan_transport::{Chan, ChanAddr};
+    use crate::chan_transport::Chan;
     use crate::{
-        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, ConnectAddress, CxList,
-        CxNil, ListenAddress, Serve,
+        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList, CxNil, Serve,
     };
     use color_eyre::Report;
     use futures_util::StreamExt;
@@ -252,17 +240,16 @@ mod test {
 
         rt.block_on(
             async move {
-                let a: ChanAddr<((), Vec<u8>)> = Chan::default().into();
+                let (mut srv, mut cln) = Chan::default().split();
+
                 let stack = CxList::from(CxNil);
                 let mut stack = stack.wrap(CxNil);
 
-                let mut srv = a.listener();
-                let rcv_st = srv.listen(a.clone()).await?;
+                let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut cln = a.connector();
-                let cln = cln.connect(a).await?;
+                let cln = cln.connect(()).await?;
                 let snd = stack.connect_wrap(cln).await?;
 
                 snd.send(((), vec![1u8; 1])).await?;
