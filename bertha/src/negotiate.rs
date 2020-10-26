@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, debug_span, trace};
+use tracing::{debug, debug_span, trace, warn};
 use tracing_futures::Instrument;
 
 /// A type that can list out the `universe()` of possible values it can have.
@@ -515,7 +515,14 @@ where
                                 .lock()
                                 .unwrap()
                                 .insert(addr, picked.clone());
-                            return Ok(None);
+
+                            // need to loop on this connection, processing nonces
+                            process_nonces_connection(
+                                cn,
+                                Arc::clone(&pending_negotiated_connections),
+                            )
+                            .await?;
+                            unreachable!();
                         }
                         ClientOffer(client_offers) => {
                             debug!(client_offers = ?&client_offers, from = ?&a, "received offer");
@@ -568,6 +575,45 @@ where
                 }
             })
             .try_filter_map(|v| futures_util::future::ready(Ok(v))))
+    }
+}
+
+async fn process_nonces_connection<A>(
+    cn: impl ChunnelConnection<Data = (A, Vec<u8>)>,
+    pending_negotiated_connections: Arc<Mutex<HashMap<A, Vec<Offer>>>>,
+) -> Result<(), Report>
+where
+    A: Serialize
+        + DeserializeOwned
+        + Eq
+        + std::hash::Hash
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+{
+    loop {
+        let (a, buf): (_, Vec<u8>) = cn.recv().await?;
+        let negotiate_msg: NegotiateMsg =
+            bincode::deserialize(&buf).wrap_err("offer deserialize failed")?;
+
+        use NegotiateMsg::*;
+        match negotiate_msg {
+            ServerNonce { addr, picked } => {
+                // send ack
+                let ack = bincode::serialize(&NegotiateMsg::ServerNonceAck).unwrap();
+                cn.send((a, ack)).await?;
+                debug!("sent nonce ack");
+
+                let addr: A = bincode::deserialize(&addr).wrap_err("mismatched addr types")?;
+                debug!(client_addr = ?&addr, nonce = ?&picked, "got nonce");
+                pending_negotiated_connections
+                    .lock()
+                    .unwrap()
+                    .insert(addr, picked.clone());
+            }
+            x => warn!(msg = ?x, "expected server nonce, got different message"),
+        }
     }
 }
 

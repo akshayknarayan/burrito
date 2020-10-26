@@ -165,6 +165,7 @@ impl ChunnelListener for UdpReqChunnel {
 
                                 let mut done = None;
                                 let c = map.entry(from).or_insert_with(|| {
+                                    trace!(from = ?&from, "new connection");
                                     let (sch, rch) = mpsc::channel(100);
                                     done = Some(UdpConn {
                                         resp_addr: from,
