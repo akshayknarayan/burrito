@@ -14,9 +14,33 @@ use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
 
 /// Connect to a Kv service.
+#[derive(Debug)]
 pub struct KvClient<C>(Arc<C>);
 
+impl<C> Clone for KvClient<C> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
 impl KvClient<()> {
+    pub async fn new_basicclient(
+        canonical_addr: SocketAddr,
+    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + 'static>, Report> {
+        debug!("make client");
+        let neg_stack = CxList::from(ProjectLeft::from(canonical_addr.clone()))
+            .wrap(OrderedChunnelProj::default())
+            .wrap(ReliabilityProjChunnel::default())
+            .wrap(SerializeChunnelProject::default());
+
+        let raw_cn = UdpSkChunnel::default().connect(()).await?;
+        debug!("negotiation");
+        let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
+            .instrument(debug_span!("client_negotiate"))
+            .await?;
+        Ok(Self::new_from_cn(cn))
+    }
+
     pub async fn new_shardclient(
         redis_addr: SocketAddr,
         canonical_addr: SocketAddr,
@@ -76,7 +100,7 @@ where
     C: ChunnelConnection<Data = Msg> + 'static,
 {
     fn do_req_fut(
-        &mut self,
+        &self,
         req: Msg,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<String>, Report>>>> {
         let cn = Arc::clone(&self.0);
@@ -84,7 +108,7 @@ where
     }
 
     pub fn update_fut(
-        &mut self,
+        &self,
         key: String,
         val: String,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<String>, Report>>>> {
@@ -92,20 +116,20 @@ where
         self.do_req_fut(req)
     }
 
-    pub async fn update(&mut self, key: String, val: String) -> Result<Option<String>, Report> {
+    pub async fn update(&self, key: String, val: String) -> Result<Option<String>, Report> {
         let req = Msg::put_req(key, val);
         do_req(&self.0, req).await
     }
 
     pub fn get_fut(
-        &mut self,
+        &self,
         key: String,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<String>, Report>>>> {
         let req = Msg::get_req(key);
         self.do_req_fut(req)
     }
 
-    pub async fn get(&mut self, key: String) -> Result<Option<String>, Report> {
+    pub async fn get(&self, key: String) -> Result<Option<String>, Report> {
         let req = Msg::get_req(key);
         do_req(&self.0, req).await
     }

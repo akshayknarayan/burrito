@@ -49,7 +49,7 @@ mod tests {
                 r.await?;
 
                 info!("make client");
-                let mut client = KvClient::new_shardclient(redis_sk_addr, srv_addr.parse()?)
+                let client = KvClient::new_shardclient(redis_sk_addr, srv_addr.parse()?)
                     .instrument(info_span!("make kvclient"))
                     .await
                     .wrap_err("make KvClient")?;

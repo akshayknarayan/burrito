@@ -29,8 +29,8 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
-    let _guard = tracing_subscriber::fmt::try_init();
-    color_eyre::install().unwrap_or_else(|_| ());
+    let _guard = tracing_subscriber::fmt::init();
+    color_eyre::install()?;
 
     let opt = Opt::from_args();
     if opt.log {
