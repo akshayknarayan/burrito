@@ -5,7 +5,6 @@ members = [
     "burrito-discovery-ctl",
     "burrito-localname-ctl",
     "burrito-shard-ctl",
-    "burrito-flatbuf",
     "burrito-util",
     "kvstore",
     "kvstore-ycsb",
