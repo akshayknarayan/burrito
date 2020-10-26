@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, trace, warn};
+use tracing::{debug, debug_span, trace, warn};
 use tracing_futures::Instrument;
 
 pub const CONTROLLER_ADDRESS: &str = "shard-ctl";
@@ -183,32 +183,37 @@ where
             futures_util::future::join_all(addrs.into_iter().map(|shard| {
                 let buf = buf.clone();
                 let cn = Arc::clone(&cn);
+                let shard_addr = shard.clone();
                 async move {
-                if let Err(e) = cn.send((shard.clone().into(), buf.clone())).await {
-                    warn!(shard = ?&shard, err = ?e, "failed sending negotiation nonce to shard");
-                }
+                    if let Err(e) = cn.send((shard.clone().into(), buf.clone())).await {
+                        warn!(err = ?e, "failed sending negotiation nonce to shard");
+                    }
 
-                match cn.recv().await {
-                    Ok((a, buf)) => match bincode::deserialize(&buf) {
-                        Ok(bertha::negotiate::NegotiateMsg::ServerNonceAck) => {
-                            if a != shard.clone().into() {
-                                warn!(shard = ?&shard, "received from unexpected address");
+                    trace!("wait for shard response");
+                    match cn.recv().await {
+                        Ok((a, buf)) => match bincode::deserialize(&buf) {
+                            Ok(bertha::negotiate::NegotiateMsg::ServerNonceAck) => {
+                                if a != shard.clone().into() {
+                                    warn!("received from unexpected address");
+                                }
+
+                                trace!("got nonce ack");
                             }
-
-                            debug!(shard = ?&shard, "got nonce ack");
-                        }
-                        Ok(m) => {
-                            warn!(shard = ?&shard, msg = ?m, "got unexpected response to nonce");
-                        }
+                            Ok(m) => {
+                                warn!(msg = ?m, "got unexpected response to nonce");
+                            }
+                            Err(e) => {
+                                warn!(err = ?e, "failed deserializing nonce ack");
+                            }
+                        },
                         Err(e) => {
-                            warn!(shard = ?&shard, err = ?e, "failed deserializing nonce ack");
+                            warn!(err = ?e, "failed waiting for nonce ack");
                         }
-                    },
-                    Err(e) => {
-                        warn!(shard = ?&shard, err = ?e, "failed waiting for nonce ack");
                     }
                 }
-            }})).await;
+                .instrument(debug_span!("shard-send-nonce", shard = ?&shard_addr))
+            }))
+            .await;
         })
     }
 }
@@ -302,7 +307,7 @@ where
                     })
                 })) as _)
             }
-            .instrument(tracing::debug_span!("serve", addr = ?&a1.clone())),
+            .instrument(debug_span!("serve", addr = ?&a1.clone())),
         )
     }
 }
@@ -574,7 +579,7 @@ where
                     (hash as usize % num_shards) + 1
                 }))
             }
-            .instrument(tracing::debug_span!("ClientShardChunnelClient::connect")),
+            .instrument(debug_span!("ClientShardChunnelClient::connect")),
         )
     }
 }
@@ -659,7 +664,7 @@ mod test {
     use futures_util::TryStreamExt;
     use serde::{Deserialize, Serialize};
     use std::net::SocketAddr;
-    use tracing::{debug, info, trace, warn};
+    use tracing::{debug, debug_span, info, trace, warn};
     use tracing_futures::Instrument;
 
     #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -770,8 +775,7 @@ mod test {
                 info!(addr = ?&addr, "start shard");
 
                 tokio::spawn(
-                    start_shard(addr, internal_srv, s)
-                        .instrument(tracing::debug_span!("shard thread")),
+                    start_shard(addr, internal_srv, s).instrument(debug_span!("shard thread")),
                 );
 
                 let _ = r.await.wrap_err("shard thread crashed").unwrap();
@@ -834,7 +838,7 @@ mod test {
                 .instrument(tracing::info_span!("chan client"))
                 .await;
             }
-            .instrument(tracing::debug_span!("single_shard")),
+            .instrument(debug_span!("single_shard")),
         );
     }
 
@@ -966,7 +970,7 @@ mod test {
                 assert_eq!(m.key(), "aaaaaaaa");
                 assert_eq!(m.val(), "bbbbbbbb");
             }
-            .instrument(tracing::debug_span!("shard_test")),
+            .instrument(debug_span!("shard_test")),
         );
     }
 
@@ -1029,7 +1033,7 @@ mod test {
                 assert_eq!(m.key(), "aaaaaaaa");
                 assert_eq!(m.val(), "bbbbbbbb");
             }
-            .instrument(tracing::debug_span!("shard_test")),
+            .instrument(debug_span!("shard_test")),
         );
     }
 
@@ -1079,9 +1083,9 @@ mod test {
                     debug!("sent echo");
                     Ok(())
                 }
-                .instrument(tracing::debug_span!("shard_connection"))
+                .instrument(debug_span!("shard_connection"))
             })
-            .instrument(tracing::debug_span!("negotiate_server"))
+            .instrument(debug_span!("negotiate_server"))
             .await
         {
             Err(e) => {
@@ -1126,7 +1130,7 @@ mod test {
             let int_srv = internal_srv.clone();
             tokio::spawn(
                 start_shard_negotiate(a, int_srv, s)
-                    .instrument(tracing::debug_span!("shardsrv", addr = ?&a)),
+                    .instrument(debug_span!("shardsrv", addr = ?&a)),
             );
             rdy.push(r);
         }
@@ -1388,7 +1392,7 @@ mod test {
                 assert_eq!(m.key(), "aaaaaaaa");
                 assert_eq!(m.val(), "bbbbbbbb");
             }
-            .instrument(tracing::debug_span!("negotiate_bothsides")),
+            .instrument(debug_span!("negotiate_bothsides")),
         );
     }
 }
