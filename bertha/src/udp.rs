@@ -317,4 +317,46 @@ mod test {
             .instrument(tracing::info_span!("udp::rendezvous")),
         );
     }
+
+    #[test]
+    fn rendezvous_multiclient() {
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let addr = "127.0.0.1:35184".to_socket_addrs().unwrap().next().unwrap();
+
+                tokio::spawn(async move {
+                    let srv = UdpReqChunnel::default().listen(addr).await.unwrap();
+                    srv.try_for_each_concurrent(None, |cn| async move {
+                        let data = cn.recv().await?;
+                        cn.send(data).await?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                });
+
+                for i in 0..3 {
+                    let cli = UdpSkChunnel::default().connect(()).await.unwrap();
+                    cli.send((addr.into(), vec![1u8; 12])).await.unwrap();
+                    let (from, data) = cli.recv().await.unwrap();
+
+                    let from: SocketAddr = from.into();
+                    let addr: SocketAddr = addr.into();
+                    assert_eq!(from, addr);
+                    assert_eq!(data, vec![i as u8; 12]);
+                }
+            }
+            .instrument(tracing::info_span!("udp::rendezvous")),
+        );
+    }
 }
