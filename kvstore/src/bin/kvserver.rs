@@ -40,7 +40,7 @@ async fn main() -> Result<(), Report> {
     info!("KV Server");
     serve(opt.redis_addr, opt.ip_addr, opt.port, opt.num_shards, None)
         .instrument(info_span!("server"))
-        .await;
+        .await?;
 
     Ok(())
 }

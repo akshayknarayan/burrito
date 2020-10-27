@@ -12,12 +12,12 @@ use bertha::{
     ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers, Serve,
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, ShardServer, SimpleShardPolicy};
-use color_eyre::eyre::{eyre, WrapErr};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{future::poll_fn, stream::TryStreamExt};
 use std::net::{IpAddr, SocketAddr};
 use tower_buffer::Buffer;
 use tower_service::Service;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, debug_span, info, trace, warn};
 use tracing_futures::Instrument;
 
 /// Start and serve a `ShardCanonicalServer` and shards.
@@ -32,7 +32,7 @@ pub async fn serve(
     srv_port: u16,
     num_shards: u16,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
-) {
+) -> Result<(), Report> {
     let shard_addrs = (1..=num_shards)
         .map(|i| SocketAddr::new(srv_ip, srv_port + i))
         .collect();
@@ -54,9 +54,7 @@ pub async fn serve(
         info!(addr = ?&a, "start shard");
         let (s, r) = tokio::sync::oneshot::channel();
         let int_srv = internal_srv.clone();
-        tokio::spawn(
-            single_shard(a, int_srv, s).instrument(tracing::debug_span!("shardsrv", addr = ?&a)),
-        );
+        tokio::spawn(single_shard(a, int_srv, s).instrument(debug_span!("shardsrv", addr = ?&a)));
         rdy.push(r);
     }
 
@@ -74,7 +72,7 @@ pub async fn serve(
         &redis_addr,
     )
     .await
-    .unwrap();
+    .wrap_err("Create ShardCanonicalServer")?;
 
     // UdpConn: (SocketAddr, Vec<u8>)
     // ProjectLeft: (SocketAddr, Vec<u8>) -> Vec<u8>
@@ -90,11 +88,11 @@ pub async fn serve(
     let st = UdpReqChunnel::default()
         .listen(si.canonical_addr.into())
         .await
-        .unwrap();
+        .wrap_err("Listen on UdpReqChunnel")?;
     let st = bertha::negotiate::negotiate_server(external, st)
         .instrument(tracing::info_span!("negotiate_server"))
         .await
-        .unwrap();
+        .wrap_err("negotiate_server")?;
 
     if let Some(ready) = ready.into() {
         ready.send(()).unwrap_or_default();
@@ -103,13 +101,16 @@ pub async fn serve(
     st.try_for_each_concurrent(None, |r| {
         async move {
             loop {
-                r.recv().await?; // ShardCanonicalServerConnection is recv-only
+                r.recv()
+                    .instrument(debug_span!("shard-canonical-server-connection"))
+                    .await?; // ShardCanonicalServerConnection is recv-only
             }
         }
     })
     .instrument(tracing::info_span!("negotiate_server"))
     .await
-    .unwrap()
+    .wrap_err("processing requests")?;
+    unreachable!()
 }
 
 /// Start and serve a single shard.
@@ -167,9 +168,9 @@ async fn single_shard(
                     debug!("sent response");
                 }
             }
-            .instrument(tracing::debug_span!("shard_connection"))
+            .instrument(debug_span!("shard_connection"))
         })
-        .instrument(tracing::debug_span!("negotiate_server"))
+        .instrument(debug_span!("negotiate_server"))
         .await
     {
         Err(e) => {
