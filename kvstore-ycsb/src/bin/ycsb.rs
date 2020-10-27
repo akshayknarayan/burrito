@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 use structopt::StructOpt;
 use tracing::{debug, info, info_span, trace};
+use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
+use tracing_subscriber::prelude::*;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "kvclient")]
@@ -40,7 +42,11 @@ struct Opt {
 
 #[tokio::main(core_threads = 8, max_threads = 8)]
 async fn main() -> Result<(), Report> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(ErrorLayer::default())
+        .init();
+
     color_eyre::install()?;
     let opt = Opt::from_args();
 
