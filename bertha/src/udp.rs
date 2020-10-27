@@ -232,11 +232,17 @@ mod test {
     use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::{StreamExt, TryStreamExt};
     use std::net::{SocketAddr, ToSocketAddrs};
+    use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[test]
     fn echo() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
@@ -281,7 +287,11 @@ mod test {
 
     #[test]
     fn rendezvous() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
@@ -321,7 +331,11 @@ mod test {
 
     #[test]
     fn rendezvous_multiclient() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()

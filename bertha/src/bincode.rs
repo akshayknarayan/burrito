@@ -221,7 +221,9 @@ mod test {
     };
     use futures_util::StreamExt;
     use tracing::trace;
+    use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     async fn send_thingy<
         C: ChunnelConnection<Data = T>,
@@ -247,7 +249,11 @@ mod test {
 
     #[test]
     fn send_u32() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
@@ -276,7 +282,11 @@ mod test {
 
     #[test]
     fn send_struct() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()

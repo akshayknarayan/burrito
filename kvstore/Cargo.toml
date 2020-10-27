@@ -21,9 +21,10 @@ tower-service = "0.3"
 tokio = {version = "0.2", features = ["rt-core", "sync"]}
 tracing = "0.1"
 tracing-futures = "0.2"
+tracing-error = "0.1"
 structopt = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
-tracing-timing  = { version = "0.3", optional = true }
+tracing-timing  = { version = "0.4", optional = true }
 
 [dev-dependencies]
 test-util = { path = "../test-util" }

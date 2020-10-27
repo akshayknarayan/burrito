@@ -705,11 +705,17 @@ mod test {
     use color_eyre::Report;
     use futures_util::StreamExt;
     use tracing::{debug, info, trace};
+    use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[test]
     fn tag_only() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
@@ -787,7 +793,11 @@ mod test {
 
     #[test]
     fn no_drops() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
@@ -821,7 +831,11 @@ mod test {
 
     #[test]
     fn reorder() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()

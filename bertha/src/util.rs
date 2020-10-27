@@ -48,7 +48,7 @@ where
             if let Some((a, d)) = data {
                 Ok((a, Some(d)))
             } else {
-                Err(eyre!("Tried to recv None"))
+                Err(eyre!("Tried to recv more than once on a Once connection"))
             }
         })
     }

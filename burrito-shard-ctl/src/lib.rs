@@ -279,7 +279,7 @@ where
                     .await
                     .into_iter()
                     .collect::<Result<_, Error>>()
-                    .wrap_err("Could not connect to shards")?;
+                    .wrap_err("Could not connect to at least one shard")?;
 
                 trace!("connected to shards");
 
@@ -675,7 +675,9 @@ mod test {
     use serde::{Deserialize, Serialize};
     use std::net::SocketAddr;
     use tracing::{debug, debug_span, info, trace, warn};
+    use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
     struct Msg {
@@ -763,7 +765,11 @@ mod test {
 
     #[test]
     fn single_shard() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
@@ -930,7 +936,11 @@ mod test {
 
     #[test]
     fn shard_shardclient() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
@@ -986,7 +996,11 @@ mod test {
 
     #[test]
     fn shard_canonicalclient() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
@@ -1198,7 +1212,11 @@ mod test {
 
     #[test]
     fn shard_negotiate_clientonly() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
@@ -1259,7 +1277,11 @@ mod test {
     fn shard_negotiate_bothsides() {
         use super::ebpf::ShardCanonicalServerEbpf;
 
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.

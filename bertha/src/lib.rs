@@ -1,5 +1,8 @@
 //! Tools for working with Chunnels.
 
+// Pin<Box<...>> is necessary and not worth breaking up
+#![allow(clippy::type_complexity)]
+
 use color_eyre::eyre;
 use futures_util::stream::Stream;
 use std::future::Future;
@@ -224,11 +227,17 @@ mod test {
     };
     use color_eyre::Report;
     use futures_util::StreamExt;
+    use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[test]
     fn cxnil() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()

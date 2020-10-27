@@ -26,3 +26,4 @@ redis = { version = "0.15" }
 test-util = { path = "../test-util" }
 tokio = { version = "0.2", features = ["rt-core"] }
 tracing-subscriber = "0.2"
+tracing-error = "0.1"

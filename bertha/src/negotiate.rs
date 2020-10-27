@@ -759,7 +759,9 @@ mod test {
         stream::{Stream, StreamExt},
     };
     use tracing::{debug, debug_span, info, info_span};
+    use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[allow(non_upper_case_globals)]
     macro_rules! mock_serve_impl {
@@ -823,7 +825,11 @@ mod test {
 
     #[test]
     fn serve_no_select() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
@@ -944,7 +950,11 @@ mod test {
 
     #[test]
     fn get_offers() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let stack = CxList::from(ChunnelA)
@@ -962,7 +972,11 @@ mod test {
 
     #[test]
     fn serve_select() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
@@ -1041,7 +1055,11 @@ mod test {
 
     #[test]
     fn client_select() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
@@ -1104,7 +1122,11 @@ mod test {
 
     #[test]
     fn both_select() {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
@@ -1168,7 +1190,11 @@ mod test {
         use futures_util::TryStreamExt;
         use std::net::ToSocketAddrs;
 
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
