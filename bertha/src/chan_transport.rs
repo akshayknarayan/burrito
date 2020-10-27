@@ -1,22 +1,24 @@
 //! Channel-based Chunnel which acts as a transport.
 
-use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Once};
+use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report};
 use futures_util::stream::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
 
+#[derive(Clone, Debug, Copy, Default)]
 pub struct Srv;
+#[derive(Clone, Debug, Copy, Default)]
 pub struct Cln;
 
 /// Channel connector where server registers on listen(), and client grabs client on connect().
 pub struct RendezvousChannel<Addr, Data, Side> {
     channel_size: usize,
-    map: Arc<Mutex<HashMap<Addr, ChanChunnel<(Addr, Data)>>>>,
+    map: Arc<StdMutex<HashMap<Addr, mpsc::Sender<ChanChunnel<(Addr, Data)>>>>>,
     side: std::marker::PhantomData<Side>,
 }
 
@@ -61,7 +63,7 @@ where
     D: Send + Sync + 'static,
 {
     type Addr = A;
-    type Connection = Once<ChanChunnel<(A, D)>, D, A>;
+    type Connection = ChanChunnel<(A, D)>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -69,21 +71,12 @@ where
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         let channel_size = self.channel_size;
-        let (s, r) = mpsc::channel(channel_size);
-        let (s1, r1) = mpsc::channel::<(A, D)>(channel_size);
         let m = Arc::clone(&self.map);
         Box::pin(async move {
             debug!(addr = ?&a, "RendezvousChannel listening");
-            m.lock()
-                .await
-                .insert(a, ChanChunnel::new(s, r1, Arc::new(|x| x)));
-            // `r.map` maps over the messages in the receive channel stream.
-            Ok(Box::pin(r.map(move |d: (A, D)| {
-                // `Once` will not call recv() on the inner C, so pass a dummy receiver.
-                let (_, r2) = mpsc::channel(1);
-                let resp_chunnel = ChanChunnel::<(A, D)>::new(s1.clone(), r2, Arc::new(|x| x));
-                Ok(Once::new(Arc::new(resp_chunnel), d))
-            })) as _)
+            let (s, r) = mpsc::channel(channel_size);
+            m.lock().expect("Lock RendezvousChannel map").insert(a, s);
+            Ok(Box::pin(r.map(Ok)) as _)
         })
     }
 }
@@ -100,18 +93,26 @@ where
     type Error = Report;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
-        let addr = a.clone();
-        let m = Arc::clone(&self.map);
-        Box::pin(async move {
-            let s = m.lock().await.remove(&addr);
-            if let Some(s) = s {
-                Ok(s)
-            } else {
-                let mp = m.lock().await;
-                let keys: Vec<_> = mp.keys().collect();
-                Err(eyre!("Address not found: {:?}: not in {:?}", addr, keys))
-            }
-        })
+        debug!(addr = ?&a, "RendezvousChannel connecting");
+        let mut m_guard = self.map.lock().expect("Lock RendezvousChannel map");
+        if let Some(notify_listener) = m_guard.get_mut(&a) {
+            let mut notify_listener = notify_listener.clone();
+            let channel_size = self.channel_size;
+            Box::pin(async move {
+                let (s1, r1) = mpsc::channel(channel_size);
+                let (s2, r2) = mpsc::channel(channel_size);
+                let connect_ch = ChanChunnel::new(s1, r2, Arc::new(|x| x));
+                let listen_ch = ChanChunnel::new(s2, r1, Arc::new(|x| x));
+                notify_listener
+                    .send(listen_ch)
+                    .await
+                    .map_err(|e| eyre!("Could not send connection to listener: {}", e))?;
+                Ok(connect_ch)
+            })
+        } else {
+            let keys: Vec<_> = m_guard.keys().map(Clone::clone).collect();
+            Box::pin(async move { Err(eyre!("Address not found: {:?}: not in {:?}", a, keys)) })
+        }
     }
 }
 
@@ -288,15 +289,16 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::Chan;
+    use super::{Chan, RendezvousChannel};
     use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use color_eyre::eyre::Report;
-    use futures_util::stream::StreamExt;
+    use futures_util::stream::{StreamExt, TryStreamExt};
     use tracing_futures::Instrument;
 
     #[test]
     fn chan() {
         let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
@@ -327,6 +329,95 @@ mod test {
                 Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("chan_test")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rendezvous() {
+        let _guard = tracing_subscriber::fmt::try_init();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let (mut srv, cln) = RendezvousChannel::new(100).split();
+                let (s, r) = tokio::sync::oneshot::channel();
+                let address = String::from("P Sherman 42 Wallaby Way Sydney");
+
+                let laddr = address.clone();
+                tokio::spawn(async move {
+                    let st = srv.listen(laddr).await.expect("listen");
+                    s.send(()).unwrap();
+                    let mut i = 0;
+                    st.try_for_each_concurrent(None, |cn| {
+                        let idx = i;
+                        i += 1;
+                        async move {
+                            debug!("new connection");
+                            loop {
+                                match cn.recv().await {
+                                    Ok(d) => {
+                                        cn.send(d).await.expect("server send");
+                                        debug!("echoed");
+                                    }
+                                    Err(e) => {
+                                        trace!(err = ?e, "error in recv");
+                                        break;
+                                    }
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        .instrument(tracing::info_span!("conn", idx))
+                    })
+                    .instrument(tracing::info_span!("server"))
+                    .await
+                    .unwrap();
+                });
+
+                info!("client 1");
+
+                r.await?;
+                let mut cln1 = cln.clone();
+                let caddr1 = address.clone();
+                async move {
+                    let cn = cln1.connect(caddr1.clone()).await?;
+
+                    cn.send((caddr1.clone(), vec![1u8; 8])).await?;
+                    let (_, d) = cn.recv().await?;
+                    assert_eq!(d, vec![1u8; 8]);
+                    Ok::<_, Report>(())
+                }
+                .instrument(tracing::info_span!("client 1"))
+                .await?;
+
+                info!("client 2");
+
+                let mut cln2 = cln.clone();
+                let caddr2 = address.clone();
+                async move {
+                    let cn = cln2.connect(caddr2.clone()).await?;
+                    info!("connected");
+
+                    cn.send((caddr2.clone(), vec![2u8; 8]))
+                        .await
+                        .wrap_err("client send")?;
+                    let (_, d) = cn.recv().await.wrap_err("client recv")?;
+                    assert_eq!(d, vec![2u8; 8]);
+                    Ok::<_, Report>(())
+                }
+                .instrument(tracing::info_span!("client 2"))
+                .await?;
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::info_span!("chan::rendezvous")),
         )
         .unwrap();
     }

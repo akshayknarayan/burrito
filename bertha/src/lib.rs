@@ -18,7 +18,6 @@ pub mod util;
 
 pub use either::*;
 pub use negotiate::*;
-use util::*;
 
 /// `Serve`s transform the semantics of the data flowing through them in some way.
 pub trait Serve<I> {
