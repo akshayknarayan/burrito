@@ -62,10 +62,12 @@ where
         let sh_info_blob: Vec<u8> = con.get::<_, Vec<u8>>(&a).await?;
         if sh_info_blob.is_empty() {
             trace!(key = ?&a, "got empty response");
-            if start.elapsed() > tokio::time::Duration::from_secs(1) {
+            if start.elapsed() > tokio::time::Duration::from_secs(5) {
                 debug!(key = ?&a, "giving up on finding key");
                 return Ok(None);
             }
+
+            tokio::time::delay_for(tokio::time::Duration::from_millis(50)).await;
             continue;
         }
 

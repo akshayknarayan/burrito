@@ -155,18 +155,21 @@ impl ChunnelListener for UdpReqChunnel {
                         // on .listen
                         tokio::select!(
                             Some((from, res)) = sends.next() => {
+                                trace!(from = ?&from, "channel send completed");
                                 if let Err(_) = res  {
                                     map.remove(&from);
                                 }
                             }
                             Ok((len, from)) = r.recv_from(&mut buf) => {
-                                trace!(from = ?&from, "received pkt");
                                 let data = buf[0..len].to_vec();
 
                                 let mut done = None;
-                                let c = map.entry(from).or_insert_with(|| {
+                                let c = map.entry(from).and_modify(|_| {
+                                    trace!(from = ?&from, pending_sends = sends.len(), "received pkt");
+                                })
+                                .or_insert_with(|| {
                                     trace!(from = ?&from, "new connection");
-                                    let (sch, rch) = mpsc::channel(100);
+                                    let (sch, rch) = mpsc::channel(1);
                                     done = Some(UdpConn {
                                         resp_addr: from,
                                         recv: Arc::new(Mutex::new(rch)),
@@ -221,6 +224,7 @@ impl ChunnelConnection for UdpConn {
         let r = Arc::clone(&self.recv);
         Box::pin(async move {
             let d = r.lock().await.recv().await;
+            trace!(from = ?&d, "got pkt from channel");
             d.ok_or_else(|| eyre!("Nothing more to receive"))
         }) as _
     }

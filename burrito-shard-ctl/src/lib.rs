@@ -1,3 +1,8 @@
+//! Sharding chunnel.
+
+// Pin<Box<...>> is necessary and not worth breaking up
+#![allow(clippy::type_complexity)]
+
 use bertha::{
     enumerate_enum, ChunnelConnection, ChunnelConnector, Client, Either, IpPort, Negotiate, Serve,
 };
@@ -666,7 +671,7 @@ mod test {
         reliable::{ReliabilityChunnel, ReliabilityProjChunnel},
         tagger::{TaggerChunnel, TaggerProjChunnel},
         udp::{UdpReqChunnel, UdpSkChunnel},
-        util::{AddrWrap, OptionUnwrap, ProjectLeft},
+        util::{AddrWrap, ProjectLeft},
         ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList, Serve,
     };
     use color_eyre::eyre;
@@ -727,8 +732,7 @@ mod test {
         s: tokio::sync::oneshot::Sender<Vec<Vec<bertha::negotiate::Offer>>>,
     ) {
         let internal_st = internal_srv.listen(addr).await.unwrap();
-        let internal_st = CxList::from(OptionUnwrap)
-            .wrap(ProjectLeft::from(addr))
+        let internal_st = CxList::from(ProjectLeft::from(addr))
             .serve(internal_st)
             .await
             .unwrap();
@@ -746,20 +750,18 @@ mod test {
         use bertha::GetOffers;
         s.send(stack.offers()).unwrap();
 
-        match st
-            .try_for_each_concurrent(None, |once| async move {
-                let msg = once.recv().await.wrap_err(eyre!("receive message error"))?;
-                // just echo.
-                once.send(msg).await.wrap_err(eyre!("send response err"))?;
-                Ok(())
+        if let Err(e) = st
+            .try_for_each_concurrent(None, |cn| async move {
+                loop {
+                    let msg = cn.recv().await.wrap_err(eyre!("receive message error"))?;
+                    // just echo.
+                    cn.send(msg).await.wrap_err(eyre!("send response err"))?;
+                }
             })
             .await
         {
-            Err(e) => {
-                warn!(err = ?e, shard_addr = ?addr,  "Shard errorred");
-                panic!(e);
-            }
-            Ok(_) => (),
+            warn!(err = ?e, shard_addr = ?addr,  "Shard errorred");
+            panic!(e);
         }
     }
 
@@ -899,7 +901,7 @@ mod test {
             internal_cli,
             // use `Hole` connection type as the external connection to the shards, because we
             // don't want any messages to be sent, because this test doesn't use negotiation.
-            Hole((si.canonical_addr.clone(), Vec::<u8>::new())),
+            Hole((si.canonical_addr, Vec::<u8>::new())),
             offers.pop().unwrap(), // the stack used for the shard
             &redis_addr,
         )
@@ -1075,8 +1077,7 @@ mod test {
         //
         // TODO alternate: add serialization and do negotiation, but make it a mem::transmute version
         // since we know the underlying thing is a channel
-        let internal_st = CxList::from(OptionUnwrap)
-            .wrap(ProjectLeft::from(addr))
+        let internal_st = CxList::from(ProjectLeft::from(addr))
             .serve(internal_st)
             .await
             .unwrap();
@@ -1096,27 +1097,26 @@ mod test {
         use bertha::GetOffers;
         s.send(stack.offers()).unwrap();
 
-        match st
-            .try_for_each_concurrent(None, |once| {
+        if let Err(e) = st
+            .try_for_each_concurrent(None, |cn| {
+                debug!("hellooooooo");
                 async move {
                     debug!("new");
-                    let msg = once.recv().await.wrap_err(eyre!("receive message error"))?;
-                    debug!(msg = ?&msg, "got msg");
-                    // just echo.
-                    once.send(msg).await.wrap_err(eyre!("send response err"))?;
-                    debug!("sent echo");
-                    Ok(())
+                    loop {
+                        let msg = cn.recv().await.wrap_err(eyre!("receive message error"))?;
+                        debug!(msg = ?&msg, "got msg");
+                        // just echo.
+                        cn.send(msg).await.wrap_err(eyre!("send response err"))?;
+                        debug!("sent echo");
+                    }
                 }
                 .instrument(debug_span!("shard_connection"))
             })
             .instrument(debug_span!("negotiate_server"))
             .await
         {
-            Err(e) => {
-                warn!(shard_addr = ?addr, err = ?e, "Shard errorred");
-                panic!(e);
-            }
-            Ok(_) => (),
+            warn!(shard_addr = ?addr, err = ?e, "Shard errorred");
+            panic!(e);
         }
     }
 
@@ -1242,7 +1242,7 @@ mod test {
 
                 let neg_stack = CxList::from(bertha::negotiate::Select(
                     cl,
-                    ProjectLeft::from(canonical_addr.clone()),
+                    ProjectLeft::from(canonical_addr),
                 ))
                 .wrap(TaggerProjChunnel)
                 .wrap(ReliabilityProjChunnel::default())
@@ -1360,15 +1360,10 @@ mod test {
                     .wrap(ReliabilityProjChunnel::<_, Msg>::default())
                     .wrap(SerializeChunnelProject::<_, (u32, Option<Msg>)>::default());
                 info!(shard_info = ?&si, "start canonical server");
-                let a: UdpReqAddr = si.canonical_addr.into();
-                let raw_st: std::pin::Pin<
-                    Box<
-                        dyn futures_util::stream::Stream<
-                                Item = Result<bertha::udp::UdpConn, eyre::Report>,
-                            > + Send
-                            + 'static,
-                    >,
-                > = a.listener().listen(a).await.unwrap();
+                let raw_st = UdpReqChunnel::default()
+                    .listen(si.canonical_addr)
+                    .await
+                    .unwrap();
                 let st = bertha::negotiate::negotiate_server(external, raw_st)
                     .instrument(tracing::info_span!("negotiate_server"))
                     .await
