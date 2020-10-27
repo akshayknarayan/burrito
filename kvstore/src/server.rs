@@ -109,7 +109,7 @@ pub async fn serve(
     })
     .instrument(tracing::info_span!("negotiate_server"))
     .await
-    .wrap_err("processing requests")?;
+    .wrap_err("kvstore/server: Error while processing requests")?;
     unreachable!()
 }
 

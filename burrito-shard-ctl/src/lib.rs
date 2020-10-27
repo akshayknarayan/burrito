@@ -117,8 +117,12 @@ impl<A, S, C> ShardCanonicalServer<A, S, C> {
         redis_addr: &str,
     ) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)?;
-        let redis_listen_connection =
-            Arc::new(Mutex::new(redis_client.get_async_connection().await?));
+        let redis_listen_connection = Arc::new(Mutex::new(
+            redis_client
+                .get_async_connection()
+                .await
+                .wrap_err("Connecting to redis")?,
+        ));
 
         Ok(ShardCanonicalServer {
             addr,
@@ -263,7 +267,13 @@ where
                 // connect to shards
                 let conns: Vec<Arc<S::Connection>> =
                     futures_util::future::join_all(addrs.into_iter().map(|a| async {
-                        let cn = shards_inner.clone().connect(a).await.map_err(Into::into)?;
+                        let a = a;
+                        let cn = shards_inner
+                            .clone()
+                            .connect(a.clone())
+                            .await
+                            .map_err(Into::into)
+                            .wrap_err(eyre!("Could not connect to {}", a))?;
                         Ok::<_, Error>(Arc::new(cn))
                     }))
                     .await
