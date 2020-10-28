@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, Mutex};
-use tracing::debug;
+use tracing::{debug, trace};
 
 #[derive(Clone, Debug, Copy, Default)]
 pub struct Srv;
@@ -70,13 +70,17 @@ where
     type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        let channel_size = self.channel_size;
         let m = Arc::clone(&self.map);
         Box::pin(async move {
+            let (s, r) = mpsc::channel(1);
+            m.lock()
+                .expect("Lock RendezvousChannel map")
+                .insert(a.clone(), s);
             debug!(addr = ?&a, "RendezvousChannel listening");
-            let (s, r) = mpsc::channel(channel_size);
-            m.lock().expect("Lock RendezvousChannel map").insert(a, s);
-            Ok(Box::pin(r.map(Ok)) as _)
+            Ok(Box::pin(r.map(move |x| {
+                debug!(addr = ?a, "RendezvousChannel returning new connection");
+                Ok(x)
+            })) as _)
         })
     }
 }
@@ -93,12 +97,12 @@ where
     type Error = Report;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
-        debug!(addr = ?&a, "RendezvousChannel connecting");
         let mut m_guard = self.map.lock().expect("Lock RendezvousChannel map");
         if let Some(notify_listener) = m_guard.get_mut(&a) {
             let mut notify_listener = notify_listener.clone();
             let channel_size = self.channel_size;
             Box::pin(async move {
+                debug!(addr = ?&a, "RendezvousChannel connecting");
                 let (s1, r1) = mpsc::channel(channel_size);
                 let (s2, r2) = mpsc::channel(channel_size);
                 let connect_ch = ChanChunnel::new(s1, r2, Arc::new(|x| x));
@@ -107,6 +111,7 @@ where
                     .send(listen_ch)
                     .await
                     .map_err(|e| eyre!("Could not send connection to listener: {}", e))?;
+                debug!(addr = ?&a, "RendezvousChannel connected");
                 Ok(connect_ch)
             })
         } else {
@@ -278,11 +283,10 @@ where
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let r = Arc::clone(&self.rcv);
         Box::pin(async move {
-            Ok(r.lock()
-                .await
-                .recv()
-                .await
-                .ok_or_else(|| eyre!("All senders dropped"))?)
+            trace!("lock");
+            let mut l = r.lock().await;
+            trace!("recv");
+            Ok(l.recv().await.ok_or_else(|| eyre!("All senders dropped"))?)
         })
     }
 }

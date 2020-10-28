@@ -322,7 +322,7 @@ where
                     })
                 })) as _)
             }
-            .instrument(debug_span!("serve", addr = ?&a1.clone())),
+            .instrument(debug_span!("serve", addr = ?&a1)),
         )
     }
 }
@@ -376,8 +376,13 @@ where
                 // TODO this assumes no reordering.
                 conn.send(data).await.wrap_err("Forward to shard")?;
 
+                trace!(shard_idx, "wait for shard response");
                 // 3. Get response from the shard, and send back to client.
-                let resp = conn.recv().await.wrap_err("Receive from shard")?;
+                let resp = conn
+                    .recv()
+                    .instrument(tracing::trace_span!("canonical-server-chan-recv"))
+                    .await
+                    .wrap_err("Receive from shard")?;
                 trace!(shard_idx, "got shard response");
                 inner.send(resp).await?;
 
@@ -448,27 +453,36 @@ where
 
     fn serve(&mut self, inner: I) -> Self::Future {
         let int_handle = self.internal.clone();
-        Box::pin(async move {
-            let mut int_guard = int_handle.lock().await;
-            let int = int_guard.take();
+        Box::pin(
+            async move {
+                debug!("serving??");
+                let mut int_guard = int_handle.lock().await;
+                let int = int_guard.take();
 
-            if let None = int {
-                // self.internal was given to whoever called serve() first.
-                // We CANNOT hand out multiple copies of self.internal by e.g. cloning because the
-                // incoming messages on the Stream would get split between the copies.
-                return Err(eyre!("Cannot ShardServer::serve() more than once."));
+                if let None = int {
+                    // self.internal was given to whoever called serve() first.
+                    // We CANNOT hand out multiple copies of self.internal by e.g. cloning because the
+                    // incoming messages on the Stream would get split between the copies.
+                    return Err(eyre!("Cannot ShardServer::serve() more than once."));
+                }
+
+                let ext_str = inner.map(|conn| Ok(Either::Left(conn.map_err(Into::into)?)));
+                let int_str = int
+                    .unwrap()
+                    .map(|conn| Ok(Either::Right(conn.map_err(Into::into)?)));
+
+                debug!("serving");
+                Ok(Box::pin(futures_util::stream::select(int_str, ext_str))
+                    as Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, Self::Error>>
+                                + Send
+                                + 'static,
+                        >,
+                    >)
             }
-
-            let ext_str = inner.map(|conn| Ok(Either::Left(conn.map_err(Into::into)?)));
-            let int_str = int
-                .unwrap()
-                .map(|conn| Ok(Either::Right(conn.map_err(Into::into)?)));
-
-            Ok(Box::pin(futures_util::stream::select(ext_str, int_str))
-                as Pin<
-                    Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>,
-                >)
-        })
+            .instrument(debug_span!("ShardServer::serve")),
+        )
     }
 }
 
@@ -1208,6 +1222,60 @@ mod test {
         );
 
         (redis_guard, si.canonical_addr)
+    }
+
+    #[test]
+    fn shard_negotiate_basicclient() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        // 0. Make rt.
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                // 0-4. make shard servers and shard canonical server
+                let (_redis_h, canonical_addr) = shard_setup_negotiate(35215, 31421).await;
+
+                // 5. make client
+                info!("make client");
+
+                let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
+                    .wrap(TaggerProjChunnel)
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default());
+
+                let raw_cn = UdpSkChunnel::default().connect(()).await.unwrap();
+                let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
+                    .await
+                    .unwrap();
+
+                // 6. issue a request
+                info!("send request");
+                cn.send(Msg {
+                    k: "aaaaaaaa".to_owned(),
+                    v: "bbbbbbbb".to_owned(),
+                })
+                .await
+                .unwrap();
+
+                info!("await response");
+                let m = cn.recv().await.unwrap();
+                use super::Kv;
+                assert_eq!(m.key(), "aaaaaaaa");
+                assert_eq!(m.val(), "bbbbbbbb");
+            }
+            .instrument(tracing::info_span!("negotiate_basicclient")),
+        );
     }
 
     #[test]

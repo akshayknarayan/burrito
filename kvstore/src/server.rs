@@ -147,14 +147,13 @@ async fn single_shard(
 
     // initialize the kv store.
     let store = Buffer::new(Store::default(), 100_000);
-
     match st
-        .try_for_each_concurrent(None, |once| {
+        .try_for_each_concurrent(None, |cn| {
             let mut store = store.clone();
             async move {
                 debug!("new");
                 loop {
-                    let msg = once.recv().await.wrap_err(eyre!("receive message error"))?;
+                    let msg = cn.recv().await.wrap_err(eyre!("receive message error"))?;
                     debug!(msg = ?&msg, "got msg");
 
                     poll_fn(|cx| store.poll_ready(cx))
@@ -163,7 +162,7 @@ async fn single_shard(
                     trace!("poll_ready for store");
                     let rsp = store.call(msg).await.unwrap();
 
-                    once.send(rsp).await.wrap_err(eyre!("send response err"))?;
+                    cn.send(rsp).await.wrap_err(eyre!("send response err"))?;
                     debug!("sent response");
                 }
             }
