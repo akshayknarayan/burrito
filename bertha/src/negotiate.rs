@@ -458,6 +458,11 @@ where
         let pending_negotiated_connections: Arc<Mutex<HashMap<A, Vec<Offer>>>> = Default::default();
         Ok(st
             .map_err(Into::into)
+            // and_then_concurrent will concurrently poll the stream, and any futures returned by
+            // this closure. The futures returned by the closure will form the basis for the output
+            // stream. Note that the `process_nonces_connection` case means that some of the
+            // futures will never resolve, so and_then_concurrent cannot poll them in order. So,
+            // the output stream may be reordered compared to the input stream.
             .and_then_concurrent(move |cn| {
                 debug!("new connection");
                 let stack = stack.clone();
