@@ -17,17 +17,18 @@ use tracing_futures::Instrument;
 /// evaluating the sharding function. Also registers with shard-ctl, which will perform other setup
 /// (loading XDP program, answering client queries, etc).
 #[derive(Clone)]
-pub struct ShardCanonicalServerEbpf<A, S, C> {
-    inner: ShardCanonicalServer<A, S, C>,
+pub struct ShardCanonicalServerEbpf<A, S, Ss, C> {
+    inner: ShardCanonicalServer<A, S, Ss, C>,
     handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
 }
 
-impl<A, S, C> ShardCanonicalServerEbpf<A, S, C> {
+impl<A, S, Ss, C> ShardCanonicalServerEbpf<A, S, Ss, C> {
     /// Inner is a chunnel for the external connection.
     /// Shards is a chunnel for an internal connection to the shards.
     pub async fn new(
         addr: ShardInfo<A>,
         shards_inner: S,
+        shards_inner_stack: Ss,
         shards_extern: C,
         shards_extern_nonce: Vec<Vec<bertha::negotiate::Offer>>,
         redis_addr: &str,
@@ -35,6 +36,7 @@ impl<A, S, C> ShardCanonicalServerEbpf<A, S, C> {
         let inner = ShardCanonicalServer::new(
             addr,
             shards_inner,
+            shards_inner_stack,
             shards_extern,
             shards_extern_nonce,
             redis_addr,
@@ -59,15 +61,15 @@ impl<A, S, C> ShardCanonicalServerEbpf<A, S, C> {
     }
 }
 
-impl<A, S, C, Cap> Negotiate for ShardCanonicalServerEbpf<A, S, C>
+impl<A, S, Ss, C, Cap> Negotiate for ShardCanonicalServerEbpf<A, S, Ss, C>
 where
     Cap: bertha::negotiate::CapabilitySet,
-    ShardCanonicalServer<A, S, C>: Negotiate<Capability = Cap>,
+    ShardCanonicalServer<A, S, Ss, C>: Negotiate<Capability = Cap>,
 {
     type Capability = Cap;
 
     fn capabilities() -> Vec<Cap> {
-        ShardCanonicalServer::<A, S, C>::capabilities()
+        ShardCanonicalServer::<A, S, Ss, C>::capabilities()
     }
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
@@ -75,10 +77,10 @@ where
     }
 }
 
-impl<I, A, S, C, Ic, Ie> Serve<I> for ShardCanonicalServerEbpf<A, S, C>
+impl<I, A, S, Ss, C, Ic, Ie> Serve<I> for ShardCanonicalServerEbpf<A, S, Ss, C>
 where
     A: Clone + IpPort + Sync + Send + 'static,
-    ShardCanonicalServer<A, S, C>: Serve<
+    ShardCanonicalServer<A, S, Ss, C>: Serve<
         I,
         Connection = Ic,
         Error = Ie,

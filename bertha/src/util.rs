@@ -54,6 +54,52 @@ where
     }
 }
 
+/// Does nothing.
+#[derive(Debug, Clone, Default)]
+pub struct Nothing<N = ()>(std::marker::PhantomData<N>);
+
+impl<N> crate::negotiate::Negotiate for Nothing<N>
+where
+    N: crate::negotiate::CapabilitySet,
+{
+    type Capability = N;
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
+}
+
+impl<N, D, InS, InC, InE> Serve<InS> for Nothing<N>
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    D: 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = InC;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(Box::pin(inner) as _))
+    }
+}
+
+impl<D, InC> Client<InC> for Nothing
+where
+    InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = InC;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(cn))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ProjectLeft<A, N = ()>(A, std::marker::PhantomData<N>);
 

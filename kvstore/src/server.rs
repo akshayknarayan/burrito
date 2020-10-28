@@ -6,12 +6,13 @@ use bertha::{
     bincode::{SerializeChunnel, SerializeChunnelProject},
     chan_transport::RendezvousChannel,
     reliable::{ReliabilityChunnel, ReliabilityProjChunnel},
+    select::SelectListener,
     tagger::{OrderedChunnel, OrderedChunnelProj},
     udp::{UdpReqChunnel, UdpSkChunnel},
     util::ProjectLeft,
-    ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers, Serve,
+    ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers,
 };
-use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, ShardServer, SimpleShardPolicy};
+use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{future::poll_fn, stream::TryStreamExt};
 use std::net::{IpAddr, SocketAddr};
@@ -48,7 +49,7 @@ pub async fn serve(
     };
 
     // 2. start shard serv
-    let (internal_srv, internal_cli) = RendezvousChannel::<SocketAddr, Msg, _>::new(100).split();
+    let (internal_srv, internal_cli) = RendezvousChannel::<SocketAddr, _, _>::new(100).split();
     let rdy = futures_util::stream::FuturesUnordered::new();
     for a in si.clone().shard_addrs {
         info!(addr = ?&a, "start shard");
@@ -67,6 +68,11 @@ pub async fn serve(
     let cnsrv = ShardCanonicalServer::new(
         si.clone(),
         internal_cli,
+        CxList::from(OrderedChunnelProj::default())
+            .wrap(ReliabilityProjChunnel::default())
+            .wrap(SerializeChunnelProject::default())
+            // to match the ProjectLeft, since we can't write down the addr at this point
+            .wrap(bertha::util::Nothing::default()),
         shards_extern,
         offers.pop().unwrap(),
         &redis_addr,
@@ -86,7 +92,7 @@ pub async fn serve(
         .wrap(SerializeChunnelProject::<_, (u32, Option<Msg>)>::default());
     info!(shard_info = ?&si, "start canonical server");
     let st = UdpReqChunnel::default()
-        .listen(si.canonical_addr.into())
+        .listen(si.canonical_addr)
         .await
         .wrap_err("Listen on UdpReqChunnel")?;
     let st = bertha::negotiate::negotiate_server(external, st)
@@ -122,23 +128,19 @@ pub async fn serve(
 /// since we expect a negotiation handshake here.
 async fn single_shard(
     addr: SocketAddr,
-    mut internal_srv: RendezvousChannel<SocketAddr, Msg, bertha::chan_transport::Srv>,
+    internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
     s: tokio::sync::oneshot::Sender<Vec<Vec<bertha::negotiate::Offer>>>,
 ) {
-    let internal_st = internal_srv.listen(addr).await.unwrap();
-    let internal_st = CxList::from(ProjectLeft::from(addr))
-        .serve(internal_st)
-        .await
-        .unwrap();
-
-    let external = CxList::from(ShardServer::new(internal_st))
-        .wrap(OrderedChunnel::default())
+    let external = CxList::from(OrderedChunnel::default())
         .wrap(ReliabilityChunnel::default())
         .wrap(SerializeChunnel::default())
         .wrap(ProjectLeft::from(addr));
     let stack = external.clone();
     info!(addr = ?&addr, "listening");
-    let st = UdpReqChunnel::default().listen(addr.into()).await.unwrap();
+    let st = SelectListener::new(UdpReqChunnel::default(), internal_srv)
+        .listen(addr)
+        .await
+        .unwrap();
     debug!("got raw connection");
     let st = bertha::negotiate::negotiate_server(external, st)
         .await
@@ -147,7 +149,7 @@ async fn single_shard(
 
     // initialize the kv store.
     let store = Buffer::new(Store::default(), 100_000);
-    match st
+    if let Err(e) = st
         .try_for_each_concurrent(None, |cn| {
             let mut store = store.clone();
             async move {
@@ -171,10 +173,7 @@ async fn single_shard(
         .instrument(debug_span!("negotiate_server"))
         .await
     {
-        Err(e) => {
-            warn!(shard_addr = ?addr, err = ?e, "Shard errorred");
-            panic!(e);
-        }
-        Ok(_) => (),
+        warn!(shard_addr = ?addr, err = ?e, "Shard errorred");
+        panic!(e);
     }
 }

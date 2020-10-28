@@ -14,6 +14,7 @@ pub mod chan_transport;
 pub mod either;
 pub mod negotiate;
 pub mod reliable;
+pub mod select;
 pub mod tagger;
 pub mod udp;
 pub mod uds;
@@ -263,7 +264,6 @@ mod test {
                 snd.send(((), vec![1u8; 1])).await?;
                 let (_, buf) = rcv.recv().await?;
                 assert_eq!(buf, vec![1u8; 1]);
-
                 Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("cxnil")),

@@ -265,36 +265,36 @@ where
     }
 }
 
-fn check_offers(offers: &[Vec<Offer>]) -> Result<(), Report> {
-    if !offers.iter().all(|l| {
-        let id = l[0].capability_guid;
-        l.iter().all(|o| o.capability_guid == id)
-    }) {
-        return Err(eyre!("Capability guid mismatch")).wrap_err_with(|| {
-            let mut idx = 0;
-            let mut ok = true;
-            for offer_set in offers.iter() {
-                let id = offer_set[0].capability_guid;
-                for o in offer_set.iter() {
-                    if o.capability_guid != id {
-                        ok = false;
-                        break;
-                    }
-                }
-
-                if !ok {
-                    return eyre!("layer {}: {:?}", idx, offer_set);
-                }
-
-                idx += 1;
-            }
-
-            unreachable!()
-        });
-    }
-
-    Ok(())
-}
+//fn check_offers(offers: &[Vec<Offer>]) -> Result<(), Report> {
+//    if !offers.iter().all(|l| {
+//        let id = l[0].capability_guid;
+//        l.iter().all(|o| o.capability_guid == id)
+//    }) {
+//        return Err(eyre!("Capability guid mismatch")).wrap_err_with(|| {
+//            let mut idx = 0;
+//            let mut ok = true;
+//            for offer_set in offers.iter() {
+//                let id = offer_set[0].capability_guid;
+//                for o in offer_set.iter() {
+//                    if o.capability_guid != id {
+//                        ok = false;
+//                        break;
+//                    }
+//                }
+//
+//                if !ok {
+//                    return eyre!("layer {}: {:?}", idx, offer_set);
+//                }
+//
+//                idx += 1;
+//            }
+//
+//            unreachable!()
+//        });
+//    }
+//
+//    Ok(())
+//}
 
 fn lacking<T: PartialEq>(a: &[T], univ: Vec<T>) -> Vec<T> {
     univ.into_iter().filter(|x| !a.contains(x)).collect()
@@ -705,18 +705,18 @@ where
 }
 
 /// Return a connection with `stack`'s semantics, connecting to `a`.
-pub fn negotiate_client<H, T, C, A>(
-    stack: CxList<H, T>,
+pub fn negotiate_client<C, A, S>(
+    stack: S,
     cn: C,
     addr: A,
-) -> impl Future<Output = Result<<<CxList<H, T> as Apply>::Applied as Client<C>>::Connection, Report>>
+) -> impl Future<Output = Result<<<S as Apply>::Applied as Client<C>>::Connection, Report>>
        + Send
        + 'static
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    CxList<H, T>: Apply + GetOffers + Clone + Send + 'static,
-    <CxList<H, T> as Apply>::Applied: Client<C> + Clone + std::fmt::Debug + Send + 'static,
-    <<CxList<H, T> as Apply>::Applied as Client<C>>::Error: Into<Report> + Send + Sync + 'static,
+    S: Apply + GetOffers + Clone + Send + 'static,
+    <S as Apply>::Applied: Client<C> + Clone + std::fmt::Debug + Send + 'static,
+    <<S as Apply>::Applied as Client<C>>::Error: Into<Report> + Send + Sync + 'static,
     A: Send + Sync + 'static,
 {
     async move {
