@@ -1,6 +1,6 @@
 use futures_util::{
     future::TryFuture,
-    stream::{FuturesOrdered, Stream, TryStream},
+    stream::{FuturesUnordered, Stream, TryStream},
 };
 use pin_project::pin_project;
 use std::future::Future;
@@ -14,7 +14,7 @@ pub trait TryStreamExtExt: TryStream {
     /// This function is similar to [`futures_util::stream::TryStreamExt::and_then`], but the
     /// stream is polled concurrently with the futures returned by `f`. An unbounded number of
     /// futures corresponding to past stream values is kept via
-    /// [`futures_util::stream::FuturesOrdered`].
+    /// [`futures_util::stream::FuturesUnordered`].
     fn and_then_concurrent<Fut, F>(self, f: F) -> AndThenConcurrent<Self, Fut, F>
     where
         Self: Sized,
@@ -31,7 +31,7 @@ impl<S: TryStream> TryStreamExtExt for S {
     {
         AndThenConcurrent {
             stream: self,
-            futs: FuturesOrdered::new(),
+            futs: FuturesUnordered::new(),
             fun: f,
         }
     }
@@ -43,7 +43,7 @@ pub struct AndThenConcurrent<St, Fut: TryFuture, F> {
     #[pin]
     stream: St,
     #[pin]
-    futs: FuturesOrdered<Fut>,
+    futs: FuturesUnordered<Fut>,
     fun: F,
 }
 
