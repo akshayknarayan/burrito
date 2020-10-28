@@ -8,7 +8,7 @@ use bertha::{
     reliable::{ReliabilityChunnel, ReliabilityProjChunnel},
     tagger::{OrderedChunnel, OrderedChunnelProj},
     udp::{UdpReqChunnel, UdpSkChunnel},
-    util::{OptionUnwrap, ProjectLeft},
+    util::ProjectLeft,
     ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers, Serve,
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, ShardServer, SimpleShardPolicy};
@@ -126,8 +126,7 @@ async fn single_shard(
     s: tokio::sync::oneshot::Sender<Vec<Vec<bertha::negotiate::Offer>>>,
 ) {
     let internal_st = internal_srv.listen(addr).await.unwrap();
-    let internal_st = CxList::from(OptionUnwrap)
-        .wrap(ProjectLeft::from(addr))
+    let internal_st = CxList::from(ProjectLeft::from(addr))
         .serve(internal_st)
         .await
         .unwrap();
