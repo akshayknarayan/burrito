@@ -28,7 +28,7 @@ impl KvClient<()> {
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + 'static>, Report> {
         debug!("make client");
-        let neg_stack = CxList::from(ProjectLeft::from(canonical_addr.clone()))
+        let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
             .wrap(OrderedChunnelProj::default())
             .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default());
@@ -52,7 +52,7 @@ impl KvClient<()> {
 
         let neg_stack = CxList::from(bertha::negotiate::Select(
             cl,
-            ProjectLeft::from(canonical_addr.clone()),
+            ProjectLeft::from(canonical_addr),
         ))
         .wrap(OrderedChunnelProj::default())
         .wrap(ReliabilityProjChunnel::default())
@@ -71,7 +71,6 @@ impl KvClient<()> {
     }
 }
 
-// NOTE assumes in-order delivery! Otherwise it will error.
 #[tracing::instrument(level = "debug", skip(cn))]
 async fn do_req<R, C>(cn: R, req: Msg) -> Result<Option<String>, Report>
 where
@@ -81,6 +80,7 @@ where
     let cn = cn.as_ref();
     let id = req.id;
     trace!("sending");
+    // NOTE assumes in-order delivery! Otherwise it will error.
     cn.send(req).await.wrap_err("Error sending request")?;
     let rsp = cn.recv().await.wrap_err("Error awaiting response")?;
     trace!("received");

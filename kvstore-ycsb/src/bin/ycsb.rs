@@ -2,12 +2,11 @@ use color_eyre::eyre::{Report, WrapErr};
 use kvstore::KvClient;
 use kvstore_ycsb::{ops, Op};
 use std::collections::HashMap;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use structopt::StructOpt;
-use tracing::{debug, info, info_span, trace};
+use tracing::{debug, info, info_span, instrument, trace};
 use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
@@ -44,6 +43,7 @@ struct Opt {
 async fn main() -> Result<(), Report> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(ErrorLayer::default())
         .init();
 
@@ -68,7 +68,9 @@ async fn main() -> Result<(), Report> {
     let mut basic_client = KvClient::new_basicclient(opt.addr)
         .instrument(info_span!("make kvclient"))
         .await?;
-    do_loads(&mut basic_client, loads).await?;
+    do_loads(&mut basic_client, loads)
+        .instrument(info_span!("loads"))
+        .await?;
     let (durs, time) = do_requests(access_by_client, opt.interarrival_client_micros as _).await?;
 
     // done
@@ -91,54 +93,51 @@ async fn do_requests<S>(
 where
     S: bertha::ChunnelConnection<Data = kvstore::Msg> + 'static,
 {
-    fn time_req(
+    async fn time_req(
         cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + 'static>,
         op: Op,
-    ) -> impl Future<Output = Result<Duration, Report>> {
-        async move {
-            let now = tokio::time::Instant::now();
-            let _ycsb_result = op.exec(&cl).await?;
-            Ok::<_, Report>(now.elapsed())
-        }
+    ) -> Result<Duration, Report> {
+        let now = tokio::time::Instant::now();
+        let _ycsb_result = op.exec(&cl).await?;
+        Ok::<_, Report>(now.elapsed())
     }
 
-    fn req_loop(
+    #[instrument(level = "info", skip(cl, ops, done))]
+    async fn req_loop(
         cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + 'static>,
         mut ops: impl futures_util::stream::Stream<Item = (usize, Op)> + Unpin + 'static,
         done: tokio::sync::watch::Receiver<bool>,
         client_id: usize,
-    ) -> impl Future<Output = Result<Vec<Duration>, Report>> {
+    ) -> Result<Vec<Duration>, Report> {
         let mut durs = vec![];
         let mut inflight = FuturesOrdered::new();
 
-        async move {
-            debug!(id = client_id, "starting");
-            loop {
-                tokio::select!(
-                    Some((remaining_cnt, o)) = ops.next() => {
-                        inflight.push(time_req(cl.clone(), o));
-                        trace!(id = client_id, remaining_cnt, inflight = inflight.len(), "new request");
-                    }
-                    Some(Ok(d)) = inflight.next() => {
-                        trace!(id = client_id, inflight = inflight.len(), "request done");
-                        durs.push(d);
-                    }
-                    else => {
-                        info!(id = client_id, completed = durs.len(), "finished requests");
-                        break;
-                    }
-                );
-
-                // This can't be inside the select because then the else clause would never be
-                // triggered.
-                if *done.borrow() {
-                    debug!(id = client_id, completed = durs.len(), "stopping");
-                    break; // the first client finished. stop.
+        debug!("starting");
+        loop {
+            tokio::select!(
+                Some((remaining_cnt, o)) = ops.next() => {
+                    inflight.push(time_req(cl.clone(), o));
+                    trace!(remaining_cnt, inflight = inflight.len(), "new request");
                 }
-            }
+                Some(Ok(d)) = inflight.next() => {
+                    trace!(inflight = inflight.len(), "request done");
+                    durs.push(d);
+                }
+                else => {
+                    info!(completed = durs.len(), "finished requests");
+                    break;
+                }
+            );
 
-            Ok::<_, Report>(durs)
+            // This can't be inside the select because then the else clause would never be
+            // triggered.
+            if *done.borrow() {
+                debug!(completed = durs.len(), "stopping");
+                break; // the first client finished. stop.
+            }
         }
+
+        Ok::<_, Report>(durs)
     }
 
     use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
@@ -191,6 +190,7 @@ async fn do_loads<C>(cl: &mut KvClient<C>, loads: Vec<Op>) -> Result<(), Report>
 where
     C: bertha::ChunnelConnection<Data = kvstore::Msg> + 'static,
 {
+    info!("starting");
     // don't need to time the loads.
     for o in loads {
         trace!("starting load");
@@ -202,6 +202,7 @@ where
         trace!("finished load");
     }
 
+    info!("done");
     Ok(())
 }
 
@@ -240,12 +241,12 @@ fn write_results(
     if let Some(f) = out_file {
         let mut f = std::fs::File::create(f).expect("Open out file");
         use std::io::Write;
-        write!(&mut f, "Interarrival_us NumOps Completion_ms Latency_us\n").expect("write");
+        writeln!(&mut f, "Interarrival_us NumOps Completion_ms Latency_us").expect("write");
         let len = durs.len();
         for d in durs {
-            write!(
+            writeln!(
                 &mut f,
-                "{} {} {} {}\n",
+                "{} {} {} {}",
                 interarrival_client_micros,
                 len,
                 time.as_millis(),

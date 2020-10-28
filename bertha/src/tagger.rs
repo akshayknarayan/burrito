@@ -103,7 +103,7 @@ where
                 let seq = snd_nxt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u32;
                 trace!(seq = ?seq, "sending");
                 inner.send((seq, data)).await?;
-                trace!(seq = ?seq, "sent");
+                trace!(seq = ?seq, "finished send");
                 Ok(())
             }
             .instrument(tracing::trace_span!("tagger_send")),
@@ -495,11 +495,13 @@ where
                     }
 
                     let (seq, d) = inner.recv().await?;
-                    trace!(seq = ?seq, "received");
+                    #[allow(clippy::comparison_chain)]
                     if seq == expected {
+                        trace!(seq = ?seq, "received in-order");
                         state.write().await.expected_recv += 1;
                         return Ok(d);
                     } else if seq > expected {
+                        trace!(seq = ?seq, "received out-of-order");
                         let mut st = state.write().await;
                         st.recvd.push((seq, d).into());
                     } else {
@@ -555,7 +557,7 @@ where
                 trace!(seq = ?seq, "sending");
                 let (addr, data) = data;
                 inner.send((addr, (seq, data))).await?;
-                trace!(seq = ?seq, "sent");
+                trace!(seq = ?seq, "finished send");
                 Ok(())
             }
             .instrument(tracing::trace_span!("orderedproj_send")),
@@ -589,11 +591,13 @@ where
                     }
 
                     let (a, (seq, d)) = inner.recv().await?;
-                    trace!(seq = ?seq, "received");
+                    #[allow(clippy::comparison_chain)]
                     if seq == expected {
+                        trace!(seq = ?seq, "received in-order");
                         state.write().await.expected_recv += 1;
                         return Ok((a, d));
                     } else if seq > expected {
+                        trace!(seq = ?seq, "received out-of-order");
                         let mut st = state.write().await;
                         st.recvd.push((seq, (a, d)).into());
                     } else {
@@ -623,7 +627,7 @@ where
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(|cn| SeqUnreliable::from(cn))) as _))
+        ready(Ok(Box::pin(inner.map_ok(SeqUnreliable::from)) as _))
     }
 }
 

@@ -307,7 +307,7 @@ where
         trace!("call inner recv");
         let (seq, data) = inner.recv().await?;
 
-        if let None = data {
+        if data.is_none() {
             // it was an ack
             let mut st = state.write().await;
             trace!(seq = ?seq, "got ack");
@@ -463,7 +463,6 @@ where
                 }
 
                 inner.send((addr, data)).await?;
-
                 transmit_proj(Arc::clone(&inner), Arc::clone(&state), r, timeout).await?;
                 Ok(())
             }
@@ -491,6 +490,7 @@ where
 
                 let (addr, (seq, data)): (A, (u32, D)) =
                     do_recv_proj::<A, _, _>(&mut inner, &mut state).await?;
+                trace!(seq = ?seq, "returning packet");
                 Ok((addr, (seq, data)))
             }
             .instrument(tracing::debug_span!("recv")),
@@ -602,7 +602,7 @@ where
         trace!("call inner recv");
         let (addr, (seq, data)) = inner.recv().await?;
 
-        if let None = data {
+        if data.is_none() {
             // it was an ack
             let mut st = state.write().await;
             trace!(seq = ?seq, "got ack");
