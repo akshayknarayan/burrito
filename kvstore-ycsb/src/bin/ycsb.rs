@@ -119,9 +119,17 @@ where
                     inflight.push(time_req(cl.clone(), o));
                     trace!(remaining_cnt, inflight = inflight.len(), "new request");
                 }
-                Some(Ok(d)) = inflight.next() => {
-                    trace!(inflight = inflight.len(), "request done");
-                    durs.push(d);
+                Some(r) = inflight.next() => {
+                    match r {
+                        Ok(d) => {
+                            trace!(inflight = inflight.len(), "request done");
+                            durs.push(d);
+                        }
+                        Err(e) => {
+                            debug!(err = ?e, "request failed");
+                            return Err(e);
+                        }
+                    }
                 }
                 else => {
                     info!(completed = durs.len(), "finished requests");
