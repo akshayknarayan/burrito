@@ -150,7 +150,7 @@ where
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(|cn| TaggerProj::from(cn))) as _))
+        ready(Ok(Box::pin(inner.map_ok(TaggerProj::from)) as _))
     }
 }
 
@@ -245,19 +245,19 @@ where
 /// It returns data segments in the order they were sent.
 #[derive(Clone, Debug)]
 pub struct OrderedChunnel {
-    hole_thresh: usize,
+    hole_thresh: Option<usize>,
 }
 
 impl OrderedChunnel {
     pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
-        self.hole_thresh = thresh;
+        self.hole_thresh = Some(thresh);
         self
     }
 }
 
 impl Default for OrderedChunnel {
     fn default() -> Self {
-        Self { hole_thresh: 5 }
+        Self { hole_thresh: None }
     }
 }
 
@@ -300,71 +300,6 @@ where
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
         ready(Ok(Ordered::new(cn, self.hole_thresh)))
-    }
-}
-
-/// `OrderedChunnelProj` takes in Data segments and tags them for use with `(A, (u32, D))` Chunnels.
-///
-/// It returns data segments in the order they were sent.
-#[derive(Clone, Debug)]
-pub struct OrderedChunnelProj {
-    hole_thresh: usize,
-}
-
-impl OrderedChunnelProj {
-    pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
-        self.hole_thresh = thresh;
-        self
-    }
-}
-
-impl Default for OrderedChunnelProj {
-    fn default() -> Self {
-        Self { hole_thresh: 5 }
-    }
-}
-
-impl Negotiate for OrderedChunnelProj {
-    type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
-}
-
-impl<A, D, InS, InC, InE> Serve<InS> for OrderedChunnelProj
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    A: Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = OrderedProj<A, InC, D>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let cfg = self.hole_thresh;
-        ready(Ok(
-            Box::pin(inner.map_ok(move |cn| OrderedProj::new(cn, cfg))) as _,
-        ))
-    }
-}
-
-impl<A, D, InC> Client<InC> for OrderedChunnelProj
-where
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    A: Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = OrderedProj<A, InC, D>;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(OrderedProj::new(cn, self.hole_thresh)))
     }
 }
 
@@ -423,12 +358,12 @@ impl<D> Default for OrderedState<D> {
 #[derive(Clone, Debug)]
 pub struct Ordered<C, D> {
     inner: Arc<C>,
-    hole_thresh: usize,
+    hole_thresh: Option<usize>,
     state: Arc<RwLock<OrderedState<D>>>,
 }
 
 impl<C, D> Ordered<C, D> {
-    pub fn new(inner: C, hole_thresh: usize) -> Self {
+    pub fn new(inner: C, hole_thresh: Option<usize>) -> Self {
         Ordered {
             inner: Arc::new(inner),
             hole_thresh,
@@ -482,7 +417,14 @@ where
                         let mut st = state.write().await;
                         let mut pop = false;
                         if let Some(DataPair(seq, _)) = st.recvd.peek() {
-                            pop = *seq == expected || st.recvd.len() > hole_thresh;
+                            pop = *seq == expected;
+                            if let Some(thresh) = hole_thresh {
+                                if st.recvd.len() > thresh {
+                                    debug!(expected = ?expected, returning = ?seq, "giving up on ordering");
+                                    pop = true;
+                                }
+                            }
+
                             if pop {
                                 trace!(seq = ?seq, next_expected = ?expected, pileup = ?st.recvd.len(), "returning ordered packet");
                             }
@@ -505,7 +447,8 @@ where
                         let mut st = state.write().await;
                         st.recvd.push((seq, d).into());
                     } else {
-                        debug!(seq = ?seq, "dropping segment");
+                        // Maybe return an error type with the data instead of dropping it?
+                        debug!(seq = ?seq, "dropping passed-by segment");
                     }
                 }
             }
@@ -514,15 +457,80 @@ where
     }
 }
 
+/// `OrderedChunnelProj` takes in Data segments and tags them for use with `(A, (u32, D))` Chunnels.
+///
+/// It returns data segments in the order they were sent.
+#[derive(Clone, Debug)]
+pub struct OrderedChunnelProj {
+    hole_thresh: Option<usize>,
+}
+
+impl OrderedChunnelProj {
+    pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
+        self.hole_thresh = Some(thresh);
+        self
+    }
+}
+
+impl Default for OrderedChunnelProj {
+    fn default() -> Self {
+        Self { hole_thresh: None }
+    }
+}
+
+impl Negotiate for OrderedChunnelProj {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
+}
+
+impl<A, D, InS, InC, InE> Serve<InS> for OrderedChunnelProj
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = OrderedProj<A, InC, D>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        let cfg = self.hole_thresh;
+        ready(Ok(
+            Box::pin(inner.map_ok(move |cn| OrderedProj::new(cn, cfg))) as _,
+        ))
+    }
+}
+
+impl<A, D, InC> Client<InC> for OrderedChunnelProj
+where
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = OrderedProj<A, InC, D>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(OrderedProj::new(cn, self.hole_thresh)))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OrderedProj<A, C, D> {
     inner: Arc<C>,
-    hole_thresh: usize,
+    hole_thresh: Option<usize>,
     state: Arc<RwLock<OrderedState<(A, D)>>>,
 }
 
 impl<A, C, D> OrderedProj<A, C, D> {
-    pub fn new(inner: C, hole_thresh: usize) -> Self {
+    pub fn new(inner: C, hole_thresh: Option<usize>) -> Self {
         OrderedProj {
             inner: Arc::new(inner),
             hole_thresh,
@@ -578,7 +586,11 @@ where
                         let mut st = state.write().await;
                         let mut pop = false;
                         if let Some(DataPair(seq, _)) = st.recvd.peek() {
-                            pop = *seq == expected || st.recvd.len() > hole_thresh;
+                            pop = *seq == expected;
+                            if let Some(thresh) = hole_thresh {
+                                pop = pop || (st.recvd.len() > thresh);
+                            }
+
                             if pop {
                                 trace!(seq = ?seq, next_expected = ?expected, pileup = ?st.recvd.len(), "returning ordered packet");
                             }

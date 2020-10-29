@@ -535,7 +535,6 @@ where
                                 }
                             } // end read lock on state
 
-
                             if need_retx {
                                 debug!("checking retransmissions");
                                 let expired = {
