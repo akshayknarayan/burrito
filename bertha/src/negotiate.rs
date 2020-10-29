@@ -496,6 +496,13 @@ where
                             .ok_or_else(|| eyre!("No connection returned"))?;
 
                         debug!(addr = ?&a, "returning pre-negotiated connection");
+
+                        // TODO we are discarding buf here. That is bad.
+                        //
+                        // To avoid discarding, wrap raw_cn_st above with something that selects on
+                        // a channel, and inject buf into the channel sender.  After that, we don't
+                        // need that channel select anymore, so it can remove itself (turn itself
+                        // into a no-op?) from the stack of `impl Stream`s.
                         return Ok(Some(Either::Right(new_cn)));
                     }
 
