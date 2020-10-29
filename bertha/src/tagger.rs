@@ -1,10 +1,12 @@
 //! Chunnel which tags Data to provide at-most-once delivery.
 
-use crate::{ChunnelConnection, Client, Negotiate, Serve};
+use crate::{
+    util::{ProjectLeft, ProjectLeftCn, Unproject},
+    ChunnelConnection, Client, Negotiate, Serve,
+};
 use color_eyre::eyre;
 use futures_util::future::{ready, Ready};
-use futures_util::stream::Stream;
-use futures_util::stream::TryStreamExt;
+use futures_util::stream::{Stream, TryStreamExt};
 use std::collections::BinaryHeap;
 use std::convert::TryInto;
 use std::future::Future;
@@ -32,13 +34,17 @@ where
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = Tagger<InC>;
+    type Connection = ProjectLeftCn<(), TaggerProj<Unproject<InC>>>;
     type Error = InE;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(|cn| Tagger::from(cn))) as _))
+        let st = inner.map_ok(Unproject);
+        match TaggerProjChunnel.serve(st).into_inner() {
+            Ok(st) => ProjectLeft::from(()).serve(st),
+            Err(e) => ready(Err(e)),
+        }
     }
 }
 
@@ -47,81 +53,17 @@ where
     InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = Tagger<InC>;
+    type Future = <ProjectLeft<()> as Client<
+        <TaggerProjChunnel as Client<Unproject<InC>>>::Connection,
+    >>::Future;
+    type Connection = ProjectLeftCn<(), TaggerProj<Unproject<InC>>>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(Tagger::from(cn)))
-    }
-}
-
-/// Assigns an sequential tag to data segments and ignores the tag otherwise.
-#[derive(Default, Debug)]
-pub struct Tagger<C> {
-    inner: Arc<C>,
-    snd_nxt: Arc<AtomicUsize>,
-}
-
-impl<Cx> From<Cx> for Tagger<Cx> {
-    fn from(cx: Cx) -> Tagger<Cx> {
-        Tagger {
-            inner: Arc::new(cx),
-            snd_nxt: Default::default(),
+        match TaggerProjChunnel.connect_wrap(Unproject(cn)).into_inner() {
+            Ok(cn) => ProjectLeft::from(()).connect_wrap(cn),
+            Err(e) => ready(Err(e)),
         }
-    }
-}
-
-impl<C> Clone for Tagger<C>
-where
-    C: Clone,
-{
-    fn clone(&self) -> Self {
-        let inner: C = self.inner.as_ref().clone();
-        Self {
-            inner: Arc::new(inner),
-            snd_nxt: self.snd_nxt.clone(),
-        }
-    }
-}
-
-impl<C, D> ChunnelConnection for Tagger<C>
-where
-    C: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Data = D;
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        let snd_nxt = Arc::clone(&self.snd_nxt);
-        Box::pin(
-            async move {
-                let seq = snd_nxt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u32;
-                trace!(seq = ?seq, "sending");
-                inner.send((seq, data)).await?;
-                trace!(seq = ?seq, "finished send");
-                Ok(())
-            }
-            .instrument(tracing::trace_span!("tagger_send")),
-        )
-    }
-
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(
-            async move {
-                let (seq, d) = inner.recv().await?;
-                trace!(seq = ?seq, "received");
-                return Ok(d);
-            }
-            .instrument(tracing::trace_span!("tagger_recv")),
-        )
     }
 }
 
@@ -243,21 +185,15 @@ where
 /// `OrderedChunnel` takes in Data segments and tags them for use with `(u32, D)` Chunnels.
 ///
 /// It returns data segments in the order they were sent.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct OrderedChunnel {
-    hole_thresh: Option<usize>,
+    inner: OrderedChunnelProj,
 }
 
 impl OrderedChunnel {
     pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
-        self.hole_thresh = Some(thresh);
+        self.inner.hole_thresh = Some(thresh);
         self
-    }
-}
-
-impl Default for OrderedChunnel {
-    fn default() -> Self {
-        Self { hole_thresh: None }
     }
 }
 
@@ -276,16 +212,17 @@ where
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = Ordered<InC, D>;
+    type Connection = ProjectLeftCn<(), OrderedProj<(), Unproject<InC>, D>>;
     type Error = InE;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        let cfg = self.hole_thresh;
-        ready(Ok(
-            Box::pin(inner.map_ok(move |cn| Ordered::new(cn, cfg))) as _
-        ))
+        let st = inner.map_ok(Unproject);
+        match self.inner.serve(st).into_inner() {
+            Ok(st) => ProjectLeft::from(()).serve(st),
+            Err(e) => ready(Err(e)),
+        }
     }
 }
 
@@ -294,12 +231,17 @@ where
     InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = Ordered<InC, D>;
+    type Future = <ProjectLeft<()> as Client<
+        <OrderedChunnelProj as Client<Unproject<InC>>>::Connection,
+    >>::Future;
+    type Connection = ProjectLeftCn<(), OrderedProj<(), Unproject<InC>, D>>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(Ordered::new(cn, self.hole_thresh)))
+        match self.inner.connect_wrap(Unproject(cn)).into_inner() {
+            Ok(cn) => ProjectLeft::from(()).connect_wrap(cn),
+            Err(e) => ready(Err(e)),
+        }
     }
 }
 
@@ -352,108 +294,6 @@ impl<D> Default for OrderedState<D> {
             expected_recv: 0,
             recvd: BinaryHeap::new(),
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Ordered<C, D> {
-    inner: Arc<C>,
-    hole_thresh: Option<usize>,
-    state: Arc<RwLock<OrderedState<D>>>,
-}
-
-impl<C, D> Ordered<C, D> {
-    pub fn new(inner: C, hole_thresh: Option<usize>) -> Self {
-        Ordered {
-            inner: Arc::new(inner),
-            hole_thresh,
-            state: Default::default(),
-        }
-    }
-}
-
-impl<C, D> ChunnelConnection for Ordered<C, D>
-where
-    C: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Data = D;
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-        let state = Arc::clone(&self.state);
-        let inner = Arc::clone(&self.inner);
-        Box::pin(
-            async move {
-                let seq = {
-                    let mut st = state.write().await;
-                    let seq = st.snd_nxt;
-                    st.snd_nxt += 1;
-                    seq
-                };
-
-                trace!(seq = ?seq, "sending");
-                inner.send((seq, data)).await?;
-                trace!(seq = ?seq, "sent");
-                Ok(())
-            }
-            .instrument(tracing::trace_span!("ordered_send")),
-        )
-    }
-
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
-        let state = Arc::clone(&self.state);
-        let inner = Arc::clone(&self.inner);
-        let hole_thresh = self.hole_thresh;
-        Box::pin(
-            async move {
-                let expected = { state.read().await.expected_recv };
-                loop {
-                    {
-                        let mut st = state.write().await;
-                        let mut pop = false;
-                        if let Some(DataPair(seq, _)) = st.recvd.peek() {
-                            pop = *seq == expected;
-                            if let Some(thresh) = hole_thresh {
-                                if st.recvd.len() > thresh {
-                                    debug!(expected = ?expected, returning = ?seq, "giving up on ordering");
-                                    pop = true;
-                                }
-                            }
-
-                            if pop {
-                                trace!(seq = ?seq, next_expected = ?expected, pileup = ?st.recvd.len(), "returning ordered packet");
-                            }
-                        }
-
-                        if pop {
-                            st.expected_recv += 1;
-                            return Ok(st.recvd.pop().unwrap().1);
-                        }
-                    }
-
-                    let (seq, d) = inner.recv().await?;
-                    #[allow(clippy::comparison_chain)]
-                    if seq == expected {
-                        trace!(seq = ?seq, "received in-order");
-                        state.write().await.expected_recv += 1;
-                        return Ok(d);
-                    } else if seq > expected {
-                        trace!(seq = ?seq, "received out-of-order");
-                        let mut st = state.write().await;
-                        st.recvd.push((seq, d).into());
-                    } else {
-                        // Maybe return an error type with the data instead of dropping it?
-                        debug!(seq = ?seq, "dropping passed-by segment");
-                    }
-                }
-            }
-            .instrument(tracing::trace_span!("ordered_recv")),
-        )
     }
 }
 

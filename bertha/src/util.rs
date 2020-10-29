@@ -100,6 +100,28 @@ where
     }
 }
 
+pub struct Unproject<C>(pub C);
+
+impl<C, D> ChunnelConnection for Unproject<C>
+where
+    C: ChunnelConnection<Data = D>,
+    D: 'static,
+{
+    type Data = ((), D);
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        self.0.send(data.1)
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        let f = self.0.recv();
+        Box::pin(async move { Ok(((), f.await?)) })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ProjectLeft<A, N = ()>(A, std::marker::PhantomData<N>);
 
@@ -203,7 +225,7 @@ where
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(|cn| OptionWrapCn::new(cn))) as _))
+        ready(Ok(Box::pin(inner.map_ok(OptionWrapCn::new)) as _))
     }
 }
 
@@ -274,15 +296,20 @@ where
     InS: Stream<Item = Result<InC, InE>> + Send + 'static,
     InC: ChunnelConnection<Data = Option<D>> + Send + Sync + 'static,
     InE: Send + Sync + 'static,
+    D: 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = OptionUnwrapCn<InC>;
+    type Connection = ProjectLeftCn<(), OptionUnwrapProjCn<Unproject<InC>>>;
     type Error = InE;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(|cn| OptionUnwrapCn::new(cn))) as _))
+        let st = inner.map_ok(Unproject);
+        match OptionUnwrapProj.serve(st).into_inner() {
+            Ok(st) => ProjectLeft::from(()).serve(st),
+            Err(e) => ready(Err(e)),
+        }
     }
 }
 
@@ -291,44 +318,17 @@ where
     InC: ChunnelConnection<Data = Option<D>> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = OptionUnwrapCn<InC>;
+    type Future = <ProjectLeft<()> as Client<
+        <OptionUnwrapProj as Client<Unproject<InC>>>::Connection,
+    >>::Future;
+    type Connection = ProjectLeftCn<(), OptionUnwrapProjCn<Unproject<InC>>>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(OptionUnwrapCn::new(cn)))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct OptionUnwrapCn<C>(Arc<C>);
-
-impl<C> OptionUnwrapCn<C> {
-    pub fn new(inner: C) -> Self {
-        Self(Arc::new(inner))
-    }
-}
-
-impl<C, D> ChunnelConnection for OptionUnwrapCn<C>
-where
-    C: ChunnelConnection<Data = Option<D>> + Send + Sync + 'static,
-{
-    type Data = D;
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.0.send(Some(data))
-    }
-
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let c = Arc::clone(&self.0);
-        Box::pin(async move {
-            Ok(c.recv()
-                .await?
-                .ok_or_else(|| eyre!("Received None value"))?)
-        })
+        match OptionUnwrapProj.connect_wrap(Unproject(cn)).into_inner() {
+            Ok(cn) => ProjectLeft::from(()).connect_wrap(cn),
+            Err(e) => ready(Err(e)),
+        }
     }
 }
 
@@ -358,9 +358,7 @@ where
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(
-            Box::pin(inner.map_ok(|cn| OptionUnwrapProjCn::new(cn))) as _
-        ))
+        ready(Ok(Box::pin(inner.map_ok(OptionUnwrapProjCn::new)) as _))
     }
 }
 
@@ -504,7 +502,7 @@ where
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(|cn| NeverCn::new(cn))) as _))
+        ready(Ok(Box::pin(inner.map_ok(NeverCn::new)) as _))
     }
 }
 

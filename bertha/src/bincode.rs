@@ -1,6 +1,9 @@
 //! Serialization chunnel with bincode.
 
-use crate::{ChunnelConnection, Client, Negotiate, Serve};
+use crate::{
+    util::{ProjectLeft, ProjectLeftCn, Unproject},
+    ChunnelConnection, Client, Negotiate, Serve,
+};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
@@ -30,13 +33,17 @@ where
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = Serialize<InC, D>;
+    type Connection = ProjectLeftCn<(), SerializeProject<(), D, Unproject<InC>>>;
     type Error = InE;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(|cn| Serialize::from(cn))) as _))
+        let st = inner.map_ok(Unproject);
+        match SerializeChunnelProject::default().serve(st).into_inner() {
+            Ok(st) => ProjectLeft::from(()).serve(st),
+            Err(e) => ready(Err(e)),
+        }
     }
 }
 
@@ -45,62 +52,20 @@ where
     InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = Serialize<InC, D>;
+    type Future = <ProjectLeft<()> as Client<
+        <SerializeChunnelProject<(), D> as Client<Unproject<InC>>>::Connection,
+    >>::Future;
+    type Connection = ProjectLeftCn<(), SerializeProject<(), D, Unproject<InC>>>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(Serialize::from(cn)))
-    }
-}
-
-#[derive(Default, Debug, Clone)]
-pub struct Serialize<C, D> {
-    inner: Arc<C>,
-    _data: std::marker::PhantomData<D>,
-}
-
-impl<Cx, D> From<Cx> for Serialize<Cx, D> {
-    fn from(cx: Cx) -> Serialize<Cx, D> {
-        Serialize {
-            inner: Arc::new(cx),
-            _data: Default::default(),
+        match SerializeChunnelProject::default()
+            .connect_wrap(Unproject(cn))
+            .into_inner()
+        {
+            Ok(cn) => ProjectLeft::from(()).connect_wrap(cn),
+            Err(e) => ready(Err(e)),
         }
-    }
-}
-
-impl<C, D> ChunnelConnection for Serialize<C, D>
-where
-    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
-    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
-{
-    type Data = D;
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(async move {
-            let buf = bincode::serialize(&data).wrap_err("serialize failed")?;
-            trace!(data = ?std::any::type_name::<D>(), buf = ?&buf, "serialized");
-            inner.send(buf).await?;
-            Ok(())
-        })
-    }
-
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(async move {
-            let buf = inner.recv().await?;
-            let data = bincode::deserialize(&buf[..]).wrap_err(eyre!(
-                "deserialize failed: {:?} -> {:?}",
-                buf,
-                std::any::type_name::<D>()
-            ))?;
-            trace!(data = ?std::any::type_name::<D>(), buf = ?&buf, "deserialized");
-            Ok(data)
-        })
     }
 }
 
@@ -139,9 +104,7 @@ where
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(
-            Box::pin(inner.map_ok(|cn| SerializeProject::from(cn))) as _
-        ))
+        ready(Ok(Box::pin(inner.map_ok(SerializeProject::from)) as _))
     }
 }
 
