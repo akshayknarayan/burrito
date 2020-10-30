@@ -270,13 +270,15 @@ impl<D> Eq for DataPair<D> {}
 
 impl<D> PartialOrd for DataPair<D> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        // make it a min-heap
+        other.0.partial_cmp(&self.0)
     }
 }
 
 impl<D> Ord for DataPair<D> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
+        // make it a min-heap
+        other.0.cmp(&self.0)
     }
 }
 
@@ -420,19 +422,20 @@ where
         let hole_thresh = self.hole_thresh;
         Box::pin(
             async move {
-                let expected = { state.read().await.expected_recv };
                 loop {
-                    {
+                    let expected = {
                         let mut st = state.write().await;
                         let mut pop = false;
                         if let Some(DataPair(seq, _)) = st.recvd.peek() {
-                            pop = *seq == expected;
+                            pop = *seq == st.expected_recv;
                             if let Some(thresh) = hole_thresh {
                                 pop = pop || (st.recvd.len() > thresh);
                             }
 
                             if pop {
-                                trace!(seq = ?seq, next_expected = ?expected, pileup = ?st.recvd.len(), "returning ordered packet");
+                                trace!(seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "returning ordered packet");
+                            } else {
+                                trace!(head_seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "calling inner recv");
                             }
                         }
 
@@ -440,10 +443,12 @@ where
                             st.expected_recv += 1;
                             return Ok(st.recvd.pop().unwrap().1);
                         }
-                    }
+
+                        st.expected_recv
+                    };
 
                     let (a, (seq, d)) = inner.recv().await?;
-                    #[allow(clippy::comparison_chain)]
+                    //#[allow(clippy::comparison_chain)]
                     if seq == expected {
                         trace!(seq = ?seq, "received in-order");
                         state.write().await.expected_recv += 1;
@@ -607,44 +612,39 @@ mod test {
     where
         C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
     {
-        let msgs = vec![vec![0u8; 10], vec![1u8; 10], vec![2u8; 10], vec![3u8; 10]];
-        let (s, r) = tokio::sync::oneshot::channel::<()>();
+        let msgs: Vec<_> = (0..10).map(|i| vec![i; 10]).collect();
 
         // recv side
         let ms = msgs.clone();
         tokio::spawn(
             async move {
-                let msgs = ms;
-                info!("starting receiver");
-                let mut cnt = 0;
-                loop {
-                    let m = rcv_ch.recv().await.unwrap();
-                    trace!(m = ?m, "rcvd");
-                    assert_eq!(m, msgs[cnt]);
-                    cnt += 1;
-                    if cnt == msgs.len() {
-                        break;
-                    }
-                }
-
-                s.send(()).unwrap();
+                let futs: futures_util::stream::FuturesOrdered<_> = (msgs.into_iter().map(|m| {
+                    debug!(m = ?m, "sending");
+                    snd_ch.send(m)
+                }))
+                .collect();
+                futs.collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<(), _>>()
+                    .unwrap();
             }
-            .instrument(tracing::debug_span!("receiver")),
+            .instrument(tracing::debug_span!("sender")),
         );
 
-        let futs: futures_util::stream::FuturesOrdered<_> = (msgs.into_iter().map(|m| {
-            debug!(m = ?m, "sending");
-            snd_ch.send(m)
-        }))
-        .collect();
-        futs.collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<(), _>>()
-            .unwrap();
-
-        r.await.unwrap();
-        info!("done");
+        let msgs = ms;
+        info!("starting receiver");
+        let mut cnt = 0;
+        loop {
+            let m = rcv_ch.recv().await.unwrap();
+            debug!(m = ?m, "rcvd");
+            assert_eq!(m, msgs[cnt]);
+            cnt += 1;
+            if cnt == msgs.len() {
+                info!("done");
+                return;
+            }
+        }
     }
 
     #[test]
@@ -691,36 +691,39 @@ mod test {
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
-        let _guard = subscriber.set_default();
+        let _guard = subscriber.try_init().unwrap_or_else(|_| ());
         color_eyre::install().unwrap_or_else(|_| ());
 
         let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+            .threaded_scheduler()
             .enable_time()
             .build()
             .unwrap();
 
-        use std::sync::{atomic::AtomicUsize, Arc, Mutex};
+        use std::ops::DerefMut;
+        use std::sync::{Arc, Mutex};
 
         rt.block_on(
             async move {
                 let mut t = Chan::default();
-                let ctr: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
-                let staged: Arc<Mutex<Vec<((), Vec<u8>)>>> = Default::default();
+                let staged: Arc<Mutex<(usize, Vec<((), Vec<u8>)>)>> = Default::default();
                 t.link_conditions(move |x| {
-                    let c = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let mut s = staged.lock().unwrap();
+                    let (c, st) = &mut s.deref_mut();
                     if let Some(x) = x {
-                        if c == 2 {
-                            s.push(x);
-                            debug!(cnt = ?c, "delaying packet");
+                        *c += 1;
+                        if *c == 3 {
+                            debug!(cnt = ?c, msg = ?x, deferred = st.len(), "delaying packet");
+                            st.push(x);
                             None
                         } else {
+                            debug!(cnt = ?c, msg=?x, deferred = st.len(), "sending packet");
                             Some(x)
                         }
                     } else {
-                        if c > 2 {
-                            s.pop()
+                        if *c > 8 && !st.is_empty() {
+                            debug!(cnt = ?c, msg = ?&st[0], deferred = st.len(), "sending packet");
+                            st.pop()
                         } else {
                             None
                         }
