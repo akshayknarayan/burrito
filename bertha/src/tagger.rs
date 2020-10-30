@@ -11,8 +11,7 @@ use std::collections::BinaryHeap;
 use std::convert::TryInto;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{atomic::AtomicUsize, Arc};
-use tokio::sync::RwLock;
+use std::sync::{atomic::AtomicUsize, Arc, Mutex};
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
@@ -368,7 +367,7 @@ where
 pub struct OrderedProj<A, C, D> {
     inner: Arc<C>,
     hole_thresh: Option<usize>,
-    state: Arc<RwLock<OrderedState<(A, D)>>>,
+    state: Arc<Mutex<OrderedState<(A, D)>>>,
 }
 
 impl<A, C, D> OrderedProj<A, C, D> {
@@ -398,7 +397,7 @@ where
         Box::pin(
             async move {
                 let seq = {
-                    let mut st = state.write().await;
+                    let mut st = state.lock().unwrap();
                     let seq = st.snd_nxt;
                     st.snd_nxt += 1;
                     seq
@@ -423,39 +422,34 @@ where
         Box::pin(
             async move {
                 loop {
-                    let expected = {
-                        let mut st = state.write().await;
-                        let mut pop = false;
+                    {
+                        let mut st = state.lock().unwrap();
                         if let Some(DataPair(seq, _)) = st.recvd.peek() {
-                            pop = *seq == st.expected_recv;
+                            let mut pop = *seq == st.expected_recv;
                             if let Some(thresh) = hole_thresh {
                                 pop = pop || (st.recvd.len() > thresh);
                             }
 
                             if pop {
                                 trace!(seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "returning ordered packet");
+                                st.expected_recv += 1;
+                                return Ok(st.recvd.pop().unwrap().1);
                             } else {
                                 trace!(head_seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "calling inner recv");
                             }
                         }
 
-                        if pop {
-                            st.expected_recv += 1;
-                            return Ok(st.recvd.pop().unwrap().1);
-                        }
-
-                        st.expected_recv
-                    };
+                    }
 
                     let (a, (seq, d)) = inner.recv().await?;
-                    //#[allow(clippy::comparison_chain)]
-                    if seq == expected {
+                    let mut st = state.lock().unwrap();
+                    #[allow(clippy::comparison_chain)]
+                    if seq == st.expected_recv {
                         trace!(seq = ?seq, "received in-order");
-                        state.write().await.expected_recv += 1;
+                        st.expected_recv += 1;
                         return Ok((a, d));
-                    } else if seq > expected {
-                        trace!(seq = ?seq, "received out-of-order");
-                        let mut st = state.write().await;
+                    } else if seq > st.expected_recv {
+                        trace!(seq = ?seq, expected = ?st.expected_recv, "received out-of-order");
                         st.recvd.push((seq, (a, d)).into());
                     } else {
                         debug!(seq = ?seq, "dropping segment");
@@ -565,7 +559,7 @@ mod test {
     };
     use color_eyre::Report;
     use futures_util::StreamExt;
-    use tracing::{debug, info, trace};
+    use tracing::{debug, info};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -712,7 +706,7 @@ mod test {
                     let (c, st) = &mut s.deref_mut();
                     if let Some(x) = x {
                         *c += 1;
-                        if *c == 3 {
+                        if *c == 3 || *c == 5 {
                             debug!(cnt = ?c, msg = ?x, deferred = st.len(), "delaying packet");
                             st.push(x);
                             None
@@ -720,13 +714,11 @@ mod test {
                             debug!(cnt = ?c, msg=?x, deferred = st.len(), "sending packet");
                             Some(x)
                         }
+                    } else if *c > 8 && !st.is_empty() {
+                        debug!(cnt = ?c, msg = ?&st[0], deferred = st.len(), "sending packet");
+                        st.pop()
                     } else {
-                        if *c > 8 && !st.is_empty() {
-                            debug!(cnt = ?c, msg = ?&st[0], deferred = st.len(), "sending packet");
-                            st.pop()
-                        } else {
-                            None
-                        }
+                        None
                     }
                 });
 
