@@ -2,31 +2,34 @@
 
 use crate::msg::Msg;
 use bertha::{
-    bincode::SerializeChunnelProject, reliable::ReliabilityProjChunnel, tagger::OrderedChunnelProj,
-    udp::UdpSkChunnel, util::ProjectLeft, ChunnelConnection, ChunnelConnector, CxList,
+    bincode::SerializeChunnelProject,
+    reliable::ReliabilityProjChunnel,
+    tagger::OrderedChunnelProj,
+    udp::UdpSkChunnel,
+    util::ProjectLeft,
+    util::{NeverCn, RecvCallOrder},
+    ChunnelConnection, ChunnelConnector, CxList,
 };
 use burrito_shard_ctl::ClientShardChunnelClient;
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
 
 /// Connect to a Kv service.
-#[derive(Debug)]
-pub struct KvClient<C>(Arc<C>);
+pub struct KvClient<C: ChunnelConnection>(RecvCallOrder<C>);
 
-impl<C> Clone for KvClient<C> {
+impl<C: ChunnelConnection> Clone for KvClient<C> {
     fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
+        Self(self.0.clone())
     }
 }
 
-impl KvClient<()> {
+impl KvClient<NeverCn> {
     pub async fn new_basicclient(
         canonical_addr: SocketAddr,
-    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + 'static>, Report> {
+    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
         let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
             .wrap(OrderedChunnelProj::default())
@@ -44,7 +47,7 @@ impl KvClient<()> {
     pub async fn new_shardclient(
         redis_addr: SocketAddr,
         canonical_addr: SocketAddr,
-    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + 'static>, Report> {
+    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
         debug!("make client");
 
@@ -66,45 +69,55 @@ impl KvClient<()> {
         Ok(Self::new_from_cn(cn))
     }
 
-    fn new_from_cn<C: ChunnelConnection<Data = Msg> + 'static>(inner: C) -> KvClient<C> {
-        KvClient(Arc::new(inner))
+    fn new_from_cn<C2: ChunnelConnection<Data = Msg> + Send + Sync + 'static>(
+        inner: C2,
+    ) -> KvClient<C2> {
+        KvClient(RecvCallOrder::new(inner))
     }
-}
-
-#[tracing::instrument(level = "debug", skip(cn))]
-async fn do_req<R, C>(cn: R, req: Msg) -> Result<Option<String>, Report>
-where
-    R: AsRef<C>,
-    C: ChunnelConnection<Data = Msg>,
-{
-    let cn = cn.as_ref();
-    let id = req.id;
-    trace!("sending");
-    // NOTE assumes in-order delivery! Otherwise it will error.
-    cn.send(req).await.wrap_err("Error sending request")?;
-    let rsp = cn.recv().await.wrap_err("Error awaiting response")?;
-    trace!("received");
-    if rsp.id != id {
-        return Err(eyre!(
-            "Msg id mismatch, check for reordering: {} != {}",
-            rsp.id,
-            id
-        ));
-    }
-
-    Ok(rsp.into_kv().1)
 }
 
 impl<C> KvClient<C>
 where
-    C: ChunnelConnection<Data = Msg> + 'static,
+    C: ChunnelConnection<Data = Msg> + Send + Sync + 'static,
+{
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn do_req(&self, req: Msg) -> Result<Option<String>, Report> {
+        let cn = &self.0;
+        let id = req.id;
+        trace!("sending");
+        // NOTE assumes the underlying chunnel has in-order delivery semantics! Otherwise it will error.
+        //
+        // What is going on here?
+        // cn.recv() on RecvCallOrder will immediately put us in line on the recvs, before the
+        // future part. Then, the send() can take as long as it wants, and when we await the recv
+        // future, we are in the right place in line.
+        // This way, the recvs are ordered in the order that the sends were called.
+        let f = cn.recv();
+        cn.send(req).await.wrap_err("Error sending request")?;
+        let rsp = f.await.wrap_err("Error awaiting response")?;
+        trace!("received");
+        if rsp.id != id {
+            return Err(eyre!(
+                "Msg id mismatch, check for reordering: {} != {}",
+                rsp.id,
+                id
+            ));
+        }
+
+        Ok(rsp.into_kv().1)
+    }
+}
+
+impl<C> KvClient<C>
+where
+    C: ChunnelConnection<Data = Msg> + Send + Sync + 'static,
 {
     fn do_req_fut(
         &self,
         req: Msg,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<String>, Report>>>> {
-        let cn = Arc::clone(&self.0);
-        Box::pin(async move { do_req(cn, req).await })
+        let cl = self.clone();
+        Box::pin(async move { cl.do_req(req).await })
     }
 
     pub fn update_fut(
@@ -118,7 +131,7 @@ where
 
     pub async fn update(&self, key: String, val: String) -> Result<Option<String>, Report> {
         let req = Msg::put_req(key, val);
-        do_req(&self.0, req).await
+        self.do_req(req).await
     }
 
     pub fn get_fut(
@@ -131,6 +144,6 @@ where
 
     pub async fn get(&self, key: String) -> Result<Option<String>, Report> {
         let req = Msg::get_req(key);
-        do_req(&self.0, req).await
+        self.do_req(req).await
     }
 }

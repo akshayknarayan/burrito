@@ -21,7 +21,9 @@ impl Op {
 
     pub async fn exec(
         self,
-        cl: &kvstore::KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + 'static>,
+        cl: &kvstore::KvClient<
+            impl bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static,
+        >,
     ) -> Result<Option<String>, Report> {
         match self {
             Op::Get(_, k) => cl.get(k).await,
@@ -40,7 +42,7 @@ impl std::str::FromStr for Op {
         } else if sp.len() == 4 && sp[1] == "UPDATE" {
             Op::Update(sp[0].parse()?, sp[2].into(), sp[3].into())
         } else {
-            Err(eyre!("Invalid line: {:?}", s))?
+            return Err(eyre!("Invalid line: {:?}", s));
         })
     }
 }

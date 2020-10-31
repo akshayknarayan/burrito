@@ -7,10 +7,84 @@ use futures_util::future::{
 };
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{oneshot, Mutex};
+use tracing::trace;
+
+/// Remember the order of calls to recv(), and return packets from the underlying connection in
+/// that order.
+#[derive(Debug)]
+pub struct RecvCallOrder<C: ChunnelConnection> {
+    inner: Arc<C>,
+    queue: Arc<StdMutex<VecDeque<oneshot::Sender<Result<C::Data, Report>>>>>,
+}
+
+impl<C: ChunnelConnection> Clone for RecvCallOrder<C> {
+    fn clone(&self) -> Self {
+        RecvCallOrder {
+            inner: Arc::clone(&self.inner),
+            queue: Arc::clone(&self.queue),
+        }
+    }
+}
+
+impl<C: ChunnelConnection> RecvCallOrder<C> {
+    pub fn new(inner: C) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            queue: Default::default(),
+        }
+    }
+}
+
+impl<C> ChunnelConnection for RecvCallOrder<C>
+where
+    C: ChunnelConnection + Send + Sync + 'static,
+    C::Data: Send + Sync + 'static,
+{
+    type Data = C::Data;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        self.inner.send(data)
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        let inner = Arc::clone(&self.inner);
+        let recv_queue = Arc::clone(&self.queue);
+        let (s, mut r) = oneshot::channel();
+        {
+            let mut rq = recv_queue.lock().unwrap();
+            rq.push_back(s);
+            trace!(pos = &rq.len(), "inserted");
+        }
+
+        Box::pin(async move {
+            loop {
+                tokio::select! {
+                    res = &mut r => {
+                        return res.expect("sender won't be dropped");
+                    }
+                    res = inner.recv() => {
+                        recv_queue
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .expect("Must have a sender waiting, since we pushed one")
+                            .send(res)
+                            .map_err(|_| ())
+                            .expect("Must have a receiver waiting");
+                    }
+                }
+            }
+        })
+    }
+}
 
 /// Dummy connection type for non-connection-oriented chunnels.
 ///
@@ -492,17 +566,16 @@ pub struct Never;
 impl<InS, InC, InE> Serve<InS> for Never
 where
     InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection + Send + Sync + 'static,
     InE: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = NeverCn<InC>;
+    type Connection = NeverCn;
     type Error = InE;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(NeverCn::new)) as _))
+        ready(Ok(Box::pin(inner.map_ok(|_| Default::default())) as _))
     }
 }
 
@@ -512,27 +585,18 @@ where
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = NeverCn<InC>;
+    type Connection = NeverCn;
     type Error = std::convert::Infallible;
 
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(NeverCn::new(cn)))
+    fn connect_wrap(&mut self, _cn: InC) -> Self::Future {
+        ready(Ok(Default::default()))
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct NeverCn<C>(Arc<C>);
+#[derive(Clone, Debug, Default)]
+pub struct NeverCn<D = ()>(std::marker::PhantomData<D>);
 
-impl<C> NeverCn<C> {
-    pub fn new(inner: C) -> Self {
-        Self(Arc::new(inner))
-    }
-}
-
-impl<C, D> ChunnelConnection for NeverCn<C>
-where
-    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
-{
+impl<D> ChunnelConnection for NeverCn<D> {
     type Data = D;
 
     fn send(
@@ -543,10 +607,6 @@ where
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let c = Arc::clone(&self.0);
-        Box::pin(async move {
-            let _ = c.recv().await?;
-            Err(eyre!("Unexpected recv in Never chunnel"))
-        })
+        Box::pin(async move { Err(eyre!("Unexpected recv in Never chunnel")) })
     }
 }

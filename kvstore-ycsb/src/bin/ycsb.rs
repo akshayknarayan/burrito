@@ -91,10 +91,10 @@ async fn do_requests<S>(
     interarrival_micros: u64,
 ) -> Result<(Vec<Duration>, Duration), Report>
 where
-    S: bertha::ChunnelConnection<Data = kvstore::Msg> + 'static,
+    S: bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static,
 {
     async fn time_req(
-        cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + 'static>,
+        cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static>,
         op: Op,
     ) -> Result<Duration, Report> {
         let now = tokio::time::Instant::now();
@@ -104,7 +104,7 @@ where
 
     #[instrument(level = "info", skip(cl, ops, done))]
     async fn req_loop(
-        cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + 'static>,
+        cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static>,
         mut ops: impl futures_util::stream::Stream<Item = (usize, Op)> + Unpin + 'static,
         done: tokio::sync::watch::Receiver<bool>,
         client_id: usize,
@@ -164,14 +164,19 @@ where
     let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
     assert!(!durs.is_empty());
     let access_end = access_start.elapsed();
-    info!("broadcasting done");
-    done_tx.broadcast(true)?;
+    if !reqs.is_empty() {
+        info!("broadcasting done");
+        done_tx
+            .broadcast(true)
+            .wrap_err("failed to broadcast experiment termination")?;
 
-    // collect all the requests that have completed.
-    let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
-    assert!(!rest_durs.is_empty());
-    info!("all clients reported");
-    durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
+        // collect all the requests that have completed.
+        let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
+        assert!(!rest_durs.is_empty());
+        info!("all clients reported");
+        durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
+    }
+
     Ok((durs, access_end))
 }
 
@@ -196,7 +201,7 @@ fn paced_ops_stream(
 
 async fn do_loads<C>(cl: &mut KvClient<C>, loads: Vec<Op>) -> Result<(), Report>
 where
-    C: bertha::ChunnelConnection<Data = kvstore::Msg> + 'static,
+    C: bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static,
 {
     info!("starting");
     // don't need to time the loads.
