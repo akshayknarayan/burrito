@@ -24,12 +24,18 @@ pub enum Op {
 // byte n: 1 = Some, 0 = None
 // bytes n-(n+8) (if Some): val length
 // bytes (n+8)-m: val
-#[derive(Debug, Clone, Hash, Serialize, Deserialize)]
+#[derive(Clone, Hash, Serialize, Deserialize)]
 pub struct Msg {
     pub(crate) id: usize,
     pub(crate) op: Op,
     pub(crate) key: String,
     pub(crate) val: Option<String>,
+}
+
+impl std::fmt::Debug for Msg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Msg").field("id", &self.id).finish()
+    }
 }
 
 impl Msg {
