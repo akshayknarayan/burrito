@@ -6,14 +6,15 @@ use color_eyre::{
     Section,
 };
 use futures_util::{
-    future::Ready,
+    future::{select, FutureExt, Ready},
     stream::{Once, Stream, TryStreamExt},
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tracing::{debug, debug_span, instrument, trace, warn};
 use tracing_futures::Instrument;
 
@@ -345,38 +346,38 @@ where
         let t1 = T1::capabilities();
         let t2 = T2::capabilities();
 
-        for idx in 0..caps.len() {
+        for co in caps.iter() {
             if t1.len() <= t2.len() {
-                let mut co: Vec<C> = caps[idx].clone();
-                co.extend_from_slice(&t1);
-                if lacking(&co, C::universe()).is_empty() {
-                    return Ok((vec![caps[idx].clone().into()], Either::Left(self.0)));
+                let mut co1: Vec<C> = co.clone();
+                co1.extend_from_slice(&t1);
+                if lacking(&co1, C::universe()).is_empty() {
+                    return Ok((vec![co1.into()], Either::Left(self.0)));
                 }
 
-                let mut co = caps[idx].clone();
-                co.extend_from_slice(&t2);
-                if lacking(&co, C::universe()).is_empty() {
-                    return Ok((vec![caps[idx].clone().into()], Either::Right(self.1)));
+                let mut co2 = co.clone();
+                co2.extend_from_slice(&t2);
+                if lacking(&co2, C::universe()).is_empty() {
+                    return Ok((vec![co2.into()], Either::Right(self.1)));
                 }
             } else {
-                let mut co = caps[idx].clone();
-                co.extend_from_slice(&t2);
-                if lacking(&co, C::universe()).is_empty() {
-                    return Ok((vec![caps[idx].clone().into()], Either::Right(self.1)));
+                let mut co1 = co.clone();
+                co1.extend_from_slice(&t2);
+                if lacking(&co1, C::universe()).is_empty() {
+                    return Ok((vec![co1.into()], Either::Right(self.1)));
                 }
 
-                let mut co = caps[idx].clone();
-                co.extend_from_slice(&t1);
-                if lacking(&co, C::universe()).is_empty() {
-                    return Ok((vec![caps[idx].clone().into()], Either::Left(self.0)));
+                let mut co2 = co.clone();
+                co2.extend_from_slice(&t1);
+                if lacking(&co2, C::universe()).is_empty() {
+                    return Ok((vec![co2.into()], Either::Left(self.0)));
                 }
             }
         }
 
-        return Err(eyre!(
+        Err(eyre!(
             "Could not find satisfying client/server capability set for {:?}",
             std::any::type_name::<C>()
-        ));
+        ))
     }
 }
 
@@ -405,6 +406,62 @@ where
     }
 }
 
+pub struct InjectWithChannel<C, D>(C, Arc<AtomicBool>, Arc<TokioMutex<oneshot::Receiver<D>>>);
+
+impl<C, D> InjectWithChannel<C, D> {
+    pub fn make(inner: C) -> (Self, oneshot::Sender<D>) {
+        let (s, r) = oneshot::channel();
+        (
+            Self(
+                inner,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(TokioMutex::new(r)),
+            ),
+            s,
+        )
+    }
+}
+
+impl<C, D> ChunnelConnection for InjectWithChannel<C, D>
+where
+    C: ChunnelConnection<Data = D>,
+    D: Send + 'static,
+{
+    type Data = D;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        self.0.send(data)
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        let f = self.0.recv();
+        if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+            f
+        } else {
+            let done = Arc::clone(&self.1);
+            let r = Arc::clone(&self.2);
+            let sel = select(
+                f,
+                Box::pin(async move {
+                    use std::ops::DerefMut;
+                    match r.lock().await.deref_mut().await {
+                        Ok(d) => {
+                            done.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(d)
+                        }
+                        Err(_) => futures_util::future::pending().await,
+                    }
+                }),
+            )
+            .map(|e| e.factor_first().0);
+            Box::pin(sel)
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NegotiateMsg {
     ClientOffer(Vec<Vec<Offer>>),
@@ -413,44 +470,53 @@ pub enum NegotiateMsg {
     ServerNonceAck,
 }
 
+type ServeInput<C, A> = Once<Ready<Result<InjectWithChannel<C, (A, Vec<u8>)>, Report>>>;
 use crate::and_then_concurrent::TryStreamExtExt;
 
 /// Return a stream of connections with `stack`'s semantics, listening on `raw_cn_st`.
-pub fn negotiate_server<H, T, Sc, Se, C, A>(
-    stack: CxList<H, T>,
+pub fn negotiate_server<Srv, Sc, Se, C, A>(
+    stack: Srv,
     raw_cn_st: Sc,
-) -> impl Future<Output = Result<
-    impl Stream<
-        Item = Result<
-            Either<
-                <<CxList<H, T> as Pick>::Picked as Serve<Once<Ready<Result<C, Report>>>>>::Connection,
-                <<CxList<H, T> as Apply>::Applied as Serve<Once<Ready<Result<C, Report>>>>>::Connection,
-            >,
-            Report,
-        >
-    >  + Send + 'static,
-    Report,
->> + Send + 'static
+) -> impl Future<
+    Output = Result<
+        impl Stream<
+                Item = Result<
+                    Either<
+                        <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Connection,
+                        <<Srv as Apply>::Applied as Serve<ServeInput<C, A>>>::Connection,
+                    >,
+                    Report,
+                >,
+            > + Send
+            + 'static,
+        Report,
+    >,
+> + Send
+       + 'static
 where
     Sc: Stream<Item = Result<C, Se>> + Send + 'static,
     Se: Into<Report> + Send + Sync + 'static,
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    CxList<H, T>: Pick + Apply + GetOffers + Clone + Send + 'static,
-    <CxList<H, T> as Pick>::Picked: NegotiatePicked + Serve<Once<Ready<Result<C, Report>>>> + Clone + Send + 'static,
-    <<CxList<H, T> as Pick>::Picked as Serve<Once<Ready<Result<C, Report>>>>>::Connection:
-        Send + Sync + 'static,
-    <<CxList<H, T> as Pick>::Picked as Serve<Once<Ready<Result<C, Report>>>>>::Error:
+    Srv: Pick + Apply + GetOffers + Clone + Send + 'static,
+    // main-line branch: Pick on incoming negotiation handshake.
+    <Srv as Pick>::Picked: NegotiatePicked + Serve<ServeInput<C, A>> + Clone + Send + 'static,
+    <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Error: Into<Report> + Send + Sync + 'static,
+    <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Stream: Unpin + Send + 'static,
+    // nonce branch: Apply stack from nonce on indicated connections.
+    <Srv as Apply>::Applied: Serve<ServeInput<C, A>> + Clone + Send + 'static,
+    <<Srv as Apply>::Applied as Serve<ServeInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<Srv as Apply>::Applied as Serve<ServeInput<C, A>>>::Error:
         Into<Report> + Send + Sync + 'static,
-    <<CxList<H, T> as Pick>::Picked as Serve<Once<Ready<Result<C, Report>>>>>::Stream:
-        Unpin + Send + 'static,
-    <CxList<H, T> as Apply>::Applied: Serve<Once<Ready<Result<C, Report>>>> + Clone + Send + 'static,
-    <<CxList<H, T> as Apply>::Applied as Serve<Once<Ready<Result<C, Report>>>>>::Connection:
-        Send + Sync + 'static,
-    <<CxList<H, T> as Apply>::Applied as Serve<Once<Ready<Result<C, Report>>>>>::Error:
-        Into<Report> + Send + Sync + 'static,
-    <<CxList<H, T> as Apply>::Applied as Serve<Once<Ready<Result<C, Report>>>>>::Stream:
-        Unpin + Send + 'static,
-    A: Serialize + DeserializeOwned + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
+    <<Srv as Apply>::Applied as Serve<ServeInput<C, A>>>::Stream: Unpin + Send + 'static,
+    A: Serialize
+        + DeserializeOwned
+        + Eq
+        + std::hash::Hash
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
 {
     async move {
         // 1. serve (A, Vec<u8>) connections.
@@ -465,6 +531,7 @@ where
             // the output stream may be reordered compared to the input stream.
             .and_then_concurrent(move |cn| {
                 debug!("new connection");
+                let (cn, s) = InjectWithChannel::make(cn);
                 let stack = stack.clone();
                 let pending_negotiated_connections = Arc::clone(&pending_negotiated_connections);
                 async move {
@@ -496,13 +563,7 @@ where
                             .ok_or_else(|| eyre!("No connection returned"))?;
 
                         debug!(addr = ?&a, "returning pre-negotiated connection");
-
-                        // TODO we are discarding buf here. That is bad.
-                        //
-                        // To avoid discarding, wrap raw_cn_st above with something that selects on
-                        // a channel, and inject buf into the channel sender.  After that, we don't
-                        // need that channel select anymore, so it can remove itself (turn itself
-                        // into a no-op?) from the stack of `impl Stream`s.
+                        s.send((a, buf)).map_err(|_| eyre!("Send failed"))?;
                         return Ok(Some(Either::Right(new_cn)));
                     }
 
