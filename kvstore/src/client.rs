@@ -4,7 +4,7 @@ use crate::msg::Msg;
 use bertha::{
     bincode::SerializeChunnelProject,
     reliable::ReliabilityProjChunnel,
-    tagger::OrderedChunnelProj,
+    tagger::{OrderedChunnelProj, TaggerProjChunnel},
     udp::UdpSkChunnel,
     util::ProjectLeft,
     util::{NeverCn, RecvCallOrder},
@@ -32,7 +32,8 @@ impl KvClient<NeverCn> {
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
         let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
-            .wrap(OrderedChunnelProj::default())
+            //.wrap(OrderedChunnelProj::default())
+            .wrap(TaggerProjChunnel::default())
             .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default());
 
@@ -57,7 +58,8 @@ impl KvClient<NeverCn> {
             cl,
             ProjectLeft::from(canonical_addr),
         ))
-        .wrap(OrderedChunnelProj::default())
+        //.wrap(OrderedChunnelProj::default())
+        .wrap(TaggerProjChunnel::default())
         .wrap(ReliabilityProjChunnel::default())
         .wrap(SerializeChunnelProject::default());
 
@@ -96,13 +98,13 @@ where
         cn.send(req).await.wrap_err("Error sending request")?;
         let rsp = f.await.wrap_err("Error awaiting response")?;
         trace!("received");
-        if rsp.id != id {
-            return Err(eyre!(
-                "Msg id mismatch, check for reordering: {} != {}",
-                rsp.id,
-                id
-            ));
-        }
+        //if rsp.id != id {
+        //    return Err(eyre!(
+        //        "Msg id mismatch, check for reordering: {} != {}",
+        //        rsp.id,
+        //        id
+        //    ));
+        //}
 
         Ok(rsp.into_kv().1)
     }

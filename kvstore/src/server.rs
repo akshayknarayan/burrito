@@ -7,7 +7,7 @@ use bertha::{
     chan_transport::RendezvousChannel,
     reliable::{ReliabilityChunnel, ReliabilityProjChunnel},
     select::SelectListener,
-    tagger::{OrderedChunnel, OrderedChunnelProj},
+    tagger::{OrderedChunnel, OrderedChunnelProj, TaggerChunnel, TaggerProjChunnel},
     udp::{UdpReqChunnel, UdpSkChunnel},
     util::ProjectLeft,
     ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers,
@@ -69,7 +69,8 @@ pub async fn serve(
     let cnsrv = ShardCanonicalServer::new(
         si.clone(),
         internal_cli,
-        CxList::from(OrderedChunnelProj::default())
+        //CxList::from(OrderedChunnelProj::default())
+        CxList::from(TaggerProjChunnel::default())
             .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default())
             // to match the ProjectLeft, since we can't write down the addr at this point
@@ -88,7 +89,8 @@ pub async fn serve(
     // OrderedChunnel: (u32, Msg) -> Msg
     // ShardCanonicalServer: Msg -> ()
     let external = CxList::from(cnsrv)
-        .wrap(OrderedChunnelProj::default())
+        //.wrap(OrderedChunnelProj::default())
+        .wrap(TaggerProjChunnel::default())
         .wrap(ReliabilityProjChunnel::<_, Msg>::default())
         .wrap(SerializeChunnelProject::<_, (u32, Option<Msg>)>::default());
     info!(shard_info = ?&si, "start canonical server");
@@ -132,7 +134,8 @@ async fn single_shard(
     internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
     s: tokio::sync::oneshot::Sender<Vec<Vec<bertha::negotiate::Offer>>>,
 ) {
-    let external = CxList::from(OrderedChunnel::default())
+    //let external = CxList::from(OrderedChunnel::default())
+    let external = CxList::from(TaggerChunnel::default())
         .wrap(ReliabilityChunnel::default())
         .wrap(SerializeChunnel::default())
         .wrap(ProjectLeft::from(addr));
