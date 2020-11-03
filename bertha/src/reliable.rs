@@ -8,6 +8,7 @@ use crate::{
     ChunnelConnection, Client, Negotiate, Serve,
 };
 use color_eyre::eyre;
+use dashmap::DashMap;
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
@@ -15,11 +16,11 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
@@ -141,7 +142,7 @@ impl<A, D> ReliabilityProjChunnel<A, D> {
 
 impl<A, InS, InC, InE, D> Serve<InS> for ReliabilityProjChunnel<A, D>
 where
-    A: Clone + Send + Sync + 'static,
+    A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
     InS: Stream<Item = Result<InC, InE>> + Send + 'static,
     InC: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
     InE: Send + Sync + 'static,
@@ -165,7 +166,7 @@ where
 
 impl<A, InC, D> Client<InC> for ReliabilityProjChunnel<A, D>
 where
-    A: Clone + Send + Sync + 'static,
+    A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
     InC: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
@@ -179,20 +180,20 @@ where
 }
 
 #[derive(Debug)]
-pub struct ReliabilityProj<A, D, C> {
+pub struct ReliabilityProj<A: Eq + Hash, D, C> {
     timeout: Duration,
     inner: Arc<C>,
-    state: Arc<RwLock<ReliabilityState<(A, D)>>>,
+    state: Arc<DashMap<A, ReliabilityState<(A, D)>>>,
 }
 
-impl<A, C, D> ReliabilityProj<A, D, C> {
+impl<A: Eq + Hash, C, D> ReliabilityProj<A, D, C> {
     pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
         self.timeout = to;
         self
     }
 }
 
-impl<Cx, A, D> From<Cx> for ReliabilityProj<A, D, Cx> {
+impl<Cx, A: Eq + Hash, D> From<Cx> for ReliabilityProj<A, D, Cx> {
     fn from(cx: Cx) -> ReliabilityProj<A, D, Cx> {
         ReliabilityProj {
             inner: Arc::new(cx),
@@ -202,7 +203,7 @@ impl<Cx, A, D> From<Cx> for ReliabilityProj<A, D, Cx> {
     }
 }
 
-impl<A, C, D> Clone for ReliabilityProj<A, D, C> {
+impl<A: Eq + Hash, C, D> Clone for ReliabilityProj<A, D, C> {
     fn clone(&self) -> Self {
         ReliabilityProj {
             timeout: self.timeout,
@@ -214,7 +215,7 @@ impl<A, C, D> Clone for ReliabilityProj<A, D, C> {
 
 impl<A, C, D> ChunnelConnection for ReliabilityProj<A, D, C>
 where
-    A: Clone + Send + Sync + 'static,
+    A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
     C: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
@@ -225,7 +226,9 @@ where
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let (addr, data) = data;
+        self.state.entry(addr.clone()).or_default();
         let seq = data.0;
+        let a = addr.clone();
 
         let state = Arc::clone(&self.state);
         let inner = Arc::clone(&self.inner);
@@ -236,19 +239,18 @@ where
                 let data = (data.0, Some(data.1));
 
                 {
-                    let mut state = state.write().await;
-                    state
-                        .inflight
+                    let mut st = state.get_mut(&addr).unwrap();
+                    st.inflight
                         .insert(seq, ((addr.clone(), data.1.clone().unwrap()), Some(s)));
-                    state.retx_tracker.insert(Instant::now(), seq);
-                    trace!(inflight = state.inflight.len(), seq = ?seq, "sent");
+                    st.retx_tracker.insert(Instant::now(), seq);
+                    trace!(inflight = st.inflight.len(), seq = ?seq, "sent");
                 }
 
                 inner.send((addr, data)).await?;
-                transmit(Arc::clone(&inner), Arc::clone(&state), r, timeout).await?;
+                transmit(Arc::clone(&inner), state, r, timeout).await?;
                 Ok(())
             }
-            .instrument(tracing::debug_span!("send", seq = ?seq)),
+            .instrument(tracing::debug_span!("send", seq = ?seq, to_addr = ?a)),
         )
     }
 
@@ -260,12 +262,9 @@ where
 
         Box::pin(
             async move {
-                {
-                    let st = state.read().await;
-                    if !st.pending_payload.is_empty() {
-                        std::mem::drop(st);
-                        let mut st = state.write().await;
-                        let (seq, (addr, d)) = st.pending_payload.pop_front().unwrap();
+                for mut e in state.iter_mut() {
+                    let st = e.value_mut();
+                    if let Some((seq, (addr, d))) = st.pending_payload.pop_front() {
                         return Ok((addr, (seq, d)));
                     }
                 }
@@ -282,12 +281,12 @@ where
 
 async fn transmit<A, C, D>(
     inner: Arc<C>,
-    state: Arc<RwLock<ReliabilityState<(A, D)>>>,
+    state: Arc<DashMap<A, ReliabilityState<(A, D)>>>,
     mut r: tokio::sync::oneshot::Receiver<Result<(), eyre::Report>>,
     timeout: Duration,
 ) -> Result<(), eyre::Report>
 where
-    A: Clone + Send + Sync + 'static,
+    A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
     C: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
@@ -303,10 +302,12 @@ where
                             return Ok::<_, eyre::Report>(());
                         }
                         _ = tokio::time::delay_for(timeout) => {
-                            // manage timeouts
-                            let mut need_retx = false;
-                            {
-                                let st = state.read().await;
+                            let mut retx_needed = vec![];
+                            for mut e in state.iter_mut() {
+                                let (a, st) = e.pair_mut();
+
+                                // manage timeouts
+                                let mut need_retx = false;
                                 match st.last_timeout {
                                     None => need_retx = true,
                                     Some(then) if then.elapsed() > timeout => {
@@ -315,36 +316,36 @@ where
                                     }
                                     _ => (),
                                 }
-                            } // end read lock on state
 
-                            if need_retx {
-                                debug!("checking retransmissions");
-                                let expired = {
-                                    let mut st = state.write().await;
-                                    let cutoff = Instant::now() - timeout;
-                                    let mut unexpired = st.retx_tracker.split_off(&cutoff);
-                                    std::mem::swap(&mut unexpired, &mut st.retx_tracker);
-                                    unexpired
-                                };
+                                if need_retx {
+                                    trace!(addr = ?a, "checking retransmissions");
+                                    let expired = {
+                                        let cutoff = Instant::now() - timeout;
+                                        let mut unexpired = st.retx_tracker.split_off(&cutoff);
+                                        std::mem::swap(&mut unexpired, &mut st.retx_tracker);
+                                        unexpired
+                                    };
 
-                                for (_, seq) in expired {
-                                    let st = state.read().await;
-                                    let d = if let Some((d, _)) = st.inflight.get(&seq) {
-                                        debug!(seq = ?seq, "retransmitting");
-                                        Some(d.clone())
-                                    } else { None };
-                                    // avoid holding lock across the await
-                                    std::mem::drop(st);
+                                    for (_, seq) in expired {
+                                        let d = if let Some((d, _)) = st.inflight.get(&seq) {
+                                            debug!(addr = ?a, seq = ?seq, "retransmitting");
+                                            Some(d.clone())
+                                        } else { None };
 
-                                    if let Some((addr, d)) = d {
-                                        inner.send((addr, (seq, Some(d.clone())))).await?;
-                                        let mut st = state.write().await;
-                                        st.retx_tracker.insert(Instant::now(), seq);
+                                        if let Some((addr, d)) = d {
+                                            retx_needed.push((addr, (seq, d)));
+                                        }
+
                                     }
-                                }
 
-                                let mut st = state.write().await;
-                                st.last_timeout = Some(Instant::now());
+                                }
+                            }
+
+                            for (addr, (seq, d)) in retx_needed.into_iter() {
+                                inner.send((addr.clone(), (seq, Some(d.clone())))).await?;
+                                let mut g = state.get_mut(&addr).unwrap();
+                                g.retx_tracker.insert(Instant::now(), seq);
+                                g.last_timeout = Some(Instant::now());
                             }
                         }
                     );
@@ -358,7 +359,7 @@ where
                 let mut state = state1;
                 loop {
                     let (addr, (seq, data)) = do_recv(&mut inner, &mut state).await?;
-                    let mut st = state.write().await;
+                    let mut st = state.entry(addr.clone()).or_default();
                     st.pending_payload.push_back((seq, (addr, data)));
                 }
             }
@@ -372,10 +373,10 @@ where
 
 async fn do_recv<A, C, D>(
     inner: &mut Arc<C>,
-    state: &mut Arc<RwLock<ReliabilityState<(A, D)>>>,
+    state: &mut Arc<DashMap<A, ReliabilityState<(A, D)>>>,
 ) -> Result<(A, (u32, D)), eyre::Report>
 where
-    A: Clone + Send + Sync + 'static,
+    A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
     C: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
@@ -385,11 +386,17 @@ where
 
         if data.is_none() {
             // it was an ack
-            let mut st = state.write().await;
+            let st = state.get_mut(&addr);
+            if st.is_none() {
+                trace!(seq = ?seq, from = ?&addr, "got ack from unknown addr");
+                continue;
+            }
+
+            let mut st = st.unwrap();
             trace!(seq = ?seq, "got ack");
             if let Some((_, Some(s))) = st.inflight.remove(&seq) {
                 s.send(Ok(())).unwrap_or_else(|_| {
-                    debug!(seq = ?seq, "discarding oneshot send");
+                    debug!(seq = ?seq, from = ?&addr, "discarding oneshot send");
                 });
             }
 
@@ -397,7 +404,7 @@ where
         } else {
             // send an ack
             inner.send((addr.clone(), (seq, None))).await?;
-            trace!(seq = ?seq, "got payload, sent ack");
+            trace!(seq = ?seq, from = ?&addr, "got payload, sent ack");
         }
 
         return Ok((addr, (seq, data.unwrap())));

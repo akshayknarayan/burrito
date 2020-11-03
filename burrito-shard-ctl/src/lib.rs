@@ -201,7 +201,7 @@ where
                         warn!(err = ?e, "failed sending negotiation nonce to shard");
                     }
 
-                    trace!("wait for shard response");
+                    trace!("wait for nonce ack");
                     match cn.recv().await {
                         Ok((a, buf)) => match bincode::deserialize(&buf) {
                             Ok(bertha::negotiate::NegotiateMsg::ServerNonceAck) => {

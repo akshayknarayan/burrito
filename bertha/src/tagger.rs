@@ -5,13 +5,15 @@ use crate::{
     ChunnelConnection, Client, Negotiate, Serve,
 };
 use color_eyre::eyre;
+use dashmap::DashMap;
 use futures_util::future::{ready, Ready};
 use futures_util::stream::{Stream, TryStreamExt};
 use std::collections::BinaryHeap;
 use std::convert::TryInto;
 use std::future::Future;
+use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::{atomic::AtomicUsize, Arc, Mutex};
+use std::sync::{atomic::AtomicUsize, Arc};
 use tracing::trace;
 use tracing_futures::Instrument;
 
@@ -244,6 +246,187 @@ where
     }
 }
 
+/// `OrderedChunnelProj` takes in Data segments and tags them for use with `(A, (u32, D))` Chunnels.
+///
+/// It returns data segments in the order they were sent.
+#[derive(Clone, Debug)]
+pub struct OrderedChunnelProj {
+    hole_thresh: Option<usize>,
+}
+
+impl OrderedChunnelProj {
+    pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
+        self.hole_thresh = Some(thresh);
+        self
+    }
+}
+
+impl Default for OrderedChunnelProj {
+    fn default() -> Self {
+        Self { hole_thresh: None }
+    }
+}
+
+impl Negotiate for OrderedChunnelProj {
+    type Capability = ();
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![]
+    }
+}
+
+impl<A, D, InS, InC, InE> Serve<InS> for OrderedChunnelProj
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = OrderedProj<A, InC, D>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        let cfg = self.hole_thresh;
+        ready(Ok(
+            Box::pin(inner.map_ok(move |cn| OrderedProj::new(cn, cfg))) as _,
+        ))
+    }
+}
+
+impl<A, D, InC> Client<InC> for OrderedChunnelProj
+where
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = OrderedProj<A, InC, D>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(OrderedProj::new(cn, self.hole_thresh)))
+    }
+}
+
+#[derive(Debug)]
+struct OrderedState<D> {
+    snd_nxt: u32,
+    expected_recv: u32,
+    recvd: BinaryHeap<DataPair<D>>, // list of out-of-order received seqs
+}
+
+impl<D> Default for OrderedState<D> {
+    fn default() -> Self {
+        OrderedState {
+            snd_nxt: 0,
+            expected_recv: 0,
+            recvd: BinaryHeap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderedProj<A: Eq + Hash, C, D> {
+    inner: Arc<C>,
+    hole_thresh: Option<usize>,
+    state: Arc<DashMap<A, OrderedState<(A, D)>>>,
+}
+
+impl<A: Eq + Hash, C, D> OrderedProj<A, C, D> {
+    pub fn new(inner: C, hole_thresh: Option<usize>) -> Self {
+        OrderedProj {
+            inner: Arc::new(inner),
+            hole_thresh,
+            state: Default::default(),
+        }
+    }
+}
+
+impl<A, C, D> ChunnelConnection for OrderedProj<A, C, D>
+where
+    C: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
+{
+    type Data = (A, D);
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        let state = Arc::clone(&self.state);
+        let inner = Arc::clone(&self.inner);
+        Box::pin(
+            async move {
+                let (addr, data) = data;
+                state.entry(addr.clone()).or_default();
+                let seq = {
+                    let mut st = state.get_mut(&addr).unwrap();
+                    let seq = st.snd_nxt;
+                    st.snd_nxt += 1;
+                    seq
+                };
+
+                trace!(seq = ?seq, "sending");
+                inner.send((addr, (seq, data))).await?;
+                trace!(seq = ?seq, "finished send");
+                Ok(())
+            }
+            .instrument(tracing::trace_span!("orderedproj_send")),
+        )
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        let state = Arc::clone(&self.state);
+        let inner = Arc::clone(&self.inner);
+        let hole_thresh = self.hole_thresh;
+        Box::pin(
+            async move {
+                loop {
+                    for mut e in state.iter_mut() {
+                        let (a, st) = e.pair_mut();
+                        if let Some(DataPair(seq, _)) = st.recvd.peek() {
+                            let mut pop = *seq == st.expected_recv;
+                            if let Some(thresh) = hole_thresh {
+                                pop = pop || (st.recvd.len() > thresh);
+                            }
+
+                            if pop {
+                                trace!(addr = ?a, seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "returning ordered packet");
+                                st.expected_recv += 1;
+                                return Ok(st.recvd.pop().unwrap().1);
+                            } else {
+                                trace!(addr = ?a, head_seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "calling inner recv");
+                            }
+                        }
+                    }
+
+                    let (a, (seq, d)) = inner.recv().await?;
+                    trace!(seq = ?seq, from=?a, "received pkt, locking state");
+                    let mut st = state.entry(a.clone()).or_default();
+                    #[allow(clippy::comparison_chain)]
+                    if seq == st.expected_recv {
+                        trace!(seq = ?seq, from=?a, "received in-order");
+                        st.expected_recv += 1;
+                        return Ok((a, d));
+                    } else if seq > st.expected_recv {
+                        trace!(seq = ?seq, from=?a, expected = ?st.expected_recv, "received out-of-order");
+                        st.recvd.push((seq, (a, d)).into());
+                    } else {
+                        trace!(seq = ?seq, from=?a, expected = ?st.expected_recv, "dropping segment");
+                    }
+                }
+            }
+            .instrument(tracing::trace_span!("orderedproj_recv")),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DataPair<D>(u32, D);
 
@@ -278,186 +461,6 @@ impl<D> Ord for DataPair<D> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // make it a min-heap
         other.0.cmp(&self.0)
-    }
-}
-
-#[derive(Debug)]
-struct OrderedState<D> {
-    snd_nxt: u32,
-    expected_recv: u32,
-    recvd: BinaryHeap<DataPair<D>>, // list of out-of-order received seqs
-}
-
-impl<D> Default for OrderedState<D> {
-    fn default() -> Self {
-        OrderedState {
-            snd_nxt: 0,
-            expected_recv: 0,
-            recvd: BinaryHeap::new(),
-        }
-    }
-}
-
-/// `OrderedChunnelProj` takes in Data segments and tags them for use with `(A, (u32, D))` Chunnels.
-///
-/// It returns data segments in the order they were sent.
-#[derive(Clone, Debug)]
-pub struct OrderedChunnelProj {
-    hole_thresh: Option<usize>,
-}
-
-impl OrderedChunnelProj {
-    pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
-        self.hole_thresh = Some(thresh);
-        self
-    }
-}
-
-impl Default for OrderedChunnelProj {
-    fn default() -> Self {
-        Self { hole_thresh: None }
-    }
-}
-
-impl Negotiate for OrderedChunnelProj {
-    type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
-}
-
-impl<A, D, InS, InC, InE> Serve<InS> for OrderedChunnelProj
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    A: std::fmt::Debug + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = OrderedProj<A, InC, D>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let cfg = self.hole_thresh;
-        ready(Ok(
-            Box::pin(inner.map_ok(move |cn| OrderedProj::new(cn, cfg))) as _,
-        ))
-    }
-}
-
-impl<A, D, InC> Client<InC> for OrderedChunnelProj
-where
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    A: std::fmt::Debug + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = OrderedProj<A, InC, D>;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(OrderedProj::new(cn, self.hole_thresh)))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct OrderedProj<A, C, D> {
-    inner: Arc<C>,
-    hole_thresh: Option<usize>,
-    state: Arc<Mutex<OrderedState<(A, D)>>>,
-}
-
-impl<A, C, D> OrderedProj<A, C, D> {
-    pub fn new(inner: C, hole_thresh: Option<usize>) -> Self {
-        OrderedProj {
-            inner: Arc::new(inner),
-            hole_thresh,
-            state: Default::default(),
-        }
-    }
-}
-
-impl<A, C, D> ChunnelConnection for OrderedProj<A, C, D>
-where
-    C: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-    A: std::fmt::Debug + Send + Sync + 'static,
-{
-    type Data = (A, D);
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-        let state = Arc::clone(&self.state);
-        let inner = Arc::clone(&self.inner);
-        Box::pin(
-            async move {
-                let seq = {
-                    let mut st = state.lock().unwrap();
-                    let seq = st.snd_nxt;
-                    st.snd_nxt += 1;
-                    seq
-                };
-
-                trace!(seq = ?seq, "sending");
-                let (addr, data) = data;
-                inner.send((addr, (seq, data))).await?;
-                trace!(seq = ?seq, "finished send");
-                Ok(())
-            }
-            .instrument(tracing::trace_span!("orderedproj_send")),
-        )
-    }
-
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
-        let state = Arc::clone(&self.state);
-        let inner = Arc::clone(&self.inner);
-        let hole_thresh = self.hole_thresh;
-        Box::pin(
-            async move {
-                loop {
-                    {
-                        let mut st = state.lock().unwrap();
-                        if let Some(DataPair(seq, _)) = st.recvd.peek() {
-                            let mut pop = *seq == st.expected_recv;
-                            if let Some(thresh) = hole_thresh {
-                                pop = pop || (st.recvd.len() > thresh);
-                            }
-
-                            if pop {
-                                trace!(seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "returning ordered packet");
-                                st.expected_recv += 1;
-                                return Ok(st.recvd.pop().unwrap().1);
-                            } else {
-                                trace!(head_seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "calling inner recv");
-                            }
-                        }
-                    }
-
-                    let (a, (seq, d)) = inner.recv().await?;
-                    trace!(seq = ?seq, from=?a, "received pkt, locking state");
-                    let mut st = state.lock().unwrap();
-                    #[allow(clippy::comparison_chain)]
-                    if seq == st.expected_recv {
-                        trace!(seq = ?seq, "received in-order");
-                        st.expected_recv += 1;
-                        return Ok((a, d));
-                    } else if seq > st.expected_recv {
-                        trace!(seq = ?seq, expected = ?st.expected_recv, "received out-of-order");
-                        st.recvd.push((seq, (a, d)).into());
-                    } else {
-                        trace!(seq = ?seq, expected = ?st.expected_recv, "dropping segment");
-                    }
-                }
-            }
-            .instrument(tracing::trace_span!("orderedproj_recv")),
-        )
     }
 }
 
