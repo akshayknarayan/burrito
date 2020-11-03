@@ -12,7 +12,7 @@ use std::convert::TryInto;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc, Mutex};
-use tracing::{debug, trace};
+use tracing::trace;
 use tracing_futures::Instrument;
 
 #[derive(Clone, Debug, Default)]
@@ -331,7 +331,7 @@ where
     InS: Stream<Item = Result<InC, InE>> + Send + 'static,
     InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
     InE: Send + Sync + 'static,
-    A: Send + Sync + 'static,
+    A: std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
@@ -351,7 +351,7 @@ where
 impl<A, D, InC> Client<InC> for OrderedChunnelProj
 where
     InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    A: Send + Sync + 'static,
+    A: std::fmt::Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
@@ -384,7 +384,7 @@ impl<A, C, D> ChunnelConnection for OrderedProj<A, C, D>
 where
     C: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
     D: Send + Sync + 'static,
-    A: Send + Sync + 'static,
+    A: std::fmt::Debug + Send + Sync + 'static,
 {
     type Data = (A, D);
 
@@ -438,10 +438,10 @@ where
                                 trace!(head_seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "calling inner recv");
                             }
                         }
-
                     }
 
                     let (a, (seq, d)) = inner.recv().await?;
+                    trace!(seq = ?seq, from=?a, "received pkt, locking state");
                     let mut st = state.lock().unwrap();
                     #[allow(clippy::comparison_chain)]
                     if seq == st.expected_recv {
@@ -452,7 +452,7 @@ where
                         trace!(seq = ?seq, expected = ?st.expected_recv, "received out-of-order");
                         st.recvd.push((seq, (a, d)).into());
                     } else {
-                        debug!(seq = ?seq, "dropping segment");
+                        trace!(seq = ?seq, expected = ?st.expected_recv, "dropping segment");
                     }
                 }
             }

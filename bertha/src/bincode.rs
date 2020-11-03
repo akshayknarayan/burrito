@@ -11,7 +11,7 @@ use futures_util::stream::TryStreamExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::trace;
+use tracing::debug;
 
 #[derive(Debug, Clone, Default)]
 pub struct SerializeChunnel<D> {
@@ -131,6 +131,7 @@ pub struct SerializeProject<A, D, C> {
 
 impl<Cx, A, D> From<Cx> for SerializeProject<A, D, Cx> {
     fn from(cx: Cx) -> SerializeProject<A, D, Cx> {
+        debug!(data = ?std::any::type_name::<D>(), "serialize chunnel");
         SerializeProject {
             inner: Arc::new(cx),
             _data: Default::default(),
@@ -153,7 +154,6 @@ where
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let buf = bincode::serialize(&data.1).wrap_err("serialize failed")?;
-            trace!(data = ?std::any::type_name::<D>(), buf = ?&buf, "serialized");
             inner.send((data.0, buf)).await?;
             Ok(())
         })
@@ -168,7 +168,6 @@ where
                 buf,
                 std::any::type_name::<D>()
             ))?;
-            trace!(data = ?std::any::type_name::<D>(), buf = ?&buf, "deserialized");
             Ok((a, data))
         })
     }

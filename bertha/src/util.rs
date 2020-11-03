@@ -55,6 +55,7 @@ where
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        //self.inner.recv()
         let inner = Arc::clone(&self.inner);
         let recv_queue = Arc::clone(&self.queue);
         let (s, mut r) = oneshot::channel();
@@ -68,6 +69,7 @@ where
             loop {
                 tokio::select! {
                     res = &mut r => {
+                        trace!("RecvCallOrder done");
                         return res.expect("sender won't be dropped");
                     }
                     res = inner.recv() => {
@@ -80,6 +82,15 @@ where
                             .map_err(|_| ())
                             .expect("Must have a receiver waiting");
                     }
+                }
+
+                match r.try_recv() {
+                    Ok(res) => {
+                        trace!("RecvCallOrder done");
+                        return res;
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => (),
+                    Err(oneshot::error::TryRecvError::Closed) => unreachable!(),
                 }
             }
         })

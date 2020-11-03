@@ -16,6 +16,7 @@ use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{future::poll_fn, stream::TryStreamExt};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{atomic::AtomicUsize, Arc};
 use tower_buffer::Buffer;
 use tower_service::Service;
 use tracing::{debug, debug_span, info, trace, warn};
@@ -149,26 +150,28 @@ async fn single_shard(
 
     // initialize the kv store.
     let store = Buffer::new(Store::default(), 100_000);
+    let idx = Arc::new(AtomicUsize::new(0));
     if let Err(e) = st
         .try_for_each_concurrent(None, |cn| {
+            let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut store = store.clone();
             async move {
                 debug!("new");
                 loop {
-                    let msg = cn.recv().await.wrap_err(eyre!("receive message error"))?;
+                    let msg: Msg = cn.recv().await.wrap_err(eyre!("receive message error"))?;
                     debug!(msg = ?&msg, "got msg");
 
                     poll_fn(|cx| store.poll_ready(cx))
                         .await
                         .map_err(|e| eyre!(e))?;
-                    trace!("poll_ready for store");
+                    trace!(msg = ?&msg, "poll_ready for store");
                     let rsp = store.call(msg).await.unwrap();
 
                     cn.send(rsp).await.wrap_err(eyre!("send response err"))?;
                     debug!("sent response");
                 }
             }
-            .instrument(debug_span!("shard_connection"))
+            .instrument(debug_span!("shard_connection", idx = ?idx))
         })
         .instrument(debug_span!("negotiate_server"))
         .await
