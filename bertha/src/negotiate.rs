@@ -346,30 +346,30 @@ where
         let t1 = T1::capabilities();
         let t2 = T2::capabilities();
 
-        for co in caps.iter() {
+        for caps_co in caps.iter() {
             if t1.len() <= t2.len() {
-                let mut co1: Vec<C> = co.clone();
-                co1.extend_from_slice(&t1);
-                if lacking(&co1, C::universe()).is_empty() {
-                    return Ok((vec![co1.into()], Either::Left(self.0)));
+                let mut co: Vec<C> = caps_co.clone();
+                co.extend_from_slice(&t1);
+                if lacking(&co, C::universe()).is_empty() {
+                    return Ok((vec![caps_co.clone().into()], Either::Left(self.0)));
                 }
 
-                let mut co2 = co.clone();
-                co2.extend_from_slice(&t2);
-                if lacking(&co2, C::universe()).is_empty() {
-                    return Ok((vec![co2.into()], Either::Right(self.1)));
+                let mut co = caps_co.clone();
+                co.extend_from_slice(&t2);
+                if lacking(&co, C::universe()).is_empty() {
+                    return Ok((vec![caps_co.clone().into()], Either::Right(self.1)));
                 }
             } else {
-                let mut co1 = co.clone();
-                co1.extend_from_slice(&t2);
-                if lacking(&co1, C::universe()).is_empty() {
-                    return Ok((vec![co1.into()], Either::Right(self.1)));
+                let mut co = caps_co.clone();
+                co.extend_from_slice(&t2);
+                if lacking(&co, C::universe()).is_empty() {
+                    return Ok((vec![caps_co.clone().into()], Either::Right(self.1)));
                 }
 
-                let mut co2 = co.clone();
-                co2.extend_from_slice(&t1);
-                if lacking(&co2, C::universe()).is_empty() {
-                    return Ok((vec![co2.into()], Either::Left(self.0)));
+                let mut co = caps_co.clone();
+                co.extend_from_slice(&t1);
+                if lacking(&co, C::universe()).is_empty() {
+                    return Ok((vec![caps_co.clone().into()], Either::Left(self.0)));
                 }
             }
         }
