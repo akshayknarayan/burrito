@@ -3,13 +3,12 @@
 use crate::kv::Store;
 use crate::msg::Msg;
 use bertha::{
-    bincode::{SerializeChunnel, SerializeChunnelProject},
+    bincode::SerializeChunnelProject,
     chan_transport::RendezvousChannel,
-    reliable::{ReliabilityChunnel, ReliabilityProjChunnel},
+    reliable::ReliabilityProjChunnel,
     select::SelectListener,
-    tagger::{OrderedChunnel, OrderedChunnelProj},
+    tagger::OrderedChunnelProj,
     udp::{UdpReqChunnel, UdpSkChunnel},
-    util::ProjectLeft,
     ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers,
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
@@ -71,9 +70,7 @@ pub async fn serve(
         internal_cli,
         CxList::from(OrderedChunnelProj::default())
             .wrap(ReliabilityProjChunnel::default())
-            .wrap(SerializeChunnelProject::default())
-            // to match the ProjectLeft, since we can't write down the addr at this point
-            .wrap(bertha::util::Nothing::default()),
+            .wrap(SerializeChunnelProject::default()),
         shards_extern,
         offers.pop().unwrap(),
         &redis_addr,
@@ -132,10 +129,9 @@ async fn single_shard(
     internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
     s: tokio::sync::oneshot::Sender<Vec<Vec<bertha::negotiate::Offer>>>,
 ) {
-    let external = CxList::from(OrderedChunnel::default())
-        .wrap(ReliabilityChunnel::default())
-        .wrap(SerializeChunnel::default())
-        .wrap(ProjectLeft::from(addr));
+    let external = CxList::from(OrderedChunnelProj::default())
+        .wrap(ReliabilityProjChunnel::default())
+        .wrap(SerializeChunnelProject::default());
     let stack = external.clone();
     info!(addr = ?&addr, "listening");
     let st = SelectListener::new(UdpReqChunnel::default(), internal_srv)
@@ -158,7 +154,8 @@ async fn single_shard(
             async move {
                 debug!("new");
                 loop {
-                    let msg: Msg = cn.recv().await.wrap_err(eyre!("receive message error"))?;
+                    let (a, msg): (_, Msg) =
+                        cn.recv().await.wrap_err(eyre!("receive message error"))?;
                     debug!(msg = ?&msg, "got msg");
 
                     poll_fn(|cx| store.poll_ready(cx))
@@ -167,7 +164,9 @@ async fn single_shard(
                     trace!(msg = ?&msg, "poll_ready for store");
                     let rsp = store.call(msg).await.unwrap();
 
-                    cn.send(rsp).await.wrap_err(eyre!("send response err"))?;
+                    cn.send((a, rsp))
+                        .await
+                        .wrap_err(eyre!("send response err"))?;
                     debug!("sent response");
                 }
             }
