@@ -680,10 +680,9 @@ mod test {
         internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
         s: tokio::sync::oneshot::Sender<Vec<Vec<bertha::negotiate::Offer>>>,
     ) {
-        let external = CxList::from(TaggerChunnel)
-            .wrap(ReliabilityChunnel::default())
-            .wrap(SerializeChunnel::default())
-            .wrap(ProjectLeft::from(addr));
+        let external = CxList::from(TaggerProjChunnel)
+            .wrap(ReliabilityProjChunnel::default())
+            .wrap(SerializeChunnelProject::default());
         let stack = external.clone();
         info!(addr = ?&addr, "listening");
         let st = SelectListener::new(UdpReqChunnel::default(), internal_srv)
@@ -702,10 +701,13 @@ mod test {
                 async move {
                     debug!("new");
                     loop {
-                        let msg: Msg = cn.recv().await.wrap_err(eyre!("receive message error"))?;
+                        let (a, msg): (_, Msg) =
+                            cn.recv().await.wrap_err(eyre!("receive message error"))?;
                         debug!(msg = ?&msg, "got msg");
                         // just echo.
-                        cn.send(msg).await.wrap_err(eyre!("send response err"))?;
+                        cn.send((a, msg))
+                            .await
+                            .wrap_err(eyre!("send response err"))?;
                         debug!("sent echo");
                     }
                 }
@@ -852,9 +854,7 @@ mod test {
             internal_cli,
             CxList::from(TaggerProjChunnel)
                 .wrap(ReliabilityProjChunnel::default())
-                .wrap(SerializeChunnelProject::default())
-                // to match the ProjectLeft, since we can't write down the addr at this point
-                .wrap(bertha::util::Nothing::default()),
+                .wrap(SerializeChunnelProject::default()),
             shards_extern,
             offers.pop().unwrap(),
             &redis_addr,
@@ -883,15 +883,20 @@ mod test {
 
         tokio::spawn(
             async move {
-                st.try_for_each_concurrent(None, |r| {
-                    async move {
-                        r.recv().await?; // ShardCanonicalServerConnection is recv-only
-                        Ok(())
-                    }
-                })
-                .instrument(tracing::info_span!("negotiate_server"))
-                .await
-                .unwrap()
+                if let Err(e) = st
+                    .try_for_each_concurrent(None, |r| {
+                        async move {
+                            loop {
+                                r.recv().await?; // ShardCanonicalServerConnection is recv-only
+                            }
+                        }
+                    })
+                    .instrument(tracing::info_span!("negotiate_server"))
+                    .await
+                {
+                    warn!(err = ?e, "canonical server crashed");
+                    panic!(e);
+                }
             }
             .instrument(tracing::info_span!("canonicalsrv", addr = ?&si.canonical_addr)),
         );

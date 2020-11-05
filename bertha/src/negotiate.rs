@@ -190,14 +190,18 @@ where
     }
 }
 
-fn get_offer<T>() -> Offer
+fn get_offer<T>() -> Option<Offer>
 where
     T: Negotiate,
     <T as Negotiate>::Capability: Serialize + DeserializeOwned,
 {
-    Offer {
-        capability_guid: T::Capability::guid(),
-        available: bincode::serialize(&T::capabilities()).unwrap(),
+    if T::Capability::guid() != 0 {
+        Some(Offer {
+            capability_guid: T::Capability::guid(),
+            available: bincode::serialize(&T::capabilities()).unwrap(),
+        })
+    } else {
+        None
     }
 }
 
@@ -224,14 +228,21 @@ where
     <N as Negotiate>::Capability: Serialize + DeserializeOwned,
 {
     fn offers(&self) -> Vec<Vec<Offer>> {
-        vec![vec![get_offer::<N>()]]
+        if let Some(o) = get_offer::<N>() {
+            vec![vec![o]]
+        } else {
+            Default::default()
+        }
     }
 }
 
 /// Trait to monomorphize a CxList with possible `Select`s into something that impls Serve
 pub trait Pick {
     type Picked;
-    fn pick(self, client_offers: Vec<Vec<Offer>>) -> Result<(Vec<Offer>, Self::Picked), Report>;
+    fn pick(
+        self,
+        client_offers: Vec<Vec<Offer>>,
+    ) -> Result<(Self::Picked, Option<Vec<Offer>>, Vec<Vec<Offer>>), Report>;
 }
 
 impl<N> Pick for N
@@ -239,12 +250,47 @@ where
     N: Negotiate,
 {
     type Picked = Self;
-    fn pick(self, o: Vec<Vec<Offer>>) -> Result<(Vec<Offer>, Self::Picked), Report> {
-        if o.is_empty() {
-            return Err(eyre!("Not enough offers for stack"));
+    fn pick(
+        self,
+        client_offers: Vec<Vec<Offer>>,
+    ) -> Result<(Self::Picked, Option<Vec<Offer>>, Vec<Vec<Offer>>), Report> {
+        if N::Capability::guid() == 0 {
+            Ok((self, None, client_offers))
+        } else {
+            let mut o = client_offers.into_iter();
+            Ok((self, o.next(), o.collect()))
         }
+    }
+}
 
-        Ok((o.into_iter().next().unwrap(), self))
+impl<H, T> Pick for CxList<H, T>
+where
+    H: Pick,
+    T: Pick,
+{
+    type Picked = CxList<H::Picked, T::Picked>;
+    fn pick(
+        self,
+        client_offers: Vec<Vec<Offer>>,
+    ) -> Result<(Self::Picked, Option<Vec<Offer>>, Vec<Vec<Offer>>), Report> {
+        let (head_pick, cl_pick, client_offers) = self.head.pick(client_offers)?;
+        let (tail_pick, rest_cl_pick, client_offers) = self.tail.pick(client_offers)?;
+        let pick = match (cl_pick, rest_cl_pick) {
+            (None, None) => None,
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some(mut a), Some(b)) => {
+                a.extend(b);
+                Some(a)
+            }
+        };
+        Ok((
+            CxList {
+                head: head_pick,
+                tail: tail_pick,
+            },
+            pick,
+            client_offers,
+        ))
     }
 }
 
@@ -259,10 +305,19 @@ where
 {
     fn offers(&self) -> Vec<Vec<Offer>> {
         // TODO won't work with nested select
-        let mut t1 = self.0.offers()[0].clone();
-        let t2 = self.1.offers()[0].clone();
-        t1.extend(t2);
-        vec![t1]
+        let t1 = self.0.offers();
+        let t2 = self.1.offers();
+        if t1.is_empty() {
+            t2
+        } else {
+            let mut t1 = t1[0].clone();
+            if !t2.is_empty() {
+                let t2 = t2[0].clone();
+                t1.extend(t2);
+            }
+
+            vec![t1]
+        }
     }
 }
 
@@ -308,12 +363,20 @@ where
     C: CapabilitySet + Serialize + DeserializeOwned + Clone,
 {
     type Picked = Either<T1, T2>;
-    fn pick(self, offers: Vec<Vec<Offer>>) -> Result<(Vec<Offer>, Self::Picked), Report> {
-        if offers.is_empty() {
+    fn pick(
+        self,
+        client_offers: Vec<Vec<Offer>>,
+    ) -> Result<(Self::Picked, Option<Vec<Offer>>, Vec<Vec<Offer>>), Report> {
+        if C::guid() == 0 {
+            return Ok((Either::Left(self.0), None, client_offers));
+        }
+
+        if client_offers.is_empty() {
             return Err(eyre!("Not enough offers for stack"));
         }
 
-        let offer = offers.into_iter().next().unwrap();
+        let mut offers = client_offers.into_iter();
+        let offer = offers.next().unwrap();
         if offer[0].capability_guid != C::guid() {
             return Err(eyre!("Capability type mismatch"));
         }
@@ -351,25 +414,41 @@ where
                 let mut co: Vec<C> = caps_co.clone();
                 co.extend_from_slice(&t1);
                 if lacking(&co, C::universe()).is_empty() {
-                    return Ok((vec![caps_co.clone().into()], Either::Left(self.0)));
+                    return Ok((
+                        Either::Left(self.0),
+                        Some(vec![caps_co.clone().into()]),
+                        offers.collect(),
+                    ));
                 }
 
                 let mut co = caps_co.clone();
                 co.extend_from_slice(&t2);
                 if lacking(&co, C::universe()).is_empty() {
-                    return Ok((vec![caps_co.clone().into()], Either::Right(self.1)));
+                    return Ok((
+                        Either::Right(self.1),
+                        Some(vec![caps_co.clone().into()]),
+                        offers.collect(),
+                    ));
                 }
             } else {
                 let mut co = caps_co.clone();
                 co.extend_from_slice(&t2);
                 if lacking(&co, C::universe()).is_empty() {
-                    return Ok((vec![caps_co.clone().into()], Either::Right(self.1)));
+                    return Ok((
+                        Either::Right(self.1),
+                        Some(vec![caps_co.clone().into()]),
+                        offers.collect(),
+                    ));
                 }
 
                 let mut co = caps_co.clone();
                 co.extend_from_slice(&t1);
                 if lacking(&co, C::universe()).is_empty() {
-                    return Ok((vec![caps_co.clone().into()], Either::Left(self.0)));
+                    return Ok((
+                        Either::Left(self.0),
+                        Some(vec![caps_co.clone().into()]),
+                        offers.collect(),
+                    ));
                 }
             }
         }
@@ -377,31 +456,6 @@ where
         Err(eyre!(
             "Could not find satisfying client/server capability set for {:?}",
             std::any::type_name::<C>()
-        ))
-    }
-}
-
-impl<H, T> Pick for CxList<H, T>
-where
-    H: Pick,
-    T: Pick,
-{
-    type Picked = CxList<H::Picked, T::Picked>;
-    fn pick(self, offers: Vec<Vec<Offer>>) -> Result<(Vec<Offer>, Self::Picked), Report> {
-        if offers.is_empty() {
-            return Err(eyre!("Not enough offers for stack"));
-        }
-
-        let mut offers_iter = offers.into_iter();
-        let (mut cl_pick, head_pick) = self.head.pick(vec![offers_iter.next().unwrap()])?;
-        let (rest_cl_pick, tail_pick) = self.tail.pick(offers_iter.collect())?;
-        cl_pick.extend(rest_cl_pick);
-        Ok((
-            cl_pick,
-            CxList {
-                head: head_pick,
-                tail: tail_pick,
-            },
         ))
     }
 }
@@ -449,6 +503,7 @@ where
                     use std::ops::DerefMut;
                     match r.lock().await.deref_mut().await {
                         Ok(d) => {
+                            trace!("recirculate first packet on prenegotiated connection");
                             done.store(true, std::sync::atomic::Ordering::SeqCst);
                             Ok(d)
                         }
@@ -549,7 +604,7 @@ where
                     if let Some(picked) = opt_picked {
                         let ofs = stack.offers();
                         let p = picked.clone();
-                        let mut stack = stack
+                        let (mut stack, _) = stack
                             .apply(picked)
                             .wrap_err("failed to apply semantics to client connection")
                             .note(format!("tried to apply: {:?}", p))
@@ -608,9 +663,14 @@ where
 
                             // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve,
                             //    impl Serve>> into a CxList<impl Serve>
-                            let (picked_offers, mut new_stack) = stack
+                            let (mut new_stack, picked_offers, leftover) = stack
                                 .pick(client_offers)
                                 .wrap_err(eyre!("error monomorphizing stack",))?;
+                            if !leftover.is_empty() {
+                                return Err(eyre!("Unmatched client offers"));
+                            }
+
+                            let picked_offers = picked_offers.unwrap_or_default();
                             debug!(picked_client_offers = ?&picked_offers, "monomorphized stack");
                             // tell all the stack elements about the nonce = (client addr, chosen stack)
                             let nonce = NegotiateMsg::ServerNonce {
@@ -694,7 +754,7 @@ where
 
 pub trait Apply {
     type Applied;
-    fn apply(self, offers: Vec<Offer>) -> Result<Self::Applied, Report>;
+    fn apply(self, offers: Vec<Offer>) -> Result<(Self::Applied, Option<Vec<Offer>>), Report>;
 }
 
 impl<N> Apply for N
@@ -703,7 +763,11 @@ where
     <N as Negotiate>::Capability: DeserializeOwned + Ord,
 {
     type Applied = Self;
-    fn apply(self, o: Vec<Offer>) -> Result<Self::Applied, Report> {
+    fn apply(self, o: Vec<Offer>) -> Result<(Self::Applied, Option<Vec<Offer>>), Report> {
+        if N::Capability::guid() == 0 {
+            return Ok((self, Some(o)));
+        }
+
         if o.is_empty() {
             return Err(eyre!("Not enough offers for stack"));
         }
@@ -730,7 +794,7 @@ where
             ));
         }
 
-        Ok(self)
+        Ok((self, None))
     }
 }
 
@@ -740,18 +804,21 @@ where
     T: Apply,
 {
     type Applied = CxList<H::Applied, T::Applied>;
-    fn apply(self, offers: Vec<Offer>) -> Result<Self::Applied, Report> {
-        if offers.is_empty() {
-            return Err(eyre!("Not enough offers for stack"));
-        }
+    fn apply(self, o: Vec<Offer>) -> Result<(Self::Applied, Option<Vec<Offer>>), Report> {
+        let mut offers_iter = o.into_iter();
+        let (head_pick, returned) = self
+            .head
+            .apply(offers_iter.next().map(|x| vec![x]).unwrap_or_default())?;
 
-        let mut offers_iter = offers.into_iter();
-        let head_pick = self.head.apply(vec![offers_iter.next().unwrap()])?;
-        let tail_pick = self.tail.apply(offers_iter.collect())?;
-        Ok(CxList {
-            head: head_pick,
-            tail: tail_pick,
-        })
+        let offers_iter = returned.into_iter().flatten().chain(offers_iter);
+        let (tail_pick, returned) = self.tail.apply(offers_iter.collect())?;
+        Ok((
+            CxList {
+                head: head_pick,
+                tail: tail_pick,
+            },
+            returned,
+        ))
     }
 }
 
@@ -761,12 +828,13 @@ where
     T2: Apply,
 {
     type Applied = Either<<T1 as Apply>::Applied, <T2 as Apply>::Applied>;
-    fn apply(self, offers: Vec<Offer>) -> Result<Self::Applied, Report> {
+    fn apply(self, offers: Vec<Offer>) -> Result<(Self::Applied, Option<Vec<Offer>>), Report> {
         match self.0.apply(offers.clone()) {
-            Ok(t1_applied) => Ok(Either::Left(t1_applied)),
+            Ok((t1_applied, r)) => Ok((Either::Left(t1_applied), r)),
             Err(e) => {
                 debug!(t1 = std::any::type_name::<T1>(), err = ?e, "Select::T1 mismatched");
-                Ok(Either::Right(self.1.apply(offers)?))
+                let (t2_applied, r) = self.1.apply(offers)?;
+                Ok((Either::Right(t2_applied), r))
             }
         }
     }
@@ -805,11 +873,18 @@ where
         // 4. monomorphize `stack`, picking received choices
         let p = picked.clone();
         let s = stack.clone();
-        let mut new_stack = stack.apply(picked).wrap_err(eyre!(
+        let (mut new_stack, leftover) = stack.apply(picked).wrap_err(eyre!(
             "Could not apply received impls to stack: picked = {:?}, stack = {:?}",
             &p,
             &s.offers()
         ))?;
+        match leftover {
+            Some(x) if x.is_empty() => (),
+            _ => {
+                return Err(eyre!("Did not use all picked offers"));
+            }
+        }
+
         debug!(applied = ?&new_stack, "applied to stack");
 
         // 5. return new_stack.connect_wrap(vec_u8_conn)
