@@ -7,7 +7,7 @@ use bertha::{
     tagger::OrderedChunnelProj,
     udp::UdpSkChunnel,
     util::ProjectLeft,
-    util::{NeverCn, RecvCallOrder},
+    util::{MsgIdMatcher, NeverCn},
     ChunnelConnection, ChunnelConnector, CxList,
 };
 use burrito_shard_ctl::ClientShardChunnelClient;
@@ -18,7 +18,7 @@ use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
 
 /// Connect to a Kv service.
-pub struct KvClient<C: ChunnelConnection>(RecvCallOrder<C>);
+pub struct KvClient<C: ChunnelConnection>(MsgIdMatcher<C, Msg>);
 
 impl<C: ChunnelConnection> Clone for KvClient<C> {
     fn clone(&self) -> Self {
@@ -72,7 +72,7 @@ impl KvClient<NeverCn> {
     fn new_from_cn<C2: ChunnelConnection<Data = Msg> + Send + Sync + 'static>(
         inner: C2,
     ) -> KvClient<C2> {
-        KvClient(RecvCallOrder::new(inner))
+        KvClient(MsgIdMatcher::new(inner))
     }
 }
 
@@ -85,16 +85,8 @@ where
         let cn = &self.0;
         let id = req.id;
         trace!("sending");
-        // NOTE assumes the underlying chunnel has in-order delivery semantics! Otherwise it will error.
-        //
-        // What is going on here?
-        // cn.recv() on RecvCallOrder will immediately put us in line on the recvs, before the
-        // future part. Then, the send() can take as long as it wants, and when we await the recv
-        // future, we are in the right place in line.
-        // This way, the recvs are ordered in the order that the sends were called.
-        let f = cn.recv();
-        cn.send(req).await.wrap_err("Error sending request")?;
-        let rsp = f.await.wrap_err("Error awaiting response")?;
+        cn.send_msg(req).await.wrap_err("Error sending request")?;
+        let rsp = cn.recv_msg(id).await.wrap_err("Error awaiting response")?;
         trace!("received");
         if rsp.id != id {
             return Err(eyre!(

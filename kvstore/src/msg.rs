@@ -85,6 +85,12 @@ impl Msg {
     }
 }
 
+impl bertha::util::MsgId for Msg {
+    fn id(&self) -> usize {
+        self.id()
+    }
+}
+
 impl burrito_shard_ctl::Kv for Msg {
     type Key = String;
     fn key(&self) -> Self::Key {

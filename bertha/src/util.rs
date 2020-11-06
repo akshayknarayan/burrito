@@ -2,6 +2,7 @@
 
 use super::{ChunnelConnection, ChunnelConnector, Client, Serve};
 use color_eyre::eyre::{eyre, Report};
+use dashmap::DashMap;
 use futures_util::future::{
     TryFutureExt, {ready, Ready},
 };
@@ -13,6 +14,71 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{oneshot, Mutex};
 use tracing::trace;
+
+pub trait MsgId {
+    fn id(&self) -> usize;
+}
+
+/// Match incoming messages to previously sent ones on the given id() field.
+pub struct MsgIdMatcher<C: ChunnelConnection, D> {
+    inner: Arc<C>,
+    inflight: Arc<DashMap<usize, oneshot::Sender<D>>>,
+    sent: Arc<DashMap<usize, oneshot::Receiver<D>>>,
+}
+
+impl<C: ChunnelConnection, D> Clone for MsgIdMatcher<C, D> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            inflight: Arc::clone(&self.inflight),
+            sent: Arc::clone(&self.sent),
+        }
+    }
+}
+
+impl<C, D> MsgIdMatcher<C, D>
+where
+    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    D: MsgId + Send + Sync + 'static,
+{
+    pub fn new(inner: C) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            inflight: Default::default(),
+            sent: Default::default(),
+        }
+    }
+
+    pub async fn send_msg(&self, data: D) -> Result<(), Report> {
+        let (s, r) = oneshot::channel();
+        self.sent.insert(data.id(), r);
+        self.inflight.insert(data.id(), s);
+        self.inner.send(data).await
+    }
+
+    pub async fn recv_msg(&self, msg_id: usize) -> Result<D, Report> {
+        let (_, mut r) = self
+            .sent
+            .remove(&msg_id)
+            .ok_or_else(|| eyre!("Requested msg id {:?} isn't known", msg_id))?;
+        loop {
+            tokio::select! {
+                res = &mut r => {
+                    trace!("MsgIdMatcher done");
+                    return Ok(res.expect("sender won't be dropped"));
+                }
+                res = self.inner.recv() => {
+                    let res = res?;
+                    if let Some((_, s)) = self.inflight.remove(&res.id()) {
+                        s.send(res).map_err(|_| ()).expect("receiver won't be dropped");
+                    } else {
+                        return Err(eyre!("Got msg {:?}, but wasn't known", res.id()));
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Remember the order of calls to recv(), and return packets from the underlying connection in
 /// that order.
