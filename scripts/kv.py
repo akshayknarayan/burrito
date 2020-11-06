@@ -208,7 +208,7 @@ def start_server(conn, redis_addr, outf, shards=1):
     #ok = conn.run(f"./target/release/xdp_clear -i {conn.addr}", wd="~/burrito", sudo=True)
     #check(ok, "Clear xdp programs", conn.addr)
 
-    ok = conn.run(f"RUST_LOG=info ./target/release/kvserver --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr}",
+    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/kvserver --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr}",
             wd="~/burrito",
             background=True,
             stdout=f"{outf}.out",
@@ -230,7 +230,7 @@ def run_client(conn, server, redis_addr, interarrival, outf, wrkload='uniform'):
     if wrkload == 'uniform':
         wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"
 
-    ok = conn.run(f"RUST_LOG=info,ycsb=debug ./target/release/ycsb --addr {server}:4242 --redis-addr={redis_addr} -i {interarrival} --accesses {wrkfile} --out-file={outf}0.data1",
+    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/ycsb --addr {server}:4242 --redis-addr={redis_addr} -i {interarrival} --accesses {wrkfile} --out-file={outf}0.data1",
         wd="~/burrito",
         stdout=f"{outf}0.out",
         stderr=f"{outf}0.err",
@@ -238,7 +238,7 @@ def run_client(conn, server, redis_addr, interarrival, outf, wrkload='uniform'):
         timeout=120,
         )
     check(ok, "client", conn.addr)
-    ok = conn.run(f"RUST_LOG=info,ycsb=debug ./target/release/ycsb --addr {server}:4242 --redis-addr={redis_addr} -i {interarrival} --accesses {wrkfile} --out-file={outf}1.data1",
+    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/ycsb --addr {server}:4242 --redis-addr={redis_addr} -i {interarrival} --accesses {wrkfile} --out-file={outf}1.data1",
         wd="~/burrito",
         stdout=f"{outf}1.out",
         stderr=f"{outf}1.err",

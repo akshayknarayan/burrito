@@ -72,7 +72,7 @@ where
                     if let Some((_, s)) = self.inflight.remove(&res.id()) {
                         s.send(res).map_err(|_| ()).expect("receiver won't be dropped");
                     } else {
-                        return Err(eyre!("Got msg {:?}, but wasn't known", res.id()));
+                        continue;
                     }
                 }
             }

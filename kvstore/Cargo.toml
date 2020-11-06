@@ -6,7 +6,7 @@ edition = "2018"
 
 [features]
 default = []
-bin = ["tracing-subscriber", "tracing-timing", "structopt", "tokio/macros", "tokio/rt-core"]
+bin = ["tracing-subscriber", "tracing-timing", "structopt", "tokio/macros", "tokio/rt-threaded"]
 
 [dependencies]
 bertha = { path = "../bertha" }

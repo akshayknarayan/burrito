@@ -104,7 +104,6 @@ where
         Box::pin(async move {
             let (addr, data) = data;
             let addr = addr.into();
-            trace!(to = ?&addr, "send");
             sk.lock().await.send_to(&data, &addr).await?;
             Ok(())
         })
@@ -116,7 +115,6 @@ where
 
         Box::pin(async move {
             let (len, from) = sk.lock().await.recv_from(&mut buf).await?;
-            trace!(from = ?&from, "recv");
             let data = buf[0..len].to_vec();
             Ok((from.into(), data))
         })
@@ -225,7 +223,7 @@ impl ChunnelConnection for UdpConn {
         let r = Arc::clone(&self.recv);
         Box::pin(async move {
             let d = r.lock().await.recv().await;
-            trace!(from = ?&d, "got pkt from channel");
+            trace!(from = ?&d.as_ref().map(|x| x.0), "got pkt");
             d.ok_or_else(|| eyre!("Nothing more to receive"))
         }) as _
     }

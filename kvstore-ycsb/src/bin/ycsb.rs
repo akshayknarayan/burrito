@@ -36,53 +36,67 @@ struct Opt {
     burrito_root: Option<String>,
 
     #[structopt(short, long)]
+    logging: bool,
+
+    #[structopt(short, long)]
     out_file: Option<PathBuf>,
 }
 
-#[tokio::main(core_threads = 8, max_threads = 32)]
-async fn main() -> Result<(), Report> {
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(ErrorLayer::default())
-        .init();
-
-    color_eyre::install()?;
+fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
+    if opt.logging {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default())
+            .init();
+        color_eyre::install()?;
+    }
 
     info!("reading workload");
     let loads = ops(opt.accesses.with_extension("load")).wrap_err("Reading loads")?;
-    let accesses = ops(opt.accesses).wrap_err("Reading accesses")?;
+    let accesses = ops(opt.accesses.clone()).wrap_err("Reading accesses")?;
     info!(num_ops = ?accesses.len(), "done reading workload");
 
-    info!("make clients");
-    let mut access_by_client = HashMap::default();
-    for (cid, ops) in group_by_client(accesses).into_iter() {
-        let client = KvClient::new_shardclient(opt.redis_addr, opt.addr)
-            .instrument(info_span!("make kvclient", client_id = ?cid))
-            .await
-            .wrap_err("make KvClient")?;
-        access_by_client.insert(cid, (client, ops));
-    }
+    let mut rt = tokio::runtime::Builder::new()
+        .threaded_scheduler()
+        .core_threads(8)
+        .enable_all()
+        .build()?;
 
-    let num_clients = access_by_client.len();
-    let mut basic_client = KvClient::new_basicclient(opt.addr)
-        .instrument(info_span!("make kvclient"))
-        .await?;
-    do_loads(&mut basic_client, loads)
-        .instrument(info_span!("loads"))
-        .await?;
-    let (durs, time) = do_requests(access_by_client, opt.interarrival_client_micros as _).await?;
+    rt.block_on(async move {
+        info!("make clients");
+        let mut access_by_client = HashMap::default();
+        for (cid, ops) in group_by_client(accesses).into_iter() {
+            let client = KvClient::new_shardclient(opt.redis_addr, opt.addr)
+                .instrument(info_span!("make kvclient", client_id = ?cid))
+                .await
+                .wrap_err("make KvClient")?;
+            access_by_client.insert(cid, (client, ops));
+        }
 
-    // done
-    write_results(
-        durs,
-        time,
-        num_clients,
-        opt.interarrival_client_micros,
-        opt.out_file,
-    );
-    Ok(())
+        let num_clients = access_by_client.len();
+        let mut basic_client = KvClient::new_basicclient(opt.addr)
+            .instrument(info_span!("make kvclient", client_id = "loads_client"))
+            .await?;
+        do_loads(&mut basic_client, loads)
+            .instrument(info_span!("loads"))
+            .await?;
+        let (durs, remaining_inflight, time) =
+            do_requests(access_by_client, opt.interarrival_client_micros as _).await?;
+
+        // done
+        write_results(
+            durs,
+            remaining_inflight,
+            time,
+            num_clients,
+            opt.interarrival_client_micros,
+            opt.out_file,
+        );
+
+        Ok(())
+    })
 }
 
 /// Issue a workload of requests, divided by client worker.
@@ -96,7 +110,7 @@ async fn main() -> Result<(), Report> {
 async fn do_requests<S>(
     access_by_client: HashMap<usize, (KvClient<S>, Vec<Op>)>,
     interarrival_micros: u64,
-) -> Result<(Vec<Duration>, Duration), Report>
+) -> Result<(Vec<Duration>, usize, Duration), Report>
 where
     S: bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static,
 {
@@ -114,10 +128,10 @@ where
     #[instrument(level = "info", skip(cl, ops, done))]
     async fn req_loop(
         cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static>,
-        mut ops: impl futures_util::stream::Stream<Item = (usize, Op)> + Unpin + 'static,
+        mut ops: impl futures_util::stream::Stream<Item = (usize, Op)> + Unpin + Send + 'static,
         done: tokio::sync::watch::Receiver<bool>,
         client_id: usize,
-    ) -> Result<Vec<Duration>, Report> {
+    ) -> Result<(Vec<Duration>, usize), Report> {
         let mut durs = vec![];
         let mut inflight = FuturesOrdered::new();
 
@@ -155,7 +169,7 @@ where
             }
         }
 
-        Ok::<_, Report>(durs)
+        Ok::<_, Report>((durs, inflight.len()))
     }
 
     let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
@@ -164,13 +178,14 @@ where
         .map(move |(client_id, (cl, ops))| {
             assert!(!ops.is_empty());
             let ops = paced_ops_stream(ops, interarrival_micros, client_id);
-            req_loop(cl, ops, done_rx.clone(), client_id)
+            let jh = tokio::spawn(req_loop(cl, ops, done_rx.clone(), client_id));
+            async move { jh.await.unwrap() }
         })
         .collect();
 
     let access_start = tokio::time::Instant::now();
     // do the accesses until the first client is done.
-    let mut durs: Vec<_> = reqs.try_next().await?.expect("durs");
+    let (mut durs, mut remaining_inflight) = reqs.try_next().await?.expect("durs");
     assert!(!durs.is_empty());
     let access_end = access_start.elapsed();
     if !reqs.is_empty() {
@@ -180,20 +195,22 @@ where
             .wrap_err("failed to broadcast experiment termination")?;
 
         // collect all the requests that have completed.
-        let rest_durs: Vec<Vec<_>> = reqs.try_collect().await?;
+        let rest_durs: Vec<(_, _)> = reqs.try_collect().await?;
+        let (rest_durs, rest_left_inflight): (Vec<_>, Vec<_>) = rest_durs.into_iter().unzip();
         assert!(!rest_durs.is_empty());
         info!("all clients reported");
         durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
+        remaining_inflight += rest_left_inflight.into_iter().sum::<usize>();
     }
 
-    Ok((durs, access_end))
+    Ok((durs, remaining_inflight, access_end))
 }
 
 fn paced_ops_stream(
     ops: Vec<Op>,
     interarrival_micros: u64,
     client_id: usize,
-) -> impl futures_util::stream::Stream<Item = (usize, Op)> {
+) -> impl futures_util::stream::Stream<Item = (usize, Op)> + Send {
     let len = ops.len();
     use futures_util::stream::StreamExt;
     //let mut ops = tokio::time::interval(Duration::from_micros(interarrival_micros as u64))
@@ -241,6 +258,7 @@ fn group_by_client(accesses: Vec<Op>) -> HashMap<usize, Vec<Op>> {
 
 fn write_results(
     mut durs: Vec<Duration>,
+    remaining_inflight: usize,
     time: Duration,
     num_clients: usize,
     interarrival_client_micros: usize,
@@ -255,13 +273,43 @@ fn write_results(
         .map(|i| durs[i])
         .collect();
     let num = durs.len() as f64;
-    let achieved_load_req_per_sec = num / time.as_secs_f64();
-    let offered_load_req_per_sec = num_clients as f64 / (interarrival_client_micros as f64 / 1e6);
+    let achieved_load_req_per_sec = (num as f64) / time.as_secs_f64();
+    let offered_load_req_per_sec = (num + remaining_inflight as f64) / time.as_secs_f64();
+    let attempted_load_req_per_sec = num_clients as f64 / (interarrival_client_micros as f64 / 1e6);
     info!(
-        num = ?&durs.len(), elapsed = ?time, ?achieved_load_req_per_sec, ?offered_load_req_per_sec,
+        num = ?&durs.len(), elapsed = ?time, ?remaining_inflight,
+        ?achieved_load_req_per_sec, ?offered_load_req_per_sec, ?attempted_load_req_per_sec,
         min = ?durs[0], p25 = ?quantiles[0], p50 = ?quantiles[1],
         p75 = ?quantiles[2], p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
         "Did accesses"
+    );
+
+    println!(
+        "Did accesses:\
+        num = {:?},\
+        elapsed = {:?},\
+        remaining_inflight = {:?},\
+        achieved_load_req_per_sec = {:?},\
+        offered_load_req_per_sec = {:?},\
+        attempted_load_req_per_sec = {:?},\
+        min = {:?},\
+        p25 = {:?},\
+        p50 = {:?},\
+        p75 = {:?},\
+        p95 = {:?},\
+        max = {:?}",
+        durs.len(),
+        time,
+        remaining_inflight,
+        achieved_load_req_per_sec,
+        offered_load_req_per_sec,
+        attempted_load_req_per_sec,
+        durs[0],
+        quantiles[0],
+        quantiles[1],
+        quantiles[2],
+        quantiles[3],
+        durs[durs.len() - 1],
     );
 
     if let Some(f) = out_file {

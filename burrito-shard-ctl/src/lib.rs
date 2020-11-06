@@ -145,7 +145,7 @@ impl<A, S, Ss, C> ShardCanonicalServer<A, S, Ss, C> {
 impl<A, A3, S, Ss, C> Negotiate for ShardCanonicalServer<A, S, Ss, C>
 where
     A: Into<A3> + Clone + std::fmt::Debug + Send + Sync + 'static,
-    A3: Send + PartialEq,
+    A3: std::fmt::Debug + Send + PartialEq,
     C: ChunnelConnection<Data = (A3, Vec<u8>)> + Send + Sync + 'static,
 {
     type Capability = ShardFns;
@@ -205,21 +205,23 @@ where
                     match cn.recv().await {
                         Ok((a, buf)) => match bincode::deserialize(&buf) {
                             Ok(bertha::negotiate::NegotiateMsg::ServerNonceAck) => {
+                                // TODO collect received addresses since we could receive acks from
+                                // any shard
                                 if a != shard.clone().into() {
-                                    warn!("received from unexpected address");
+                                    warn!(addr = ?a, expected = ?shard.clone().into(), "received from unexpected address");
                                 }
 
                                 trace!("got nonce ack");
                             }
                             Ok(m) => {
-                                warn!(msg = ?m, "got unexpected response to nonce");
+                                warn!(msg = ?m, shard = ?shard.clone(), "got unexpected response to nonce");
                             }
                             Err(e) => {
-                                warn!(err = ?e, "failed deserializing nonce ack");
+                                warn!(err = ?e, shard = ?shard.clone(), "failed deserializing nonce ack");
                             }
                         },
                         Err(e) => {
-                            warn!(err = ?e, "failed waiting for nonce ack");
+                            warn!(err = ?e, shard = ?shard.clone(), "failed waiting for nonce ack");
                         }
                     }
                 }

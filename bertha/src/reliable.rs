@@ -12,7 +12,6 @@ use dashmap::DashMap;
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -45,7 +44,7 @@ impl<D> Negotiate for ReliabilityChunnel<D> {
 }
 
 impl<D> ReliabilityChunnel<D> {
-    pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
+    pub fn set_timeout_factor(&mut self, to: usize) -> &mut Self {
         self.inner.timeout = to;
         self
     }
@@ -92,28 +91,9 @@ where
     }
 }
 
-#[derive(Debug)]
-struct ReliabilityState<D> {
-    inflight: HashMap<u32, (D, Option<oneshot::Sender<Result<(), eyre::Report>>>)>, // list of inflight seqs
-    retx_tracker: BTreeMap<Instant, u32>,
-    last_timeout: Option<Instant>,
-    pending_payload: VecDeque<(u32, D)>, // payloads we have received that are waiting for a recv() call
-}
-
-impl<D> Default for ReliabilityState<D> {
-    fn default() -> Self {
-        ReliabilityState {
-            inflight: HashMap::new(),
-            retx_tracker: BTreeMap::new(),
-            last_timeout: Default::default(),
-            pending_payload: VecDeque::new(),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct ReliabilityProjChunnel<A, D> {
-    timeout: Duration,
+    timeout: usize,
     _data: std::marker::PhantomData<(A, D)>,
 }
 
@@ -127,14 +107,14 @@ impl<A, D> Negotiate for ReliabilityProjChunnel<A, D> {
 impl<A, D> Default for ReliabilityProjChunnel<A, D> {
     fn default() -> Self {
         ReliabilityProjChunnel {
-            timeout: std::time::Duration::from_millis(100),
+            timeout: 5,
             _data: Default::default(),
         }
     }
 }
 
 impl<A, D> ReliabilityProjChunnel<A, D> {
-    pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
+    pub fn set_timeout_factor(&mut self, to: usize) -> &mut Self {
         self.timeout = to;
         self
     }
@@ -158,7 +138,7 @@ where
         let cfg = self.timeout;
         ready(Ok(Box::pin(inner.map_ok(move |cn| {
             let mut r = ReliabilityProj::from(cn);
-            r.set_timeout(cfg);
+            r.set_timeout_factor(cfg);
             r
         })) as _))
     }
@@ -181,13 +161,13 @@ where
 
 #[derive(Debug)]
 pub struct ReliabilityProj<A: Eq + Hash, D, C> {
-    timeout: Duration,
+    timeout: usize,
     inner: Arc<C>,
     state: Arc<DashMap<A, ReliabilityState<(A, D)>>>,
 }
 
 impl<A: Eq + Hash, C, D> ReliabilityProj<A, D, C> {
-    pub fn set_timeout(&mut self, to: Duration) -> &mut Self {
+    pub fn set_timeout_factor(&mut self, to: usize) -> &mut Self {
         self.timeout = to;
         self
     }
@@ -197,7 +177,7 @@ impl<Cx, A: Eq + Hash, D> From<Cx> for ReliabilityProj<A, D, Cx> {
     fn from(cx: Cx) -> ReliabilityProj<A, D, Cx> {
         ReliabilityProj {
             inner: Arc::new(cx),
-            timeout: Duration::from_millis(100),
+            timeout: 5,
             state: Default::default(),
         }
     }
@@ -209,6 +189,30 @@ impl<A: Eq + Hash, C, D> Clone for ReliabilityProj<A, D, C> {
             timeout: self.timeout,
             inner: Arc::clone(&self.inner),
             state: Arc::clone(&self.state),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReliabilityState<D> {
+    inflight: HashMap<
+        u32,
+        (
+            D,
+            Option<oneshot::Sender<Result<(), eyre::Report>>>,
+            Instant,
+        ),
+    >, // list of inflight seqs
+    pending_payload: VecDeque<(u32, D)>, // payloads we have received that are waiting for a recv() call
+    rtt_est: Duration,
+}
+
+impl<D> Default for ReliabilityState<D> {
+    fn default() -> Self {
+        ReliabilityState {
+            inflight: HashMap::new(),
+            pending_payload: VecDeque::new(),
+            rtt_est: Duration::from_micros(1000),
         }
     }
 }
@@ -238,16 +242,22 @@ where
                 let (s, r) = oneshot::channel();
                 let data = (data.0, Some(data.1));
 
-                {
+                let to = {
                     let mut st = state.get_mut(&addr).unwrap();
-                    st.inflight
-                        .insert(seq, ((addr.clone(), data.1.clone().unwrap()), Some(s)));
-                    st.retx_tracker.insert(Instant::now(), seq);
-                    trace!(inflight = st.inflight.len(), seq = ?seq, "sent");
-                }
+                    st.inflight.insert(
+                        seq,
+                        (
+                            (addr.clone(), data.1.clone().unwrap()),
+                            Some(s),
+                            Instant::now(),
+                        ),
+                    );
+                    trace!(inflight = st.inflight.len(), "sending");
+                    st.rtt_est * (timeout as _)
+                };
 
-                inner.send((addr, data)).await?;
-                transmit(Arc::clone(&inner), state, r, timeout).await?;
+                inner.send((addr.clone(), data.clone())).await?;
+                transmit(Arc::clone(&inner), state, (addr, data), r, to).await?;
                 Ok(())
             }
             .instrument(tracing::debug_span!("send", seq = ?seq, to_addr = ?a)),
@@ -265,13 +275,14 @@ where
                 for mut e in state.iter_mut() {
                     let st = e.value_mut();
                     if let Some((seq, (addr, d))) = st.pending_payload.pop_front() {
+                        trace!(seq = ?seq, addr = ?addr, was_pending = true, "returning packet");
                         return Ok((addr, (seq, d)));
                     }
                 }
 
                 let (addr, (seq, data)): (A, (u32, D)) =
                     do_recv::<A, _, _>(&mut inner, &mut state).await?;
-                trace!(seq = ?seq, "returning packet");
+                trace!(seq = ?seq, addr = ?addr, was_pending = false, "returning packet");
                 Ok((addr, (seq, data)))
             }
             .instrument(tracing::debug_span!("recv")),
@@ -282,6 +293,7 @@ where
 async fn transmit<A, C, D>(
     inner: Arc<C>,
     state: Arc<DashMap<A, ReliabilityState<(A, D)>>>,
+    segment: (A, (u32, Option<D>)),
     mut r: tokio::sync::oneshot::Receiver<Result<(), eyre::Report>>,
     timeout: Duration,
 ) -> Result<(), eyre::Report>
@@ -292,61 +304,36 @@ where
 {
     let inner1 = Arc::clone(&inner);
     let state1 = Arc::clone(&state);
+    let jitter = {
+        use rand::distributions::{Distribution, Uniform};
+        let mut rng = rand::thread_rng();
+        let dist = Uniform::from(25..50);
+        let jitter: u64 = dist.sample(&mut rng);
+        Duration::from_micros(jitter)
+    };
+    let timeout = timeout + jitter;
     futures_util::future::select(
         Box::pin(
             async move {
+                let mut retx_ctr = 0;
+                let mut to_ms = timeout.as_millis();
                 loop {
+                    let to = Duration::from_millis(to_ms as u64);
                     tokio::select!(
                         done = &mut r => {
                             done??;
+                            let (_, (seq, _)) = segment;
+                            trace!(?seq, ?retx_ctr, "transmit done");
                             return Ok::<_, eyre::Report>(());
                         }
-                        _ = tokio::time::delay_for(timeout) => {
-                            let mut retx_needed = vec![];
-                            for mut e in state.iter_mut() {
-                                let (a, st) = e.pair_mut();
-
-                                // manage timeouts
-                                let mut need_retx = false;
-                                match st.last_timeout {
-                                    None => need_retx = true,
-                                    Some(then) if then.elapsed() > timeout => {
-                                        // might need to retransmit things.
-                                        need_retx = true;
-                                    }
-                                    _ => (),
-                                }
-
-                                if need_retx {
-                                    trace!(addr = ?a, "checking retransmissions");
-                                    let expired = {
-                                        let cutoff = Instant::now() - timeout;
-                                        let mut unexpired = st.retx_tracker.split_off(&cutoff);
-                                        std::mem::swap(&mut unexpired, &mut st.retx_tracker);
-                                        unexpired
-                                    };
-
-                                    for (_, seq) in expired {
-                                        let d = if let Some((d, _)) = st.inflight.get(&seq) {
-                                            debug!(addr = ?a, seq = ?seq, "retransmitting");
-                                            Some(d.clone())
-                                        } else { None };
-
-                                        if let Some((addr, d)) = d {
-                                            retx_needed.push((addr, (seq, d)));
-                                        }
-
-                                    }
-
-                                }
-                            }
-
-                            for (addr, (seq, d)) in retx_needed.into_iter() {
-                                inner.send((addr.clone(), (seq, Some(d.clone())))).await?;
-                                let mut g = state.get_mut(&addr).unwrap();
-                                g.retx_tracker.insert(Instant::now(), seq);
-                                g.last_timeout = Some(Instant::now());
-                            }
+                        _ = tokio::time::delay_for(to) => {
+                            let (ref addr, (seq, _)) = segment;
+                            retx_ctr += 1;
+                            to_ms *= to_ms;
+                            trace!(addr = ?addr, seq = ?seq, cnt = ?retx_ctr, ?to, "retransmitting");
+                            inner.send(segment.clone()).await?;
+                            debug!(addr = ?addr, seq = ?seq, cnt = ?retx_ctr, ?to, "retransmitted");
+                            //state.get_mut(addr)
                         }
                     );
                 }
@@ -393,11 +380,17 @@ where
             }
 
             let mut st = st.unwrap();
-            trace!(seq = ?seq, "got ack");
-            if let Some((_, Some(s))) = st.inflight.remove(&seq) {
+            if let Some((_, Some(s), send_time)) = st.inflight.remove(&seq) {
+                trace!(seq = ?seq, from = ?&addr, rtt = ?send_time.elapsed(), "got ack");
+                //let rtt = send_time.elapsed();
+                //st.rtt_est = Duration::from_secs_f64(
+                //    st.rtt_est.as_secs_f64() * 0.9 + rtt.as_secs_f64() * 0.1,
+                //);
                 s.send(Ok(())).unwrap_or_else(|_| {
                     debug!(seq = ?seq, from = ?&addr, "discarding oneshot send");
                 });
+            } else {
+                trace!(seq = ?seq, from = ?&addr, "got unknown ack from addr");
             }
 
             continue;

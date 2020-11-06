@@ -161,7 +161,7 @@ where
                 trace!(seq = ?seq, "sending");
                 let (addr, data) = data;
                 inner.send((addr, (seq, data))).await?;
-                trace!(seq = ?seq, "sent");
+                trace!(seq = ?seq, "finished send");
                 Ok(())
             }
             .instrument(tracing::trace_span!("taggerproj_send")),

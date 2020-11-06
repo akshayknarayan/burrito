@@ -156,18 +156,18 @@ async fn single_shard(
                 loop {
                     let (a, msg): (_, Msg) =
                         cn.recv().await.wrap_err(eyre!("receive message error"))?;
-                    debug!(msg = ?&msg, "got msg");
+                    trace!(msg = ?&msg, "got msg");
 
                     poll_fn(|cx| store.poll_ready(cx))
                         .await
                         .map_err(|e| eyre!(e))?;
-                    trace!(msg = ?&msg, "poll_ready for store");
                     let rsp = store.call(msg).await.unwrap();
 
+                    let id = rsp.id;
                     cn.send((a, rsp))
                         .await
                         .wrap_err(eyre!("send response err"))?;
-                    debug!("sent response");
+                    trace!(msg_id = id, "sent response");
                 }
             }
             .instrument(debug_span!("shard_connection", idx = ?idx))
