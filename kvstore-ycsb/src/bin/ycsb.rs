@@ -65,6 +65,7 @@ async fn main() -> Result<(), Report> {
         access_by_client.insert(cid, (client, ops));
     }
 
+    let num_clients = access_by_client.len();
     let mut basic_client = KvClient::new_basicclient(opt.addr)
         .instrument(info_span!("make kvclient"))
         .await?;
@@ -74,7 +75,13 @@ async fn main() -> Result<(), Report> {
     let (durs, time) = do_requests(access_by_client, opt.interarrival_client_micros as _).await?;
 
     // done
-    write_results(durs, time, opt.interarrival_client_micros, opt.out_file);
+    write_results(
+        durs,
+        time,
+        num_clients,
+        opt.interarrival_client_micros,
+        opt.out_file,
+    );
     Ok(())
 }
 
@@ -116,8 +123,13 @@ where
         loop {
             tokio::select!(
                 Some((remaining_cnt, o)) = ops.next() => {
-                    inflight.push(time_req(cl.clone(), o));
-                    trace!(remaining_cnt, inflight = inflight.len(), "new request");
+                    if remaining_cnt > 0 {
+                        inflight.push(time_req(cl.clone(), o));
+                        trace!(remaining_cnt, inflight = inflight.len(), "new request");
+                    } else {
+                        info!(completed = durs.len(), "finished requests");
+                        break;
+                    }
                 }
                 Some(r) = inflight.next() => {
                     match r {
@@ -130,10 +142,6 @@ where
                             return Err(e);
                         }
                     }
-                }
-                else => {
-                    info!(completed = durs.len(), "finished requests");
-                    break;
                 }
             );
 
@@ -233,6 +241,7 @@ fn group_by_client(accesses: Vec<Op>) -> HashMap<usize, Vec<Op>> {
 fn write_results(
     mut durs: Vec<Duration>,
     time: Duration,
+    num_clients: usize,
     interarrival_client_micros: usize,
     out_file: Option<PathBuf>,
 ) {
@@ -244,10 +253,13 @@ fn write_results(
         .map(|q| (len * q) as usize)
         .map(|i| durs[i])
         .collect();
+    let num = durs.len() as f64;
+    let achieved_load_req_per_sec = num / time.as_secs_f64();
+    let offered_load_req_per_sec = num_clients as f64 / (interarrival_client_micros as f64 / 1e6);
     info!(
-        num = ?&durs.len(), elapsed = ?time, min = ?durs[0],
-        p25 = ?quantiles[0], p50 = ?quantiles[1], p75 = ?quantiles[2],
-        p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
+        num = ?&durs.len(), elapsed = ?time, ?achieved_load_req_per_sec, ?offered_load_req_per_sec,
+        min = ?durs[0], p25 = ?quantiles[0], p50 = ?quantiles[1],
+        p75 = ?quantiles[2], p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
         "Did accesses"
     );
 
