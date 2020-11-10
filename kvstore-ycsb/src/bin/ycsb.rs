@@ -51,8 +51,8 @@ async fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
 
     info!("reading workload");
-    let loads = ops(opt.accesses.with_extension("load"))?;
-    let accesses = ops(opt.accesses)?;
+    let loads = ops(opt.accesses.with_extension("load")).wrap_err("Reading loads")?;
+    let accesses = ops(opt.accesses).wrap_err("Reading accesses")?;
     info!(num_ops = ?accesses.len(), "done reading workload");
 
     info!("make clients");

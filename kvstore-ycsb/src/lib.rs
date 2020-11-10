@@ -1,4 +1,4 @@
-use color_eyre::eyre::{eyre, Report};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -49,7 +49,7 @@ impl std::str::FromStr for Op {
 
 pub fn ops(f: std::path::PathBuf) -> Result<Vec<Op>, Report> {
     use std::io::BufRead;
-    let f = std::fs::File::open(f)?;
+    let f = std::fs::File::open(&f).wrap_err(eyre!("Could not open {:?}", &f))?;
     let f = std::io::BufReader::new(f);
     Ok(f.lines().filter_map(|l| l.ok()?.parse().ok()).collect())
 }
