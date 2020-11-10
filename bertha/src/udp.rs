@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// UDP Chunnel connector.
 ///
@@ -40,7 +40,6 @@ impl ChunnelListener for UdpSkChunnel {
     type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        let a: SocketAddr = a.into();
         Box::pin(async move {
             let sk = tokio::net::UdpSocket::bind(a).map(|sk| {
                 let (recv, send) = sk?.split();
@@ -61,12 +60,14 @@ impl ChunnelConnector for UdpSkChunnel {
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         Box::pin(async move {
             use std::net::ToSocketAddrs;
-            let (recv, send) = tokio::net::UdpSocket::bind(
+            let sk = tokio::net::UdpSocket::bind(
                 ("0.0.0.0:0").to_socket_addrs().unwrap().next().unwrap(),
             )
             .await
-            .unwrap()
-            .split();
+            .unwrap();
+            let local_addr = sk.local_addr()?;
+            debug!(?local_addr, "Bound to udp address");
+            let (recv, send) = sk.split();
             Ok(UdpSk::new(send, recv))
         })
     }

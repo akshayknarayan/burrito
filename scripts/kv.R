@@ -13,7 +13,7 @@ df <- read.csv(args[1], sep=" ")
 summary(df)
 ggplot(df, aes(x=Latency_us, colour=factor(Ops))) + 
     stat_ecdf() + 
-    coord_cartesian(xlim=c(0, 250)) + 
+    #coord_cartesian(xlim=c(0, 250)) + 
     facet_grid(ShardType ~ NumShards)
 
 ggsave(args[2], width=8, height=5)

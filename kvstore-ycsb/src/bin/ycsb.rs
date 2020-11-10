@@ -39,7 +39,7 @@ struct Opt {
     out_file: Option<PathBuf>,
 }
 
-#[tokio::main(core_threads = 8, max_threads = 8)]
+#[tokio::main(core_threads = 8, max_threads = 32)]
 async fn main() -> Result<(), Report> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Report> {
     let mut access_by_client = HashMap::default();
     for (cid, ops) in group_by_client(accesses).into_iter() {
         let client = KvClient::new_shardclient(opt.redis_addr, opt.addr)
-            .instrument(info_span!("make kvclient"))
+            .instrument(info_span!("make kvclient", client_id = ?cid))
             .await
             .wrap_err("make KvClient")?;
         access_by_client.insert(cid, (client, ops));
@@ -100,6 +100,8 @@ async fn do_requests<S>(
 where
     S: bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static,
 {
+    use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
+
     async fn time_req(
         cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static>,
         op: Op,
@@ -156,7 +158,6 @@ where
         Ok::<_, Report>(durs)
     }
 
-    use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
     let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
     let mut reqs: FuturesUnordered<_> = access_by_client
         .into_iter()
