@@ -212,7 +212,7 @@ impl<D> Default for ReliabilityState<D> {
         ReliabilityState {
             inflight: HashMap::new(),
             pending_payload: VecDeque::new(),
-            rtt_est: Duration::from_micros(1000),
+            rtt_est: Duration::from_micros(1_000_000),
         }
     }
 }

@@ -159,11 +159,12 @@ async fn single_shard(
             async move {
                 debug!("new");
                 loop {
+                    trace!("call recv");
                     tokio::select!(
                         inc = cn.recv() => {
                             let (a, msg): (_, Msg) =
                                 inc.wrap_err(eyre!("receive message error"))?;
-                            trace!(msg = ?&msg, "got msg");
+                            trace!(msg = ?&msg, from=?&a, pending_sends = pending_sends.len(), "got msg");
 
                             poll_fn(|cx| store.poll_ready(cx))
                                 .await

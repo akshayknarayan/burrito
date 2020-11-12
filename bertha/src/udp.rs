@@ -12,16 +12,13 @@
 //! address as the original recv_from.
 
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
+use ahash::AHashMap;
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use futures_util::{
-    future::FutureExt,
-    stream::{Stream, StreamExt},
-};
-use std::collections::HashMap;
+use futures_util::{future::FutureExt, stream::Stream};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicUsize, Arc};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, trace};
 
@@ -139,56 +136,50 @@ impl ChunnelListener for UdpReqChunnel {
                 .wrap_err("socket bind failed")?;
 
             let (recv, send) = sk.split();
-            let sends = futures_util::stream::FuturesUnordered::new();
             Ok(Box::pin(futures_util::stream::try_unfold(
                 (
                     recv,
                     Arc::new(Mutex::new(send)),
-                    sends,
-                    HashMap::<_, mpsc::Sender<(SocketAddr, Vec<u8>)>>::new(),
+                    AHashMap::<_, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>::new(),
                 ),
-                |(mut r, s, mut sends, mut map)| async move {
+                |(mut r, s, mut map)| async move {
                     let mut buf = [0u8; 1024];
+                    let pending_ctr: Arc<AtomicUsize> = Default::default();
                     loop {
                         // careful: potential deadlocks since .recv on returned connection blocks
                         // on .listen
-                        tokio::select!(
-                            Some((from, res)) = sends.next() => {
-                                trace!(from = ?&from, "channel send completed");
-                                if let Err(_) = res  {
-                                    map.remove(&from);
-                                }
-                            }
-                            Ok((len, from)) = r.recv_from(&mut buf) => {
-                                let data = buf[0..len].to_vec();
+                        let (len, from) = r.recv_from(&mut buf).await?;
+                        let data = buf[0..len].to_vec();
 
-                                let mut done = None;
-                                let c = map.entry(from).and_modify(|_| {
-                                    trace!(from = ?&from, pending_sends = sends.len(), "received pkt");
-                                })
-                                .or_insert_with(|| {
-                                    trace!(from = ?&from, "new connection");
-                                    let (sch, rch) = mpsc::channel(1);
-                                    done = Some(UdpConn {
-                                        resp_addr: from,
-                                        recv: Arc::new(Mutex::new(rch)),
-                                        send: Arc::clone(&s),
-                                    });
-
-                                    sch
+                        let mut done = None;
+                        let c = map
+                            .entry(from)
+                            .and_modify(|_| {
+                                let ctr =
+                                    pending_ctr.fetch_add(1, std::sync::atomic::Ordering::Release);
+                                trace!(from = ?&from, pending = &ctr, "received pkt");
+                            })
+                            .or_insert_with(|| {
+                                trace!(from = ?&from, "new connection");
+                                let (sch, rch) = mpsc::unbounded_channel();
+                                done = Some(UdpConn {
+                                    resp_addr: from,
+                                    pending_ctr: Arc::clone(&pending_ctr),
+                                    recv: Arc::new(Mutex::new(rch)),
+                                    send: Arc::clone(&s),
                                 });
 
-                                let mut c = c.clone();
-                                sends.push(async move {
-                                    let res = c.send((from, data)).await;
-                                    (from, res)
-                                });
+                                sch
+                            });
 
-                                if let Some(d) = done {
-                                    return Ok(Some((d, (r, s, sends,  map))));
-                                }
-                            }
-                        )
+                        if c.send((from, data)).is_err() {
+                            pending_ctr.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                            map.remove(&from);
+                        }
+
+                        if let Some(d) = done {
+                            return Ok(Some((d, (r, s, map))));
+                        }
                     }
                 },
             )) as _)
@@ -199,7 +190,8 @@ impl ChunnelListener for UdpReqChunnel {
 #[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
-    recv: Arc<Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>>,
+    pending_ctr: Arc<AtomicUsize>,
+    recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
     send: Arc<Mutex<tokio::net::udp::SendHalf>>,
 }
 
@@ -221,8 +213,10 @@ impl ChunnelConnection for UdpConn {
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let r = Arc::clone(&self.recv);
+        let ctr = Arc::clone(&self.pending_ctr);
         Box::pin(async move {
             let d = r.lock().await.recv().await;
+            ctr.fetch_sub(1, std::sync::atomic::Ordering::Release);
             trace!(from = ?&d.as_ref().map(|x| x.0), "got pkt");
             d.ok_or_else(|| eyre!("Nothing more to receive"))
         }) as _
