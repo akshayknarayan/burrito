@@ -13,7 +13,10 @@ use bertha::{
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use futures_util::{future::poll_fn, stream::TryStreamExt};
+use futures_util::{
+    future::poll_fn,
+    stream::{FuturesUnordered, StreamExt, TryStreamExt},
+};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{atomic::AtomicUsize, Arc};
 use tower_buffer::Buffer;
@@ -151,23 +154,34 @@ async fn single_shard(
         .try_for_each_concurrent(None, |cn| {
             let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut store = store.clone();
+            // TODO deduplicate possible spurious retxs by req id
+            let mut pending_sends = FuturesUnordered::new();
             async move {
                 debug!("new");
                 loop {
-                    let (a, msg): (_, Msg) =
-                        cn.recv().await.wrap_err(eyre!("receive message error"))?;
-                    trace!(msg = ?&msg, "got msg");
+                    tokio::select!(
+                        inc = cn.recv() => {
+                            let (a, msg): (_, Msg) =
+                                inc.wrap_err(eyre!("receive message error"))?;
+                            trace!(msg = ?&msg, "got msg");
 
-                    poll_fn(|cx| store.poll_ready(cx))
-                        .await
-                        .map_err(|e| eyre!(e))?;
-                    let rsp = store.call(msg).await.unwrap();
+                            poll_fn(|cx| store.poll_ready(cx))
+                                .await
+                                .map_err(|e| eyre!(e))?;
+                            let rsp = store.call(msg).await.unwrap();
 
-                    let id = rsp.id;
-                    cn.send((a, rsp))
-                        .await
-                        .wrap_err(eyre!("send response err"))?;
-                    trace!(msg_id = id, "sent response");
+                            let id = rsp.id;
+                            let send_fut = cn.send((a, rsp));
+                            pending_sends.push(async move {
+                                send_fut.await.wrap_err(eyre!("send response err"))?;
+                                trace!(msg_id = id, "sent response");
+                                Ok::<_, Report>(())
+                            });
+                        }
+                        Some(send_res) = pending_sends.next() => {
+                            send_res?;
+                        }
+                    );
                 }
             }
             .instrument(debug_span!("shard_connection", idx = ?idx))
