@@ -148,12 +148,12 @@ async fn single_shard(
     s.send(stack.offers()).unwrap();
 
     // initialize the kv store.
-    let store = Buffer::new(Store::default(), 100_000);
+    //let store = Buffer::new(Store::default(), 100_000);
     let idx = Arc::new(AtomicUsize::new(0));
     if let Err(e) = st
         .try_for_each_concurrent(None, |cn| {
             let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut store = store.clone();
+            //let mut store = store.clone();
             // TODO deduplicate possible spurious retxs by req id
             let mut pending_sends = FuturesUnordered::new();
             async move {
@@ -166,10 +166,11 @@ async fn single_shard(
                                 inc.wrap_err(eyre!("receive message error"))?;
                             trace!(msg = ?&msg, from=?&a, pending_sends = pending_sends.len(), "got msg");
 
-                            poll_fn(|cx| store.poll_ready(cx))
-                                .await
-                                .map_err(|e| eyre!(e))?;
-                            let rsp = store.call(msg).await.unwrap();
+                            //poll_fn(|cx| store.poll_ready(cx))
+                            //    .await
+                            //    .map_err(|e| eyre!(e))?;
+                            //let rsp = store.call(msg).await.unwrap();
+                            let rsp = msg;
 
                             let id = rsp.id;
                             let send_fut = cn.send((a, rsp));

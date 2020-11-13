@@ -155,31 +155,22 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         let snd_nxt = Arc::clone(&self.snd_nxt);
-        Box::pin(
-            async move {
-                let seq = snd_nxt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u32;
-                trace!(seq = ?seq, "sending");
-                let (addr, data) = data;
-                inner.send((addr, (seq, data))).await?;
-                trace!(seq = ?seq, "finished send");
-                Ok(())
-            }
-            .instrument(tracing::trace_span!("taggerproj_send")),
-        )
+        Box::pin(async move {
+            let seq = snd_nxt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u32;
+            let (addr, data) = data;
+            inner.send((addr, (seq, data))).await?;
+            Ok(())
+        })
     }
 
     fn recv(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
-        Box::pin(
-            async move {
-                let (addr, (seq, d)) = inner.recv().await?;
-                trace!(seq = ?seq, "received");
-                return Ok((addr, d));
-            }
-            .instrument(tracing::trace_span!("taggerproj_recv")),
-        )
+        Box::pin(async move {
+            let (addr, (_, d)) = inner.recv().await?;
+            return Ok((addr, d));
+        })
     }
 }
 

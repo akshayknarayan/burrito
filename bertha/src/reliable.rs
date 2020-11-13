@@ -205,6 +205,34 @@ struct ReliabilityState<D> {
     >, // list of inflight seqs
     pending_payload: VecDeque<(u32, D)>, // payloads we have received that are waiting for a recv() call
     rtt_est: Duration,
+    last_print: Option<Instant>,
+    raw_rtts: hdrhistogram::Histogram<u64>,
+    extra_acks: usize,
+    retx_ctrs: hdrhistogram::Histogram<u64>,
+}
+
+impl<D> ReliabilityState<D> {
+    fn dump(&self) {
+        tracing::info!(
+            p5 = self.raw_rtts.value_at_quantile(0.05),
+            p25 = self.raw_rtts.value_at_quantile(0.25),
+            p50 = self.raw_rtts.value_at_quantile(0.5),
+            p75 = self.raw_rtts.value_at_quantile(0.75),
+            p95 = self.raw_rtts.value_at_quantile(0.95),
+            cnt = self.raw_rtts.len(),
+            extra_acks = self.extra_acks,
+            "last tx -> ack rtts (us)",
+        );
+        tracing::info!(
+            p5 = self.retx_ctrs.value_at_quantile(0.05),
+            p25 = self.retx_ctrs.value_at_quantile(0.25),
+            p50 = self.retx_ctrs.value_at_quantile(0.5),
+            p75 = self.retx_ctrs.value_at_quantile(0.75),
+            p95 = self.retx_ctrs.value_at_quantile(0.95),
+            cnt = self.retx_ctrs.len(),
+            "retx_ctrs",
+        );
+    }
 }
 
 impl<D> Default for ReliabilityState<D> {
@@ -213,7 +241,17 @@ impl<D> Default for ReliabilityState<D> {
             inflight: HashMap::new(),
             pending_payload: VecDeque::new(),
             rtt_est: Duration::from_micros(1_000_000),
+            last_print: None,
+            raw_rtts: hdrhistogram::Histogram::new_with_max(10_000_000, 2).unwrap(),
+            extra_acks: 0,
+            retx_ctrs: hdrhistogram::Histogram::new_with_max(100, 2).unwrap(),
         }
+    }
+}
+
+impl<D> Drop for ReliabilityState<D> {
+    fn drop(&mut self) {
+        self.dump();
     }
 }
 
@@ -260,7 +298,7 @@ where
                 transmit(Arc::clone(&inner), state, (addr, data), r, to).await?;
                 Ok(())
             }
-            .instrument(tracing::debug_span!("send", seq = ?seq, to_addr = ?a)),
+            .instrument(tracing::trace_span!("reliable_send", seq = ?seq, to_addr = ?a)),
         )
     }
 
@@ -285,7 +323,7 @@ where
                 trace!(seq = ?seq, addr = ?addr, was_pending = false, "returning packet");
                 Ok((addr, (seq, data)))
             }
-            .instrument(tracing::debug_span!("recv")),
+            .instrument(tracing::trace_span!("reliable_recv")),
         )
     }
 }
@@ -322,8 +360,10 @@ where
                     tokio::select!(
                         done = &mut r => {
                             done??;
-                            let (_, (seq, _)) = segment;
+                            let (addr, (seq, _)) = segment;
                             trace!(?seq, ?retx_ctr, "transmit done");
+                            let mut st = state.get_mut(&addr).expect("conn not found");
+                            st.retx_ctrs.saturating_record(retx_ctr);
                             return Ok::<_, eyre::Report>(());
                         }
                         _ = tokio::time::delay_for(to) => {
@@ -333,7 +373,11 @@ where
                             trace!(addr = ?addr, seq = ?seq, cnt = ?retx_ctr, ?to, "retransmitting");
                             inner.send(segment.clone()).await?;
                             debug!(addr = ?addr, seq = ?seq, cnt = ?retx_ctr, ?to, "retransmitted");
-                            //state.get_mut(addr)
+
+                            // send_time is the time since the last transmission
+                            let mut st = state.get_mut(addr).expect("conn not found");
+                            let (_, _, ref mut send_time) = st.inflight.get_mut(&seq).expect("pkt state not found");
+                            *send_time = Instant::now();
                         }
                     );
                 }
@@ -368,36 +412,49 @@ where
     D: Send + Sync + 'static,
 {
     loop {
-        trace!("call inner recv");
         let (addr, (seq, data)) = inner.recv().await?;
+        trace!("called inner recv");
 
         if data.is_none() {
             // it was an ack
             let st = state.get_mut(&addr);
             if st.is_none() {
-                trace!(seq = ?seq, from = ?&addr, "got ack from unknown addr");
+                tracing::warn!(seq = ?seq, from = ?&addr, event = "bad ack, unknown addr", "got pkt");
                 continue;
             }
 
             let mut st = st.unwrap();
             if let Some((_, Some(s), send_time)) = st.inflight.remove(&seq) {
-                trace!(seq = ?seq, from = ?&addr, rtt = ?send_time.elapsed(), "got ack");
+                let elapsed = send_time.elapsed();
+                trace!(seq = ?seq, from = ?&addr, rtt = ?elapsed, event = "good ack", "got pkt");
+                st.raw_rtts.saturating_record(elapsed.as_micros() as _);
+                match st.last_print {
+                    None => {
+                        st.last_print = Some(Instant::now());
+                    }
+                    Some(t) if t.elapsed() > Duration::from_secs(1) => {
+                        st.dump();
+                        st.raw_rtts.clear();
+                        st.last_print = Some(Instant::now());
+                    }
+                    _ => (),
+                }
+
                 //let rtt = send_time.elapsed();
                 //st.rtt_est = Duration::from_secs_f64(
                 //    st.rtt_est.as_secs_f64() * 0.9 + rtt.as_secs_f64() * 0.1,
                 //);
-                s.send(Ok(())).unwrap_or_else(|_| {
-                    debug!(seq = ?seq, from = ?&addr, "discarding oneshot send");
-                });
+                s.send(Ok(())).unwrap();
             } else {
-                trace!(seq = ?seq, from = ?&addr, "got unknown ack from addr");
+                trace!(seq = ?seq, from = ?&addr, event = "bad ack, unknown ack", "got pkt");
+                st.extra_acks += 1;
             }
 
             continue;
         } else {
             // send an ack
             inner.send((addr.clone(), (seq, None))).await?;
-            trace!(seq = ?seq, from = ?&addr, "got payload, sent ack");
+            trace!(seq = ?seq, from = ?&addr, event = "payload, sent ack", "got pkt");
         }
 
         return Ok((addr, (seq, data.unwrap())));

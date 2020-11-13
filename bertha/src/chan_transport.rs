@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, trace};
+use tracing::debug;
 
 #[derive(Clone, Debug, Copy, Default)]
 pub struct Srv;
@@ -102,7 +102,6 @@ where
             let mut notify_listener = notify_listener.clone();
             let channel_size = self.channel_size;
             Box::pin(async move {
-                debug!(addr = ?&a, "RendezvousChannel connecting");
                 let (s1, r1) = mpsc::channel(channel_size);
                 let (s2, r2) = mpsc::channel(channel_size);
                 let connect_ch = ChanChunnel::new(s1, r2, Arc::new(|x| x));
@@ -111,7 +110,6 @@ where
                     .send(listen_ch)
                     .await
                     .map_err(|e| eyre!("Could not send connection to listener: {}", e))?;
-                debug!(addr = ?&a, "RendezvousChannel connected");
                 Ok(connect_ch)
             })
         } else {
@@ -283,9 +281,7 @@ where
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let r = Arc::clone(&self.rcv);
         Box::pin(async move {
-            trace!("lock");
             let mut l = r.lock().await;
-            trace!("recv");
             Ok(l.recv().await.ok_or_else(|| eyre!("All senders dropped"))?)
         })
     }
