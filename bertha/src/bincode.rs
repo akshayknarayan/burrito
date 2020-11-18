@@ -131,7 +131,7 @@ pub struct SerializeProject<A, D, C> {
 
 impl<Cx, A, D> From<Cx> for SerializeProject<A, D, Cx> {
     fn from(cx: Cx) -> SerializeProject<A, D, Cx> {
-        debug!(data = ?std::any::type_name::<D>(), "serialize chunnel");
+        debug!(data = ?std::any::type_name::<D>(), "make serialize chunnel");
         SerializeProject {
             inner: Arc::new(cx),
             _data: Default::default(),
