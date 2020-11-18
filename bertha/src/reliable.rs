@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tracing::{debug, trace};
+use tracing::{debug, instrument, trace};
 use tracing_futures::Instrument;
 
 #[derive(Clone, Debug)]
@@ -53,7 +53,7 @@ impl<D> ReliabilityChunnel<D> {
 impl<InS, InC, InE, D> Serve<InS> for ReliabilityChunnel<D>
 where
     InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (u32, Option<D>)> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
     InE: Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
@@ -74,20 +74,17 @@ where
 
 impl<InC, D> Client<InC> for ReliabilityChunnel<D>
 where
-    InC: ChunnelConnection<Data = (u32, Option<D>)> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
-    type Future = <ProjectLeft<()> as Client<
-        <ReliabilityProjChunnel<(), D> as Client<Unproject<InC>>>::Connection,
-    >>::Future;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Connection = ProjectLeftCn<(), ReliabilityProj<(), D, Unproject<InC>>>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        match self.inner.connect_wrap(Unproject(cn)).into_inner() {
-            Ok(cn) => ProjectLeft::from(()).connect_wrap(cn),
-            Err(e) => ready(Err(e)),
-        }
+        let fut = self.inner.connect_wrap(Unproject(cn));
+        Box::pin(async move { ProjectLeft::from(()).connect_wrap(fut.await?).await })
     }
 }
 
@@ -124,7 +121,7 @@ impl<A, InS, InC, InE, D> Serve<InS> for ReliabilityProjChunnel<A, D>
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
     InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
     InE: Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
@@ -136,10 +133,12 @@ where
 
     fn serve(&mut self, inner: InS) -> Self::Future {
         let cfg = self.timeout;
-        ready(Ok(Box::pin(inner.map_ok(move |cn| {
+        ready(Ok(Box::pin(inner.and_then(move |cn| async move {
             let mut r = ReliabilityProj::from(cn);
             r.set_timeout_factor(cfg);
-            r
+            // spawn the delayed ack thingy
+            tokio::spawn(nagler(Arc::clone(&r.inner), Arc::clone(&r.state)));
+            Ok(r)
         })) as _))
     }
 }
@@ -147,15 +146,21 @@ where
 impl<A, InC, D> Client<InC> for ReliabilityProjChunnel<A, D>
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
-    InC: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Connection = ReliabilityProj<A, D, InC>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(ReliabilityProj::from(cn)))
+        Box::pin(async move {
+            let r = ReliabilityProj::from(cn);
+            // spawn the delayed ack thingy
+            tokio::spawn(nagler(Arc::clone(&r.inner), Arc::clone(&r.state)));
+            Ok(r)
+        })
     }
 }
 
@@ -163,7 +168,7 @@ where
 pub struct ReliabilityProj<A: Eq + Hash, D, C> {
     timeout: usize,
     inner: Arc<C>,
-    state: Arc<DashMap<A, ReliabilityState<(A, D)>>>,
+    state: Arc<DashMap<A, ReliabilityState<A, D>>>,
 }
 
 impl<A: Eq + Hash, C, D> ReliabilityProj<A, D, C> {
@@ -193,8 +198,65 @@ impl<A: Eq + Hash, C, D> Clone for ReliabilityProj<A, D, C> {
     }
 }
 
+/// Message format for reliability chunnel
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Pkt<D> {
+    pub acks: Vec<u32>,
+    pub payload: Option<(u32, D)>,
+}
+
+impl<D> Default for Pkt<D> {
+    fn default() -> Self {
+        Pkt {
+            acks: Default::default(),
+            payload: None,
+        }
+    }
+}
+
+impl<D> Pkt<D> {
+    pub fn payload(seq: u32, payload: D) -> Self {
+        Pkt {
+            acks: Default::default(),
+            payload: Some((seq, payload)),
+        }
+    }
+
+    pub fn add_ack(&mut self, ack: u32) {
+        self.acks.push(ack);
+    }
+
+    pub fn take_acks(&mut self) -> Vec<u32> {
+        let a = Vec::new();
+        std::mem::replace(&mut self.acks, a)
+    }
+
+    pub fn clear_acks(&mut self) {
+        self.acks.clear();
+    }
+
+    pub fn add_payload(&mut self, seq: u32, p: D) -> Option<(u32, D)> {
+        let t = self.payload.take();
+        self.payload = Some((seq, p));
+        t
+    }
+}
+
+impl<D> std::fmt::Debug for Pkt<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut p = f.debug_struct("Pkt");
+        if let Some((s, _)) = self.payload {
+            p.field("seq", &s);
+        }
+        if !self.acks.is_empty() {
+            p.field("acks", &self.acks);
+        }
+        p.finish()
+    }
+}
+
 #[derive(Debug)]
-struct ReliabilityState<D> {
+struct ReliabilityState<A, D> {
     inflight: HashMap<
         u32,
         (
@@ -203,7 +265,8 @@ struct ReliabilityState<D> {
             Instant,
         ),
     >, // list of inflight seqs
-    pending_payload: VecDeque<(u32, D)>, // payloads we have received that are waiting for a recv() call
+    pending_payload: VecDeque<(A, Pkt<D>)>, // payloads we have received that are waiting for a recv() call
+    pending_acks: Pkt<D>,
     rtt_est: Duration,
     last_print: Option<Instant>,
     raw_rtts: hdrhistogram::Histogram<u64>,
@@ -211,7 +274,7 @@ struct ReliabilityState<D> {
     retx_ctrs: hdrhistogram::Histogram<u64>,
 }
 
-impl<D> ReliabilityState<D> {
+impl<A, D> ReliabilityState<A, D> {
     fn dump(&self) {
         tracing::info!(
             p5 = self.raw_rtts.value_at_quantile(0.05),
@@ -235,11 +298,12 @@ impl<D> ReliabilityState<D> {
     }
 }
 
-impl<D> Default for ReliabilityState<D> {
+impl<A, D> Default for ReliabilityState<A, D> {
     fn default() -> Self {
         ReliabilityState {
             inflight: HashMap::new(),
             pending_payload: VecDeque::new(),
+            pending_acks: Default::default(),
             rtt_est: Duration::from_micros(1_000_000),
             last_print: None,
             raw_rtts: hdrhistogram::Histogram::new_with_max(10_000_000, 2).unwrap(),
@@ -249,7 +313,7 @@ impl<D> Default for ReliabilityState<D> {
     }
 }
 
-impl<D> Drop for ReliabilityState<D> {
+impl<A, D> Drop for ReliabilityState<A, D> {
     fn drop(&mut self) {
         self.dump();
     }
@@ -258,7 +322,7 @@ impl<D> Drop for ReliabilityState<D> {
 impl<A, C, D> ChunnelConnection for ReliabilityProj<A, D, C>
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
-    C: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
     type Data = (A, (u32, D)); // a tag and its data.
@@ -278,24 +342,20 @@ where
         Box::pin(
             async move {
                 let (s, r) = oneshot::channel();
-                let data = (data.0, Some(data.1));
-
-                let to = {
+                let (mut pkt, to) = {
                     let mut st = state.get_mut(&addr).unwrap();
-                    st.inflight.insert(
-                        seq,
-                        (
-                            (addr.clone(), data.1.clone().unwrap()),
-                            Some(s),
-                            Instant::now(),
-                        ),
-                    );
+                    st.inflight
+                        .insert(seq, (data.1.clone(), Some(s), Instant::now()));
+                    let new_p: Pkt<D> = Pkt::default();
+                    let p = std::mem::replace(&mut st.pending_acks, new_p);
                     trace!(inflight = st.inflight.len(), "sending");
-                    st.rtt_est * (timeout as _)
+                    (p, st.rtt_est * (timeout as _))
                 };
 
-                inner.send((addr.clone(), data.clone())).await?;
-                transmit(Arc::clone(&inner), state, (addr, data), r, to).await?;
+                pkt.add_payload(data.0, data.1);
+                inner.send((addr.clone(), pkt.clone())).await?;
+                pkt.clear_acks();
+                transmit(Arc::clone(&inner), state, (addr, pkt), r, to).await?;
                 Ok(())
             }
             .instrument(tracing::trace_span!("reliable_send", seq = ?seq, to_addr = ?a)),
@@ -312,16 +372,16 @@ where
             async move {
                 for mut e in state.iter_mut() {
                     let st = e.value_mut();
-                    if let Some((seq, (addr, d))) = st.pending_payload.pop_front() {
-                        trace!(seq = ?seq, addr = ?addr, was_pending = true, "returning packet");
-                        return Ok((addr, (seq, d)));
+                    if let Some((addr, p)) = st.pending_payload.pop_front() {
+                        trace!(pkt = ?p, addr = ?addr, was_pending = true, "returning packet");
+                        return Ok((addr, p.payload.unwrap()));
                     }
                 }
 
-                let (addr, (seq, data)): (A, (u32, D)) =
-                    do_recv::<A, _, _>(&mut inner, &mut state).await?;
-                trace!(seq = ?seq, addr = ?addr, was_pending = false, "returning packet");
-                Ok((addr, (seq, data)))
+                let (addr, pkt) = do_recv::<A, _, _>(&mut inner, &mut state).await?;
+                trace!(pkt = ?&pkt, addr = ?addr, was_pending = false, "returning packet");
+                let p = pkt.payload.unwrap();
+                Ok((addr, p))
             }
             .instrument(tracing::trace_span!("reliable_recv")),
         )
@@ -330,26 +390,18 @@ where
 
 async fn transmit<A, C, D>(
     inner: Arc<C>,
-    state: Arc<DashMap<A, ReliabilityState<(A, D)>>>,
-    segment: (A, (u32, Option<D>)),
+    state: Arc<DashMap<A, ReliabilityState<A, D>>>,
+    segment: (A, Pkt<D>),
     mut r: tokio::sync::oneshot::Receiver<Result<(), eyre::Report>>,
     timeout: Duration,
 ) -> Result<(), eyre::Report>
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
-    C: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
     let inner1 = Arc::clone(&inner);
     let state1 = Arc::clone(&state);
-    let jitter = {
-        use rand::distributions::{Distribution, Uniform};
-        let mut rng = rand::thread_rng();
-        let dist = Uniform::from(25..50);
-        let jitter: u64 = dist.sample(&mut rng);
-        Duration::from_micros(jitter)
-    };
-    let timeout = timeout + jitter;
     futures_util::future::select(
         Box::pin(
             async move {
@@ -360,22 +412,23 @@ where
                     tokio::select!(
                         done = &mut r => {
                             done??;
-                            let (addr, (seq, _)) = segment;
-                            trace!(?seq, ?retx_ctr, "transmit done");
+                            let (addr, pkt) = segment;
+                            trace!(?pkt, ?retx_ctr, "transmit done");
                             let mut st = state.get_mut(&addr).expect("conn not found");
                             st.retx_ctrs.saturating_record(retx_ctr);
                             return Ok::<_, eyre::Report>(());
                         }
                         _ = tokio::time::delay_for(to) => {
-                            let (ref addr, (seq, _)) = segment;
+                            let (ref addr, ref pkt) = segment;
                             retx_ctr += 1;
                             to_ms *= to_ms;
-                            trace!(addr = ?addr, seq = ?seq, cnt = ?retx_ctr, ?to, "retransmitting");
+                            trace!(?addr, ?pkt, ?retx_ctr, ?to, "retransmitting");
                             inner.send(segment.clone()).await?;
-                            debug!(addr = ?addr, seq = ?seq, cnt = ?retx_ctr, ?to, "retransmitted");
+                            trace!(?addr, ?pkt, ?retx_ctr, ?to, "retransmitted");
 
                             // send_time is the time since the last transmission
                             let mut st = state.get_mut(addr).expect("conn not found");
+                            let seq = pkt.payload.as_ref().unwrap().0;
                             let (_, _, ref mut send_time) = st.inflight.get_mut(&seq).expect("pkt state not found");
                             *send_time = Instant::now();
                         }
@@ -389,9 +442,9 @@ where
                 let mut inner = inner1;
                 let mut state = state1;
                 loop {
-                    let (addr, (seq, data)) = do_recv(&mut inner, &mut state).await?;
+                    let (addr, pkt) = do_recv(&mut inner, &mut state).await?;
                     let mut st = state.entry(addr.clone()).or_default();
-                    st.pending_payload.push_back((seq, (addr, data)));
+                    st.pending_payload.push_back((addr, pkt));
                 }
             }
             .instrument(tracing::debug_span!("send_select_recv")),
@@ -404,35 +457,39 @@ where
 
 async fn do_recv<A, C, D>(
     inner: &mut Arc<C>,
-    state: &mut Arc<DashMap<A, ReliabilityState<(A, D)>>>,
-) -> Result<(A, (u32, D)), eyre::Report>
+    state: &mut Arc<DashMap<A, ReliabilityState<A, D>>>,
+) -> Result<(A, Pkt<D>), eyre::Report>
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
-    C: ChunnelConnection<Data = (A, (u32, Option<D>))> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     loop {
-        let (addr, (seq, data)) = inner.recv().await?;
+        let (addr, mut pkt) = inner.recv().await?;
         trace!("called inner recv");
+        let mut st = state.get_mut(&addr);
+        if st.is_none() && !pkt.acks.is_empty() {
+            trace!(pkt = ?&pkt, from = ?&addr, event = "bad ack, unknown addr", "got pkt");
+            continue;
+        } else if st.is_none() {
+            // there are no acks so we don't expect there to be state, but we need to init state to
+            // handle delayed acks.
+            state.insert(addr.clone(), Default::default());
+            st = state.get_mut(&addr);
+        }
 
-        if data.is_none() {
-            // it was an ack
-            let st = state.get_mut(&addr);
-            if st.is_none() {
-                tracing::warn!(seq = ?seq, from = ?&addr, event = "bad ack, unknown addr", "got pkt");
-                continue;
-            }
-
-            let mut st = st.unwrap();
+        let mut st = st.unwrap();
+        let acks = pkt.take_acks();
+        for seq in acks {
             if let Some((_, Some(s), send_time)) = st.inflight.remove(&seq) {
                 let elapsed = send_time.elapsed();
-                trace!(seq = ?seq, from = ?&addr, rtt = ?elapsed, event = "good ack", "got pkt");
+                trace!(seq = ?&seq, from = ?&addr, rtt = ?elapsed, event = "good ack", "got pkt");
                 st.raw_rtts.saturating_record(elapsed.as_micros() as _);
                 match st.last_print {
                     None => {
                         st.last_print = Some(Instant::now());
                     }
-                    Some(t) if t.elapsed() > Duration::from_secs(1) => {
+                    Some(t) if t.elapsed() > Duration::from_secs(10) => {
                         st.dump();
                         st.raw_rtts.clear();
                         st.last_print = Some(Instant::now());
@@ -446,18 +503,48 @@ where
                 //);
                 s.send(Ok(())).unwrap();
             } else {
-                trace!(seq = ?seq, from = ?&addr, event = "bad ack, unknown ack", "got pkt");
+                trace!(seq = ?&seq, from = ?&addr, event = "bad ack, unknown ack", "got pkt");
                 st.extra_acks += 1;
             }
-
-            continue;
-        } else {
-            // send an ack
-            inner.send((addr.clone(), (seq, None))).await?;
-            trace!(seq = ?seq, from = ?&addr, event = "payload, sent ack", "got pkt");
         }
 
-        return Ok((addr, (seq, data.unwrap())));
+        if let Some((seq, _)) = pkt.payload {
+            // queue an ack
+            st.pending_acks.acks.push(seq);
+            trace!(pkt = ?&pkt, from = ?&addr, event = "payload, queued ack", "got pkt");
+            if st.pending_acks.acks.len() > 1 {
+                let mut send_p = Default::default();
+                std::mem::swap(&mut send_p, &mut st.pending_acks);
+                inner.send((addr.clone(), send_p)).await?;
+            }
+
+            return Ok((addr, pkt));
+        }
+    }
+}
+
+/// Ticks every 10 ms, and sends out any unsent delayed acks.
+/// This is sucky, but even Linux doesn't have a better way...
+#[instrument(skip(inner, state))]
+async fn nagler<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
+    inner: Arc<C>,
+    state: Arc<DashMap<A, ReliabilityState<A, D>>>,
+) where
+    C: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
+{
+    loop {
+        tokio::time::delay_for(Duration::from_millis(10)).await;
+        for mut entry in state.iter_mut() {
+            let (addr, st) = entry.pair_mut();
+            if !st.pending_acks.acks.is_empty() {
+                let mut send_p = Default::default();
+                std::mem::swap(&mut send_p, &mut st.pending_acks);
+                trace!(?addr, ?send_p, "sent delayed acks");
+                if let Err(e) = inner.send((addr.clone(), send_p)).await {
+                    debug!(err = ?e, ?addr, "failed sending delayed acks");
+                }
+            }
+        }
     }
 }
 
@@ -512,7 +599,7 @@ mod test {
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
-        let msgs = vec![(0, vec![0u8; 10]), (1, vec![1u8; 10]), (2, vec![2u8; 10])];
+        let msgs = (0..7).map(|i| (i, vec![i as u8; 10])).collect();
 
         let mut rt = tokio::runtime::Builder::new()
             .basic_scheduler()
