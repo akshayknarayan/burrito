@@ -94,7 +94,7 @@ async fn server(addr: SocketAddr, reliable: bool) -> Result<(), Report> {
 async fn client(addr: SocketAddr, reliable: bool) -> Result<Vec<Duration>, Report> {
     async fn reqs(cn: impl ChunnelConnection<Data = Msg>) -> Result<Vec<Duration>, Report> {
         let mut durs = vec![];
-        for _ in 0..100_000 {
+        for _ in 0..100 {
             cn.send(Msg::new()).await.wrap_err("client send")?;
             let m = cn.recv().await.wrap_err("client recv")?;
             durs.push(m.elapsed());
@@ -161,10 +161,10 @@ async fn main() -> Result<(), Report> {
     } else if let Some(a) = opt.addr {
         let jhs = FuturesUnordered::new();
         let start = Instant::now();
-        for _ in 0..8 {
-            let jh = tokio::spawn(client(a, opt.reliable));
-            jhs.push(async move { jh.await.unwrap() });
-        }
+        //for _ in 0..8 {
+        let jh = tokio::spawn(client(a, opt.reliable));
+        jhs.push(async move { jh.await.unwrap() });
+        //}
 
         let durs: Result<Vec<_>, _> = jhs.try_collect().await;
         let time = start.elapsed();

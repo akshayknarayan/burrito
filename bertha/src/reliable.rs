@@ -9,6 +9,7 @@ use crate::{
 };
 use ahash::AHashMap;
 use color_eyre::eyre;
+use dashmap::DashMap;
 use futures_util::future::{ready, Ready};
 use futures_util::stream::{Stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
@@ -161,7 +162,7 @@ pub struct ReliabilityProj<A: Eq + Hash, D, C> {
     inner: Arc<C>,
     new_send: mpsc::UnboundedSender<(A, PktHeader, Option<oneshot::Sender<()>>, Instant)>,
     new_recv: mpsc::UnboundedSender<(A, PktHeader)>,
-    delayed_ack: Arc<Mutex<AHashMap<A, PktHeader>>>,
+    delayed_ack: Arc<DashMap<A, PktHeader>>,
     pending_payload_send: mpsc::UnboundedSender<(A, Pkt<D>)>,
     pending_payload_recv: Arc<Mutex<mpsc::UnboundedReceiver<(A, Pkt<D>)>>>,
 }
@@ -244,14 +245,9 @@ where
                 let mut pkt = Pkt::payload(seq, data);
                 // notify send
                 new_send.send((addr.clone(), pkt.pkt_header(), Some(s), Instant::now()))?;
-                // try getting any delayed acks
-                if let Ok(mut delayed) = delayed_ack.try_lock() {
-                    if let Some(mut acks_hdr) = delayed.get_mut(&addr) {
-                        let new_p = PktHeader::default();
-                        let acks = std::mem::replace(acks_hdr.deref_mut(), new_p);
-                        pkt.acks = acks.acks;
-                    }
-                }
+                // we just created pkt, so acks is clear.
+                try_get_delayed_acks(&mut pkt, &addr, &delayed_ack);
+                trace!(?pkt, "sending");
 
                 // inner.send with the acks
                 inner.send((addr.clone(), pkt.clone())).await?;
@@ -304,7 +300,7 @@ async fn transmit<A, C, D>(
     new_send: mpsc::UnboundedSender<(A, PktHeader, Option<oneshot::Sender<()>>, Instant)>,
     new_recv: mpsc::UnboundedSender<(A, PktHeader)>,
     pending_payload: mpsc::UnboundedSender<(A, Pkt<D>)>,
-    delayed_ack: Arc<Mutex<AHashMap<A, PktHeader>>>,
+    delayed_ack: Arc<DashMap<A, PktHeader>>,
     timeout: Duration,
 ) -> Result<(), eyre::Report>
 where
@@ -312,47 +308,29 @@ where
     C: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
-    let inner1 = Arc::clone(&inner);
-    futures_util::future::select(
-        Box::pin(async move {
-            let mut to_ms = timeout.as_millis();
-            loop {
-                let to = Duration::from_millis(to_ms as u64);
-                tokio::select!(
-                    Ok(_) = &mut r => {
-                        let (_, pkt) = segment;
-                        trace!(?pkt, "transmit done");
-                        return Ok::<_, eyre::Report>(());
-                    }
-                    _ = tokio::time::delay_for(to) => {
-                        to_ms *= to_ms;
-                        let (addr, mut pkt) = segment.clone();
-                        // try getting any delayed acks
-                        if let Ok(mut delayed) = delayed_ack.try_lock() {
-                            if let Some(mut acks_hdr) = delayed.get_mut(&addr) {
-                                let new_p = PktHeader::default();
-                                let acks = std::mem::replace(acks_hdr.deref_mut(), new_p);
-                                pkt.acks = acks.acks;
-                            }
-                        }
-
-                        new_send.send((addr.clone(), pkt.pkt_header(), None, Instant::now()))?;
-                        inner.send((addr, pkt)).await?;
-                    }
-                );
+    let mut inner1 = Arc::clone(&inner);
+    let mut to_ms = timeout.as_millis();
+    loop {
+        let to = Duration::from_millis(to_ms as u64);
+        tokio::select!(
+            Ok(_) = &mut r => {
+                let (_, pkt) = segment;
+                trace!(?pkt, "transmit done");
+                return Ok::<_, eyre::Report>(());
             }
-        }),
-        Box::pin(async move {
-            let mut inner = inner1;
-            loop {
-                let (addr, pkt) = do_recv(&mut inner, &new_recv).await?;
+            _ = tokio::time::delay_for(to) => {
+                to_ms *= to_ms;
+                let (addr, mut pkt) = segment.clone();
+                // pkt.acks was cleared when passed in to this fn.
+                try_get_delayed_acks(&mut pkt, &addr, &delayed_ack);
+                new_send.send((addr.clone(), pkt.pkt_header(), None, Instant::now()))?;
+                inner.send((addr, pkt)).await?;
+            }
+            Ok((addr, pkt)) = do_recv(&mut inner1, &new_recv) => {
                 pending_payload.send((addr, pkt))?;
             }
-        }),
-    )
-    .await
-    .factor_first()
-    .0
+        );
+    }
 }
 
 async fn do_recv<A, C, D>(
@@ -374,6 +352,19 @@ where
         if pkt.payload.is_some() {
             return Ok((addr, pkt));
         }
+    }
+}
+
+// pkt.acks must be clear
+fn try_get_delayed_acks<A, D>(
+    pkt: &mut Pkt<D>,
+    addr: &A,
+    delayed_ack: impl AsRef<DashMap<A, PktHeader>>,
+) where
+    A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
+{
+    if let Some(mut acks_hdr) = delayed_ack.as_ref().get_mut(addr) {
+        std::mem::swap(&mut acks_hdr.deref_mut().acks, &mut pkt.acks);
     }
 }
 
@@ -474,25 +465,25 @@ struct ReliabilityState {
 
 impl ReliabilityState {
     fn dump(&self) {
-        //tracing::info!(
-        //    p5 = self.raw_rtts.value_at_quantile(0.05),
-        //    p25 = self.raw_rtts.value_at_quantile(0.25),
-        //    p50 = self.raw_rtts.value_at_quantile(0.5),
-        //    p75 = self.raw_rtts.value_at_quantile(0.75),
-        //    p95 = self.raw_rtts.value_at_quantile(0.95),
-        //    cnt = self.raw_rtts.len(),
-        //    extra_acks = self.extra_acks,
-        //    "last tx -> ack rtts (us)",
-        //);
-        //tracing::info!(
-        //    p5 = self.retx_ctrs.value_at_quantile(0.05),
-        //    p25 = self.retx_ctrs.value_at_quantile(0.25),
-        //    p50 = self.retx_ctrs.value_at_quantile(0.5),
-        //    p75 = self.retx_ctrs.value_at_quantile(0.75),
-        //    p95 = self.retx_ctrs.value_at_quantile(0.95),
-        //    cnt = self.retx_ctrs.len(),
-        //    "retx_ctrs",
-        //);
+        tracing::info!(
+            p5 = self.raw_rtts.value_at_quantile(0.05),
+            p25 = self.raw_rtts.value_at_quantile(0.25),
+            p50 = self.raw_rtts.value_at_quantile(0.5),
+            p75 = self.raw_rtts.value_at_quantile(0.75),
+            p95 = self.raw_rtts.value_at_quantile(0.95),
+            cnt = self.raw_rtts.len(),
+            extra_acks = self.extra_acks,
+            "last tx -> ack rtts (us)",
+        );
+        tracing::info!(
+            p5 = self.retx_ctrs.value_at_quantile(0.05),
+            p25 = self.retx_ctrs.value_at_quantile(0.25),
+            p50 = self.retx_ctrs.value_at_quantile(0.5),
+            p75 = self.retx_ctrs.value_at_quantile(0.75),
+            p95 = self.retx_ctrs.value_at_quantile(0.95),
+            cnt = self.retx_ctrs.len(),
+            "retx_ctrs",
+        );
     }
 }
 
@@ -520,14 +511,19 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
     inner: Arc<C>,
     mut new_send: mpsc::UnboundedReceiver<(A, PktHeader, Option<oneshot::Sender<()>>, Instant)>,
     mut new_recv: mpsc::UnboundedReceiver<(A, PktHeader)>,
-    delayed_ack: Arc<Mutex<AHashMap<A, PktHeader>>>,
+    delayed_ack: Arc<DashMap<A, PktHeader>>,
 ) where
     C: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
 {
     let mut state = AHashMap::<A, ReliabilityState>::new();
     let mut delayed_ack_to = tokio::time::interval(Duration::from_millis(10));
     let mut pending_send_futs = futures_util::stream::FuturesUnordered::new();
+    //let mut select_time: hdrhistogram::Histogram<u64> =
+    //    hdrhistogram::Histogram::new_with_max(100, 2).unwrap();
+    //let start = Instant::now();
+    //let mut last_print = Instant::now();
     loop {
+        //let select_start = Instant::now();
         tokio::select! (
             Some((addr, pkt, s, t)) = new_send.recv() => {
                 let st = state.entry(addr.clone()).or_default();
@@ -579,10 +575,16 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
                     }
                 }
 
+
                 if let Some(seq) = hdr.seq {
                     // queue an ack
-                    let mut ph = delayed_ack.lock().expect("lock acquire");
-                    let ent = ph.entry(addr.clone()).or_default();
+                    let mut ent = delayed_ack.get_mut(&addr);
+                    if ent.is_none() {
+                        delayed_ack.insert(addr.clone(), Default::default());
+                        ent = delayed_ack.get_mut(&addr);
+                    }
+
+                    let mut ent = ent.unwrap();
                     ent.acks.push(seq);
                     trace!(?seq, from = ?&addr, event = "payload, queued ack", "got pkt");
                     if ent.acks.len() > 1 {
@@ -600,8 +602,8 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
             _ = delayed_ack_to.tick() => {
                 // Ticks every interval, and sends out any unsent delayed acks.
                 // This is sucky, but even Linux doesn't have a better way...
-                let mut ph = delayed_ack.lock().expect("lock acquire");
-                for (addr, mut h) in ph.drain().filter(|(_, h)| !h.acks.is_empty()) {
+                for mut ent in delayed_ack.iter_mut().filter(|e| !e.value().acks.is_empty()) {
+                    let (addr, h) = ent.pair_mut();
                     let mut send_p: PktHeader = Default::default();
                     std::mem::swap(&mut send_p.acks, &mut h.acks);
                     trace!(?addr, ?send_p, "sent delayed acks");
@@ -609,6 +611,22 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
                 }
             }
         );
+
+        //select_time.saturating_record(select_start.elapsed().as_micros() as _);
+        //if last_print.elapsed() > Duration::from_secs(3) {
+        //    tracing::info!(
+        //        p5 = select_time.value_at_quantile(0.05),
+        //        p25 = select_time.value_at_quantile(0.25),
+        //        p50 = select_time.value_at_quantile(0.5),
+        //        p75 = select_time.value_at_quantile(0.75),
+        //        p95 = select_time.value_at_quantile(0.95),
+        //        cnt = select_time.len(),
+        //        elapsed = ?start.elapsed(),
+        //        "select_time",
+        //    );
+        //    select_time.clear();
+        //    last_print = Instant::now();
+        //}
     }
 }
 
