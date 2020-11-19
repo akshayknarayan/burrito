@@ -24,5 +24,7 @@ lazy_static = "1.4"
 tokio = { version = "0.2", features = ["rt-core", "rt-threaded"] }
 tracing-subscriber = "0.2"
 tracing-error = "0.1"
+tracing-timing  = { version = "0.4", features = ["layer"] }
 serde = { version = "1", features = ["derive"] }
 structopt = "0.3"
+ctrlc = "3"

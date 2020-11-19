@@ -274,17 +274,18 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let mut inner = Arc::clone(&self.inner);
         let pending_payload_recv = Arc::clone(&self.pending_payload_recv);
+        let delayed_ack = Arc::clone(&self.delayed_ack);
         let new_recv = self.new_recv.clone();
 
         Box::pin(
             async move {
                 if let Ok((addr, p)) = pending_payload_recv.lock().expect("lock mutex").try_recv() {
-                    trace!(pkt = ?p, addr = ?addr, was_pending = true, "returning packet");
+                    trace!(pkt = ?p, addr = ?addr, "returning pending packet");
                     return Ok((addr, p.payload.unwrap()));
                 }
 
-                let (addr, pkt) = do_recv(&mut inner, &new_recv).await?;
-                trace!(pkt = ?&pkt, addr = ?addr, was_pending = false, "returning packet");
+                let (addr, pkt) = do_recv(&mut inner, &new_recv, delayed_ack).await?;
+                trace!(pkt = ?&pkt, addr = ?addr, "returning new packet");
                 let p = pkt.payload.unwrap();
                 Ok((addr, p))
             }
@@ -293,6 +294,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn transmit<A, C, D>(
     inner: Arc<C>,
     segment: (A, Pkt<D>),
@@ -326,7 +328,7 @@ where
                 new_send.send((addr.clone(), pkt.pkt_header(), None, Instant::now()))?;
                 inner.send((addr, pkt)).await?;
             }
-            Ok((addr, pkt)) = do_recv(&mut inner1, &new_recv) => {
+            Ok((addr, pkt)) = do_recv(&mut inner1, &new_recv, &delayed_ack) => {
                 pending_payload.send((addr, pkt))?;
             }
         );
@@ -336,6 +338,7 @@ where
 async fn do_recv<A, C, D>(
     inner: &mut Arc<C>,
     new_recv: &mpsc::UnboundedSender<(A, PktHeader)>,
+    delayed_ack: impl AsRef<DashMap<A, PktHeader>>,
 ) -> Result<(A, Pkt<D>), eyre::Report>
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
@@ -345,10 +348,23 @@ where
     loop {
         let (addr, mut pkt) = inner.recv().await?;
         trace!("called inner recv");
-
         let hdr = pkt.take_pkt_header();
-        new_recv.send((addr.clone(), hdr))?;
+        if let Some(seq) = hdr.seq {
+            // queue an ack
+            let da = delayed_ack.as_ref();
+            let mut ent = da.get_mut(&addr);
+            if ent.is_none() {
+                da.insert(addr.clone(), Default::default());
+                ent = da.get_mut(&addr);
+            }
 
+            let mut ent = ent.unwrap();
+            ent.acks.push(seq);
+            trace!(?seq, from = ?&addr, event = "payload, queued ack", "got pkt");
+        }
+
+        // this channel send must happen after the above delayed ack check
+        new_recv.send((addr.clone(), hdr))?;
         if pkt.payload.is_some() {
             return Ok((addr, pkt));
         }
@@ -465,25 +481,25 @@ struct ReliabilityState {
 
 impl ReliabilityState {
     fn dump(&self) {
-        tracing::info!(
-            p5 = self.raw_rtts.value_at_quantile(0.05),
-            p25 = self.raw_rtts.value_at_quantile(0.25),
-            p50 = self.raw_rtts.value_at_quantile(0.5),
-            p75 = self.raw_rtts.value_at_quantile(0.75),
-            p95 = self.raw_rtts.value_at_quantile(0.95),
-            cnt = self.raw_rtts.len(),
-            extra_acks = self.extra_acks,
-            "last tx -> ack rtts (us)",
-        );
-        tracing::info!(
-            p5 = self.retx_ctrs.value_at_quantile(0.05),
-            p25 = self.retx_ctrs.value_at_quantile(0.25),
-            p50 = self.retx_ctrs.value_at_quantile(0.5),
-            p75 = self.retx_ctrs.value_at_quantile(0.75),
-            p95 = self.retx_ctrs.value_at_quantile(0.95),
-            cnt = self.retx_ctrs.len(),
-            "retx_ctrs",
-        );
+        //tracing::info!(
+        //    p5 = self.raw_rtts.value_at_quantile(0.05),
+        //    p25 = self.raw_rtts.value_at_quantile(0.25),
+        //    p50 = self.raw_rtts.value_at_quantile(0.5),
+        //    p75 = self.raw_rtts.value_at_quantile(0.75),
+        //    p95 = self.raw_rtts.value_at_quantile(0.95),
+        //    cnt = self.raw_rtts.len(),
+        //    extra_acks = self.extra_acks,
+        //    "last tx -> ack rtts (us)",
+        //);
+        //tracing::info!(
+        //    p5 = self.retx_ctrs.value_at_quantile(0.05),
+        //    p25 = self.retx_ctrs.value_at_quantile(0.25),
+        //    p50 = self.retx_ctrs.value_at_quantile(0.5),
+        //    p75 = self.retx_ctrs.value_at_quantile(0.75),
+        //    p95 = self.retx_ctrs.value_at_quantile(0.95),
+        //    cnt = self.retx_ctrs.len(),
+        //    "retx_ctrs",
+        //);
     }
 }
 
@@ -554,19 +570,19 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
                     if let Some((s, send_time, ctr)) = st.inflight.remove(&seq) {
                         let elapsed = send_time.elapsed();
                         trace!(seq = ?&seq, from = ?&addr, rtt = ?elapsed, retx_ctr = ?ctr, event = "good ack", "got pkt");
-                        st.raw_rtts.saturating_record(elapsed.as_micros() as _);
-                        st.retx_ctrs.saturating_record(ctr as _);
-                        match st.last_print {
-                            None => {
-                                st.last_print = Some(Instant::now());
-                            }
-                            Some(t) if t.elapsed() > Duration::from_secs(10) => {
-                                st.dump();
-                                st.raw_rtts.clear();
-                                st.last_print = Some(Instant::now());
-                            }
-                            _ => (),
-                        }
+                        //st.raw_rtts.saturating_record(elapsed.as_micros() as _);
+                        //st.retx_ctrs.saturating_record(ctr as _);
+                        //match st.last_print {
+                        //    None => {
+                        //        st.last_print = Some(Instant::now());
+                        //    }
+                        //    Some(t) if t.elapsed() > Duration::from_secs(10) => {
+                        //        st.dump();
+                        //        st.raw_rtts.clear();
+                        //        st.last_print = Some(Instant::now());
+                        //    }
+                        //    _ => (),
+                        //}
 
                         s.send(()).unwrap();
                     } else {
@@ -576,22 +592,12 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
                 }
 
 
-                if let Some(seq) = hdr.seq {
-                    // queue an ack
-                    let mut ent = delayed_ack.get_mut(&addr);
-                    if ent.is_none() {
-                        delayed_ack.insert(addr.clone(), Default::default());
-                        ent = delayed_ack.get_mut(&addr);
-                    }
-
-                    let mut ent = ent.unwrap();
-                    ent.acks.push(seq);
-                    trace!(?seq, from = ?&addr, event = "payload, queued ack", "got pkt");
-                    if ent.acks.len() > 1 {
-                        let mut send_p: PktHeader = Default::default();
-                        std::mem::swap(&mut send_p.acks, &mut ent.acks);
-                        pending_send_futs.push(inner.send((addr.clone(), Pkt::from_header(send_p))));
-                    }
+                let mut ent = delayed_ack.get_mut(&addr).unwrap();
+                if ent.acks.len() > 1 {
+                    let mut send_p: PktHeader = Default::default();
+                    std::mem::swap(&mut send_p.acks, &mut ent.acks);
+                    trace!(?addr, ?send_p, "sending delayed acks");
+                    pending_send_futs.push(inner.send((addr.clone(), Pkt::from_header(send_p))));
                 }
             }
             Some(res) = pending_send_futs.next() => {

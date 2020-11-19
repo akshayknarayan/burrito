@@ -150,7 +150,7 @@ impl ChunnelListener for UdpReqChunnel {
                 move |(mut r, s, mut map, pending_inc_ctr, pending_dec_ctr)| {
                     async move {
                         let mut buf = [0u8; 1024];
-                        let mut last_print = std::time::Instant::now();
+                        //let mut last_print = std::time::Instant::now();
                         loop {
                             // careful: potential deadlocks since .recv on returned connection blocks
                             // on .listen
@@ -181,18 +181,18 @@ impl ChunnelListener for UdpReqChunnel {
                                 map.remove(&from);
                             }
 
-                            if last_print.elapsed() > std::time::Duration::from_millis(1000) {
-                                let p_inc =
-                                    pending_inc_ctr.load(std::sync::atomic::Ordering::SeqCst);
-                                let p_dec =
-                                    pending_dec_ctr.load(std::sync::atomic::Ordering::SeqCst);
-                                tracing::info!(
-                                    from = ?from,
-                                    ?p_inc, ?p_dec,
-                                    "pending"
-                                );
-                                last_print = std::time::Instant::now();
-                            }
+                            //if last_print.elapsed() > std::time::Duration::from_millis(1000) {
+                            //    let p_inc =
+                            //        pending_inc_ctr.load(std::sync::atomic::Ordering::SeqCst);
+                            //    let p_dec =
+                            //        pending_dec_ctr.load(std::sync::atomic::Ordering::SeqCst);
+                            //    tracing::info!(
+                            //        from = ?from,
+                            //        ?p_inc, ?p_dec,
+                            //        "pending"
+                            //    );
+                            //    last_print = std::time::Instant::now();
+                            //}
 
                             if let Some(d) = done {
                                 return Ok(Some((
