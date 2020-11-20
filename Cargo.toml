@@ -2,8 +2,6 @@
 
 members = [
     "bertha",
-    "burrito-discovery-ctl",
-    "burrito-localname-ctl",
     "burrito-shard-ctl",
     "burrito-util",
     "kvstore",
