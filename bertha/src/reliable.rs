@@ -361,7 +361,18 @@ where
             }
 
             let mut ent = ent.unwrap();
-            ent.acks.push(seq);
+            if ent.num_acks() == 4 {
+                // immediately send ack
+                let mut send_p: PktHeader = Default::default();
+                std::mem::swap(&mut send_p.acks, &mut ent.acks);
+                trace!(?addr, ?send_p, "delayed acks full, sending");
+                inner
+                    .as_ref()
+                    .send((addr.clone(), Pkt::from_header(send_p)))
+                    .await?;
+            }
+
+            ent.add_ack(seq);
             trace!(?seq, from = ?&addr, event = "payload, queued ack", "got pkt");
         }
 
@@ -389,7 +400,7 @@ fn try_get_delayed_acks<A, D>(
 /// Message format for reliability chunnel
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pkt<D> {
-    pub acks: Vec<u32>,
+    pub acks: [Option<u32>; 4],
     pub payload: Option<(u32, D)>,
 }
 
@@ -403,7 +414,7 @@ impl<D> Default for Pkt<D> {
 }
 
 impl<D> Pkt<D> {
-    pub fn payload(seq: u32, payload: D) -> Self {
+    fn payload(seq: u32, payload: D) -> Self {
         Pkt {
             acks: Default::default(),
             payload: Some((seq, payload)),
@@ -417,24 +428,19 @@ impl<D> Pkt<D> {
         }
     }
 
-    pub fn add_ack(&mut self, ack: u32) {
-        self.acks.push(ack);
+    fn take_acks(&mut self) -> [Option<u32>; 4] {
+        std::mem::replace(&mut self.acks, [None; 4])
     }
 
-    pub fn take_acks(&mut self) -> Vec<u32> {
-        let a = Vec::new();
-        std::mem::replace(&mut self.acks, a)
+    fn clear_acks(&mut self) {
+        self.take_acks();
     }
 
-    pub fn clear_acks(&mut self) {
-        self.acks.clear();
-    }
-
-    pub fn add_payload(&mut self, seq: u32, p: D) -> Option<(u32, D)> {
-        let t = self.payload.take();
-        self.payload = Some((seq, p));
-        t
-    }
+    //fn add_payload(&mut self, seq: u32, p: D) -> Option<(u32, D)> {
+    //    let t = self.payload.take();
+    //    self.payload = Some((seq, p));
+    //    t
+    //}
 
     fn take_pkt_header(&mut self) -> PktHeader {
         let acks = self.take_acks();
@@ -446,7 +452,7 @@ impl<D> Pkt<D> {
 
     fn pkt_header(&self) -> PktHeader {
         PktHeader {
-            acks: self.acks.clone(),
+            acks: self.acks,
             seq: self.payload.as_ref().map(|x| x.0),
         }
     }
@@ -468,7 +474,30 @@ impl<D> std::fmt::Debug for Pkt<D> {
 #[derive(Debug, Default)]
 struct PktHeader {
     seq: Option<u32>,
-    acks: Vec<u32>,
+    acks: [Option<u32>; 4],
+}
+
+impl PktHeader {
+    /// Cannot call this if there are already 4 acks. It will panic.
+    fn add_ack(&mut self, ack: u32) {
+        for i in 0..4 {
+            if self.acks[i].is_none() {
+                self.acks[i] = Some(ack);
+                return;
+            }
+        }
+        unreachable!("Cannot have more than 4 delayed acks");
+    }
+
+    fn num_acks(&self) -> usize {
+        for i in 0..4 {
+            if self.acks[i].is_none() {
+                return i;
+            }
+        }
+
+        4
+    }
 }
 
 #[derive(Debug)]
@@ -576,7 +605,11 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
             Some((addr, hdr)) = new_recv.recv() => {
                 if let Some(st) = state.get_mut(&addr) {
                     for seq in &hdr.acks {
-                        if let Some((s, send_time, ctr)) = st.inflight.remove(&seq) {
+                        if seq.is_none() {
+                            break;
+                        }
+
+                        if let Some((s, send_time, ctr)) = st.inflight.remove(seq.as_ref().unwrap()) {
                             let elapsed = send_time.elapsed();
                             //st.raw_rtts.saturating_record(elapsed.as_micros() as _);
                             //st.retx_ctrs.saturating_record(ctr as _);
@@ -599,12 +632,12 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
                             trace!(seq = ?&seq, from = ?&addr, event = "bad ack, unknown ack", "got pkt");
                         }
                     }
-                }
-
-                if let Some(mut ent) = delayed_ack.get_mut(&addr) {
-                    if !ent.acks.is_empty() {
+                } else if let Some(mut ent) = delayed_ack.get_mut(&addr) {
+                    if ent.num_acks() > 1 {
                         get_delayed_acks(&mut pending_send_futs, ent.deref_mut(), addr, &inner);
                     }
+                } else {
+                    trace!(?hdr, from = ?&addr, event = "bad ack, unknown addr", "got pkt");
                 }
             }
             Some(res) = pending_send_futs.next() => {
@@ -612,10 +645,10 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
                     debug!(?err, "inner send failed");
                 }
             }
-            _ = delayed_ack_to.tick(), if delayed_ack.iter().any(|e| !e.value().acks.is_empty()) => {
+            _ = delayed_ack_to.tick(), if delayed_ack.iter().any(|e| e.value().num_acks() > 0) => {
                 // Ticks every interval, and sends out any unsent delayed acks.
                 // This is sucky, but even Linux doesn't have a better way...
-                for mut ent in delayed_ack.iter_mut().filter(|e| !e.value().acks.is_empty()) {
+                for mut ent in delayed_ack.iter_mut().filter(|e| e.value().num_acks() > 0) {
                     let (addr, mut h) = ent.pair_mut();
                     get_delayed_acks(&mut pending_send_futs, h.deref_mut(), addr.clone(), &inner);
                 }
