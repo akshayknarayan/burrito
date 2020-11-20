@@ -4,6 +4,7 @@ use eyre::{eyre, Error};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_compat_02::FutureExt;
 use tracing::{debug, trace, warn};
 
 fn redis_key<A>(a: &A) -> String
@@ -33,7 +34,7 @@ where
     r.set(&name, shard_blob).ignore();
 
     trace!("adding");
-    r.query_async(&mut *conn.lock().await).await?;
+    r.query_async(&mut *conn.lock().await).compat().await?;
     Ok(())
 }
 
@@ -59,7 +60,7 @@ where
     let start = tokio::time::Instant::now();
     let sh_info_blob = loop {
         trace!(key = ?&a, "sending request");
-        let sh_info_blob: Vec<u8> = con.get::<_, Vec<u8>>(&a).await?;
+        let sh_info_blob: Vec<u8> = con.get::<_, Vec<u8>>(&a).compat().await?;
         if sh_info_blob.is_empty() {
             trace!(key = ?&a, "got empty response");
             if start.elapsed() > tokio::time::Duration::from_secs(5) {
@@ -67,7 +68,7 @@ where
                 return Ok(None);
             }
 
-            tokio::time::delay_for(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             continue;
         }
 
