@@ -63,16 +63,17 @@ impl Server {
             Work::Immediate => (),
             Work::Const => {
                 let completion_time = then + std::time::Duration::from_micros(amt);
-                tokio::time::delay_until(tokio::time::Instant::from_std(completion_time)).await;
+                tokio::time::sleep_until(completion_time.into()).await;
             }
             Work::Poisson => {
                 let completion_time = then + gen_poisson_duration(amt as f64)?;
-                tokio::time::delay_until(tokio::time::Instant::from_std(completion_time)).await;
+                tokio::time::sleep_until(completion_time.into()).await;
             }
             Work::BusyTimeConst => {
                 let completion_time = then + std::time::Duration::from_micros(amt);
                 while std::time::Instant::now() < completion_time {
                     // spin
+                    tokio::task::yield_now().await;
                 }
             }
             Work::BusyWorkConst => {
@@ -140,7 +141,7 @@ async fn serve_udp(srv: Server, port: u16) -> Result<(), Report> {
     // udp server
     let mut buf = [0u8; 1024];
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-    let mut sk = tokio::net::UdpSocket::bind::<std::net::SocketAddr>(addr)
+    let sk = tokio::net::UdpSocket::bind::<std::net::SocketAddr>(addr)
         .await
         .unwrap();
     loop {
