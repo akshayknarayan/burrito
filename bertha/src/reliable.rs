@@ -244,8 +244,10 @@ where
                 let (s, r) = oneshot::channel();
                 let mut pkt = Pkt::payload(seq, data);
                 // notify send
+                trace!(?pkt, "channel send");
                 new_send.send((addr.clone(), pkt.pkt_header(), Some(s), Instant::now()))?;
                 // we just created pkt, so acks is clear.
+                trace!(?pkt, "getting delayed acks");
                 try_get_delayed_acks(&mut pkt, &addr, &delayed_ack);
                 trace!(?pkt, "sending");
 
@@ -538,8 +540,26 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
     //    hdrhistogram::Histogram::new_with_max(100, 2).unwrap();
     //let start = Instant::now();
     //let mut last_print = Instant::now();
+    type ChunnelSendFut = Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>>;
+    fn get_delayed_acks<
+        A: Eq + Hash + Clone + std::fmt::Debug,
+        C: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
+        D,
+    >(
+        pending_send_futs: &mut futures_util::stream::FuturesUnordered<ChunnelSendFut>,
+        h: &mut PktHeader,
+        addr: A,
+        inner: impl AsRef<C>,
+    ) {
+        let mut send_p: PktHeader = Default::default();
+        std::mem::swap(&mut send_p.acks, &mut h.acks);
+        trace!(?addr, ?send_p, "sending delayed acks");
+        pending_send_futs.push(inner.as_ref().send((addr, Pkt::from_header(send_p))));
+    }
+
     loop {
         //let select_start = Instant::now();
+        trace!("loop start");
         tokio::select! (
             Some((addr, pkt, s, t)) = new_send.recv() => {
                 let st = state.entry(addr.clone()).or_default();
@@ -547,57 +567,44 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
                     if let Some(s) = s {
                         st.inflight.insert(seq, (s, t, 0));
                     } else if let Some((_, time, ctr)) = st.inflight.get_mut(&seq) {
-                        trace!(?pkt, ?addr, "retransmitted");
                         *time = t;
                         *ctr += 1;
+                        trace!(?pkt, ?addr, "retransmitted");
                     }
                 }
             }
             Some((addr, hdr)) = new_recv.recv() => {
-                let mut st = state.get_mut(&addr);
-                if st.is_none() && !hdr.acks.is_empty() {
-                    trace!(?hdr, from = ?&addr, event = "bad ack, unknown addr", "got pkt");
-                    continue;
-                } else if st.is_none() {
-                    // there are no acks so we don't expect there to be state, but we need to init state to
-                    // handle delayed acks.
-                    state.insert(addr.clone(), Default::default());
-                    st = state.get_mut(&addr);
-                }
+                if let Some(st) = state.get_mut(&addr) {
+                    for seq in &hdr.acks {
+                        if let Some((s, send_time, ctr)) = st.inflight.remove(&seq) {
+                            let elapsed = send_time.elapsed();
+                            //st.raw_rtts.saturating_record(elapsed.as_micros() as _);
+                            //st.retx_ctrs.saturating_record(ctr as _);
+                            //match st.last_print {
+                            //    None => {
+                            //        st.last_print = Some(Instant::now());
+                            //    }
+                            //    Some(t) if t.elapsed() > Duration::from_secs(10) => {
+                            //        st.dump();
+                            //        st.raw_rtts.clear();
+                            //        st.last_print = Some(Instant::now());
+                            //    }
+                            //    _ => (),
+                            //}
 
-                let st = st.unwrap();
-                for seq in hdr.acks {
-                    if let Some((s, send_time, ctr)) = st.inflight.remove(&seq) {
-                        let elapsed = send_time.elapsed();
-                        trace!(seq = ?&seq, from = ?&addr, rtt = ?elapsed, retx_ctr = ?ctr, event = "good ack", "got pkt");
-                        //st.raw_rtts.saturating_record(elapsed.as_micros() as _);
-                        //st.retx_ctrs.saturating_record(ctr as _);
-                        //match st.last_print {
-                        //    None => {
-                        //        st.last_print = Some(Instant::now());
-                        //    }
-                        //    Some(t) if t.elapsed() > Duration::from_secs(10) => {
-                        //        st.dump();
-                        //        st.raw_rtts.clear();
-                        //        st.last_print = Some(Instant::now());
-                        //    }
-                        //    _ => (),
-                        //}
-
-                        s.send(()).unwrap();
-                    } else {
-                        trace!(seq = ?&seq, from = ?&addr, event = "bad ack, unknown ack", "got pkt");
-                        st.extra_acks += 1;
+                            s.send(()).unwrap();
+                            trace!(seq = ?&seq, from = ?&addr, rtt = ?elapsed, retx_ctr = ?ctr, event = "good ack", "got pkt");
+                        } else {
+                            st.extra_acks += 1;
+                            trace!(seq = ?&seq, from = ?&addr, event = "bad ack, unknown ack", "got pkt");
+                        }
                     }
                 }
 
-
-                let mut ent = delayed_ack.get_mut(&addr).unwrap();
-                if ent.acks.len() > 1 {
-                    let mut send_p: PktHeader = Default::default();
-                    std::mem::swap(&mut send_p.acks, &mut ent.acks);
-                    trace!(?addr, ?send_p, "sending delayed acks");
-                    pending_send_futs.push(inner.send((addr.clone(), Pkt::from_header(send_p))));
+                if let Some(mut ent) = delayed_ack.get_mut(&addr) {
+                    if !ent.acks.is_empty() {
+                        get_delayed_acks(&mut pending_send_futs, ent.deref_mut(), addr, &inner);
+                    }
                 }
             }
             Some(res) = pending_send_futs.next() => {
@@ -605,16 +612,16 @@ async fn reliability_state<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
                     debug!(?err, "inner send failed");
                 }
             }
-            _ = delayed_ack_to.tick() => {
+            _ = delayed_ack_to.tick(), if delayed_ack.iter().any(|e| !e.value().acks.is_empty()) => {
                 // Ticks every interval, and sends out any unsent delayed acks.
                 // This is sucky, but even Linux doesn't have a better way...
                 for mut ent in delayed_ack.iter_mut().filter(|e| !e.value().acks.is_empty()) {
-                    let (addr, h) = ent.pair_mut();
-                    let mut send_p: PktHeader = Default::default();
-                    std::mem::swap(&mut send_p.acks, &mut h.acks);
-                    trace!(?addr, ?send_p, "sent delayed acks");
-                    pending_send_futs.push(inner.send((addr.clone(), Pkt::from_header(send_p))));
+                    let (addr, mut h) = ent.pair_mut();
+                    get_delayed_acks(&mut pending_send_futs, h.deref_mut(), addr.clone(), &inner);
                 }
+            }
+            else => {
+                return;
             }
         );
 
