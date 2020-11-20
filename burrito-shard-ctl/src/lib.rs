@@ -733,10 +733,8 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
-            .enable_time()
-            .enable_io()
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
 
@@ -865,14 +863,14 @@ mod test {
         .unwrap();
         // UdpConn: (SocketAddr, Vec<u8>)
         // ProjectLeft: (SocketAddr, Vec<u8>) -> Vec<u8>
-        // SerializeChunnel: Vec<u8> -> (u32, Option<Msg>)
-        // ReliabilityChunnel: (u32, Option<Msg>) -> (u32, Msg)
+        // SerializeChunnel: Vec<u8> -> _
+        // ReliabilityChunnel: _ -> (u32, Msg)
         // TaggerChunnel: (u32, Msg) -> Msg
         // ShardCanonicalServer: Msg -> ()
         let external = CxList::from(cnsrv)
             .wrap(TaggerProjChunnel)
             .wrap(ReliabilityProjChunnel::<_, Msg>::default())
-            .wrap(SerializeChunnelProject::<_, (u32, Option<Msg>)>::default());
+            .wrap(SerializeChunnelProject::default());
         info!(shard_info = ?&si, "start canonical server");
         let st = UdpReqChunnel::default()
             .listen(si.canonical_addr)
@@ -916,10 +914,8 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
-            .enable_time()
-            .enable_io()
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
 
@@ -970,10 +966,8 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
-            .enable_time()
-            .enable_io()
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
 
@@ -1035,10 +1029,8 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
-            .enable_time()
-            .enable_io()
+        let mut rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
 
