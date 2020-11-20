@@ -418,7 +418,7 @@ where
                             st.retx_ctrs.saturating_record(retx_ctr);
                             return Ok::<_, eyre::Report>(());
                         }
-                        _ = tokio::time::delay_for(to) => {
+                        _ = tokio::time::sleep(to) => {
                             let (ref addr, ref pkt) = segment;
                             retx_ctr += 1;
                             to_ms *= to_ms;
@@ -533,7 +533,7 @@ async fn nagler<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
     C: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
 {
     loop {
-        tokio::time::delay_for(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         for mut entry in state.iter_mut() {
             let (addr, st) = entry.pair_mut();
             if !st.pending_acks.acks.is_empty() {
@@ -601,8 +601,7 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
         let msgs = (0..7).map(|i| (i, vec![i as u8; 10])).collect();
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
@@ -637,8 +636,7 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
         let msgs = vec![(0, vec![0u8; 10]), (1, vec![1u8; 10]), (2, vec![2u8; 10])];
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
@@ -717,8 +715,7 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
         let msgs = vec![vec![0u8; 10], vec![1u8; 10], vec![2u8; 10]];
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();

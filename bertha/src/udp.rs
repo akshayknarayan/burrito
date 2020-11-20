@@ -39,10 +39,7 @@ impl ChunnelListener for UdpSkChunnel {
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
-            let sk = tokio::net::UdpSocket::bind(a).map(|sk| {
-                let (recv, send) = sk?.split();
-                Ok(UdpSk::new(send, recv))
-            });
+            let sk = tokio::net::UdpSocket::bind(a).map(|sk| Ok(UdpSk::new(sk?)));
             Ok(Box::pin(futures_util::stream::once(sk)) as _)
         })
     }
@@ -65,24 +62,21 @@ impl ChunnelConnector for UdpSkChunnel {
             .unwrap();
             let local_addr = sk.local_addr()?;
             debug!(?local_addr, "Bound to udp address");
-            let (recv, send) = sk.split();
-            Ok(UdpSk::new(send, recv))
+            Ok(UdpSk::new(sk))
         })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct UdpSk<A> {
-    send: Arc<Mutex<tokio::net::udp::SendHalf>>,
-    recv: Arc<Mutex<tokio::net::udp::RecvHalf>>,
+    sk: Arc<tokio::net::UdpSocket>,
     _phantom: std::marker::PhantomData<A>,
 }
 
 impl<A> UdpSk<A> {
-    fn new(send: tokio::net::udp::SendHalf, recv: tokio::net::udp::RecvHalf) -> Self {
+    fn new(sk: tokio::net::UdpSocket) -> Self {
         Self {
-            send: Arc::new(Mutex::new(send)),
-            recv: Arc::new(Mutex::new(recv)),
+            sk: Arc::new(sk),
             _phantom: Default::default(),
         }
     }
@@ -98,21 +92,21 @@ where
         &self,
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let sk = Arc::clone(&self.send);
+        let sk = Arc::clone(&self.sk);
         Box::pin(async move {
             let (addr, data) = data;
             let addr = addr.into();
-            sk.lock().await.send_to(&data, &addr).await?;
+            sk.send_to(&data, &addr).await?;
             Ok(())
         })
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let mut buf = [0u8; 1024];
-        let sk = Arc::clone(&self.recv);
+        let sk = Arc::clone(&self.sk);
 
         Box::pin(async move {
-            let (len, from) = sk.lock().await.recv_from(&mut buf).await?;
+            let (len, from) = sk.recv_from(&mut buf).await?;
             let data = buf[0..len].to_vec();
             Ok((from.into(), data))
         })
@@ -138,23 +132,21 @@ impl ChunnelListener for UdpReqChunnel {
 
             let pending_inc_ctr: Arc<AtomicUsize> = Default::default();
             let pending_dec_ctr: Arc<AtomicUsize> = Default::default();
-            let (recv, send) = sk.split();
             Ok(Box::pin(futures_util::stream::try_unfold(
                 (
-                    recv,
-                    Arc::new(Mutex::new(send)),
+                    Arc::new(sk),
                     AHashMap::<_, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>::new(),
                     pending_inc_ctr,
                     pending_dec_ctr,
                 ),
-                move |(mut r, s, mut map, pending_inc_ctr, pending_dec_ctr)| {
+                move |(sk, mut map, pending_inc_ctr, pending_dec_ctr)| {
                     async move {
                         let mut buf = [0u8; 1024];
                         let mut last_print = std::time::Instant::now();
                         loop {
                             // careful: potential deadlocks since .recv on returned connection blocks
                             // on .listen
-                            let (len, from) = r.recv_from(&mut buf).await?;
+                            let (len, from) = sk.recv_from(&mut buf).await?;
                             let data = buf[0..len].to_vec();
                             let ctr =
                                 pending_inc_ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -167,7 +159,7 @@ impl ChunnelListener for UdpReqChunnel {
                                     resp_addr: from,
                                     pending_ctr: Arc::clone(&pending_dec_ctr),
                                     recv: Arc::new(Mutex::new(rch)),
-                                    send: Arc::clone(&s),
+                                    send: Arc::clone(&sk),
                                 });
 
                                 sch
@@ -195,10 +187,7 @@ impl ChunnelListener for UdpReqChunnel {
                             }
 
                             if let Some(d) = done {
-                                return Ok(Some((
-                                    d,
-                                    (r, s, map, pending_inc_ctr, pending_dec_ctr),
-                                )));
+                                return Ok(Some((d, (sk, map, pending_inc_ctr, pending_dec_ctr))));
                             }
                         }
                     }
@@ -214,7 +203,7 @@ pub struct UdpConn {
     resp_addr: SocketAddr,
     pending_ctr: Arc<AtomicUsize>,
     recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
-    send: Arc<Mutex<tokio::net::udp::SendHalf>>,
+    send: Arc<tokio::net::UdpSocket>,
 }
 
 impl ChunnelConnection for UdpConn {
@@ -228,7 +217,7 @@ impl ChunnelConnection for UdpConn {
         let addr = self.resp_addr;
         let (_, data) = data;
         Box::pin(async move {
-            sk.lock().await.send_to(&data, &addr).await?;
+            sk.send_to(&data, addr).await?;
             Ok(())
         })
     }
@@ -264,8 +253,7 @@ mod test {
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_io()
             .build()
@@ -313,8 +301,7 @@ mod test {
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_io()
             .build()
@@ -357,8 +344,7 @@ mod test {
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_io()
             .build()
