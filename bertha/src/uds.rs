@@ -1,7 +1,5 @@
 //! Unix datagram/socket chunnel.
 
-// TODO UnixDatagram has a split() impl merged, but not released yet.
-
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report};
 use futures_util::stream::{Stream, StreamExt};
@@ -30,13 +28,10 @@ impl ChunnelListener for UnixSkChunnel {
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
-            let recv = std::os::unix::net::UnixDatagram::bind(a)?;
-            let send = recv.try_clone()?;
-            let recv = tokio::net::UnixDatagram::from_std(recv)?;
-            let send = tokio::net::UnixDatagram::from_std(send)?;
+            let sk = tokio::net::UnixDatagram::bind(a)?;
             Ok(
                 Box::pin(futures_util::stream::once(futures_util::future::ready(Ok(
-                    UnixSk::new(send, recv),
+                    UnixSk::new(sk),
                 )))) as _,
             )
         })
@@ -60,27 +55,20 @@ impl ChunnelConnector for UnixSkChunnel {
                 .collect();
             let d = std::env::temp_dir();
             let f = d.join(stem);
-            let recv = std::os::unix::net::UnixDatagram::bind(f)?;
-            let send = recv.try_clone()?;
-            let recv = tokio::net::UnixDatagram::from_std(recv)?;
-            let send = tokio::net::UnixDatagram::from_std(send)?;
-            Ok(UnixSk::new(send, recv))
+            let sk = tokio::net::UnixDatagram::bind(f)?;
+            Ok(UnixSk::new(sk))
         })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct UnixSk {
-    send: Arc<Mutex<tokio::net::UnixDatagram>>,
-    recv: Arc<Mutex<tokio::net::UnixDatagram>>,
+    sk: Arc<tokio::net::UnixDatagram>,
 }
 
 impl UnixSk {
-    fn new(send: tokio::net::UnixDatagram, recv: tokio::net::UnixDatagram) -> Self {
-        Self {
-            send: Arc::new(Mutex::new(send)),
-            recv: Arc::new(Mutex::new(recv)),
-        }
+    fn new(sk: tokio::net::UnixDatagram) -> Self {
+        Self { sk: Arc::new(sk) }
     }
 }
 
@@ -91,21 +79,21 @@ impl ChunnelConnection for UnixSk {
         &self,
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let sk = Arc::clone(&self.send);
+        let sk = Arc::clone(&self.sk);
         Box::pin(async move {
             let (addr, data) = data;
             trace!(to = ?&addr, "send");
-            sk.lock().await.send_to(&data, &addr).await?;
+            sk.send_to(&data, &addr).await?;
             Ok(())
         })
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let mut buf = [0u8; 1024];
-        let sk = Arc::clone(&self.recv);
+        let sk = Arc::clone(&self.sk);
 
         Box::pin(async move {
-            let (len, from) = sk.lock().await.recv_from(&mut buf).await?;
+            let (len, from) = sk.recv_from(&mut buf).await?;
             trace!(from = ?&from, "recv");
             let data = buf[0..len].to_vec();
             Ok((
@@ -131,31 +119,27 @@ impl ChunnelListener for UnixReqChunnel {
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
-            let recv = std::os::unix::net::UnixDatagram::bind(a)?;
-            let send = recv.try_clone()?;
-            let recv = tokio::net::UnixDatagram::from_std(recv)?;
-            let send = tokio::net::UnixDatagram::from_std(send)?;
-
+            let sk = tokio::net::UnixDatagram::bind(a)?;
             let sends = futures_util::stream::FuturesUnordered::new();
             Ok(Box::pin(futures_util::stream::try_unfold(
                 (
-                    recv,
-                    Arc::new(Mutex::new(send)),
+                    Arc::new(sk),
                     sends,
                     HashMap::<_, mpsc::Sender<(PathBuf, Vec<u8>)>>::new(),
                 ),
-                |(mut r, s, mut sends, mut map)| async move {
+                |(sk, mut sends, mut map)| async move {
                     let mut buf = [0u8; 1024];
                     loop {
                         // careful: potential deadlocks since .recv on returned connection blocks
                         // on .listen
                         tokio::select!(
                             Some((from, res)) = sends.next() => {
-                                if let Err(_) = res  {
+                                #[allow(clippy::redundant_pattern_matching)]
+                                if let Err(_) = res {
                                     map.remove(&from);
                                 }
                             }
-                            Ok((len, from)) = r.recv_from(&mut buf) => {
+                            Ok((len, from)) = sk.recv_from(&mut buf) => {
                                 trace!(from = ?&from, "received pkt");
                                 let data = buf[0..len].to_vec();
 
@@ -169,20 +153,20 @@ impl ChunnelListener for UnixReqChunnel {
                                     done = Some(UnixConn {
                                         resp_addr: from.clone(),
                                         recv: Arc::new(Mutex::new(rch)),
-                                        send: Arc::clone(&s),
+                                        send: Arc::clone(&sk),
                                     });
 
                                     sch
                                 });
 
-                                let mut c = c.clone();
+                                let c = c.clone();
                                 sends.push(async move {
                                     let res = c.send((from.clone(), data)).await;
                                     (from, res)
                                 });
 
                                 if let Some(d) = done {
-                                    return Ok(Some((d, (r, s, sends,  map))));
+                                    return Ok(Some((d, (sk, sends,  map))));
                                 }
                             }
                         )
@@ -197,7 +181,7 @@ impl ChunnelListener for UnixReqChunnel {
 pub struct UnixConn {
     resp_addr: PathBuf,
     recv: Arc<Mutex<mpsc::Receiver<(PathBuf, Vec<u8>)>>>,
-    send: Arc<Mutex<tokio::net::UnixDatagram>>,
+    send: Arc<tokio::net::UnixDatagram>,
 }
 
 impl ChunnelConnection for UnixConn {
@@ -211,7 +195,7 @@ impl ChunnelConnection for UnixConn {
         let addr = self.resp_addr.clone();
         let (_, data) = data;
         Box::pin(async move {
-            sk.lock().await.send_to(&data, &addr).await?;
+            sk.send_to(&data, &addr).await?;
             Ok(())
         })
     }
@@ -244,8 +228,7 @@ mod test {
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_io()
             .build()
@@ -297,8 +280,7 @@ mod test {
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_io()
             .build()

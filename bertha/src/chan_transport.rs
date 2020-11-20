@@ -2,11 +2,11 @@
 
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report};
+use dashmap::DashMap;
 use futures_util::stream::{Stream, StreamExt};
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
 
@@ -18,11 +18,14 @@ pub struct Cln;
 /// Channel connector where server registers on listen(), and client grabs client on connect().
 pub struct RendezvousChannel<Addr, Data, Side> {
     channel_size: usize,
-    map: Arc<StdMutex<HashMap<Addr, mpsc::Sender<ChanChunnel<(Addr, Data)>>>>>,
+    map: Arc<DashMap<Addr, mpsc::Sender<ChanChunnel<(Addr, Data)>>>>,
     side: std::marker::PhantomData<Side>,
 }
 
-impl<A, D> RendezvousChannel<A, D, ()> {
+impl<A, D> RendezvousChannel<A, D, ()>
+where
+    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
+{
     pub fn new(channel_size: usize) -> Self {
         Self {
             channel_size,
@@ -73,9 +76,7 @@ where
         let m = Arc::clone(&self.map);
         Box::pin(async move {
             let (s, r) = mpsc::channel(1);
-            m.lock()
-                .expect("Lock RendezvousChannel map")
-                .insert(a.clone(), s);
+            m.insert(a.clone(), s);
             debug!(addr = ?&a, "RendezvousChannel listening");
             Ok(Box::pin(r.map(move |x| {
                 debug!(addr = ?a, "RendezvousChannel returning new connection");
@@ -97,9 +98,8 @@ where
     type Error = Report;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
-        let mut m_guard = self.map.lock().expect("Lock RendezvousChannel map");
-        if let Some(notify_listener) = m_guard.get_mut(&a) {
-            let mut notify_listener = notify_listener.clone();
+        if let Some(notify_listener) = self.map.get(&a) {
+            let notify_listener = notify_listener.clone();
             let channel_size = self.channel_size;
             Box::pin(async move {
                 let (s1, r1) = mpsc::channel(channel_size);
@@ -113,7 +113,7 @@ where
                 Ok(connect_ch)
             })
         } else {
-            let keys: Vec<_> = m_guard.keys().map(Clone::clone).collect();
+            let keys: Vec<_> = self.map.iter().map(|x| x.key().clone()).collect();
             Box::pin(async move { Err(eyre!("Address not found: {:?}: not in {:?}", a, keys)) })
         }
     }
@@ -307,8 +307,7 @@ mod test {
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
@@ -349,8 +348,7 @@ mod test {
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();

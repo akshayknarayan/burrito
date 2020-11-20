@@ -322,7 +322,7 @@ where
                 trace!(?pkt, "transmit done");
                 return Ok::<_, eyre::Report>(());
             }
-            _ = tokio::time::delay_for(to) => {
+            _ = tokio::time::sleep(to) => {
                 to_ms *= to_ms;
                 let (addr, mut pkt) = segment.clone();
                 // pkt.acks was cleared when passed in to this fn.
@@ -729,8 +729,7 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
         let msgs = (0..7).map(|i| (i, vec![i as u8; 10])).collect();
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
@@ -765,8 +764,7 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
         let msgs = (0..7).map(|i| (i, vec![i as u8; 10])).collect();
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
@@ -845,8 +843,7 @@ mod test {
         color_eyre::install().unwrap_or_else(|_| ());
         let msgs = vec![vec![0u8; 10], vec![1u8; 10], vec![2u8; 10]];
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();

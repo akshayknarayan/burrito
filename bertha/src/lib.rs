@@ -241,8 +241,7 @@ mod test {
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
