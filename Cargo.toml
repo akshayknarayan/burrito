@@ -15,6 +15,7 @@ members = [
 
 [profile.release]
 debug = true
+lto = true
 
 [profile.release.package.kvstore]
 debug = true
