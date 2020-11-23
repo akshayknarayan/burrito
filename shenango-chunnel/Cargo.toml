@@ -1,0 +1,16 @@
+[package]
+name = "shenango-chunnel"
+version = "0.1.0"
+authors = ["Akshay Narayan <akshayn@mit.edu>"]
+edition = "2018"
+
+[dependencies]
+bertha = { path = "../bertha" }
+tracing = { version = "0.1" }
+tracing-futures = "0.2"
+color-eyre = "0.5"
+shenango = { path = "../../shenango/bindings/rust" }
+crossbeam = "0.8"
+futures-util = "0.3"
+lazy_static = "1"
+tokio = { version = "0.3", features = ["sync"] }
