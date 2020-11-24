@@ -7,7 +7,7 @@ use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
@@ -30,6 +30,7 @@ impl Msg {
 
 #[instrument]
 async fn server(mut s: ShenangoUdpSkChunnel, addr: SocketAddrV4) -> Result<(), Report> {
+    debug!(?addr, "listen");
     let st = s.listen(addr).await.wrap_err("Listen on UdpReqChunnel")?;
     st.try_for_each_concurrent(None, |cn| async move {
         let mut sends = FuturesUnordered::new();
@@ -67,7 +68,9 @@ async fn client(mut s: ShenangoUdpSkChunnel, addr: SocketAddrV4) -> Result<Vec<D
         Ok(durs)
     }
 
+    debug!(?addr, "connect");
     let cn = s.connect(()).await?;
+    debug!("starting");
     reqs(cn, addr).await
 }
 
@@ -99,9 +102,11 @@ async fn main() -> Result<(), Report> {
     let ch = ShenangoUdpSkChunnel::new(&opt.cfg)?;
 
     if let Some(p) = opt.port {
+        info!(mode = "server", "created ShenangoUdpSkChunnel");
         let a = SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), p);
         server(ch, a).await
     } else if let Some(a) = opt.addr {
+        info!(mode = "client", "created ShenangoUdpSkChunnel");
         //let jhs = FuturesUnordered::new();
         let start = Instant::now();
         //for _ in 0..8 {
