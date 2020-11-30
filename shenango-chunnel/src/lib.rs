@@ -23,7 +23,6 @@ enum NewConn {
         outgoing: channel::Receiver<(SocketAddrV4, Vec<u8>)>,
     },
     Dial {
-        addr: SocketAddrV4,
         incoming: mpsc::UnboundedSender<(SocketAddrV4, Vec<u8>)>,
         outgoing: channel::Receiver<(SocketAddrV4, Vec<u8>)>,
     },
@@ -55,15 +54,11 @@ fn shenango_runtime_start(
                     incoming,
                     outgoing,
                 ),
-                Dial {
-                    addr,
-                    incoming,
-                    outgoing,
-                } => {
+                Dial { incoming, outgoing } => {
                     let laddr = SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), 0);
                     (
                         Arc::new(
-                            shenango::udp::UdpConnection::dial(laddr, addr)
+                            shenango::udp::UdpConnection::new(laddr)
                                 .wrap_err("Failed to make shenango udp socket")
                                 .expect("make udp conn"),
                         ),
@@ -123,11 +118,10 @@ impl ShenangoUdpSkChunnel {
         Ok(ShenangoUdpSk::new(incoming_r, outgoing_s))
     }
 
-    fn make_dial(&self, a: SocketAddrV4) -> Result<ShenangoUdpSk, Report> {
+    fn make_dial(&self) -> Result<ShenangoUdpSk, Report> {
         let (incoming_s, incoming_r) = mpsc::unbounded_channel();
         let (outgoing_s, outgoing_r) = channel::unbounded();
         self.events.send(NewConn::Dial {
-            addr: a,
             incoming: incoming_s,
             outgoing: outgoing_r,
         })?;
@@ -165,9 +159,7 @@ impl ChunnelConnector for ShenangoUdpSkChunnel {
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         // pass an arbitrary port, we're not going to use it
-        Box::pin(futures_util::future::ready(self.make_dial(
-            SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 12411),
-        )))
+        Box::pin(futures_util::future::ready(self.make_dial()))
     }
 }
 
