@@ -58,7 +58,7 @@ fn shenango_runtime_start(
                     let laddr = SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), 0);
                     (
                         Arc::new(
-                            shenango::udp::UdpConnection::new(laddr)
+                            shenango::udp::UdpConnection::listen(laddr)
                                 .wrap_err("Failed to make shenango udp socket")
                                 .expect("make udp conn"),
                         ),
