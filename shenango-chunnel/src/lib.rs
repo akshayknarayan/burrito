@@ -9,7 +9,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use tokio::sync::{mpsc, Mutex};
@@ -247,5 +247,78 @@ impl ChunnelConnection for ShenangoUdpSk {
                 .expect("shenango side will never drop");
             Ok((SocketAddr::V4(a), d))
         })
+    }
+}
+
+pub struct ShenangoUdpReqChunnel(pub ShenangoUdpSkChunnel);
+
+impl ChunnelListener for ShenangoUdpReqChunnel {
+    type Addr = SocketAddr;
+    type Connection = UdpConn;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Report;
+
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
+        let sk = self.0.listen(a);
+        Box::pin(async move {
+            use futures_util::StreamExt;
+            // the stream won't panic
+            let sk = bertha::util::AddrSteer::new(sk.await?.next().await.unwrap().unwrap());
+            Ok(sk.steer(UdpConn::new))
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UdpConn {
+    resp_addr: SocketAddr,
+    pending_ctr: Arc<AtomicUsize>,
+    recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
+    send: ShenangoUdpSk,
+}
+
+impl UdpConn {
+    fn new(
+        resp_addr: SocketAddr,
+        send: ShenangoUdpSk,
+        recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
+        pending_ctr: Arc<AtomicUsize>,
+    ) -> Self {
+        UdpConn {
+            resp_addr,
+            pending_ctr,
+            recv,
+            send,
+        }
+    }
+}
+
+impl ChunnelConnection for UdpConn {
+    type Data = (SocketAddr, Vec<u8>);
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        let sk = self.send.clone();
+        let addr = self.resp_addr;
+        let (_, data) = data;
+        Box::pin(async move {
+            sk.send((addr, data)).await?;
+            Ok(())
+        })
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        let r = Arc::clone(&self.recv);
+        let ctr = Arc::clone(&self.pending_ctr);
+        Box::pin(async move {
+            let d = r.lock().await.recv().await;
+            ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            trace!(from = ?&d.as_ref().map(|x| x.0), "recv pkt");
+            d.ok_or_else(|| eyre!("Nothing more to receive"))
+        }) as _
     }
 }
