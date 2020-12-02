@@ -100,26 +100,22 @@ enumerate_enum!(pub ShardFns, 0xe898734df758d0c0, Sharding);
 ///
 /// Forwards incoming messages to one of the internal connections specified by `shards_inner` after
 /// evaluating the sharding function.
-/// `shards_extern` should be a connection that can talk to a shard with `Data = (A,
-/// Vec<u8)` semantics.
 #[derive(Clone)]
-pub struct ShardCanonicalServer<A, S, Ss, C> {
+pub struct ShardCanonicalServer<A, S, Ss> {
     addr: ShardInfo<A>,
     shards_inner: S,
     shards_inner_stack: Ss,
-    shards_extern: Arc<C>,
     shards_extern_nonce: Vec<Vec<bertha::negotiate::Offer>>,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
 }
 
-impl<A, S, Ss, C> ShardCanonicalServer<A, S, Ss, C> {
+impl<A, S, Ss> ShardCanonicalServer<A, S, Ss> {
     /// Inner is a chunnel for the external connection.
     /// Shards is a chunnel for an internal connection to the shards.
     pub async fn new(
         addr: ShardInfo<A>,
         shards_inner: S,
         shards_inner_stack: Ss,
-        shards_extern: C,
         shards_extern_nonce: Vec<Vec<bertha::negotiate::Offer>>,
         redis_addr: &str,
     ) -> Result<Self, Error> {
@@ -135,18 +131,18 @@ impl<A, S, Ss, C> ShardCanonicalServer<A, S, Ss, C> {
             addr,
             shards_inner,
             shards_inner_stack,
-            shards_extern: Arc::new(shards_extern),
             shards_extern_nonce,
             redis_listen_connection,
         })
     }
 }
 
-impl<A, A3, S, Ss, C> Negotiate for ShardCanonicalServer<A, S, Ss, C>
+impl<A, S, Ss> Negotiate for ShardCanonicalServer<A, S, Ss>
 where
-    A: Into<A3> + Clone + std::fmt::Debug + Send + Sync + 'static,
-    A3: std::fmt::Debug + Send + PartialEq,
-    C: ChunnelConnection<Data = (A3, Vec<u8>)> + Send + Sync + 'static,
+    A: Clone + std::fmt::Debug + PartialEq + Send + Sync + 'static,
+    S: ChunnelConnector<Addr = A> + Clone + Send + Sync + 'static,
+    <S as ChunnelConnector>::Error: Into<eyre::Report>,
+    S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
 {
     type Capability = ShardFns;
 
@@ -156,7 +152,7 @@ where
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
         let addrs = self.addr.shard_addrs.clone();
-        let cn = Arc::clone(&self.shards_extern);
+        let ctr = self.shards_inner.clone();
         let offer: Vec<bertha::negotiate::Offer> = self
             .shards_extern_nonce
             .iter()
@@ -194,11 +190,20 @@ where
         Box::pin(async move {
             futures_util::future::join_all(addrs.into_iter().map(|shard| {
                 let buf = buf.clone();
-                let cn = Arc::clone(&cn);
+                let mut ctr = ctr.clone();
                 let shard_addr = shard.clone();
                 async move {
-                    if let Err(e) = cn.send((shard.clone().into(), buf.clone())).await {
+                    let cn = match ctr.connect(shard.clone()).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let e = e.into();
+                            warn!(err = ?e, "failed making connection to shard");
+                            return;
+                        }
+                    };
+                    if let Err(e) = cn.send((shard.clone(), buf.clone())).await {
                         warn!(err = ?e, "failed sending negotiation nonce to shard");
+                        return;
                     }
 
                     trace!("wait for nonce ack");
@@ -207,8 +212,8 @@ where
                             Ok(bertha::negotiate::NegotiateMsg::ServerNonceAck) => {
                                 // TODO collect received addresses since we could receive acks from
                                 // any shard
-                                if a != shard.clone().into() {
-                                    warn!(addr = ?a, expected = ?shard.clone().into(), "received from unexpected address");
+                                if a != shard.clone() {
+                                    warn!(addr = ?a, expected = ?shard.clone(), "received from unexpected address");
                                 }
 
                                 trace!("got nonce ack");
@@ -232,7 +237,7 @@ where
     }
 }
 
-impl<I, Ic, Ie, A, S, Ss, C, D, E> Serve<I> for ShardCanonicalServer<A, S, Ss, C>
+impl<I, Ic, Ie, A, S, Ss, D, E> Serve<I> for ShardCanonicalServer<A, S, Ss>
 where
     I: Stream<Item = Result<Ic, Ie>> + Send + 'static,
     Ic: ChunnelConnection<Data = D> + Send + Sync + 'static,
@@ -848,14 +853,12 @@ mod test {
         let mut offers: Vec<Vec<Vec<bertha::negotiate::Offer>>> = rdy.try_collect().await.unwrap();
 
         // 4. start canonical server
-        let shards_extern = UdpSkChunnel.connect(()).await.unwrap();
         let cnsrv = ShardCanonicalServer::new(
             si.clone(),
             internal_cli,
             CxList::from(TaggerProjChunnel)
                 .wrap(ReliabilityProjChunnel::default())
                 .wrap(SerializeChunnelProject::default()),
-            shards_extern,
             offers.pop().unwrap(),
             &redis_addr,
         )

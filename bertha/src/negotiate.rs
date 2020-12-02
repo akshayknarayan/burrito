@@ -645,11 +645,16 @@ where
                             debug!("sent nonce ack");
 
                             // need to loop on this connection, processing nonces
-                            process_nonces_connection(
+                            if let Err(_) = process_nonces_connection(
                                 cn,
                                 Arc::clone(&pending_negotiated_connections),
                             )
-                            .await?;
+                            .await
+                            .wrap_err("process_nonces_connection")
+                            {
+                                return Ok(None);
+                            }
+
                             unreachable!();
                         }
                         ClientOffer(client_offers) => {
@@ -728,7 +733,7 @@ where
 {
     loop {
         trace!("call recv()");
-        let (a, buf): (_, Vec<u8>) = cn.recv().await?;
+        let (a, buf): (_, Vec<u8>) = cn.recv().await.wrap_err("conn recv")?;
         let negotiate_msg: NegotiateMsg =
             bincode::deserialize(&buf).wrap_err("offer deserialize failed")?;
 
