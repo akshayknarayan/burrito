@@ -83,14 +83,14 @@ pub async fn serve(
 
     // UdpConn: (SocketAddr, Vec<u8>)
     // ProjectLeft: (SocketAddr, Vec<u8>) -> Vec<u8>
-    // SerializeChunnel: Vec<u8> -> (u32, Option<Msg>)
-    // ReliabilityChunnel: (u32, Option<Msg>) -> (u32, Msg)
+    // SerializeChunnel: Vec<u8> -> (u32, _)
+    // ReliabilityChunnel: (u32, _) -> (u32, Msg)
     // OrderedChunnel: (u32, Msg) -> Msg
     // ShardCanonicalServer: Msg -> ()
     let external = CxList::from(cnsrv)
         .wrap(OrderedChunnelProj::default())
         .wrap(ReliabilityProjChunnel::<_, Msg>::default())
-        .wrap(SerializeChunnelProject::<_, (u32, Option<Msg>)>::default());
+        .wrap(SerializeChunnelProject::default());
     info!(shard_info = ?&si, "start canonical server");
     let st = UdpReqChunnel::default()
         .listen(si.canonical_addr)
