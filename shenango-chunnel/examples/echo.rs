@@ -51,27 +51,21 @@ async fn server(mut s: ShenangoUdpSkChunnel, addr: SocketAddrV4) -> Result<(), R
 
 #[instrument]
 async fn client(mut s: ShenangoUdpSkChunnel, addr: SocketAddrV4) -> Result<Vec<Duration>, Report> {
-    async fn reqs(
-        cn: impl ChunnelConnection<Data = (SocketAddrV4, Vec<u8>)>,
-        addr: SocketAddrV4,
-    ) -> Result<Vec<Duration>, Report> {
-        let mut durs = vec![];
-        for _ in 0..100_000 {
-            let m = Msg::new();
-            let v = bincode::serialize(&m).unwrap();
-            cn.send((addr, v)).await.wrap_err("client send")?;
-            let (_, v) = cn.recv().await.wrap_err("client recv")?;
-            let m: Msg = bincode::deserialize(&v).unwrap();
-            durs.push(m.elapsed());
-        }
-
-        Ok(durs)
-    }
-
     debug!(?addr, "connect");
     let cn = s.connect(()).await?;
     debug!("starting");
-    reqs(cn, addr).await
+    let mut durs = vec![];
+    for _ in 0..1000 {
+        let m = Msg::new();
+        let v = bincode::serialize(&m).unwrap();
+        cn.send((addr, v)).await.wrap_err("client send")?;
+
+        let (_, v) = cn.recv().await.wrap_err("client recv")?;
+        let m: Msg = bincode::deserialize(&v).unwrap();
+        durs.push(m.elapsed());
+    }
+
+    Ok(durs)
 }
 
 #[derive(Debug, StructOpt)]
