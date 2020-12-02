@@ -3,7 +3,7 @@ use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use shenango_chunnel::ShenangoUdpSkChunnel;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
@@ -29,7 +29,7 @@ impl Msg {
 }
 
 #[instrument]
-async fn server(mut s: ShenangoUdpSkChunnel, addr: SocketAddrV4) -> Result<(), Report> {
+async fn server(mut s: ShenangoUdpSkChunnel, addr: SocketAddr) -> Result<(), Report> {
     debug!(?addr, "listen");
     let st = s.listen(addr).await.wrap_err("Listen on UdpReqChunnel")?;
     st.try_for_each_concurrent(None, |cn| async move {
@@ -53,7 +53,7 @@ async fn server(mut s: ShenangoUdpSkChunnel, addr: SocketAddrV4) -> Result<(), R
 async fn client(
     idx: usize,
     mut s: ShenangoUdpSkChunnel,
-    addr: SocketAddrV4,
+    addr: SocketAddr,
 ) -> Result<Vec<Duration>, Report> {
     debug!(?addr, "connect");
     let cn = s.connect(()).await?;
@@ -81,7 +81,7 @@ struct Opt {
     port: Option<u16>,
 
     #[structopt(short, long)]
-    addr: Option<SocketAddrV4>,
+    addr: Option<SocketAddr>,
 
     #[structopt(short, long, default_value = "1")]
     num_clients: usize,
@@ -102,12 +102,12 @@ async fn main() -> Result<(), Report> {
     d.init();
 
     let opt = Opt::from_args();
-    let ch = ShenangoUdpSkChunnel::new(&opt.cfg)?;
+    let ch = ShenangoUdpSkChunnel::new(&opt.cfg);
     let num_cl = opt.num_clients;
 
     if let Some(p) = opt.port {
         info!(mode = "server", "created ShenangoUdpSkChunnel");
-        let a = SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), p);
+        let a = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), p);
         server(ch, a).await
     } else if let Some(a) = opt.addr {
         info!(mode = "client", "created ShenangoUdpSkChunnel");

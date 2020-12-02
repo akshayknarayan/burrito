@@ -5,7 +5,7 @@ use color_eyre::eyre::{eyre, Report, WrapErr};
 use crossbeam::channel;
 use futures_util::stream::Stream;
 use std::future::Future;
-use std::net::SocketAddrV4;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{
@@ -159,23 +159,30 @@ impl ShenangoUdpSkChunnel {
 }
 
 impl ChunnelListener for ShenangoUdpSkChunnel {
-    type Addr = SocketAddrV4;
+    type Addr = SocketAddr;
     type Connection = ShenangoUdpSk;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Report;
 
-    fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        Box::pin(futures_util::future::ready(self.make_listen(a).and_then(
-            |sk| {
-                Ok(
-                    Box::pin(futures_util::stream::once(futures_util::future::ready(Ok(
-                        sk,
-                    )))) as _,
-                )
-            },
-        )))
+    fn listen(&mut self, addr: Self::Addr) -> Self::Future {
+        use SocketAddr::*;
+        match addr {
+            V4(a) => Box::pin(futures_util::future::ready(self.make_listen(a).and_then(
+                |sk| {
+                    Ok(
+                        Box::pin(futures_util::stream::once(futures_util::future::ready(Ok(
+                            sk,
+                        )))) as _,
+                    )
+                },
+            ))),
+            V6(a) => Box::pin(futures_util::future::ready(Err(eyre!(
+                "Only IPv4 is supported: {:?}",
+                a
+            )))),
+        }
     }
 }
 
@@ -187,7 +194,6 @@ impl ChunnelConnector for ShenangoUdpSkChunnel {
     type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
-        // pass an arbitrary port, we're not going to use it
         Box::pin(futures_util::future::ready(self.make_dial()))
     }
 }
@@ -211,25 +217,35 @@ impl ShenangoUdpSk {
 }
 
 impl ChunnelConnection for ShenangoUdpSk {
-    type Data = (SocketAddrV4, Vec<u8>);
+    type Data = (SocketAddr, Vec<u8>);
 
     fn send(
         &self,
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.outgoing.send(data).expect("shenango won't drop");
-        Box::pin(futures_util::future::ready(Ok(())))
+        use SocketAddr::*;
+        match data {
+            (V4(addr), d) => {
+                self.outgoing.send((addr, d)).expect("shenango won't drop");
+                Box::pin(futures_util::future::ready(Ok(())))
+            }
+            (V6(a), _) => Box::pin(futures_util::future::ready(Err(eyre!(
+                "Only IPv4 is supported: {:?}",
+                a
+            )))),
+        }
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let inc = Arc::clone(&self.incoming);
         Box::pin(async move {
-            Ok(inc
+            let (a, d) = inc
                 .lock()
                 .await
                 .recv()
                 .await
-                .expect("shenango side will never drop"))
+                .expect("shenango side will never drop");
+            Ok((SocketAddr::V4(a), d))
         })
     }
 }
