@@ -84,9 +84,17 @@ fn shenango_runtime_start(
             });
 
             // send
-            shenango::thread::spawn(move || {
-                while let Ok((a, data)) = outgoing.recv() {
-                    sk.write_to(&data, a).wrap_err("shenango write_to").unwrap();
+            shenango::thread::spawn(move || loop {
+                match outgoing.try_recv() {
+                    Ok((a, data)) => {
+                        sk.write_to(&data, a).wrap_err("shenango write_to").unwrap();
+                    }
+                    Err(crossbeam::channel::TryRecvError::Empty) => {
+                        shenango::thread::thread_yield();
+                    }
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                        break;
+                    }
                 }
             });
         }
