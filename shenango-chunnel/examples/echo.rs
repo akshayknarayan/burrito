@@ -77,6 +77,9 @@ struct Opt {
     #[structopt(short, long)]
     addr: Option<SocketAddrV4>,
 
+    #[structopt(short, long, default_value = "1")]
+    num_clients: usize,
+
     #[structopt(short, long)]
     cfg: PathBuf,
 }
@@ -94,6 +97,7 @@ async fn main() -> Result<(), Report> {
 
     let opt = Opt::from_args();
     let ch = ShenangoUdpSkChunnel::new(&opt.cfg)?;
+    let num_cl = opt.num_clients;
 
     if let Some(p) = opt.port {
         info!(mode = "server", "created ShenangoUdpSkChunnel");
@@ -101,17 +105,16 @@ async fn main() -> Result<(), Report> {
         server(ch, a).await
     } else if let Some(a) = opt.addr {
         info!(mode = "client", "created ShenangoUdpSkChunnel");
-        //let jhs = FuturesUnordered::new();
+        let jhs = FuturesUnordered::new();
         let start = Instant::now();
-        //for _ in 0..8 {
-        //    let jh = tokio::spawn(client(ch, a));
-        //    jhs.push(async move { jh.await.unwrap() });
-        //}
-        let mut durs = client(ch, a).await?;
+        for _ in 0..num_cl {
+            let jh = tokio::spawn(client(ch.clone(), a));
+            jhs.push(async move { jh.await.unwrap() });
+        }
 
-        //let durs: Result<Vec<_>, _> = jhs.try_collect().await;
+        let durs: Result<Vec<_>, _> = jhs.try_collect().await;
         let time = start.elapsed();
-        //let mut durs: Vec<_> = durs?.into_iter().flatten().collect();
+        let mut durs: Vec<_> = durs?.into_iter().flatten().collect();
         durs.sort();
         let len = durs.len() as f64;
         let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
@@ -127,6 +130,7 @@ async fn main() -> Result<(), Report> {
             p75 = ?quantiles[2], p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
             "Did accesses"
         );
+
         Ok(())
     } else {
         Err(eyre!(
