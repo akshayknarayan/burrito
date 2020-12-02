@@ -1,14 +1,13 @@
 //! Unix datagram/socket chunnel.
 
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{eyre, Report};
-use futures_util::stream::{Stream, StreamExt};
-use std::collections::HashMap;
+use color_eyre::eyre::{eyre, Report, WrapErr};
+use futures_util::stream::Stream;
 use std::fmt::Debug;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicUsize, Arc};
 use tokio::sync::{mpsc, Mutex};
 use tracing::trace;
 
@@ -119,60 +118,9 @@ impl ChunnelListener for UnixReqChunnel {
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
-            let sk = tokio::net::UnixDatagram::bind(a)?;
-            let sends = futures_util::stream::FuturesUnordered::new();
-            Ok(Box::pin(futures_util::stream::try_unfold(
-                (
-                    Arc::new(sk),
-                    sends,
-                    HashMap::<_, mpsc::Sender<(PathBuf, Vec<u8>)>>::new(),
-                ),
-                |(sk, mut sends, mut map)| async move {
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        // careful: potential deadlocks since .recv on returned connection blocks
-                        // on .listen
-                        tokio::select!(
-                            Some((from, res)) = sends.next() => {
-                                #[allow(clippy::redundant_pattern_matching)]
-                                if let Err(_) = res {
-                                    map.remove(&from);
-                                }
-                            }
-                            Ok((len, from)) = sk.recv_from(&mut buf) => {
-                                trace!(from = ?&from, "received pkt");
-                                let data = buf[0..len].to_vec();
-
-                                let from = from.as_pathname()
-                                    .ok_or_else(|| eyre!("received from unnamed socket"))?
-                                    .to_path_buf();
-
-                                let mut done = None;
-                                let c = map.entry(from.clone()).or_insert_with(|| {
-                                    let (sch, rch) = mpsc::channel(100);
-                                    done = Some(UnixConn {
-                                        resp_addr: from.clone(),
-                                        recv: Arc::new(Mutex::new(rch)),
-                                        send: Arc::clone(&sk),
-                                    });
-
-                                    sch
-                                });
-
-                                let c = c.clone();
-                                sends.push(async move {
-                                    let res = c.send((from.clone(), data)).await;
-                                    (from, res)
-                                });
-
-                                if let Some(d) = done {
-                                    return Ok(Some((d, (sk, sends,  map))));
-                                }
-                            }
-                        )
-                    }
-                },
-            )) as _)
+            let sk = tokio::net::UnixDatagram::bind(a).wrap_err("socket bind failed")?;
+            let sk = crate::util::AddrSteer::new(UnixSk::new(sk));
+            Ok(sk.steer(UnixConn::new))
         })
     }
 }
@@ -180,8 +128,23 @@ impl ChunnelListener for UnixReqChunnel {
 #[derive(Debug, Clone)]
 pub struct UnixConn {
     resp_addr: PathBuf,
-    recv: Arc<Mutex<mpsc::Receiver<(PathBuf, Vec<u8>)>>>,
-    send: Arc<tokio::net::UnixDatagram>,
+    recv: Arc<Mutex<mpsc::UnboundedReceiver<(PathBuf, Vec<u8>)>>>,
+    send: UnixSk,
+}
+
+impl UnixConn {
+    fn new(
+        resp_addr: PathBuf,
+        send: UnixSk,
+        recv: Arc<Mutex<mpsc::UnboundedReceiver<(PathBuf, Vec<u8>)>>>,
+        _pending_ctr: Arc<AtomicUsize>,
+    ) -> Self {
+        UnixConn {
+            resp_addr,
+            recv,
+            send,
+        }
+    }
 }
 
 impl ChunnelConnection for UnixConn {
@@ -191,11 +154,11 @@ impl ChunnelConnection for UnixConn {
         &self,
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let sk = Arc::clone(&self.send);
+        let sk = self.send.clone();
         let addr = self.resp_addr.clone();
         let (_, data) = data;
         Box::pin(async move {
-            sk.send_to(&data, &addr).await?;
+            sk.send((addr, data)).await?;
             Ok(())
         })
     }

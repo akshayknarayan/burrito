@@ -1,6 +1,7 @@
 //! Helper Chunnel types to transform Data types, etc.
 
 use super::{ChunnelConnection, ChunnelConnector, Client, Serve};
+use ahash::AHashMap;
 use color_eyre::eyre::{eyre, Report};
 use dashmap::DashMap;
 use futures_util::future::{
@@ -11,9 +12,10 @@ use futures_util::stream::TryStreamExt;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{oneshot, Mutex};
+use std::sync::{atomic::AtomicUsize, Arc, Mutex as StdMutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::trace;
+use tracing_futures::Instrument;
 
 pub trait MsgId {
     fn id(&self) -> usize;
@@ -160,6 +162,98 @@ where
                 }
             }
         })
+    }
+}
+
+/// Steer incoming packets to per-address connections
+pub struct AddrSteer<C>(C);
+
+impl<C> AddrSteer<C> {
+    pub fn new(inner: C) -> Self {
+        AddrSteer(inner)
+    }
+}
+
+impl<A, C> AddrSteer<C>
+where
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Clone + Send + Sync + 'static,
+    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + 'static,
+{
+    pub fn steer<MkConn, Conn>(
+        self,
+        make_conn: MkConn,
+    ) -> Pin<Box<dyn Stream<Item = Result<Conn, Report>> + Send + 'static>>
+    where
+        MkConn: Fn(A, C, Arc<Mutex<mpsc::UnboundedReceiver<(A, Vec<u8>)>>>, Arc<AtomicUsize>) -> Conn
+            + Send
+            + 'static,
+        Conn: ChunnelConnection,
+    {
+        let sk = self.0;
+        let pending_inc_ctr: Arc<AtomicUsize> = Default::default();
+        let pending_dec_ctr: Arc<AtomicUsize> = Default::default();
+        Box::pin(futures_util::stream::try_unfold(
+            (
+                sk,
+                AHashMap::<_, mpsc::UnboundedSender<(A, Vec<u8>)>>::new(),
+                pending_inc_ctr,
+                pending_dec_ctr,
+                make_conn,
+            ),
+            move |(sk, mut map, pending_inc_ctr, pending_dec_ctr, make_conn)| {
+                async move {
+                    let mut last_print = std::time::Instant::now();
+                    loop {
+                        // careful: potential deadlocks since .recv on returned connection blocks
+                        // on .listen
+                        let (from, data) = sk.recv().await?;
+                        let ctr = pending_inc_ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                        let mut done = None;
+                        let c = map.entry(from.clone()).or_insert_with(|| {
+                            trace!(from = ?&from, "new connection");
+                            let (sch, rch) = mpsc::unbounded_channel();
+                            let cn = make_conn(
+                                from.clone(),
+                                sk.clone(),
+                                Arc::new(Mutex::new(rch)),
+                                Arc::clone(&pending_dec_ctr),
+                            );
+
+                            done = Some(cn);
+                            sch
+                        });
+
+                        trace!(from = ?&from, pending = &ctr, "received pkt");
+
+                        // the send fails only if the receiver stopped listening.
+                        if c.send((from.clone(), data)).is_err() {
+                            pending_dec_ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            map.remove(&from);
+                        }
+
+                        if last_print.elapsed() > std::time::Duration::from_millis(1000) {
+                            let p_inc = pending_inc_ctr.load(std::sync::atomic::Ordering::SeqCst);
+                            let p_dec = pending_dec_ctr.load(std::sync::atomic::Ordering::SeqCst);
+                            tracing::info!(
+                                from = ?from,
+                                ?p_inc, ?p_dec,
+                                "pending"
+                            );
+                            last_print = std::time::Instant::now();
+                        }
+
+                        if let Some(d) = done {
+                            return Ok(Some((
+                                d,
+                                (sk, map, pending_inc_ctr, pending_dec_ctr, make_conn),
+                            )));
+                        }
+                    }
+                }
+                .instrument(tracing::info_span!("steer"))
+            },
+        )) as _
     }
 }
 
