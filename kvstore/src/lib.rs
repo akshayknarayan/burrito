@@ -15,17 +15,23 @@ mod tests {
     use color_eyre::eyre::{eyre, Report, WrapErr};
     use std::net::SocketAddr;
     use tracing::{info, info_span};
+    use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[test]
     fn put_get() -> Result<(), Report> {
-        let _guard = tracing_subscriber::fmt::try_init();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or_else(|_| ());
 
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()?;
+            .build()
+            .unwrap();
 
         rt.block_on(
             async move {
