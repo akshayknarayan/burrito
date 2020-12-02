@@ -50,7 +50,11 @@ async fn server(mut s: ShenangoUdpSkChunnel, addr: SocketAddrV4) -> Result<(), R
 }
 
 #[instrument]
-async fn client(mut s: ShenangoUdpSkChunnel, addr: SocketAddrV4) -> Result<Vec<Duration>, Report> {
+async fn client(
+    idx: usize,
+    mut s: ShenangoUdpSkChunnel,
+    addr: SocketAddrV4,
+) -> Result<Vec<Duration>, Report> {
     debug!(?addr, "connect");
     let cn = s.connect(()).await?;
     debug!("starting");
@@ -64,6 +68,8 @@ async fn client(mut s: ShenangoUdpSkChunnel, addr: SocketAddrV4) -> Result<Vec<D
         let m: Msg = bincode::deserialize(&v).unwrap();
         durs.push(m.elapsed());
     }
+
+    info!("done");
 
     Ok(durs)
 }
@@ -107,8 +113,8 @@ async fn main() -> Result<(), Report> {
         info!(mode = "client", "created ShenangoUdpSkChunnel");
         let jhs = FuturesUnordered::new();
         let start = Instant::now();
-        for _ in 0..num_cl {
-            let jh = tokio::spawn(client(ch.clone(), a));
+        for i in 0..num_cl {
+            let jh = tokio::spawn(client(i, ch.clone(), a));
             jhs.push(async move { jh.await.unwrap() });
         }
 
