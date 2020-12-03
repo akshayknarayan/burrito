@@ -645,13 +645,14 @@ where
                             debug!("sent nonce ack");
 
                             // need to loop on this connection, processing nonces
-                            if let Err(_) = process_nonces_connection(
+                            if let Err(e) = process_nonces_connection(
                                 cn,
                                 Arc::clone(&pending_negotiated_connections),
                             )
                             .await
                             .wrap_err("process_nonces_connection")
                             {
+                                debug!(err = ?e, "process_nonces_connection exited");
                                 return Ok(None);
                             }
 
