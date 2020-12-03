@@ -8,14 +8,14 @@ use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::{atomic::AtomicUsize, Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, trace};
 
-static SHENANGO_RUNTIME_INIT: AtomicBool = AtomicBool::new(false);
+lazy_static::lazy_static! {
+static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>>>> =
+    Arc::new(StdMutex::new(None));
+}
 
 enum NewConn {
     Listen {
@@ -99,28 +99,36 @@ impl NewConn {
 
 // everything here blocks.
 // On success, this won't return while the ShenangoUdpSkChunnel still lives.
-fn shenango_runtime_start(
-    shenango_config: &Path,
-    conns: channel::Receiver<NewConn>,
-) -> Result<(), Report> {
-    SHENANGO_RUNTIME_INIT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .map_err(|_| eyre!("Can only start shenango runtime once"))?;
-    shenango::runtime_init(shenango_config.to_str().unwrap().to_owned(), move || loop {
-        match conns.try_recv() {
-            Ok(conn) => {
-                conn.start();
+fn shenango_runtime_start(shenango_config: &Path) -> channel::Sender<NewConn> {
+    let mut rt_guard = SHENANGO_RUNTIME_SENDER
+        .lock()
+        .expect("Shenango runtime lock acquisition failure is critical");
+    if let Some(ref s) = *rt_guard {
+        return s.clone();
+    }
+
+    let (s, conns) = channel::bounded(0);
+    rt_guard.replace(s.clone());
+    let cfg = shenango_config.to_str().unwrap().to_owned();
+    std::thread::spawn(move || {
+        shenango::runtime_init(cfg, move || loop {
+            match conns.try_recv() {
+                Ok(conn) => {
+                    conn.start();
+                }
+                Err(crossbeam::channel::TryRecvError::Empty) => {
+                    shenango::thread::thread_yield();
+                }
+                Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    debug!("main thread exiting");
+                    break;
+                }
             }
-            Err(crossbeam::channel::TryRecvError::Empty) => {
-                shenango::thread::thread_yield();
-            }
-            Err(crossbeam::channel::TryRecvError::Disconnected) => {
-                debug!("main thread exiting");
-                break;
-            }
-        }
-    })
-    .map_err(|i| eyre!("shenango runtime error: {:?}", i))
+        })
+        .map_err(|i| eyre!("shenango runtime error: {:?}", i))
+    });
+
+    s
 }
 
 #[derive(Clone, Debug)]
@@ -129,11 +137,10 @@ pub struct ShenangoUdpSkChunnel {
 }
 
 impl ShenangoUdpSkChunnel {
-    pub fn new(config: impl AsRef<Path>) -> Result<Self, Report> {
-        let (s, r) = channel::bounded(0);
+    pub fn new(config: impl AsRef<Path>) -> Self {
         let config = config.as_ref().to_path_buf();
-        std::thread::spawn(move || shenango_runtime_start(&config, r));
-        Ok(Self { events: s })
+        let s = shenango_runtime_start(&config);
+        Self { events: s }
     }
 
     fn make_listen(&self, a: SocketAddrV4) -> Result<ShenangoUdpSk, Report> {
@@ -264,7 +271,8 @@ impl ChunnelListener for ShenangoUdpReqChunnel {
         let sk = self.0.listen(a);
         Box::pin(async move {
             use futures_util::StreamExt;
-            // the stream won't panic
+            // .listen() gives a Once<Ready<...>>, so the top level might error but after that
+            // unwraps are ok.
             let sk = bertha::util::AddrSteer::new(sk.await?.next().await.unwrap().unwrap());
             Ok(sk.steer(UdpConn::new))
         })
