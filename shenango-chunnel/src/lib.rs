@@ -257,6 +257,7 @@ impl ChunnelConnection for ShenangoUdpSk {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct ShenangoUdpReqChunnel(pub ShenangoUdpSkChunnel);
 
 impl ChunnelListener for ShenangoUdpReqChunnel {
