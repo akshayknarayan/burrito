@@ -5,13 +5,13 @@ use crate::msg::Msg;
 use bertha::{
     bincode::SerializeChunnelProject, chan_transport::RendezvousChannel,
     reliable::ReliabilityProjChunnel, select::SelectListener, tagger::OrderedChunnelProj,
-    udp::UdpReqChunnel, ChunnelConnection, ChunnelListener, CxList, GetOffers,
+    ChunnelConnection, ChunnelListener, CxList, GetOffers,
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
     future::poll_fn,
-    stream::{FuturesUnordered, StreamExt, TryStreamExt},
+    stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt},
 };
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{atomic::AtomicUsize, Arc};
@@ -22,30 +22,30 @@ use tracing_futures::Instrument;
 
 /// Start and serve a `ShardCanonicalServer` and shards.
 ///
+/// `raw_listener`: A ChunnelListener that can return `Data = (SocketAddr, Vec<u8>)`
+/// `ChunnelConnection`s.
 /// `redis_addr`: Address of a redis instance.
+/// `srv_ip`: Local ip to serve on.
 /// `srv_port`: Local port to serve on.
 /// `num_shards`: Number of shards to start. Shard addresses are selected sequentially after
 /// `srv_port`, but this could change.
+/// `ready`: An optional notification for after setup and negotiation are done and before we start serving.
 pub async fn serve(
+    mut raw_listener: impl ChunnelListener<
+            Addr = SocketAddr,
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+            Error = impl Into<Report> + Send + Sync + 'static,
+        > + Clone
+        + Send
+        + 'static,
     redis_addr: SocketAddr,
     srv_ip: IpAddr,
     srv_port: u16,
     num_shards: u16,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
 ) -> Result<(), Report> {
-    let shard_addrs = (1..=num_shards)
-        .map(|i| SocketAddr::new(srv_ip, srv_port + i))
-        .collect();
     // 1. Define addr.
-    let si: ShardInfo<SocketAddr> = ShardInfo {
-        canonical_addr: SocketAddr::new(srv_ip, srv_port),
-        shard_addrs,
-        // TODO fix this
-        shard_info: SimpleShardPolicy {
-            packet_data_offset: 18,
-            packet_data_length: 4,
-        },
-    };
+    let si = make_shardinfo(srv_ip, srv_port, num_shards);
 
     // 2. start shard serv
     let (internal_srv, internal_cli) = RendezvousChannel::<SocketAddr, _, _>::new(100).split();
@@ -54,12 +54,45 @@ pub async fn serve(
         info!(addr = ?&a, "start shard");
         let (s, r) = tokio::sync::oneshot::channel();
         let int_srv = internal_srv.clone();
-        tokio::spawn(single_shard(a, int_srv, s).instrument(debug_span!("shardsrv", addr = ?&a)));
+        tokio::spawn(
+            single_shard(a, raw_listener.clone(), int_srv, s)
+                .instrument(debug_span!("shardsrv", addr = ?&a)),
+        );
         rdy.push(r);
     }
 
     let mut offers: Vec<Vec<Vec<bertha::negotiate::Offer>>> = rdy.try_collect().await.unwrap();
 
+    let st = raw_listener
+        .listen(si.canonical_addr)
+        .await
+        .map_err(Into::into)
+        .wrap_err("Listen on UdpReqChunnel")?;
+    serve_canonical(
+        si,
+        st.map_err(Into::into),
+        internal_cli,
+        redis_addr,
+        offers.pop().unwrap(),
+        ready,
+    )
+    .await
+}
+
+async fn serve_canonical(
+    si: ShardInfo<SocketAddr>,
+    st: impl Stream<
+            Item = Result<
+                impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+                Report,
+            >,
+        > + Send
+        + 'static,
+    internal_cli: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Cln>,
+    redis_addr: SocketAddr,
+    offer: Vec<Vec<bertha::negotiate::Offer>>,
+    ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
+) -> Result<(), Report> {
     // 3. start canonical server
     // TODO Ebpf chunnel
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
@@ -69,27 +102,17 @@ pub async fn serve(
         CxList::from(OrderedChunnelProj::default())
             .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default()),
-        offers.pop().unwrap(),
+        offer,
         &redis_addr,
     )
     .await
     .wrap_err("Create ShardCanonicalServer")?;
 
-    // UdpConn: (SocketAddr, Vec<u8>)
-    // ProjectLeft: (SocketAddr, Vec<u8>) -> Vec<u8>
-    // SerializeChunnel: Vec<u8> -> (u32, _)
-    // ReliabilityChunnel: (u32, _) -> (u32, Msg)
-    // OrderedChunnel: (u32, Msg) -> Msg
-    // ShardCanonicalServer: Msg -> ()
     let external = CxList::from(cnsrv)
         .wrap(OrderedChunnelProj::default())
         .wrap(ReliabilityProjChunnel::<_, Msg>::default())
         .wrap(SerializeChunnelProject::default());
     info!(shard_info = ?&si, "start canonical server");
-    let st = UdpReqChunnel::default()
-        .listen(si.canonical_addr)
-        .await
-        .wrap_err("Listen on UdpReqChunnel")?;
     let st = bertha::negotiate::negotiate_server(external, st)
         .instrument(tracing::info_span!("negotiate_server"))
         .await
@@ -123,6 +146,11 @@ pub async fn serve(
 /// since we expect a negotiation handshake here.
 async fn single_shard(
     addr: SocketAddr,
+    raw_listener: impl ChunnelListener<
+        Addr = SocketAddr,
+        Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+        Error = impl Into<Report> + Send + Sync + 'static,
+    >,
     internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
     s: tokio::sync::oneshot::Sender<Vec<Vec<bertha::negotiate::Offer>>>,
 ) {
@@ -131,7 +159,7 @@ async fn single_shard(
         .wrap(SerializeChunnelProject::default());
     let stack = external.clone();
     info!(addr = ?&addr, "listening");
-    let st = SelectListener::new(UdpReqChunnel::default(), internal_srv)
+    let st = SelectListener::new(raw_listener, internal_srv)
         .listen(addr)
         .await
         .unwrap();
@@ -184,7 +212,22 @@ async fn single_shard(
         .instrument(debug_span!("negotiate_server"))
         .await
     {
-        warn!(shard_addr = ?addr, err = ?e, "Shard errorred");
+        warn!(err = ?e, "Shard errorred");
         panic!(e);
+    }
+}
+
+fn make_shardinfo(srv_ip: IpAddr, srv_port: u16, num_shards: u16) -> ShardInfo<SocketAddr> {
+    let shard_addrs = (1..=num_shards)
+        .map(|i| SocketAddr::new(srv_ip, srv_port + i))
+        .collect();
+    ShardInfo {
+        canonical_addr: SocketAddr::new(srv_ip, srv_port),
+        shard_addrs,
+        // TODO fix this
+        shard_info: SimpleShardPolicy {
+            packet_data_offset: 18,
+            packet_data_length: 4,
+        },
     }
 }

@@ -48,8 +48,15 @@ mod tests {
 
                 info!("start server");
                 tokio::spawn(
-                    serve(redis_sk_addr, "127.0.0.1".parse()?, srv_port, 2, s)
-                        .instrument(info_span!("server")),
+                    serve(
+                        bertha::udp::UdpReqChunnel::default(),
+                        redis_sk_addr,
+                        "127.0.0.1".parse()?,
+                        srv_port,
+                        2,
+                        s,
+                    )
+                    .instrument(info_span!("server")),
                 );
 
                 r.await?;
