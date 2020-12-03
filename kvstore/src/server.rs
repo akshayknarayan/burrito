@@ -9,14 +9,9 @@ use bertha::{
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use futures_util::{
-    future::poll_fn,
-    stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt},
-};
+use futures_util::stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{atomic::AtomicUsize, Arc};
-use tower_buffer::Buffer;
-use tower_service::Service;
 use tracing::{debug, debug_span, info, trace, warn};
 use tracing_futures::Instrument;
 
@@ -170,12 +165,12 @@ async fn single_shard(
     s.send(stack.offers()).unwrap();
 
     // initialize the kv store.
-    let store = Buffer::new(Store::default(), 100_000);
+    let store = Store::default();
     let idx = Arc::new(AtomicUsize::new(0));
     if let Err(e) = st
         .try_for_each_concurrent(None, |cn| {
             let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut store = store.clone();
+            let store = store.clone();
             // TODO deduplicate possible spurious retxs by req id
             let mut pending_sends = FuturesUnordered::new();
             async move {
@@ -187,12 +182,7 @@ async fn single_shard(
                             let (a, msg): (_, Msg) =
                                 inc.wrap_err(eyre!("receive message error"))?;
                             trace!(msg = ?&msg, from=?&a, pending_sends = pending_sends.len(), "got msg");
-
-                            poll_fn(|cx| store.poll_ready(cx))
-                                .await
-                                .map_err(|e| eyre!(e))?;
-                            let rsp = store.call(msg).await.unwrap();
-
+                            let rsp = store.call(msg);
                             let id = rsp.id;
                             let send_fut = cn.send((a, rsp));
                             pending_sends.push(async move {
