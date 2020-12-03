@@ -3,13 +3,9 @@
 use crate::kv::Store;
 use crate::msg::Msg;
 use bertha::{
-    bincode::SerializeChunnelProject,
-    chan_transport::RendezvousChannel,
-    reliable::ReliabilityProjChunnel,
-    select::SelectListener,
-    tagger::OrderedChunnelProj,
-    udp::{UdpReqChunnel, UdpSkChunnel},
-    ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers,
+    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel,
+    reliable::ReliabilityProjChunnel, select::SelectListener, tagger::OrderedChunnelProj,
+    udp::UdpReqChunnel, ChunnelConnection, ChunnelListener, CxList, GetOffers,
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{eyre, Report, WrapErr};
@@ -67,14 +63,12 @@ pub async fn serve(
     // 3. start canonical server
     // TODO Ebpf chunnel
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
-    let shards_extern = UdpSkChunnel.connect(()).await.unwrap();
     let cnsrv = ShardCanonicalServer::new(
         si.clone(),
         internal_cli,
         CxList::from(OrderedChunnelProj::default())
             .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default()),
-        shards_extern,
         offers.pop().unwrap(),
         &redis_addr,
     )
