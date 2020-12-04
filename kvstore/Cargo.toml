@@ -7,6 +7,7 @@ edition = "2018"
 [features]
 default = []
 bin = ["tracing-subscriber", "tracing-timing", "structopt", "ctrlc", "tokio/rt-multi-thread", "tracing/release_max_level_trace"]
+use-shenango = ["shenango-chunnel"]
 
 [dependencies]
 bertha = { path = "../bertha" }
@@ -24,6 +25,7 @@ structopt = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
 tracing-timing  = { version = "0.4", features = ["layer"], optional = true }
 ctrlc = { version = "3", optional = true }
+shenango-chunnel = { path = "../shenango-chunnel", optional = true }
 
 [dev-dependencies]
 test-util = { path = "../test-util" }

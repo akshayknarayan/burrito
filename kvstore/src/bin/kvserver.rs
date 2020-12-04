@@ -19,6 +19,9 @@ struct Opt {
     redis_addr: std::net::SocketAddr,
 
     #[structopt(short, long)]
+    shenango_cfg: Option<std::path::PathBuf>,
+
+    #[structopt(short, long)]
     num_shards: u16,
 
     #[structopt(short, long)]
@@ -67,11 +70,44 @@ async fn main() -> Result<(), Report> {
     }
 
     info!("KV Server");
-    serve(opt.redis_addr, opt.ip_addr, opt.port, opt.num_shards, None)
-        .instrument(info_span!("server"))
-        .await?;
-
+    run_server(opt).await?;
     Ok(())
+}
+
+#[cfg(not(use_shenango))]
+async fn run_server(opt: Opt) -> Result<(), Report> {
+    serve(
+        bertha::udp::UdpReqChunnel::default(),
+        opt.redis_addr,
+        opt.ip_addr,
+        opt.port,
+        opt.num_shards,
+        None,
+    )
+    .instrument(info_span!("server"))
+    .await
+}
+
+#[cfg(use_shenango)]
+async fn run_server(opt: Opt) -> Result<(), Report> {
+    if opt.shenango_cfg.is_none() {
+        return Err(eyre!(
+            "If shenango feature is enabled, shenango_cfg must be specified"
+        ));
+    }
+
+    let s = shenango_chunnel::ShenangoUdpSkChunnel::new(&opt.shenango_cfg.unwrap());
+    let l = shenango_chunnel::ShenangoUdpReqChunnel(s);
+    serve(
+        l,
+        opt.redis_addr,
+        opt.ip_addr,
+        opt.port,
+        opt.num_shards,
+        None,
+    )
+    .instrument(info_span!("server"))
+    .await?;
 }
 
 fn dump_tracing(timing: &'_ tracing_timing::TimingLayer) {
