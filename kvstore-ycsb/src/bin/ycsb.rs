@@ -58,9 +58,8 @@ fn main() -> Result<(), Report> {
     let accesses = ops(opt.accesses.clone()).wrap_err("Reading accesses")?;
     info!(num_ops = ?accesses.len(), "done reading workload");
 
-    let mut rt = tokio::runtime::Builder::new()
-        .threaded_scheduler()
-        .core_threads(8)
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
         .enable_all()
         .build()?;
 
@@ -191,7 +190,7 @@ where
     if !reqs.is_empty() {
         info!("broadcasting done");
         done_tx
-            .broadcast(true)
+            .send(true)
             .wrap_err("failed to broadcast experiment termination")?;
 
         // collect all the requests that have completed.

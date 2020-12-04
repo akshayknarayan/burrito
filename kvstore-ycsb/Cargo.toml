@@ -9,20 +9,13 @@ bertha = { path = "../bertha" }
 burrito-shard-ctl = {path = "../burrito-shard-ctl"}
 kvstore = {path = "../kvstore"}
 futures-util = "0.3"
-pin-project = "1"
 structopt = "0.3"
-tokio = {version = "0.2.20", features = ["rt-core", "rt-threaded"]}
+tokio = {version = "0.3", features = ["rt", "rt-multi-thread", "macros"] }
 poisson-ticker = { git = "https://github.com/akshayknarayan/poisson-ticker", branch="debug" }
-tower-buffer = "0.3"
-tower-service = "0.3"
 tracing = "0.1"
 tracing-futures = "0.2"
 tracing-subscriber = "0.2"
 tracing-timing  = "0.4"
 tracing-error  = "0.1"
-rand = "0.7"
-rand_distr = "0.2"
-crossbeam = "0.7"
 bincode = "1"
 color-eyre = "0.5"
-#ahash = "0.3"
