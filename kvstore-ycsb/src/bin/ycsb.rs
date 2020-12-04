@@ -1,3 +1,4 @@
+use bertha::{ChunnelConnection, ChunnelConnector};
 use color_eyre::eyre::{Report, WrapErr};
 use kvstore::KvClient;
 use kvstore_ycsb::{ops, Op};
@@ -42,6 +43,17 @@ struct Opt {
     out_file: Option<PathBuf>,
 }
 
+fn get_raw_connector() -> Result<
+    impl ChunnelConnector<
+            Addr = (),
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
+            Error = impl Into<Report> + Send + Sync + 'static,
+        > + Clone,
+    Report,
+> {
+    Ok(bertha::udp::UdpSkChunnel::default())
+}
+
 fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
     if opt.logging {
@@ -64,20 +76,26 @@ fn main() -> Result<(), Report> {
         .build()?;
 
     rt.block_on(async move {
+        let ctr = get_raw_connector()?;
         info!("make clients");
         let mut access_by_client = HashMap::default();
         for (cid, ops) in group_by_client(accesses).into_iter() {
-            let client = KvClient::new_shardclient(opt.redis_addr, opt.addr)
-                .instrument(info_span!("make kvclient", client_id = ?cid))
-                .await
-                .wrap_err("make KvClient")?;
+            let client = KvClient::new_shardclient(
+                ctr.clone().connect(()).await.map_err(Into::into)?,
+                opt.redis_addr,
+                opt.addr,
+            )
+            .instrument(info_span!("make kvclient", client_id = ?cid))
+            .await
+            .wrap_err("make KvClient")?;
             access_by_client.insert(cid, (client, ops));
         }
 
         let num_clients = access_by_client.len();
-        let mut basic_client = KvClient::new_basicclient(opt.addr)
-            .instrument(info_span!("make kvclient", client_id = "loads_client"))
-            .await?;
+        let mut basic_client =
+            KvClient::new_basicclient(ctr.clone().connect(()).await.map_err(Into::into)?, opt.addr)
+                .instrument(info_span!("make kvclient", client_id = "loads_client"))
+                .await?;
         do_loads(&mut basic_client, loads)
             .instrument(info_span!("loads"))
             .await?;
