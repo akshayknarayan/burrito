@@ -22,19 +22,13 @@ struct Opt {
     redis_addr: SocketAddr,
 
     #[structopt(short, long)]
-    num_shards_thresh: Option<usize>,
-
-    #[structopt(short, long)]
-    connections_per_client: bool,
-
-    #[structopt(short, long)]
     interarrival_client_micros: usize,
 
     #[structopt(long)]
     accesses: PathBuf,
 
     #[structopt(short, long)]
-    burrito_root: Option<String>,
+    shenango_config: Option<PathBuf>,
 
     #[structopt(short, long)]
     logging: bool,
@@ -43,7 +37,27 @@ struct Opt {
     out_file: Option<PathBuf>,
 }
 
-fn get_raw_connector() -> Result<
+#[cfg(use_shenango)]
+fn get_raw_connector(
+    path: Option<PathBuf>,
+) -> Result<
+    impl ChunnelConnector<
+            Addr = (),
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
+            Error = impl Into<Report> + Send + Sync + 'static,
+        > + Clone,
+    Report,
+> {
+    let path = path.ok_or_else(eyre!(
+        "If shenango feature is enabled, shenango_cfg must be specified"
+    ))?;
+    Ok(shenango_chunnel::ShenangoUdpSkChunnel::new(&path))
+}
+
+#[cfg(not(use_shenango))]
+fn get_raw_connector(
+    _: Option<PathBuf>,
+) -> Result<
     impl ChunnelConnector<
             Addr = (),
             Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
@@ -76,7 +90,7 @@ fn main() -> Result<(), Report> {
         .build()?;
 
     rt.block_on(async move {
-        let ctr = get_raw_connector()?;
+        let ctr = get_raw_connector(opt.shenango_config)?;
         info!("make clients");
         let mut access_by_client = HashMap::default();
         for (cid, ops) in group_by_client(accesses).into_iter() {

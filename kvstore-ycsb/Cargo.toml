@@ -4,6 +4,10 @@ version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
+[features]
+default = []
+use-shenango = ["shenango-chunnel"]
+
 [dependencies]
 bertha = { path = "../bertha" } 
 burrito-shard-ctl = {path = "../burrito-shard-ctl"}
@@ -18,3 +22,4 @@ tracing-subscriber = "0.2"
 tracing-timing  = "0.4"
 tracing-error  = "0.1"
 color-eyre = "0.5"
+shenango-chunnel = { path = "../shenango-chunnel", optional = true }
