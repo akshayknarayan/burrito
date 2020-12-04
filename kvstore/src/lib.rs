@@ -62,7 +62,9 @@ mod tests {
                 r.await?;
 
                 info!("make client");
-                let client = KvClient::new_shardclient(redis_sk_addr, srv_addr.parse()?)
+                use bertha::ChunnelConnector;
+                let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
+                let client = KvClient::new_shardclient(raw_cn, redis_sk_addr, srv_addr.parse()?)
                     .instrument(info_span!("make kvclient"))
                     .await
                     .wrap_err("make KvClient")?;

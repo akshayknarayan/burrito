@@ -5,10 +5,9 @@ use bertha::{
     bincode::SerializeChunnelProject,
     reliable::ReliabilityProjChunnel,
     tagger::OrderedChunnelProj,
-    udp::UdpSkChunnel,
     util::ProjectLeft,
     util::{MsgIdMatcher, NeverCn},
-    ChunnelConnection, ChunnelConnector, CxList,
+    ChunnelConnection, CxList,
 };
 use burrito_shard_ctl::ClientShardChunnelClient;
 use color_eyre::eyre::{eyre, Report, WrapErr};
@@ -28,6 +27,7 @@ impl<C: ChunnelConnection> Clone for KvClient<C> {
 
 impl KvClient<NeverCn> {
     pub async fn new_basicclient(
+        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
@@ -36,7 +36,6 @@ impl KvClient<NeverCn> {
             .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default());
 
-        let raw_cn = UdpSkChunnel::default().connect(()).await?;
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
             .instrument(debug_span!("client_negotiate"))
@@ -45,6 +44,7 @@ impl KvClient<NeverCn> {
     }
 
     pub async fn new_shardclient(
+        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         redis_addr: SocketAddr,
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
@@ -61,7 +61,6 @@ impl KvClient<NeverCn> {
         .wrap(ReliabilityProjChunnel::default())
         .wrap(SerializeChunnelProject::default());
 
-        let raw_cn = UdpSkChunnel::default().connect(()).await?;
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
             .instrument(debug_span!("client_negotiate"))
