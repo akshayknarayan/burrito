@@ -34,7 +34,7 @@ impl Msg {
 #[instrument]
 async fn server(
     addr: SocketAddr,
-    reliable: bool,
+    reliable: usize,
     shenango_cfg: Option<std::path::PathBuf>,
 ) -> Result<(), Report> {
     #[cfg(not(feature = "use-shenango"))]
@@ -91,7 +91,7 @@ async fn server(
         .await
         .map_err(Into::into)
         .wrap_err("Listen on UdpReqChunnel")?;
-    if reliable {
+    if reliable >= 2 {
         let stack = CxList::from(OrderedChunnelProj::default())
             .wrap(ReliabilityProjChunnel::<_, _>::default())
             .wrap(SerializeChunnelProject::<_, _>::default());
@@ -115,9 +115,31 @@ async fn server(
         .await
         .wrap_err("Error while processing requests")?;
         unreachable!()
-    } else {
+    } else if reliable == 1 {
         let stack = CxList::from(OrderedChunnelProj::default())
             .wrap(SerializeChunnelProject::<_, _>::default());
+        let st = bertha::negotiate::negotiate_server(stack, st)
+            .instrument(tracing::info_span!("negotiate_server"))
+            .await
+            .wrap_err("negotiate_server")?;
+        st.try_for_each_concurrent(None, |cn| async move {
+            let mut sends = FuturesUnordered::new();
+            loop {
+                tokio::select! (
+                    Ok(m) = cn.recv() => {
+                        let m: (_, Msg) = m;
+                        let f = cn.send(m);
+                        sends.push(f);
+                    },
+                    Some(_) = sends.next() => {},
+                );
+            }
+        })
+        .await
+        .wrap_err("Error while processing requests")?;
+        unreachable!()
+    } else {
+        let stack = SerializeChunnelProject::<_, _>::default();
         let st = bertha::negotiate::negotiate_server(stack, st)
             .instrument(tracing::info_span!("negotiate_server"))
             .await
@@ -144,7 +166,7 @@ async fn server(
 #[instrument]
 async fn client(
     addr: SocketAddr,
-    reliable: bool,
+    reliable: usize,
     shenango_cfg: Option<PathBuf>,
 ) -> Result<Vec<Duration>, Report> {
     #[cfg(feature = "use-shenango")]
@@ -182,23 +204,12 @@ async fn client(
         Ok(bertha::udp::UdpSkChunnel::default())
     }
 
-    async fn reqs(cn: impl ChunnelConnection<Data = Msg>) -> Result<Vec<Duration>, Report> {
-        let mut durs = vec![];
-        for _ in 0..100_000 {
-            cn.send(Msg::new()).await.wrap_err("client send")?;
-            let m = cn.recv().await.wrap_err("client recv")?;
-            durs.push(m.elapsed());
-        }
-
-        Ok(durs)
-    }
-
     let raw_cn = get_raw_connector(shenango_cfg)?
         .connect(())
         .await
         .map_err(Into::into)?;
     debug!("make client");
-    if reliable {
+    if reliable >= 3 {
         let stack = CxList::from(ProjectLeft::from(addr))
             .wrap(OrderedChunnelProj::default())
             .wrap(ReliabilityProjChunnel::default())
@@ -208,8 +219,15 @@ async fn client(
         let cn = bertha::negotiate::negotiate_client(stack, raw_cn, addr)
             .instrument(debug_span!("client_negotiate"))
             .await?;
-        reqs(cn).await
-    } else {
+        let mut durs = vec![];
+        for _ in 0..100_000 {
+            cn.send(Msg::new()).await.wrap_err("client send")?;
+            let m = cn.recv().await.wrap_err("client recv")?;
+            durs.push(m.elapsed());
+        }
+
+        Ok(durs)
+    } else if reliable == 2 {
         let stack = CxList::from(ProjectLeft::from(addr))
             .wrap(OrderedChunnelProj::default())
             .wrap(SerializeChunnelProject::default());
@@ -218,7 +236,60 @@ async fn client(
         let cn = bertha::negotiate::negotiate_client(stack, raw_cn, addr)
             .instrument(debug_span!("client_negotiate"))
             .await?;
-        reqs(cn).await
+        let mut durs = vec![];
+        for i in 0..100_000 {
+            let mut ctr = 0;
+            let t = loop {
+                if ctr > 0 {
+                    debug!(?i, ?ctr, "resending");
+                }
+
+                cn.send(Msg::new()).await.wrap_err("client send")?;
+                if let Ok(m) =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), cn.recv()).await
+                {
+                    break m.wrap_err("client recv")?;
+                }
+
+                ctr += 1;
+            };
+
+            durs.push(t.elapsed());
+        }
+
+        Ok(durs)
+    } else if reliable == 1 {
+        let stack = CxList::from(ProjectLeft::from(addr))
+            .wrap(OrderedChunnelProj::default())
+            .wrap(SerializeChunnelProject::default());
+
+        debug!("negotiation");
+        let cn = bertha::negotiate::negotiate_client(stack, raw_cn, addr)
+            .instrument(debug_span!("client_negotiate"))
+            .await?;
+        let mut durs = vec![];
+        for _ in 0..100_000 {
+            cn.send(Msg::new()).await.wrap_err("client send")?;
+            let m = cn.recv().await.wrap_err("client recv")?;
+            durs.push(m.elapsed());
+        }
+
+        Ok(durs)
+    } else {
+        let stack = CxList::from(ProjectLeft::from(addr)).wrap(SerializeChunnelProject::default());
+
+        debug!("negotiation");
+        let cn = bertha::negotiate::negotiate_client(stack, raw_cn, addr)
+            .instrument(debug_span!("client_negotiate"))
+            .await?;
+        let mut durs = vec![];
+        for _ in 0..100_000 {
+            cn.send(Msg::new()).await.wrap_err("client send")?;
+            let m = cn.recv().await.wrap_err("client recv")?;
+            durs.push(m.elapsed());
+        }
+
+        Ok(durs)
     }
 }
 
@@ -231,8 +302,8 @@ struct Opt {
     #[structopt(short, long)]
     addr: Option<SocketAddr>,
 
-    #[structopt(short, long)]
-    reliable: bool,
+    #[structopt(short, long, default_value = "0")]
+    reliable: usize,
 
     #[structopt(short, long, default_value = "1")]
     num_clients: usize,
