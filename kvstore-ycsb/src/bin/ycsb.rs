@@ -1,5 +1,5 @@
 use bertha::{ChunnelConnection, ChunnelConnector};
-use color_eyre::eyre::{Report, WrapErr};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use kvstore::KvClient;
 use kvstore_ycsb::{ops, Op};
 use std::collections::HashMap;
@@ -37,7 +37,7 @@ struct Opt {
     out_file: Option<PathBuf>,
 }
 
-#[cfg(use_shenango)]
+#[cfg(feature = "use-shenango")]
 fn get_raw_connector(
     path: Option<PathBuf>,
 ) -> Result<
@@ -48,15 +48,14 @@ fn get_raw_connector(
         > + Clone,
     Report,
 > {
-    let path = path.ok_or_else(eyre!(
-        "If shenango feature is enabled, shenango_cfg must be specified"
-    ))?;
+    let path = path
+        .ok_or_else(|| eyre!("If shenango feature is enabled, shenango_cfg must be specified"))?;
     Ok(shenango_chunnel::ShenangoUdpSkChunnel::new(&path))
 }
 
-#[cfg(not(use_shenango))]
+#[cfg(not(feature = "use-shenango"))]
 fn get_raw_connector(
-    _: Option<PathBuf>,
+    p: Option<PathBuf>,
 ) -> Result<
     impl ChunnelConnector<
             Addr = (),
@@ -65,6 +64,10 @@ fn get_raw_connector(
         > + Clone,
     Report,
 > {
+    if p.is_some() {
+        tracing::warn!(cfg_file = ?p, "Shenango is disabled, ignoring config");
+    }
+
     Ok(bertha::udp::UdpSkChunnel::default())
 }
 
