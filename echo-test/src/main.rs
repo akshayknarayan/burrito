@@ -1,15 +1,12 @@
 use bertha::{
-    bincode::SerializeChunnelProject,
-    reliable::ReliabilityProjChunnel,
-    tagger::OrderedChunnelProj,
-    udp::{UdpReqChunnel, UdpSkChunnel},
-    util::ProjectLeft,
-    ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
+    bincode::SerializeChunnelProject, reliable::ReliabilityProjChunnel, tagger::OrderedChunnelProj,
+    util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
 };
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
 use tracing::{debug, debug_span, info, instrument};
@@ -35,10 +32,64 @@ impl Msg {
 }
 
 #[instrument]
-async fn server(addr: SocketAddr, reliable: bool) -> Result<(), Report> {
-    let st = UdpReqChunnel::default()
+async fn server(
+    addr: SocketAddr,
+    reliable: bool,
+    shenango_cfg: Option<std::path::PathBuf>,
+) -> Result<(), Report> {
+    #[cfg(not(feature = "use-shenango"))]
+    fn get_raw(
+        cfg: Option<PathBuf>,
+    ) -> Result<
+        impl ChunnelListener<
+                Addr = SocketAddr,
+                Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>
+                                 + Send
+                                 + Sync
+                                 + 'static,
+                Error = impl Into<Report> + Send + Sync + 'static,
+            > + Clone
+            + Send
+            + 'static,
+        Report,
+    > {
+        if cfg.is_some() {
+            tracing::warn!(cfg_file = ?cfg, "Shenango is disabled, ignoring config");
+        }
+
+        Ok(bertha::udp::UdpReqChunnel::default())
+    }
+
+    #[cfg(feature = "use-shenango")]
+    fn get_raw(
+        cfg: Option<PathBuf>,
+    ) -> Result<
+        impl ChunnelListener<
+                Addr = SocketAddr,
+                Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>
+                                 + Send
+                                 + Sync
+                                 + 'static,
+                Error = impl Into<Report> + Send + Sync + 'static,
+            > + Clone
+            + Send
+            + 'static,
+        Report,
+    > {
+        if cfg.is_none() {
+            return Err(eyre!(
+                "If shenango feature is enabled, shenango_cfg must be specified"
+            ));
+        }
+
+        let s = shenango_chunnel::ShenangoUdpSkChunnel::new(&cfg.unwrap());
+        Ok(shenango_chunnel::ShenangoUdpReqChunnel(s))
+    }
+
+    let st = get_raw(shenango_cfg)?
         .listen(addr)
         .await
+        .map_err(Into::into)
         .wrap_err("Listen on UdpReqChunnel")?;
     if reliable {
         let stack = CxList::from(OrderedChunnelProj::default())
@@ -91,7 +142,46 @@ async fn server(addr: SocketAddr, reliable: bool) -> Result<(), Report> {
 }
 
 #[instrument]
-async fn client(addr: SocketAddr, reliable: bool) -> Result<Vec<Duration>, Report> {
+async fn client(
+    addr: SocketAddr,
+    reliable: bool,
+    shenango_cfg: Option<PathBuf>,
+) -> Result<Vec<Duration>, Report> {
+    #[cfg(feature = "use-shenango")]
+    fn get_raw_connector(
+        path: Option<PathBuf>,
+    ) -> Result<
+        impl ChunnelConnector<
+                Addr = (),
+                Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
+                Error = impl Into<Report> + Send + Sync + 'static,
+            > + Clone,
+        Report,
+    > {
+        let path = path.ok_or_else(|| {
+            eyre!("If shenango feature is enabled, shenango_cfg must be specified")
+        })?;
+        Ok(shenango_chunnel::ShenangoUdpSkChunnel::new(&path))
+    }
+
+    #[cfg(not(feature = "use-shenango"))]
+    fn get_raw_connector(
+        p: Option<PathBuf>,
+    ) -> Result<
+        impl ChunnelConnector<
+                Addr = (),
+                Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
+                Error = impl Into<Report> + Send + Sync + 'static,
+            > + Clone,
+        Report,
+    > {
+        if p.is_some() {
+            tracing::warn!(cfg_file = ?p, "Shenango is disabled, ignoring config");
+        }
+
+        Ok(bertha::udp::UdpSkChunnel::default())
+    }
+
     async fn reqs(cn: impl ChunnelConnection<Data = Msg>) -> Result<Vec<Duration>, Report> {
         let mut durs = vec![];
         for _ in 0..100_000 {
@@ -103,7 +193,10 @@ async fn client(addr: SocketAddr, reliable: bool) -> Result<Vec<Duration>, Repor
         Ok(durs)
     }
 
-    let raw_cn = UdpSkChunnel::default().connect(()).await?;
+    let raw_cn = get_raw_connector(shenango_cfg)?
+        .connect(())
+        .await
+        .map_err(Into::into)?;
     debug!("make client");
     if reliable {
         let stack = CxList::from(ProjectLeft::from(addr))
@@ -140,6 +233,12 @@ struct Opt {
 
     #[structopt(short, long)]
     reliable: bool,
+
+    #[structopt(short, long, default_value = "1")]
+    num_clients: usize,
+
+    #[structopt(short, long)]
+    shenango_cfg: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -157,12 +256,12 @@ async fn main() -> Result<(), Report> {
 
     if let Some(p) = opt.port {
         let a = ([0, 0, 0, 0], p).into();
-        server(a, opt.reliable).await
+        server(a, opt.reliable, opt.shenango_cfg).await
     } else if let Some(a) = opt.addr {
         let jhs = FuturesUnordered::new();
         let start = Instant::now();
-        for _ in 0..8 {
-            let jh = tokio::spawn(client(a, opt.reliable));
+        for _ in 0..opt.num_clients {
+            let jh = tokio::spawn(client(a, opt.reliable, opt.shenango_cfg.clone()));
             jhs.push(async move { jh.await.unwrap() });
         }
 
