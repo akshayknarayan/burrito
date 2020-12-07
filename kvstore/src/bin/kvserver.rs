@@ -1,4 +1,4 @@
-use color_eyre::eyre::Report;
+use color_eyre::eyre::{eyre, Report};
 use kvstore::serve;
 use structopt::StructOpt;
 use tracing::{info, info_span};
@@ -74,8 +74,12 @@ async fn main() -> Result<(), Report> {
     Ok(())
 }
 
-#[cfg(not(use_shenango))]
+#[cfg(not(feature = "use-shenango"))]
 async fn run_server(opt: Opt) -> Result<(), Report> {
+    if opt.shenango_cfg.is_some() {
+        tracing::warn!(cfg_file = ?opt.shenangp_cfg, "Shenango is disabled, ignoring config");
+    }
+
     serve(
         bertha::udp::UdpReqChunnel::default(),
         opt.redis_addr,
@@ -88,7 +92,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
     .await
 }
 
-#[cfg(use_shenango)]
+#[cfg(feature = "use-shenango")]
 async fn run_server(opt: Opt) -> Result<(), Report> {
     if opt.shenango_cfg.is_none() {
         return Err(eyre!(
@@ -107,7 +111,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         None,
     )
     .instrument(info_span!("server"))
-    .await?;
+    .await
 }
 
 fn dump_tracing(timing: &'_ tracing_timing::TimingLayer) {
