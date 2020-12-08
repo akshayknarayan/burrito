@@ -3,8 +3,6 @@
 use crate::msg::Msg;
 use bertha::{
     bincode::SerializeChunnelProject,
-    reliable::ReliabilityProjChunnel,
-    tagger::OrderedChunnelProj,
     util::ProjectLeft,
     util::{MsgIdMatcher, NeverCn},
     ChunnelConnection, CxList,
@@ -32,8 +30,6 @@ impl KvClient<NeverCn> {
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
         let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
-            .wrap(OrderedChunnelProj::default())
-            .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
@@ -57,8 +53,6 @@ impl KvClient<NeverCn> {
             cl,
             ProjectLeft::from(canonical_addr),
         ))
-        .wrap(OrderedChunnelProj::default())
-        .wrap(ReliabilityProjChunnel::default())
         .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
@@ -84,8 +78,24 @@ where
         let cn = &self.0;
         let id = req.id;
         trace!("sending");
-        cn.send_msg(req).await.wrap_err("Error sending request")?;
-        let rsp = cn.recv_msg(id).await.wrap_err("Error awaiting response")?;
+        cn.send_msg(req.clone())
+            .await
+            .wrap_err("Error sending request")?;
+
+        // retry loop
+        let rsp = loop {
+            tokio::select! (
+                rsp = cn.recv_msg(id) => {
+                    break rsp.wrap_err("Error awaiting response")?;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    cn.send_msg(req.clone())
+                        .await
+                        .wrap_err("Error sending request")?;
+                }
+            );
+        };
+
         trace!("received");
         if rsp.id != id {
             return Err(eyre!(

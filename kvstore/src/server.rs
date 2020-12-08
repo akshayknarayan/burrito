@@ -3,8 +3,7 @@
 use crate::kv::Store;
 use crate::msg::Msg;
 use bertha::{
-    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel,
-    reliable::ReliabilityProjChunnel, select::SelectListener, tagger::OrderedChunnelProj,
+    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel, select::SelectListener,
     ChunnelConnection, ChunnelListener, CxList, GetOffers,
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
@@ -94,19 +93,14 @@ async fn serve_canonical(
     let cnsrv = ShardCanonicalServer::new(
         si.clone(),
         internal_cli,
-        CxList::from(OrderedChunnelProj::default())
-            .wrap(ReliabilityProjChunnel::default())
-            .wrap(SerializeChunnelProject::default()),
+        SerializeChunnelProject::default(),
         offer,
         &redis_addr,
     )
     .await
     .wrap_err("Create ShardCanonicalServer")?;
 
-    let external = CxList::from(cnsrv)
-        .wrap(OrderedChunnelProj::default())
-        .wrap(ReliabilityProjChunnel::default())
-        .wrap(SerializeChunnelProject::default());
+    let external = CxList::from(cnsrv).wrap(SerializeChunnelProject::default());
     info!(shard_info = ?&si, "start canonical server");
     let st = bertha::negotiate::negotiate_server(external, st)
         .instrument(tracing::info_span!("negotiate_server"))
@@ -150,9 +144,7 @@ async fn single_shard(
     internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
     s: tokio::sync::oneshot::Sender<Vec<bertha::negotiate::Offer>>,
 ) {
-    let external = CxList::from(OrderedChunnelProj::default())
-        .wrap(ReliabilityProjChunnel::default())
-        .wrap(SerializeChunnelProject::default());
+    let external = SerializeChunnelProject::default();
     let stack = external.clone();
     info!(addr = ?&addr, "listening");
     let st = SelectListener::new(raw_listener, internal_srv)
