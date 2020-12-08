@@ -22,6 +22,9 @@ pub trait MsgId {
 }
 
 /// Match incoming messages to previously sent ones on the given id() field.
+///
+/// `recv_msg` will deliver a message with that id *at most once* among a set of concurrently
+/// inflight messages (`send_msg` returning -> `recv_msg` returning).
 pub struct MsgIdMatcher<C: ChunnelConnection, D> {
     inner: Arc<C>,
     inflight: Arc<DashMap<usize, oneshot::Sender<D>>>,
@@ -52,9 +55,12 @@ where
     }
 
     pub async fn send_msg(&self, data: D) -> Result<(), Report> {
-        let (s, r) = oneshot::channel();
-        self.sent.insert(data.id(), r);
-        self.inflight.insert(data.id(), s);
+        if !self.inflight.contains_key(&data.id()) {
+            let (s, r) = oneshot::channel();
+            self.sent.insert(data.id(), r);
+            self.inflight.insert(data.id(), s);
+        }
+
         self.inner.send(data).await
     }
 
@@ -84,6 +90,8 @@ where
 
 /// Remember the order of calls to recv(), and return packets from the underlying connection in
 /// that order.
+///
+/// Relies on underlying chunnel being ordered.
 #[derive(Debug)]
 pub struct RecvCallOrder<C: ChunnelConnection> {
     inner: Arc<C>,
