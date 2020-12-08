@@ -13,8 +13,9 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::trace;
+use tracing::{debug, trace};
 use tracing_futures::Instrument;
 
 pub trait MsgId {
@@ -27,8 +28,9 @@ pub trait MsgId {
 /// inflight messages (`send_msg` returning -> `recv_msg` returning).
 pub struct MsgIdMatcher<C: ChunnelConnection, D> {
     inner: Arc<C>,
-    inflight: Arc<DashMap<usize, oneshot::Sender<D>>>,
+    inflight: Arc<DashMap<usize, (std::time::Instant, oneshot::Sender<D>)>>,
     sent: Arc<DashMap<usize, oneshot::Receiver<D>>>,
+    times_us: Arc<StdMutex<hdrhistogram::Histogram<u64>>>,
 }
 
 impl<C: ChunnelConnection, D> Clone for MsgIdMatcher<C, D> {
@@ -37,6 +39,7 @@ impl<C: ChunnelConnection, D> Clone for MsgIdMatcher<C, D> {
             inner: Arc::clone(&self.inner),
             inflight: Arc::clone(&self.inflight),
             sent: Arc::clone(&self.sent),
+            times_us: Arc::clone(&self.times_us),
         }
     }
 }
@@ -51,14 +54,23 @@ where
             inner: Arc::new(inner),
             inflight: Default::default(),
             sent: Default::default(),
+            // max 200ms
+            times_us: Arc::new(StdMutex::new(
+                hdrhistogram::Histogram::new_with_max(200_000, 3).unwrap(),
+            )),
         }
+    }
+
+    pub fn times_us(&self) -> Arc<StdMutex<hdrhistogram::Histogram<u64>>> {
+        Arc::clone(&self.times_us)
     }
 
     pub async fn send_msg(&self, data: D) -> Result<(), Report> {
         if !self.inflight.contains_key(&data.id()) {
             let (s, r) = oneshot::channel();
             self.sent.insert(data.id(), r);
-            self.inflight.insert(data.id(), s);
+            self.inflight
+                .insert(data.id(), (std::time::Instant::now(), s));
         }
 
         self.inner.send(data).await
@@ -69,17 +81,25 @@ where
             .sent
             .remove(&msg_id)
             .ok_or_else(|| eyre!("Requested msg id {:?} isn't known", msg_id))?;
+        let mut times: Vec<Duration> = vec![];
         loop {
             tokio::select! {
                 res = &mut r => {
                     trace!("MsgIdMatcher done");
+                    let mut g = self.times_us.lock().unwrap();
+                    for t in times {
+                        g.saturating_record(t.as_micros() as _);
+                    }
+
                     return Ok(res.expect("sender won't be dropped"));
                 }
                 res = self.inner.recv() => {
                     let res = res?;
-                    if let Some((_, s)) = self.inflight.remove(&res.id()) {
+                    if let Some((_, (t, s))) = self.inflight.remove(&res.id()) {
+                        times.push(t.elapsed());
                         s.send(res).map_err(|_| ()).expect("receiver won't be dropped");
                     } else {
+                        debug!(msg = ?res.id(), "Not found in inflight");
                         continue;
                     }
                 }

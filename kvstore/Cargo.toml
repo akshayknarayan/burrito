@@ -21,11 +21,14 @@ tokio = {version = "0.3", features = ["rt", "sync", "macros"]}
 tracing = "0.1"
 tracing-futures = "0.2"
 tracing-error = "0.1"
+hdrhistogram = "7"
 structopt = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
 tracing-timing  = { version = "0.4", features = ["layer"], optional = true }
 ctrlc = { version = "3", optional = true }
 shenango-chunnel = { path = "../shenango-chunnel", optional = true }
+quanta = "0.6"
+lazy_static = "1.4"
 
 [dev-dependencies]
 test-util = { path = "../test-util" }

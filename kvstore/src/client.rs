@@ -11,6 +11,7 @@ use burrito_shard_ctl::ClientShardChunnelClient;
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
 
@@ -69,13 +70,22 @@ impl KvClient<NeverCn> {
     }
 }
 
+lazy_static::lazy_static! {
+    static ref CLOCK: quanta::Clock = quanta::Clock::new();
+}
+
 impl<C> KvClient<C>
 where
     C: ChunnelConnection<Data = Msg> + Send + Sync + 'static,
 {
+    pub fn times_us(&self) -> Arc<Mutex<hdrhistogram::Histogram<u64>>> {
+        self.0.times_us()
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn do_req(&self, req: Msg) -> Result<Option<String>, Report> {
+    async fn do_req(&self, mut req: Msg) -> Result<Option<String>, Report> {
         let cn = &self.0;
+        req.id = CLOCK.raw() as _;
         let id = req.id;
         trace!("sending");
         cn.send_msg(req.clone())
@@ -83,12 +93,15 @@ where
             .wrap_err("Error sending request")?;
 
         // retry loop
+        let rsp_fut = cn.recv_msg(id);
+        tokio::pin!(rsp_fut);
         let rsp = loop {
             tokio::select! (
-                rsp = cn.recv_msg(id) => {
+                rsp = &mut rsp_fut => {
                     break rsp.wrap_err("Error awaiting response")?;
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    debug!("re-sending");
                     cn.send_msg(req.clone())
                         .await
                         .wrap_err("Error sending request")?;
@@ -107,12 +120,7 @@ where
 
         Ok(rsp.into_kv().1)
     }
-}
 
-impl<C> KvClient<C>
-where
-    C: ChunnelConnection<Data = Msg> + Send + Sync + 'static,
-{
     fn do_req_fut(
         &self,
         req: Msg,

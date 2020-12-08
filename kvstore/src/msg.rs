@@ -104,9 +104,10 @@ impl burrito_shard_ctl::Kv for Msg {
 }
 
 fn get_id() -> usize {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    rng.gen()
+    //use rand::Rng;
+    //let mut rng = rand::thread_rng();
+    //rng.gen()
+    0 //CLOCK.raw() as _
 }
 
 #[cfg(test)]

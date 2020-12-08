@@ -203,6 +203,18 @@ where
             }
         }
 
+        let times_us = cl.times_us();
+        let g = times_us.lock().unwrap();
+        debug!(
+            p5 = g.value_at_quantile(0.05),
+            p25 = g.value_at_quantile(0.25),
+            p50 = g.value_at_quantile(0.5),
+            p75 = g.value_at_quantile(0.75),
+            p95 = g.value_at_quantile(0.95),
+            cnt = g.len(),
+            "msgIdMatcher times (us)",
+        );
+
         Ok::<_, Report>((durs, inflight.len()))
     }
 

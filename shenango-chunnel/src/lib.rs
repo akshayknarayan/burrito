@@ -10,7 +10,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 lazy_static::lazy_static! {
 static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>>>> =
@@ -20,8 +20,7 @@ static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>
 enum NewConn {
     Listen {
         addr: SocketAddrV4,
-        incoming: mpsc::UnboundedSender<(SocketAddrV4, Vec<u8>)>,
-        outgoing: channel::Receiver<(SocketAddrV4, Vec<u8>)>,
+        cn: Self::Dial,
     },
     Dial {
         incoming: mpsc::UnboundedSender<(SocketAddrV4, Vec<u8>)>,
@@ -35,8 +34,7 @@ impl NewConn {
         let (sk, incoming, outgoing) = match self {
             Listen {
                 addr,
-                incoming,
-                outgoing,
+                cn: Dial { incoming, outgoing },
             } => (
                 Arc::new(
                     shenango::udp::UdpConnection::listen(addr)
@@ -61,36 +59,147 @@ impl NewConn {
         };
 
         let laddr = sk.local_addr();
+        use std::convert::TryInto;
+        use std::time::Instant;
+        let times: Arc<dashmap::DashMap<u64, Instant>> = Default::default();
+        let rtimes = Arc::clone(&times);
 
         let rsk = Arc::clone(&sk);
         // receive
         shenango::thread::spawn(move || {
             let mut buf = [0u8; 1024];
+            let mut times_us = hdrhistogram::Histogram::<u64>::new_with_max(100_000, 3).unwrap();
             loop {
                 let (read_len, from_addr) = rsk
                     .read_from(&mut buf)
                     .wrap_err("shenango read_from")
                     .unwrap();
+
+                // TODO check times
+                let msg_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+                if let Some((_, then)) = rtimes.remove(&msg_id) {
+                    times_us.saturating_record(then.elapsed().as_micros() as _);
+                }
+
                 trace!(sk=?laddr, "recv");
-                incoming
-                    .send((from_addr, buf[..read_len].to_vec()))
-                    .unwrap();
+                if let Err(_) = incoming.send((from_addr, buf[..read_len].to_vec())) {
+                    warn!(sk=?laddr, "Incoming channel dropped, recv thread exiting");
+                    break;
+                }
+
+                if times_us.len() % 1000 == 0 {
+                    debug!(
+                        p5 = times_us.value_at_quantile(0.05),
+                        p25 = times_us.value_at_quantile(0.25),
+                        p50 = times_us.value_at_quantile(0.5),
+                        p75 = times_us.value_at_quantile(0.75),
+                        p95 = times_us.value_at_quantile(0.95),
+                        cnt = times_us.len(),
+                        "shenango times (us)",
+                    );
+                }
             }
+
+            debug!(
+                p5 = times_us.value_at_quantile(0.05),
+                p25 = times_us.value_at_quantile(0.25),
+                p50 = times_us.value_at_quantile(0.5),
+                p75 = times_us.value_at_quantile(0.75),
+                p95 = times_us.value_at_quantile(0.95),
+                cnt = times_us.len(),
+                "shenango times (us)",
+            );
         });
 
         // send
-        shenango::thread::spawn(move || loop {
-            match outgoing.try_recv() {
-                Ok((a, data)) => {
-                    trace!(sk=?laddr, "send");
-                    sk.write_to(&data, a).wrap_err("shenango write_to").unwrap();
-                }
-                Err(crossbeam::channel::TryRecvError::Empty) => {
-                    shenango::thread::thread_yield();
-                }
-                Err(crossbeam::channel::TryRecvError::Disconnected) => {
-                    debug!(sk=?laddr, "send thread exiting");
-                    break;
+        shenango::thread::spawn(move || {
+            let mut no_yield_ctr = 0;
+            let mut no_yield_ctr_hist =
+                hdrhistogram::Histogram::<u16>::new_with_max(1000, 3).unwrap();
+            let mut yield_time_hist =
+                hdrhistogram::Histogram::<u32>::new_with_max(10000, 4).unwrap();
+            let mut write_time_hist =
+                hdrhistogram::Histogram::<u32>::new_with_max(10000, 4).unwrap();
+            let mut queue_time_hist =
+                hdrhistogram::Histogram::<u32>::new_with_max(10_000, 4).unwrap();
+            let clock = quanta::Clock::new();
+            loop {
+                match outgoing.try_recv() {
+                    Ok((a, data)) => {
+                        // TODO record msg id time
+                        let msg_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                        times.insert(msg_id, Instant::now());
+
+                        // msg id is secretly the msg creation time
+                        queue_time_hist
+                            .saturating_record(clock.delta(msg_id, clock.end()).as_micros() as _);
+
+                        no_yield_ctr += 1;
+
+                        trace!(sk=?laddr, "send");
+
+                        let write_time_start = clock.start();
+                        sk.write_to(&data, a).wrap_err("shenango write_to").unwrap();
+                        let write_time_end = clock.end();
+                        let write_time = clock.delta(write_time_start, write_time_end);
+                        write_time_hist.saturating_record(write_time.as_nanos() as _);
+                    }
+                    Err(crossbeam::channel::TryRecvError::Empty) => {
+                        if no_yield_ctr > 0 {
+                            no_yield_ctr_hist.saturating_record(no_yield_ctr);
+                        }
+
+                        no_yield_ctr = 0;
+                        let yield_time_start = clock.start();
+                        shenango::thread::thread_yield();
+                        let yield_time_end = clock.end();
+                        let yield_time = clock.delta(yield_time_start, yield_time_end);
+                        yield_time_hist.saturating_record(yield_time.as_nanos() as _);
+                    }
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                        debug!(sk=?laddr, "send thread exiting");
+                        debug!(
+                            p5 = no_yield_ctr_hist.value_at_quantile(0.05),
+                            p25 = no_yield_ctr_hist.value_at_quantile(0.25),
+                            p50 = no_yield_ctr_hist.value_at_quantile(0.5),
+                            p75 = no_yield_ctr_hist.value_at_quantile(0.75),
+                            p95 = no_yield_ctr_hist.value_at_quantile(0.95),
+                            cnt = no_yield_ctr_hist.len(),
+                            thread = ?laddr,
+                            "shenango no yield ctr",
+                        );
+                        debug!(
+                            p5 = yield_time_hist.value_at_quantile(0.05),
+                            p25 = yield_time_hist.value_at_quantile(0.25),
+                            p50 = yield_time_hist.value_at_quantile(0.5),
+                            p75 = yield_time_hist.value_at_quantile(0.75),
+                            p95 = yield_time_hist.value_at_quantile(0.95),
+                            cnt = yield_time_hist.len(),
+                            thread = ?laddr,
+                            "shenango yield time (ns)",
+                        );
+                        debug!(
+                            p5 = write_time_hist.value_at_quantile(0.05),
+                            p25 = write_time_hist.value_at_quantile(0.25),
+                            p50 = write_time_hist.value_at_quantile(0.5),
+                            p75 = write_time_hist.value_at_quantile(0.75),
+                            p95 = write_time_hist.value_at_quantile(0.95),
+                            cnt = write_time_hist.len(),
+                            thread = ?laddr,
+                            "shenango write time (ns)",
+                        );
+                        debug!(
+                            p5 =  queue_time_hist.value_at_quantile(0.05),
+                            p25 = queue_time_hist.value_at_quantile(0.25),
+                            p50 = queue_time_hist.value_at_quantile(0.5),
+                            p75 = queue_time_hist.value_at_quantile(0.75),
+                            p95 = queue_time_hist.value_at_quantile(0.95),
+                            cnt = queue_time_hist.len(),
+                            thread = ?laddr,
+                            "shenango queue time (us)",
+                        );
+                        break;
+                    }
                 }
             }
         });
@@ -148,8 +257,10 @@ impl ShenangoUdpSkChunnel {
         let (outgoing_s, outgoing_r) = channel::unbounded();
         self.events.send(NewConn::Listen {
             addr: a,
-            incoming: incoming_s,
-            outgoing: outgoing_r,
+            cn: NewConn::Dial {
+                incoming: incoming_s,
+                outgoing: outgoing_r,
+            },
         })?;
         Ok(ShenangoUdpSk::new(incoming_r, outgoing_s))
     }
@@ -209,6 +320,22 @@ impl ChunnelConnector for ShenangoUdpSkChunnel {
 pub struct ShenangoUdpSk {
     outgoing: channel::Sender<(SocketAddrV4, Vec<u8>)>,
     incoming: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddrV4, Vec<u8>)>>>,
+    outgoing_len_hist: Arc<StdMutex<hdrhistogram::Histogram<u32>>>,
+}
+
+impl Drop for ShenangoUdpSk {
+    fn drop(&mut self) {
+        let hist = self.outgoing_len_hist.lock().unwrap();
+        debug!(
+            p5 = hist.value_at_quantile(0.05),
+            p25 = hist.value_at_quantile(0.25),
+            p50 = hist.value_at_quantile(0.5),
+            p75 = hist.value_at_quantile(0.75),
+            p95 = hist.value_at_quantile(0.95),
+            cnt = hist.len(),
+            "shenango queue len (us)",
+        );
+    }
 }
 
 impl ShenangoUdpSk {
@@ -219,6 +346,9 @@ impl ShenangoUdpSk {
         Self {
             incoming: Arc::new(Mutex::new(inc)),
             outgoing: out,
+            outgoing_len_hist: Arc::new(StdMutex::new(
+                hdrhistogram::Histogram::<u32>::new_with_max(10000, 3).unwrap(),
+            )),
         }
     }
 }
@@ -233,6 +363,10 @@ impl ChunnelConnection for ShenangoUdpSk {
         use SocketAddr::*;
         match data {
             (V4(addr), d) => {
+                self.outgoing_len_hist
+                    .lock()
+                    .unwrap()
+                    .saturating_record(self.outgoing.len() as _);
                 self.outgoing.send((addr, d)).expect("shenango won't drop");
                 Box::pin(futures_util::future::ready(Ok(())))
             }

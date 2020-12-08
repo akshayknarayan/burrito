@@ -14,6 +14,9 @@ crossbeam = "0.8"
 futures-util = "0.3"
 lazy_static = "1"
 tokio = { version = "0.3", features = ["sync"] }
+dashmap = "3"
+hdrhistogram = "7"
+quanta = "0.6"
 
 [dev-dependencies]
 lazy_static = "1.4"
