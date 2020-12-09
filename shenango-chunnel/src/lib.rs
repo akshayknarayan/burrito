@@ -10,7 +10,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 lazy_static::lazy_static! {
 static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>>>> =
@@ -72,9 +72,10 @@ impl NewConn {
                     .wrap_err("shenango read_from")
                     .unwrap();
                 trace!(sk=?laddr, "recv");
-                incoming
-                    .send((from_addr, buf[..read_len].to_vec()))
-                    .unwrap();
+                if let Err(_) = incoming.send((from_addr, buf[..read_len].to_vec())) {
+                    warn!(sk=?laddr, "Incoming channel dropped, recv thread exiting");
+                    break;
+                }
             }
         });
 
