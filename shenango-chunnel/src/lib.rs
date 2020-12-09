@@ -17,15 +17,17 @@ static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>
     Arc::new(StdMutex::new(None));
 }
 
+struct NewShenangoSk {
+    incoming: mpsc::UnboundedSender<(SocketAddrV4, Vec<u8>)>,
+    outgoing: channel::Receiver<(SocketAddrV4, Vec<u8>)>,
+}
+
 enum NewConn {
     Listen {
         addr: SocketAddrV4,
-        cn: Self::Dial,
+        cn: NewShenangoSk,
     },
-    Dial {
-        incoming: mpsc::UnboundedSender<(SocketAddrV4, Vec<u8>)>,
-        outgoing: channel::Receiver<(SocketAddrV4, Vec<u8>)>,
-    },
+    Dial(NewShenangoSk),
 }
 
 impl NewConn {
@@ -34,7 +36,7 @@ impl NewConn {
         let (sk, incoming, outgoing) = match self {
             Listen {
                 addr,
-                cn: Dial { incoming, outgoing },
+                cn: NewShenangoSk { incoming, outgoing },
             } => (
                 Arc::new(
                     shenango::udp::UdpConnection::listen(addr)
@@ -44,7 +46,7 @@ impl NewConn {
                 incoming,
                 outgoing,
             ),
-            Dial { incoming, outgoing } => {
+            Dial(NewShenangoSk { incoming, outgoing }) => {
                 let laddr = SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), 0);
                 (
                     Arc::new(
@@ -257,7 +259,7 @@ impl ShenangoUdpSkChunnel {
         let (outgoing_s, outgoing_r) = channel::unbounded();
         self.events.send(NewConn::Listen {
             addr: a,
-            cn: NewConn::Dial {
+            cn: NewShenangoSk {
                 incoming: incoming_s,
                 outgoing: outgoing_r,
             },
@@ -268,10 +270,10 @@ impl ShenangoUdpSkChunnel {
     fn make_dial(&self) -> Result<ShenangoUdpSk, Report> {
         let (incoming_s, incoming_r) = mpsc::unbounded_channel();
         let (outgoing_s, outgoing_r) = channel::unbounded();
-        self.events.send(NewConn::Dial {
+        self.events.send(NewConn::Dial(NewShenangoSk {
             incoming: incoming_s,
             outgoing: outgoing_r,
-        })?;
+        }))?;
         Ok(ShenangoUdpSk::new(incoming_r, outgoing_s))
     }
 }
