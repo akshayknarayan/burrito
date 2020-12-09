@@ -4,6 +4,7 @@ use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use crossbeam::channel;
 use futures_util::stream::Stream;
+use std::convert::TryInto;
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
@@ -19,7 +20,7 @@ static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>
 
 struct NewShenangoSk {
     incoming: mpsc::UnboundedSender<(SocketAddrV4, Vec<u8>)>,
-    outgoing: channel::Receiver<(SocketAddrV4, Vec<u8>)>,
+    outgoing: mpsc_channel::Receiver<(SocketAddrV4, Vec<u8>)>,
 }
 
 enum NewConn {
@@ -61,7 +62,6 @@ impl NewConn {
         };
 
         let laddr = sk.local_addr();
-        use std::convert::TryInto;
         use std::time::Instant;
         let times: Arc<dashmap::DashMap<u64, Instant>> = Default::default();
         let rtimes = Arc::clone(&times);
@@ -115,6 +115,8 @@ impl NewConn {
 
         // send
         shenango::thread::spawn(move || {
+            let clock = quanta::Clock::new();
+            let mut deq_call_time = clock.start();
             let mut no_yield_ctr = 0;
             let mut no_yield_ctr_hist =
                 hdrhistogram::Histogram::<u16>::new_with_max(1000, 3).unwrap();
@@ -123,30 +125,24 @@ impl NewConn {
             let mut write_time_hist =
                 hdrhistogram::Histogram::<u32>::new_with_max(10000, 4).unwrap();
             let mut queue_time_hist =
-                hdrhistogram::Histogram::<u32>::new_with_max(10_000, 4).unwrap();
-            let clock = quanta::Clock::new();
+                hdrhistogram::Histogram::<u32>::new_with_max(100_000, 2).unwrap();
+            let mut inter_deq_time_hist =
+                hdrhistogram::Histogram::<u32>::new_with_max(100_000, 2).unwrap();
+            let mut entrs = vec![
+                (
+                    SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), 0),
+                    vec![0u8; 0]
+                );
+                32
+            ];
             loop {
-                match outgoing.try_recv() {
-                    Ok((a, data)) => {
-                        // TODO record msg id time
-                        let msg_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                        times.insert(msg_id, Instant::now());
+                let deq_call_time_end = clock.end();
+                let deq_inter = clock.delta(deq_call_time, deq_call_time_end);
+                deq_call_time = deq_call_time_end;
+                inter_deq_time_hist.saturating_record(deq_inter.as_nanos() as _);
 
-                        // msg id is secretly the msg creation time
-                        queue_time_hist
-                            .saturating_record(clock.delta(msg_id, clock.end()).as_micros() as _);
-
-                        no_yield_ctr += 1;
-
-                        trace!(sk=?laddr, "send");
-
-                        let write_time_start = clock.start();
-                        sk.write_to(&data, a).wrap_err("shenango write_to").unwrap();
-                        let write_time_end = clock.end();
-                        let write_time = clock.delta(write_time_start, write_time_end);
-                        write_time_hist.saturating_record(write_time.as_nanos() as _);
-                    }
-                    Err(crossbeam::channel::TryRecvError::Empty) => {
+                match outgoing.dequeue(&mut entrs) {
+                    Ok(empty) if empty.is_empty() => {
                         if no_yield_ctr > 0 {
                             no_yield_ctr_hist.saturating_record(no_yield_ctr);
                         }
@@ -158,7 +154,31 @@ impl NewConn {
                         let yield_time = clock.delta(yield_time_start, yield_time_end);
                         yield_time_hist.saturating_record(yield_time.as_nanos() as _);
                     }
-                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    Ok(recvd) => {
+                        no_yield_ctr += recvd.len() as u64;
+                        let write_time_start = clock.start();
+                        for (a, data) in recvd {
+                            // TODO record msg id time
+                            let msg_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                            times.insert(msg_id, Instant::now());
+
+                            // msg id is secretly the msg creation time
+                            queue_time_hist.saturating_record(
+                                clock.delta(msg_id, clock.end()).as_micros() as _,
+                            );
+
+                            trace!(sk=?laddr, "send");
+
+                            sk.write_to(&data, *a)
+                                .wrap_err("shenango write_to")
+                                .unwrap();
+                        }
+
+                        let write_time_end = clock.end();
+                        let write_time = clock.delta(write_time_start, write_time_end);
+                        write_time_hist.saturating_record(write_time.as_nanos() as _);
+                    }
+                    Err(_) => {
                         debug!(sk=?laddr, "send thread exiting");
                         debug!(
                             p5 = no_yield_ctr_hist.value_at_quantile(0.05),
@@ -166,6 +186,8 @@ impl NewConn {
                             p50 = no_yield_ctr_hist.value_at_quantile(0.5),
                             p75 = no_yield_ctr_hist.value_at_quantile(0.75),
                             p95 = no_yield_ctr_hist.value_at_quantile(0.95),
+                            p99 = no_yield_ctr_hist.value_at_quantile(0.99),
+                            max = no_yield_ctr_hist.max(),
                             cnt = no_yield_ctr_hist.len(),
                             thread = ?laddr,
                             "shenango no yield ctr",
@@ -176,6 +198,8 @@ impl NewConn {
                             p50 = yield_time_hist.value_at_quantile(0.5),
                             p75 = yield_time_hist.value_at_quantile(0.75),
                             p95 = yield_time_hist.value_at_quantile(0.95),
+                            p99 = yield_time_hist.value_at_quantile(0.99),
+                            max = yield_time_hist.max(),
                             cnt = yield_time_hist.len(),
                             thread = ?laddr,
                             "shenango yield time (ns)",
@@ -186,6 +210,8 @@ impl NewConn {
                             p50 = write_time_hist.value_at_quantile(0.5),
                             p75 = write_time_hist.value_at_quantile(0.75),
                             p95 = write_time_hist.value_at_quantile(0.95),
+                            p99 = write_time_hist.value_at_quantile(0.99),
+                            max = write_time_hist.max(),
                             cnt = write_time_hist.len(),
                             thread = ?laddr,
                             "shenango write time (ns)",
@@ -196,9 +222,24 @@ impl NewConn {
                             p50 = queue_time_hist.value_at_quantile(0.5),
                             p75 = queue_time_hist.value_at_quantile(0.75),
                             p95 = queue_time_hist.value_at_quantile(0.95),
+                            p99 = queue_time_hist.value_at_quantile(0.99),
+                            max = queue_time_hist.max(),
                             cnt = queue_time_hist.len(),
                             thread = ?laddr,
                             "shenango queue time (us)",
+                        );
+                        debug!(
+                            p5 =  inter_deq_time_hist.value_at_quantile(0.05),
+                            p25 = inter_deq_time_hist.value_at_quantile(0.25),
+                            p50 = inter_deq_time_hist.value_at_quantile(0.5),
+                            p75 = inter_deq_time_hist.value_at_quantile(0.75),
+                            p95 = inter_deq_time_hist.value_at_quantile(0.95),
+                            p99 = inter_deq_time_hist.value_at_quantile(0.99),
+                            p999 = inter_deq_time_hist.value_at_quantile(0.999),
+                            max = inter_deq_time_hist.max(),
+                            cnt = inter_deq_time_hist.len(),
+                            thread = ?laddr,
+                            "shenango inter-deq time (ns)",
                         );
                         break;
                     }
@@ -256,7 +297,7 @@ impl ShenangoUdpSkChunnel {
 
     fn make_listen(&self, a: SocketAddrV4) -> Result<ShenangoUdpSk, Report> {
         let (incoming_s, incoming_r) = mpsc::unbounded_channel();
-        let (outgoing_s, outgoing_r) = channel::unbounded();
+        let (outgoing_s, outgoing_r) = mpsc_channel::new_mpsc_queue_pair_with_size(32);
         self.events.send(NewConn::Listen {
             addr: a,
             cn: NewShenangoSk {
@@ -269,7 +310,7 @@ impl ShenangoUdpSkChunnel {
 
     fn make_dial(&self) -> Result<ShenangoUdpSk, Report> {
         let (incoming_s, incoming_r) = mpsc::unbounded_channel();
-        let (outgoing_s, outgoing_r) = channel::unbounded();
+        let (outgoing_s, outgoing_r) = mpsc_channel::new_mpsc_queue_pair_with_size(32);
         self.events.send(NewConn::Dial(NewShenangoSk {
             incoming: incoming_s,
             outgoing: outgoing_r,
@@ -318,9 +359,9 @@ impl ChunnelConnector for ShenangoUdpSkChunnel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ShenangoUdpSk {
-    outgoing: channel::Sender<(SocketAddrV4, Vec<u8>)>,
+    outgoing: mpsc_channel::Sender<(SocketAddrV4, Vec<u8>)>,
     incoming: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddrV4, Vec<u8>)>>>,
     outgoing_len_hist: Arc<StdMutex<hdrhistogram::Histogram<u32>>>,
 }
@@ -335,7 +376,7 @@ impl Drop for ShenangoUdpSk {
             p75 = hist.value_at_quantile(0.75),
             p95 = hist.value_at_quantile(0.95),
             cnt = hist.len(),
-            "shenango queue len (us)",
+            "bertha queue time (us)",
         );
     }
 }
@@ -343,13 +384,13 @@ impl Drop for ShenangoUdpSk {
 impl ShenangoUdpSk {
     fn new(
         inc: mpsc::UnboundedReceiver<(SocketAddrV4, Vec<u8>)>,
-        out: channel::Sender<(SocketAddrV4, Vec<u8>)>,
+        out: mpsc_channel::Sender<(SocketAddrV4, Vec<u8>)>,
     ) -> Self {
         Self {
             incoming: Arc::new(Mutex::new(inc)),
             outgoing: out,
             outgoing_len_hist: Arc::new(StdMutex::new(
-                hdrhistogram::Histogram::<u32>::new_with_max(10000, 3).unwrap(),
+                hdrhistogram::Histogram::<u32>::new_with_max(40000, 2).unwrap(),
             )),
         }
     }
@@ -365,11 +406,18 @@ impl ChunnelConnection for ShenangoUdpSk {
         use SocketAddr::*;
         match data {
             (V4(addr), d) => {
+                let clock = quanta::Clock::new();
+                let msg_id = u64::from_le_bytes(d[0..8].try_into().unwrap());
+
+                // msg id is secretly the msg creation time
                 self.outgoing_len_hist
                     .lock()
                     .unwrap()
-                    .saturating_record(self.outgoing.len() as _);
-                self.outgoing.send((addr, d)).expect("shenango won't drop");
+                    .saturating_record(clock.delta(msg_id, clock.end()).as_micros() as _);
+
+                // TODO careful, this can block
+                self.outgoing.enqueue_wait((addr, d));
+
                 Box::pin(futures_util::future::ready(Ok(())))
             }
             (V6(a), _) => Box::pin(futures_util::future::ready(Err(eyre!(
@@ -416,7 +464,7 @@ impl ChunnelListener for ShenangoUdpReqChunnel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
     pending_ctr: Arc<AtomicUsize>,

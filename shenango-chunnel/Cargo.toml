@@ -11,6 +11,7 @@ tracing-futures = "0.2"
 color-eyre = "0.5"
 shenango = { path = "../../caladan/bindings/rust" }
 crossbeam = "0.8"
+mpsc-channel = { path = "../../mpsc-channel" }
 futures-util = "0.3"
 lazy_static = "1"
 tokio = { version = "0.3", features = ["sync"] }
