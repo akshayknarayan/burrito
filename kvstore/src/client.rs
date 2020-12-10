@@ -32,8 +32,7 @@ impl KvClient<NeverCn> {
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
         let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
-            .wrap(OrderedChunnelProj::default())
-            .wrap(ReliabilityProjChunnel::default())
+            .wrap(crate::reliability::KvReliabilityChunnel::default())
             .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
@@ -57,8 +56,7 @@ impl KvClient<NeverCn> {
             cl,
             ProjectLeft::from(canonical_addr),
         ))
-        .wrap(OrderedChunnelProj::default())
-        .wrap(ReliabilityProjChunnel::default())
+        .wrap(crate::reliability::KvReliabilityChunnel::default())
         .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
