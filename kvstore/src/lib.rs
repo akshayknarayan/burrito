@@ -3,6 +3,7 @@
 mod client;
 mod kv;
 mod msg;
+pub mod reliability;
 mod server;
 
 pub use client::KvClient;
