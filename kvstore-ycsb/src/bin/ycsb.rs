@@ -321,29 +321,29 @@ fn write_results(
     println!(
         "Did accesses:\
         num = {:?},\
-        elapsed = {:?},\
+        elapsed_sec = {:?},\
         remaining_inflight = {:?},\
         achieved_load_req_per_sec = {:?},\
         offered_load_req_per_sec = {:?},\
         attempted_load_req_per_sec = {:?},\
-        min = {:?},\
-        p25 = {:?},\
-        p50 = {:?},\
-        p75 = {:?},\
-        p95 = {:?},\
-        max = {:?}",
+        min_us = {:?},\
+        p25_us = {:?},\
+        p50_us = {:?},\
+        p75_us = {:?},\
+        p95_us = {:?},\
+        max_us = {:?}",
         durs.len(),
-        time,
+        time.as_secs_f64(),
         remaining_inflight,
         achieved_load_req_per_sec,
         offered_load_req_per_sec,
         attempted_load_req_per_sec,
-        durs[0],
-        quantiles[0],
-        quantiles[1],
-        quantiles[2],
-        quantiles[3],
-        durs[durs.len() - 1],
+        durs[0].as_micros(),
+        quantiles[0].as_micros(),
+        quantiles[1].as_micros(),
+        quantiles[2].as_micros(),
+        quantiles[3].as_micros(),
+        durs[durs.len() - 1].as_micros(),
     );
 
     if let Some(f) = out_file {
