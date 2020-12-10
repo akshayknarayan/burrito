@@ -128,7 +128,7 @@ pub struct Chan<Data, Side> {
     _side: std::marker::PhantomData<Side>,
 }
 
-impl Default for Chan<((), Vec<u8>), ()> {
+impl<T> Default for Chan<T, ()> {
     fn default() -> Self {
         let (s1, r1) = mpsc::channel(100);
         let (s2, r2) = mpsc::channel(100);
