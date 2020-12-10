@@ -52,9 +52,12 @@ where
     }
 
     pub async fn send_msg(&self, data: D) -> Result<(), Report> {
-        let (s, r) = oneshot::channel();
-        self.sent.insert(data.id(), r);
-        self.inflight.insert(data.id(), s);
+        if !self.sent.contains_key(&data.id()) {
+            let (s, r) = oneshot::channel();
+            self.sent.insert(data.id(), r);
+            self.inflight.insert(data.id(), s);
+        }
+
         self.inner.send(data).await
     }
 
