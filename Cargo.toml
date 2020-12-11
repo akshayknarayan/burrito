@@ -11,6 +11,7 @@ members = [
     "test-util",
     "xdp-shard",
     "echo-test",
+    "find-calls",
 ]
 
 [profile.release]
