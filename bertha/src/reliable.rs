@@ -4,8 +4,9 @@
 //! segment, the `Vec<u8>`.
 
 use crate::{
+    semantics::ConnectionSemantics,
     util::{ProjectLeft, ProjectLeftCn, Unproject},
-    ChunnelConnection, Client, Negotiate, Serve,
+    Apply, ChunnelConnection, Client, Negotiate, Serve,
 };
 use color_eyre::eyre;
 use dashmap::DashMap;
@@ -23,13 +24,33 @@ use tokio::sync::oneshot;
 use tracing::{debug, instrument, trace};
 use tracing_futures::Instrument;
 
-pub struct Reliable;
-
-impl crate::semantics::SemanticsPicker for Reliable {
-    fn pick_client(self, semantics: ConnectionSemantics) -> impl Apply {
-        ReliabilityChunnel
-    }
-}
+//pub struct Reliable;
+//
+//lazy_static::lazy_static! {
+//    pub static ref RELIABLE_SEMANTICS_REGISTRY: HashMap<
+//        ConnectionSemantics,
+//        Box<dyn Fn() -> Box<dyn Apply>>
+//    > = {
+//        let mut m = HashMap::new();
+//        // TODO this will need to be fixed, currently there's no way to pass config options to the
+//        // chunnel
+//        m.insert(ConnectionSemantics::Generic, Box::new(|| Box::new(ReliabilityProjChunnel::default())));
+//        m
+//    };
+//}
+//
+//impl crate::semantics::SemanticsPicker for Reliable {
+//    fn pick_client(self, semantics: ConnectionSemantics) -> impl Apply {
+//        if let Some(f) = RELIABLE_SEMANTICS_REGISTRY.get(&semantics) {
+//            f()
+//        } else {
+//            let f = RELIABLE_SEMANTICS_REGISTRY
+//                .get(&ConnectionSemantics::Generic)
+//                .unwrap();
+//            f()
+//        }
+//    }
+//}
 
 #[derive(Clone, Debug)]
 pub struct ReliabilityChunnel {
