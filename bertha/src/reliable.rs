@@ -38,9 +38,6 @@ impl Default for ReliabilityChunnel {
 
 impl Negotiate for ReliabilityChunnel {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl ReliabilityChunnel {
