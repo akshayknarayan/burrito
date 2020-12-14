@@ -6,7 +6,7 @@ edition = "2018"
 
 [dependencies]
 tokio = { version = "0.3", features = ["rt", "sync", "time", "macros", "stream", "net"] }
-color-eyre = "0.5"
+color-eyre = "=0.5.7"
 futures-util = "0.3"
 tracing = { version = "0.1" }
 tracing-futures = "0.2"

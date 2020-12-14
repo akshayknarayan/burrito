@@ -1224,7 +1224,7 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                let (mut srv, mut cln) = Chan::default().split();
+                let (mut srv, mut cln) = Chan::<(_, Vec<u8>), _>::default().split();
                 let stack = CxList::from(ChunnelA)
                     .wrap(Select(ChunnelB, ChunnelBAlt))
                     .wrap(ChunnelC);
