@@ -28,11 +28,11 @@ pub struct KvReliabilityChunnel {
     timeout: Duration,
 }
 
-//lazy_static::lazy_static! {
-//    static ref _REGISTER: () = {
-//        bertha::reliable::RELIABLE_SEMANTICS_REGISTRY.insert(bertha::semantics::RequestResponse, Box::new(|| KvReliabilityChunnel::default()));
-//    };
-//}
+lazy_static::lazy_static! {
+    static ref _REGISTER: () = {
+        bertha::reliable::RELIABLE_SEMANTICS_REGISTRY.insert(bertha::semantics::ConnectionSemantics::RequestResponse, Box::new(|| KvReliabilityChunnel::default()));
+    };
+}
 
 impl Negotiate for KvReliabilityChunnel {
     type Capability = ();
