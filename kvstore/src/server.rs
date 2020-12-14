@@ -105,7 +105,7 @@ async fn serve_canonical(
 
     let external = CxList::from(cnsrv)
         .wrap(OrderedChunnelProj::default())
-        .wrap(ReliabilityProjChunnel::<_, Msg>::default())
+        .wrap(ReliabilityProjChunnel::default())
         .wrap(SerializeChunnelProject::default());
     info!(shard_info = ?&si, "start canonical server");
     let st = bertha::negotiate::negotiate_server(external, st)
@@ -120,7 +120,8 @@ async fn serve_canonical(
     st.try_for_each_concurrent(None, |r| {
         async move {
             loop {
-                r.recv()
+                let _: Option<(_, Msg)> = r
+                    .recv()
                     .instrument(debug_span!("shard-canonical-server-connection"))
                     .await?; // ShardCanonicalServerConnection is recv-only
             }

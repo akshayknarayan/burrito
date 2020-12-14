@@ -376,7 +376,9 @@ where
     S: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    type Data = ();
+    /// This Option<D> is entirely unnecessary and will always be `None`, it only exists for type
+    /// hinting.
+    type Data = Option<D>;
 
     fn recv(
         &self,
@@ -414,7 +416,7 @@ where
                 trace!(shard_idx, "got shard response");
                 inner.send(resp).await?;
 
-                Ok(())
+                Ok(None)
             }
             .instrument(tracing::trace_span!("server-shard-recv")),
         )
@@ -424,7 +426,8 @@ where
         &self,
         _data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-        unimplemented!()
+        warn!("Called ShardCanonicalServerConnection.send(), a useless function");
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -872,7 +875,7 @@ mod test {
         // ShardCanonicalServer: Msg -> ()
         let external = CxList::from(cnsrv)
             .wrap(TaggerProjChunnel)
-            .wrap(ReliabilityProjChunnel::<_, Msg>::default())
+            .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default());
         info!(shard_info = ?&si, "start canonical server");
         let st = UdpReqChunnel::default()
@@ -890,7 +893,7 @@ mod test {
                     .try_for_each_concurrent(None, |r| {
                         async move {
                             loop {
-                                r.recv().await?; // ShardCanonicalServerConnection is recv-only
+                                let _: Option<(_, Msg)> = r.recv().await?; // ShardCanonicalServerConnection is recv-only
                             }
                         }
                     })
