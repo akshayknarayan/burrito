@@ -2,6 +2,7 @@
 //! output type.
 
 use super::{ChunnelConnection, Client, Serve};
+use crate::negotiate::Apply;
 use color_eyre::eyre::Report;
 use futures_util::{
     future::FutureExt,

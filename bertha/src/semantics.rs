@@ -8,50 +8,28 @@ use color_eyre::eyre::{self, Report};
 /// set of Chunnel semantics. These semantics specify how the connection object will be used
 /// locally.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub enum ConnectionSemantics<A1, A2> {
+pub enum ConnectionSemantics {
     /// No specification.
-    Generic(Option<A1>),
+    Generic,
     /// For each call to `send()`, there will be a single corresponding subsequent call to
     /// `recv()`.
-    RequestResponse(Option<A2>),
+    RequestResponse,
 }
 
-impl<A1, A2> Apply for ConnectionSemantics<A1, A2>
-where
-    A1: Apply,
-    A2: Apply,
-{
-    type Applied = Either<A1::Applied, A2::Applied>;
-    fn apply(self, offers: Vec<Offer>) -> Result<(Self::Applied, Option<Vec<Offer>>), Report> {
-        use ConnectionSemantics::*;
-        Ok(match self {
-            Generic(Some(a)) => {
-                let (e, o) = a.apply(offers)?;
-                (Either::Left(e), o)
-            }
-            RequestResponse(Some(a)) => {
-                let (e, o) = a.apply(offers)?;
-                (Either::Right(e), o)
-            }
-            _ => {
-                eyre::bail!("Semantics is not populated but apply was called");
-            }
-        })
-    }
-}
-
-pub trait SemanticsPicker<A1, A2> {
+pub trait SemanticsPicker {
+    // Return value should impl Apply, but we can't express this since we don't know what Applied
+    // should be.
     // TODO this will need to be fixed, currently there's no way to pass config options to the
     // picked chunnel
-    fn pick_client(self, semantics: ConnectionSemantics<A1, A2>) -> ConnectionSemantics<A1, A2>;
+    fn pick_client(self, semantics: ConnectionSemantics) -> Box<dyn std::any::Any>;
 }
 
-impl<A1, A2> SemanticsPicker<A1, A2> for A1
+impl<A> SemanticsPicker for A
 where
-    A1: Apply,
+    A: Apply + 'static,
 {
-    fn pick_client(self, semantics: ConnectionSemantics<A1, A2>) -> ConnectionSemantics<A1, A2> {
-        ConnectionSemantics::Generic(Some(self))
+    fn pick_client(self, _semantics: ConnectionSemantics) -> Box<dyn std::any::Any> {
+        Box::new(self) as _
     }
 }
 
@@ -60,7 +38,7 @@ where
 //    H: SemanticsPicker,
 //    T: SemanticsPicker,
 //{
-//    fn pick_client(self, semantics: ConnectionSemantics) -> Box<dyn Apply> {
+//    fn pick_client(self, semantics: ConnectionSemantics) -> Box<dyn std::any::Any> {
 //        CxList {
 //            head: self.head.pick_client(semantics),
 //            tail: self.tail.pick_client(semantics),

@@ -24,33 +24,35 @@ use tokio::sync::oneshot;
 use tracing::{debug, instrument, trace};
 use tracing_futures::Instrument;
 
-//pub struct Reliable;
-//
-//lazy_static::lazy_static! {
-//    pub static ref RELIABLE_SEMANTICS_REGISTRY: HashMap<
-//        ConnectionSemantics,
-//        Box<dyn Fn() -> Box<dyn Apply>>
-//    > = {
-//        let mut m = HashMap::new();
-//        // TODO this will need to be fixed, currently there's no way to pass config options to the
-//        // chunnel
-//        m.insert(ConnectionSemantics::Generic, Box::new(|| Box::new(ReliabilityProjChunnel::default())));
-//        m
-//    };
-//}
-//
-//impl crate::semantics::SemanticsPicker for Reliable {
-//    fn pick_client(self, semantics: ConnectionSemantics) -> impl Apply {
-//        if let Some(f) = RELIABLE_SEMANTICS_REGISTRY.get(&semantics) {
-//            f()
-//        } else {
-//            let f = RELIABLE_SEMANTICS_REGISTRY
-//                .get(&ConnectionSemantics::Generic)
-//                .unwrap();
-//            f()
-//        }
-//    }
-//}
+pub struct Reliable;
+
+lazy_static::lazy_static! {
+    pub static ref RELIABLE_SEMANTICS_REGISTRY: HashMap<
+        ConnectionSemantics,
+        Box<dyn std::any::Any + Send + Sync>,
+    > = {
+        let mut m = HashMap::new();
+        // TODO this will need to be fixed, currently there's no way to pass config options to the
+        // chunnel
+        m.insert(ConnectionSemantics::Generic, Box::new(ReliabilityProjChunnel::default()) as _);
+        m
+    };
+}
+
+impl crate::semantics::SemanticsPicker for Reliable {
+    fn pick_client(self, semantics: ConnectionSemantics) -> Box<dyn std::any::Any> {
+        if let Some(f) = RELIABLE_SEMANTICS_REGISTRY.get(&semantics) {
+            Box::new(f.clone())
+        } else {
+            Box::new(
+                RELIABLE_SEMANTICS_REGISTRY
+                    .get(&ConnectionSemantics::Generic)
+                    .unwrap()
+                    .clone(),
+            )
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ReliabilityChunnel {
