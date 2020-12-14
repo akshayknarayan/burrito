@@ -24,11 +24,11 @@ use tracing::{debug, instrument, trace};
 use tracing_futures::Instrument;
 
 #[derive(Clone, Debug)]
-pub struct ReliabilityChunnel<D> {
-    inner: ReliabilityProjChunnel<(), D>,
+pub struct ReliabilityChunnel {
+    inner: ReliabilityProjChunnel,
 }
 
-impl<D> Default for ReliabilityChunnel<D> {
+impl Default for ReliabilityChunnel {
     fn default() -> Self {
         Self {
             inner: Default::default(),
@@ -36,21 +36,21 @@ impl<D> Default for ReliabilityChunnel<D> {
     }
 }
 
-impl<D> Negotiate for ReliabilityChunnel<D> {
+impl Negotiate for ReliabilityChunnel {
     type Capability = ();
     fn capabilities() -> Vec<Self::Capability> {
         vec![]
     }
 }
 
-impl<D> ReliabilityChunnel<D> {
+impl ReliabilityChunnel {
     pub fn set_timeout_factor(&mut self, to: usize) -> &mut Self {
         self.inner.timeout = to;
         self
     }
 }
 
-impl<InS, InC, InE, D> Serve<InS> for ReliabilityChunnel<D>
+impl<InS, InC, InE, D> Serve<InS> for ReliabilityChunnel
 where
     InS: Stream<Item = Result<InC, InE>> + Send + 'static,
     InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
@@ -72,7 +72,7 @@ where
     }
 }
 
-impl<InC, D> Client<InC> for ReliabilityChunnel<D>
+impl<InC, D> Client<InC> for ReliabilityChunnel
 where
     InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
@@ -89,35 +89,31 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub struct ReliabilityProjChunnel<A, D> {
+pub struct ReliabilityProjChunnel {
     timeout: usize,
-    _data: std::marker::PhantomData<(A, D)>,
 }
 
-impl<A, D> Negotiate for ReliabilityProjChunnel<A, D> {
+impl Negotiate for ReliabilityProjChunnel {
     type Capability = ();
     fn capabilities() -> Vec<Self::Capability> {
         vec![]
     }
 }
 
-impl<A, D> Default for ReliabilityProjChunnel<A, D> {
+impl Default for ReliabilityProjChunnel {
     fn default() -> Self {
-        ReliabilityProjChunnel {
-            timeout: 5,
-            _data: Default::default(),
-        }
+        ReliabilityProjChunnel { timeout: 5 }
     }
 }
 
-impl<A, D> ReliabilityProjChunnel<A, D> {
+impl ReliabilityProjChunnel {
     pub fn set_timeout_factor(&mut self, to: usize) -> &mut Self {
         self.timeout = to;
         self
     }
 }
 
-impl<A, InS, InC, InE, D> Serve<InS> for ReliabilityProjChunnel<A, D>
+impl<A, InS, InC, InE, D> Serve<InS> for ReliabilityProjChunnel
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
     InS: Stream<Item = Result<InC, InE>> + Send + 'static,
@@ -143,7 +139,7 @@ where
     }
 }
 
-impl<A, InC, D> Client<InC> for ReliabilityProjChunnel<A, D>
+impl<A, InC, D> Client<InC> for ReliabilityProjChunnel
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
     InC: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
