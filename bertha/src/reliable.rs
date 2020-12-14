@@ -23,6 +23,14 @@ use tokio::sync::oneshot;
 use tracing::{debug, instrument, trace};
 use tracing_futures::Instrument;
 
+pub struct Reliable;
+
+impl crate::semantics::SemanticsPicker for Reliable {
+    fn pick_client(self, semantics: ConnectionSemantics) -> impl Apply {
+        ReliabilityChunnel
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReliabilityChunnel {
     inner: ReliabilityProjChunnel,
@@ -38,9 +46,6 @@ impl Default for ReliabilityChunnel {
 
 impl Negotiate for ReliabilityChunnel {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl ReliabilityChunnel {

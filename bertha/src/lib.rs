@@ -15,6 +15,7 @@ pub mod either;
 pub mod negotiate;
 pub mod reliable;
 pub mod select;
+pub mod semantics;
 pub mod tagger;
 pub mod udp;
 pub mod uds;
