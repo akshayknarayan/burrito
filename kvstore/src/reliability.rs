@@ -30,7 +30,7 @@ pub struct KvReliabilityChunnel {
 
 lazy_static::lazy_static! {
     static ref _REGISTER: () = {
-        bertha::reliable::RELIABLE_SEMANTICS_REGISTRY.insert(bertha::semantics::ConnectionSemantics::RequestResponse, Box::new(|| KvReliabilityChunnel::default()));
+        bertha::reliable::RELIABLE_SEMANTICS_REGISTRY.lock().unwrap().insert(bertha::semantics::ConnectionSemantics::RequestResponse, Box::new(|| KvReliabilityChunnel::default()));
     };
 }
 
