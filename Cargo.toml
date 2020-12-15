@@ -2,6 +2,7 @@
 
 members = [
     "bertha",
+    "bertha-attr",
     "burrito-shard-ctl",
     "burrito-util",
     "kvstore",
