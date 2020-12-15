@@ -11,6 +11,7 @@ use-shenango = ["shenango-chunnel"]
 
 [dependencies]
 bertha = { path = "../bertha" }
+bertha-attr = { path = "../bertha-attr" }
 burrito-shard-ctl = { path = "../burrito-shard-ctl" }
 color-eyre = "0.5"
 futures-util = "0.3"

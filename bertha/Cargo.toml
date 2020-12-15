@@ -5,6 +5,7 @@ authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
 [dependencies]
+bertha-attr = { path = "../bertha-attr" }
 tokio = { version = "0.3", features = ["rt", "sync", "time", "macros", "stream", "net"] }
 color-eyre = "=0.5.7"
 futures-util = "0.3"

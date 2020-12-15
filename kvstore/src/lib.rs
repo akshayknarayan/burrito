@@ -1,9 +1,11 @@
 //! Chunnel-enabled key-value protocol, server, and client.
 
+// This must be before `client` for the semantics-picker macro to work.
+pub mod reliability;
+
 mod client;
 mod kv;
 mod msg;
-pub mod reliability;
 mod server;
 
 pub use client::KvClient;

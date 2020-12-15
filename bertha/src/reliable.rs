@@ -23,6 +23,11 @@ use tokio::sync::oneshot;
 use tracing::{debug, instrument, trace};
 use tracing_futures::Instrument;
 
+#[bertha_attr::chunnel_semantics((
+    Reliability,
+    Generic,
+    CxList(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default())
+))]
 #[derive(Clone, Debug)]
 pub struct ReliabilityProjChunnel {
     timeout: usize,

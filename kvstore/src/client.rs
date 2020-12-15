@@ -25,21 +25,13 @@ impl<C: ChunnelConnection> Clone for KvClient<C> {
     }
 }
 
-macro_rules! reliability_semantics {
-    (Generic) => {{
-        CxList(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default())
-    }};
-    (RequestResponse) => {{
-        crate::reliability::KvReliabilityChunnel::default()
-    }};
-}
-
 impl KvClient<NeverCn> {
     pub async fn new_basicclient(
         raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
+
         let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
             .wrap(OrderedChunnelProj::default())
             .wrap(ReliabilityProjChunnel::default())
@@ -62,11 +54,14 @@ impl KvClient<NeverCn> {
 
         let cl = ClientShardChunnelClient::new(canonical_addr, &redis_addr).await?;
 
+        // The picked semantics will in this case give us an impl starting with `kvstore::`, which
+        // is the current crate. This is necessary for that to work.
+        extern crate self as kvstore;
         let neg_stack = CxList::from(bertha::negotiate::Select(
             cl,
             ProjectLeft::from(canonical_addr),
         ))
-        .wrap(reliability_semantics!(RequestResponse))
+        .wrap(bertha_attr::pick_semantics!((Reliability, RequestResponse)))
         .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
