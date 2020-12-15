@@ -6,5 +6,5 @@ edition = "2018"
 
 [dependencies]
 eyre = "0.6"
-redis = "0.15"
+redis = "0.18"
 tracing = "0.1"

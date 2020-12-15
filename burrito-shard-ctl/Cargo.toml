@@ -4,8 +4,6 @@ version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [features]
 default = []
 ebpf = ["xdp-shard/ebpf"]
@@ -20,10 +18,7 @@ tracing-futures = "0.2"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "0.3", features = ["sync", "time"] }
-# Waiting for
-# - https://github.com/mitsuhiko/redis-rs/pull/405
-tokio-compat-02 = "0.1"
-redis = { version = "0.17" }
+redis = { version = "0.18", default-features = false, features = ["aio", "tokio-comp"] }
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
