@@ -10,6 +10,7 @@ pub fn find_calls(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     match item {
         syn::Item::Fn(item) => {
+            eprintln!("fn name: {:?}", item.sig.ident);
             for stmt in item.block.stmts {
                 match stmt {
                     syn::Stmt::Semi(expr, _) | syn::Stmt::Expr(expr) => {
@@ -32,6 +33,9 @@ pub fn find_calls(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => (),
                 }
             }
+        }
+        syn::Item::Struct(item) => {
+            eprintln!("struct: {:?}", item);
         }
         _ => {
             eprintln!("wrong item type");
