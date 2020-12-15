@@ -25,6 +25,15 @@ impl<C: ChunnelConnection> Clone for KvClient<C> {
     }
 }
 
+macro_rules! reliability_semantics {
+    (Generic) => {{
+        CxList(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default())
+    }};
+    (RequestResponse) => {{
+        crate::reliability::KvReliabilityChunnel::default()
+    }};
+}
+
 impl KvClient<NeverCn> {
     pub async fn new_basicclient(
         raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
@@ -57,8 +66,7 @@ impl KvClient<NeverCn> {
             cl,
             ProjectLeft::from(canonical_addr),
         ))
-        .wrap(OrderedChunnelProj::default())
-        .wrap(ReliabilityProjChunnel::default())
+        .wrap(reliability_semantics!(RequestResponse))
         .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
