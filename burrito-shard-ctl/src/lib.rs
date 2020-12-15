@@ -653,9 +653,9 @@ mod test {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
-    struct Msg {
-        k: String,
-        v: String,
+    pub(crate) struct Msg {
+        pub(crate) k: String,
+        pub(crate) v: String,
     }
 
     impl super::Kv for Msg {
@@ -669,7 +669,7 @@ mod test {
         }
     }
 
-    async fn start_shard(
+    pub(crate) async fn start_shard(
         addr: SocketAddr,
         internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
         s: tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>,

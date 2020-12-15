@@ -1,8 +1,7 @@
-use super::eyre::Error;
+use super::eyre::Report;
 use super::ShardCanonicalServer;
 use crate::ShardInfo;
-use bertha::{ChunnelConnection, IpPort, Negotiate, Serve};
-use futures_util::stream::Stream;
+use bertha::{negotiate::Offer, Chunnel, ChunnelConnection, IpPort, Negotiate};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -17,27 +16,33 @@ use tracing_futures::Instrument;
 /// evaluating the sharding function. Also registers with shard-ctl, which will perform other setup
 /// (loading XDP program, answering client queries, etc).
 #[derive(Clone)]
-pub struct ShardCanonicalServerEbpf<A, S, Ss, C> {
-    inner: ShardCanonicalServer<A, S, Ss, C>,
+pub struct ShardCanonicalServerEbpf<A, S, Ss> {
+    inner: ShardCanonicalServer<A, S, Ss>,
     handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
 }
 
-impl<A, S, Ss, C> ShardCanonicalServerEbpf<A, S, Ss, C> {
+impl<A: std::fmt::Debug, S, Ss> std::fmt::Debug for ShardCanonicalServerEbpf<A, S, Ss> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardCanonicalServerEbpf")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl<A, S, Ss> ShardCanonicalServerEbpf<A, S, Ss> {
     /// Inner is a chunnel for the external connection.
     /// Shards is a chunnel for an internal connection to the shards.
     pub async fn new(
         addr: ShardInfo<A>,
         shards_inner: S,
         shards_inner_stack: Ss,
-        shards_extern: C,
-        shards_extern_nonce: Vec<Vec<bertha::negotiate::Offer>>,
+        shards_extern_nonce: HashMap<u64, Offer>,
         redis_addr: &str,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Report> {
         let inner = ShardCanonicalServer::new(
             addr,
             shards_inner,
             shards_inner_stack,
-            shards_extern,
             shards_extern_nonce,
             redis_addr,
         )
@@ -61,15 +66,19 @@ impl<A, S, Ss, C> ShardCanonicalServerEbpf<A, S, Ss, C> {
     }
 }
 
-impl<A, S, Ss, C, Cap> Negotiate for ShardCanonicalServerEbpf<A, S, Ss, C>
+impl<A, S, Ss, Cap> Negotiate for ShardCanonicalServerEbpf<A, S, Ss>
 where
     Cap: bertha::negotiate::CapabilitySet,
-    ShardCanonicalServer<A, S, Ss, C>: Negotiate<Capability = Cap>,
+    ShardCanonicalServer<A, S, Ss>: Negotiate<Capability = Cap>,
 {
     type Capability = Cap;
 
+    fn guid() -> u64 {
+        0xe91d00534cb2b99f
+    }
+
     fn capabilities() -> Vec<Cap> {
-        ShardCanonicalServer::<A, S, Ss, C>::capabilities()
+        ShardCanonicalServer::<A, S, Ss>::capabilities()
     }
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
@@ -77,26 +86,20 @@ where
     }
 }
 
-impl<I, A, S, Ss, C, Ic, Ie> Serve<I> for ShardCanonicalServerEbpf<A, S, Ss, C>
+impl<I, A, S, Ss, Ic, Ie> Chunnel<I> for ShardCanonicalServerEbpf<A, S, Ss>
 where
     A: Clone + IpPort + Sync + Send + 'static,
-    ShardCanonicalServer<A, S, Ss, C>: Serve<
-        I,
-        Connection = Ic,
-        Error = Ie,
-        Stream = Pin<Box<dyn Stream<Item = Result<Ic, Ie>> + Send + 'static>>,
-    >,
+    ShardCanonicalServer<A, S, Ss>: Chunnel<I, Connection = Ic, Error = Ie>,
     Ic: ChunnelConnection + Send + 'static,
     Ie: Send + Sync + 'static,
 {
     type Connection = Ic;
     type Error = Ie;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
-    fn serve(&mut self, inner: I) -> Self::Future {
-        let fut = self.inner.serve(inner);
+    fn connect_wrap(&mut self, inner: I) -> Self::Future {
+        let fut = self.inner.connect_wrap(inner);
         let addr = self.inner.addr.clone();
         let handles = Arc::clone(&self.handles);
         Box::pin(async move {
@@ -185,7 +188,7 @@ pub(crate) async fn register_shardinfo<A: IpPort + Clone>(
 pub(crate) async fn read_shard_stats(
     handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
     mut stats_log: Option<std::fs::File>,
-) -> Result<(), Error> {
+) -> Result<(), Report> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut first = true;
     let start = std::time::Instant::now();
@@ -246,33 +249,30 @@ pub(crate) async fn read_shard_stats(
 }
 
 #[cfg(test)]
-mod t {
-    use super::{ClientShardChunnelClient, Kv, ShardCanonicalServer, ShardInfo};
+mod test {
+    use super::ShardCanonicalServerEbpf;
     use crate::test::{start_shard, Msg};
+    use crate::{ClientShardChunnelClient, Kv, ShardCanonicalServer, ShardInfo};
     use bertha::{
         bincode::SerializeChunnelProject,
         chan_transport::RendezvousChannel,
+        negotiate::{Offer, Select},
         reliable::ReliabilityProjChunnel,
-        select::SelectListener,
         tagger::TaggerProjChunnel,
         udp::{UdpReqChunnel, UdpSkChunnel},
         util::{Nothing, ProjectLeft},
         ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     };
-    use color_eyre::eyre;
-    use eyre::{eyre, WrapErr};
     use futures_util::TryStreamExt;
-    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
     use std::net::SocketAddr;
-    use tracing::{debug, debug_span, info, warn};
+    use tracing::{debug_span, info, warn};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[test]
-    fn shard_negotiate_bothsides() {
-        use super::ebpf::ShardCanonicalServerEbpf;
-
+    fn shard_negotiate_ebpf() {
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -281,126 +281,28 @@ mod t {
         color_eyre::install().unwrap_or_else(|_| ());
 
         // 0. Make rt.
-        let mut rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         rt.block_on(
             async move {
-                // 1. start redis.
-                let redis_port = 42215;
-                let redis_addr = format!("redis://127.0.0.1:{}", redis_port);
-                info!(port = ?redis_port, "start redis");
-                let redis_h = test_util::start_redis(redis_port);
-
-                // 2. Define addr.
-                let si: ShardInfo<SocketAddr> = ShardInfo {
-                    canonical_addr: "127.0.0.1:41471".parse().unwrap(),
-                    shard_addrs: vec![
-                        "127.0.0.1:41472".parse().unwrap(),
-                        "127.0.0.1:41473".parse().unwrap(),
-                    ],
-                    shard_info: super::SimpleShardPolicy {
-                        packet_data_offset: 18,
-                        packet_data_length: 4,
-                    },
-                };
-
-                // 3. start shard serv
-                let (internal_srv, internal_cli) =
-                    RendezvousChannel::<SocketAddr, Vec<u8>, _>::new(100).split();
-
-                let rdy = futures_util::stream::FuturesUnordered::new();
-                for a in si.clone().shard_addrs {
-                    info!(addr = ?&a, "start shard");
-                    let (s, r) = tokio::sync::oneshot::channel();
-                    let int_srv = internal_srv.clone();
-                    tokio::spawn(
-                        start_shard(a, int_srv, s)
-                            .instrument(tracing::info_span!("shard", addr = ?&a)),
-                    );
-
-                    rdy.push(r);
-                }
-
-                let offers: Vec<Vec<Vec<bertha::negotiate::Offer>>> =
-                    rdy.try_collect().await.unwrap();
-
-                // 4. start canonical server
-                let stack = CxList::from(TaggerProjChunnel)
-                    .wrap(ReliabilityProjChunnel::default())
-                    .wrap(SerializeChunnelProject::default())
-                    // to match the ProjectLeft, since we can't write down the addr at this point
-                    .wrap(bertha::util::Nothing::default());
-                let shards_extern = UdpSkChunnel.connect(()).await.unwrap();
-                let cnsrv = ShardCanonicalServer::new(
-                    si.clone(),
-                    internal_cli.clone(),
-                    stack.clone(),
-                    shards_extern,
-                    offers[0].clone(),
-                    &redis_addr,
-                )
-                .await
-                .unwrap();
-                let shards_extern = UdpSkChunnel.connect(()).await.unwrap();
-                let esrv = ShardCanonicalServerEbpf::new(
-                    si.clone(),
-                    internal_cli.clone(),
-                    stack.clone(),
-                    shards_extern,
-                    offers[0].clone(),
-                    &redis_addr,
-                )
-                .await
-                .unwrap();
-                let external = CxList::from(bertha::negotiate::Select(cnsrv, esrv))
-                    .wrap(TaggerProjChunnel)
-                    .wrap(ReliabilityProjChunnel::<_, Msg>::default())
-                    .wrap(SerializeChunnelProject::<_, (u32, Option<Msg>)>::default());
-                info!(shard_info = ?&si, "start canonical server");
-                let raw_st = UdpReqChunnel::default()
-                    .listen(si.canonical_addr)
-                    .await
-                    .unwrap();
-                let st = bertha::negotiate::negotiate_server(external, raw_st)
-                    .instrument(tracing::info_span!("negotiate_server"))
-                    .await
-                    .unwrap();
-
-                tokio::spawn(
-                    async move {
-                        st.try_for_each_concurrent(None, |r| async move {
-                            r.recv().await?;
-                            Ok(())
-                        })
-                        .instrument(tracing::info_span!("negotiate_server"))
-                        .await
-                        .unwrap()
-                    }
-                    .instrument(tracing::info_span!("canonicalsrv", addr = ?&si.canonical_addr)),
-                );
-
-                // 5. make client
-                info!("make client");
+                let (redis_h, canonical_addr) = shard_setup_ebpf(45215, 41421).await;
                 let redis_addr = redis_h.get_addr();
 
-                let cl = ClientShardChunnelClient::new(si.canonical_addr, &redis_addr)
-                    .await
-                    .unwrap();
+                info!("make client");
 
-                let udp_addr = si.canonical_addr;
-                let neg_stack =
-                    CxList::from(bertha::negotiate::Select(cl, ProjectLeft::from(udp_addr)))
-                        .wrap(TaggerProjChunnel)
-                        .wrap(ReliabilityProjChunnel::default())
-                        .wrap(SerializeChunnelProject::default());
+                let udp_addr = canonical_addr;
+                let neg_stack = CxList::from(TaggerProjChunnel)
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default());
 
                 let raw_cn = UdpSkChunnel::default().connect(()).await.unwrap();
                 let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, udp_addr)
                     .await
                     .unwrap();
+                let cn = ProjectLeft::new(udp_addr, cn);
 
                 // 6. issue a request
                 info!("send request");
@@ -413,11 +315,92 @@ mod t {
 
                 info!("await response");
                 let m = cn.recv().await.unwrap();
-                use super::Kv;
                 assert_eq!(m.key(), "aaaaaaaa");
                 assert_eq!(m.val(), "bbbbbbbb");
             }
             .instrument(debug_span!("negotiate_bothsides")),
         );
+    }
+
+    async fn shard_setup_ebpf(redis_port: u16, srv_port: u16) -> (test_util::Redis, SocketAddr) {
+        // 1. start redis.
+        let redis_addr = format!("redis://127.0.0.1:{}", redis_port);
+        info!(port = ?redis_port, "start redis");
+        let redis_guard = test_util::start_redis(redis_port);
+
+        let shard1_port = srv_port + 1;
+        let shard2_port = srv_port + 2;
+        // 2. Define addr.
+        let si: ShardInfo<SocketAddr> = ShardInfo {
+            canonical_addr: format!("127.0.0.1:{}", srv_port).parse().unwrap(),
+            shard_addrs: vec![
+                format!("127.0.0.1:{}", shard1_port).parse().unwrap(),
+                format!("127.0.0.1:{}", shard2_port).parse().unwrap(),
+            ],
+            shard_info: crate::SimpleShardPolicy {
+                packet_data_offset: 18,
+                packet_data_length: 4,
+            },
+        };
+
+        // 3. start shard serv
+        let (internal_srv, internal_cli) =
+            RendezvousChannel::<SocketAddr, Vec<u8>, _>::new(100).split();
+        let rdy = futures_util::stream::FuturesUnordered::new();
+        for a in si.clone().shard_addrs {
+            info!(addr = ?&a, "start shard");
+            let (s, r) = tokio::sync::oneshot::channel();
+            let int_srv = internal_srv.clone();
+            tokio::spawn(
+                start_shard(a, int_srv, s).instrument(debug_span!("shardsrv", addr = ?&a)),
+            );
+            rdy.push(r);
+        }
+
+        let mut offers: Vec<Vec<HashMap<u64, Offer>>> = rdy.try_collect().await.unwrap();
+
+        let stack = CxList::from(TaggerProjChunnel)
+            .wrap(ReliabilityProjChunnel::default())
+            .wrap(SerializeChunnelProject::default());
+        let offer = offers.pop().unwrap().pop().unwrap();
+        let esrv =
+            ShardCanonicalServerEbpf::new(si.clone(), internal_cli, stack, offer, &redis_addr)
+                .await
+                .unwrap();
+        let external = CxList::from(esrv)
+            .wrap(TaggerProjChunnel)
+            .wrap(ReliabilityProjChunnel::default())
+            .wrap(SerializeChunnelProject::default());
+        info!(shard_info = ?&si, "start canonical server");
+        let st = UdpReqChunnel::default()
+            .listen(si.canonical_addr)
+            .await
+            .unwrap();
+        let st = bertha::negotiate::negotiate_server(external, st)
+            .instrument(tracing::info_span!("negotiate_server"))
+            .await
+            .unwrap();
+
+        tokio::spawn(
+            async move {
+                if let Err(e) = st
+                    .try_for_each_concurrent(None, |r| {
+                        async move {
+                            loop {
+                                let _: Option<(_, Msg)> = r.recv().await?; // ShardCanonicalServerConnection is recv-only
+                            }
+                        }
+                    })
+                    .instrument(tracing::info_span!("negotiate_server"))
+                    .await
+                {
+                    warn!(err = ?e, "canonical server crashed");
+                    panic!(e);
+                }
+            }
+            .instrument(tracing::info_span!("canonicalsrv", addr = ?&si.canonical_addr)),
+        );
+
+        (redis_guard, si.canonical_addr)
     }
 }
