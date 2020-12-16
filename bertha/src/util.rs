@@ -11,6 +11,7 @@ use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -180,7 +181,7 @@ impl<C> AddrSteer<C> {
 impl<A, C> AddrSteer<C>
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Clone + Send + Sync + 'static,
-    A: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + 'static,
+    A: Clone + Eq + Hash + std::fmt::Debug + Send + 'static,
 {
     pub fn steer<MkConn, Conn>(
         self,
@@ -311,9 +312,6 @@ where
     N: crate::negotiate::CapabilitySet,
 {
     type Capability = N;
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<N, D, InS, InC, InE> Serve<InS> for Nothing<N>
@@ -384,9 +382,6 @@ where
     N: crate::negotiate::CapabilitySet,
 {
     type Capability = N;
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<N, A, D, InS, InC, InE> Serve<InS> for ProjectLeft<A, N>
@@ -534,9 +529,6 @@ pub struct OptionUnwrap;
 
 impl crate::negotiate::Negotiate for OptionUnwrap {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<D, InS, InC, InE> Serve<InS> for OptionUnwrap
@@ -588,9 +580,6 @@ pub struct OptionUnwrapProj;
 
 impl crate::negotiate::Negotiate for OptionUnwrapProj {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<A, D, InS, InC, InE> Serve<InS> for OptionUnwrapProj

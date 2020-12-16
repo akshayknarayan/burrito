@@ -167,3 +167,18 @@ where
         }
     }
 }
+
+impl<A, B, I> Iterator for Either<A, B>
+where
+    A: Iterator<Item = I>,
+    B: Iterator<Item = I>,
+{
+    type Item = I;
+    fn next(&mut self) -> Option<Self::Item> {
+        use Either::*;
+        match self {
+            Left(i) => i.next(),
+            Right(i) => i.next(),
+        }
+    }
+}

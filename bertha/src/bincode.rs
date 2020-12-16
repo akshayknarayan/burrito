@@ -20,9 +20,6 @@ pub struct SerializeChunnel<D> {
 
 impl<D> Negotiate for SerializeChunnel<D> {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<D, InS, InC, InE> Serve<InS> for SerializeChunnel<D>
@@ -76,9 +73,6 @@ pub struct SerializeChunnelProject<A, D> {
 
 impl<A, D> Negotiate for SerializeChunnelProject<A, D> {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<A, D> Default for SerializeChunnelProject<A, D> {

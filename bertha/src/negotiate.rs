@@ -1,10 +1,7 @@
 //! Chunnel wrapper types to negotiate between multiple implementations.
 
 use crate::{ChunnelConnection, Client, CxList, CxNil, Either, Serve};
-use color_eyre::{
-    eyre::{eyre, Report, WrapErr},
-    Section,
-};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
     future::{select, FutureExt, Ready},
     stream::{Once, Stream, TryStreamExt},
@@ -12,6 +9,7 @@ use futures_util::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
+use std::iter::{empty, once, Chain, Empty, Once as IterOnce};
 use std::pin::Pin;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
@@ -34,20 +32,6 @@ impl CapabilitySet for () {
 
     fn guid() -> u64 {
         0
-    }
-}
-
-impl<T, U> CapabilitySet for (Vec<T>, Vec<U>)
-where
-    T: CapabilitySet + Clone,
-    U: CapabilitySet,
-{
-    fn universe() -> Vec<Self> {
-        vec![(T::universe(), U::universe())]
-    }
-
-    fn guid() -> u64 {
-        T::guid() + U::guid()
     }
 }
 
@@ -95,11 +79,11 @@ macro_rules! enumerate_enum {
 /// Expresses the ability to negotiate chunnel implementations over a set of capabilities enumerated
 /// by the `Capability` type.
 ///
-/// Read: `Negotiate` *over* `Capability`.
-///
-/// TODO Add endedness to this trait: onesided_capabilities vs bothsided_capabilities
+/// We don't care about intra-stack compatibility here, since the type system will deal with that
+/// for us. Instead, focus only on what server and client need to agree on: the set of semantics.
 pub trait Negotiate {
     type Capability: CapabilitySet;
+
     fn capabilities() -> Vec<Self::Capability> {
         vec![]
     }
@@ -115,9 +99,6 @@ pub trait Negotiate {
 
 impl Negotiate for CxNil {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<T1, T2, C> Negotiate for Either<T1, T2>
@@ -127,6 +108,7 @@ where
     C: CapabilitySet,
 {
     type Capability = C;
+
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
         match self {
             Either::Left(a) => a.picked(nonce),
@@ -172,22 +154,14 @@ where
     }
 }
 
+/// Negotiation type to choose between `T1` and `T2`.
+#[derive(Clone)]
+pub struct Select<T1, T2>(pub T1, pub T2);
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Offer {
     capability_guid: u64,
     available: Vec<u8>,
-}
-
-impl<C> From<Vec<C>> for Offer
-where
-    C: CapabilitySet + Serialize,
-{
-    fn from(f: Vec<C>) -> Self {
-        Offer {
-            capability_guid: C::guid(),
-            available: bincode::serialize(&f).unwrap(),
-        }
-    }
 }
 
 fn get_offer<T>() -> Option<Offer>
@@ -206,7 +180,8 @@ where
 }
 
 pub trait GetOffers {
-    fn offers(&self) -> Vec<Vec<Offer>>;
+    type Iter: Iterator<Item = Offer>;
+    fn offers(&self) -> Self::Iter;
 }
 
 impl<H, T> GetOffers for CxList<H, T>
@@ -214,11 +189,9 @@ where
     H: GetOffers,
     T: GetOffers,
 {
-    fn offers(&self) -> Vec<Vec<Offer>> {
-        let mut offers = self.head.offers();
-        let rest = self.tail.offers();
-        offers.extend(rest);
-        offers
+    type Iter = Chain<H::Iter, T::Iter>;
+    fn offers(&self) -> Self::Iter {
+        self.head.offers().chain(self.tail.offers())
     }
 }
 
@@ -227,22 +200,40 @@ where
     N: Negotiate,
     <N as Negotiate>::Capability: Serialize + DeserializeOwned,
 {
-    fn offers(&self) -> Vec<Vec<Offer>> {
+    type Iter = Either<IterOnce<Offer>, Empty<Offer>>;
+
+    fn offers(&self) -> Self::Iter {
         if let Some(o) = get_offer::<N>() {
-            vec![vec![o]]
+            Either::Left(once(o))
         } else {
-            Default::default()
+            Either::Right(empty())
         }
+    }
+}
+
+impl<T1, T2> GetOffers for Select<T1, T2>
+where
+    T1: GetOffers,
+    T2: GetOffers,
+{
+    type Iter = Chain<T1::Iter, T2::Iter>;
+    fn offers(&self) -> Self::Iter {
+        self.0.offers().chain(self.1.offers())
     }
 }
 
 /// Trait to monomorphize a CxList with possible `Select`s into something that impls Serve
 pub trait Pick {
     type Picked;
+    type Iter: Iterator<Item = Offer>;
+
+    /// input: set of offers from a client (`client_offers`), grouped by capability_guid
+    ///
+    /// Returns (new_stack, picked_offers, leftover)
     fn pick(
         self,
-        client_offers: Vec<Vec<Offer>>,
-    ) -> Result<(Self::Picked, Option<Vec<Offer>>, Vec<Vec<Offer>>), Report>;
+        client_offers: HashMap<u64, Vec<Offer>>,
+    ) -> Result<(Self::Picked, Self::Iter, HashMap<u64, Vec<Offer>>), Report>;
 }
 
 impl<N> Pick for N
@@ -250,15 +241,19 @@ where
     N: Negotiate,
 {
     type Picked = Self;
+    type Iter = Either<IterOnce<Offer>, Empty<Offer>>;
+
     fn pick(
         self,
-        client_offers: Vec<Vec<Offer>>,
-    ) -> Result<(Self::Picked, Option<Vec<Offer>>, Vec<Vec<Offer>>), Report> {
+        mut client_offers: HashMap<u64, Vec<Offer>>,
+    ) -> Result<(Self::Picked, Self::Iter, HashMap<u64, Vec<Offer>>), Report> {
         if N::Capability::guid() == 0 {
-            Ok((self, None, client_offers))
+            Ok((self, Either::Right(empty()), client_offers))
+        } else if let Some(os) = client_offers.remove(&N::Capability::guid()) {
+            let o = os.into_iter().next().unwrap();
+            Ok((self, Either::Left(once(o)), client_offers))
         } else {
-            let mut o = client_offers.into_iter();
-            Ok((self, o.next(), o.collect()))
+            Ok((self, Either::Right(empty()), client_offers))
         }
     }
 }
@@ -269,20 +264,15 @@ where
     T: Pick,
 {
     type Picked = CxList<H::Picked, T::Picked>;
+    type Iter = Chain<H::Iter, T::Iter>;
+
     fn pick(
         self,
-        client_offers: Vec<Vec<Offer>>,
-    ) -> Result<(Self::Picked, Option<Vec<Offer>>, Vec<Vec<Offer>>), Report> {
+        client_offers: HashMap<u64, Vec<Offer>>,
+    ) -> Result<(Self::Picked, Self::Iter, HashMap<u64, Vec<Offer>>), Report> {
         let (head_pick, cl_pick, client_offers) = self.head.pick(client_offers)?;
         let (tail_pick, rest_cl_pick, client_offers) = self.tail.pick(client_offers)?;
-        let pick = match (cl_pick, rest_cl_pick) {
-            (None, None) => None,
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (Some(mut a), Some(b)) => {
-                a.extend(b);
-                Some(a)
-            }
-        };
+        let pick = cl_pick.chain(rest_cl_pick);
         Ok((
             CxList {
                 head: head_pick,
@@ -294,63 +284,17 @@ where
     }
 }
 
-/// Negotiation type to choose between `T1` and `T2`.
-#[derive(Clone)]
-pub struct Select<T1, T2>(pub T1, pub T2);
-
-impl<T1, T2> GetOffers for Select<T1, T2>
+impl<C> From<&Vec<C>> for Offer
 where
-    T1: GetOffers,
-    T2: GetOffers,
+    C: CapabilitySet + Serialize,
 {
-    fn offers(&self) -> Vec<Vec<Offer>> {
-        // TODO won't work with nested select
-        let t1 = self.0.offers();
-        let t2 = self.1.offers();
-        if t1.is_empty() {
-            t2
-        } else {
-            let mut t1 = t1[0].clone();
-            if !t2.is_empty() {
-                let t2 = t2[0].clone();
-                t1.extend(t2);
-            }
-
-            vec![t1]
+    fn from(f: &Vec<C>) -> Self {
+        Offer {
+            capability_guid: C::guid(),
+            available: bincode::serialize(f).unwrap(),
         }
     }
 }
-
-//fn check_offers(offers: &[Vec<Offer>]) -> Result<(), Report> {
-//    if !offers.iter().all(|l| {
-//        let id = l[0].capability_guid;
-//        l.iter().all(|o| o.capability_guid == id)
-//    }) {
-//        return Err(eyre!("Capability guid mismatch")).wrap_err_with(|| {
-//            let mut idx = 0;
-//            let mut ok = true;
-//            for offer_set in offers.iter() {
-//                let id = offer_set[0].capability_guid;
-//                for o in offer_set.iter() {
-//                    if o.capability_guid != id {
-//                        ok = false;
-//                        break;
-//                    }
-//                }
-//
-//                if !ok {
-//                    return eyre!("layer {}: {:?}", idx, offer_set);
-//                }
-//
-//                idx += 1;
-//            }
-//
-//            unreachable!()
-//        });
-//    }
-//
-//    Ok(())
-//}
 
 fn lacking<T: PartialEq>(a: &[T], univ: Vec<T>) -> Vec<T> {
     univ.into_iter().filter(|x| !a.contains(x)).collect()
@@ -363,31 +307,33 @@ where
     C: CapabilitySet + Serialize + DeserializeOwned + Clone,
 {
     type Picked = Either<T1, T2>;
+    type Iter = Either<IterOnce<Offer>, Empty<Offer>>;
+
     fn pick(
         self,
-        client_offers: Vec<Vec<Offer>>,
-    ) -> Result<(Self::Picked, Option<Vec<Offer>>, Vec<Vec<Offer>>), Report> {
+        mut client_offers: HashMap<u64, Vec<Offer>>,
+    ) -> Result<(Self::Picked, Self::Iter, HashMap<u64, Vec<Offer>>), Report> {
         if C::guid() == 0 {
-            return Ok((Either::Left(self.0), None, client_offers));
+            return Ok((Either::Left(self.0), Either::Right(empty()), client_offers));
         }
 
-        if client_offers.is_empty() {
-            return Err(eyre!("Not enough offers for stack"));
-        }
+        let offers = match client_offers.remove(&C::guid()) {
+            None => {
+                return Err(eyre!(
+                    "Missing offer for type {:?}",
+                    std::any::type_name::<C>()
+                ));
+            }
+            Some(o) => o,
+        };
 
-        let mut offers = client_offers.into_iter();
-        let offer = offers.next().unwrap();
-        if offer[0].capability_guid != C::guid() {
-            return Err(eyre!("Capability type mismatch"));
-        }
-
-        debug!(
+        trace!(
             cap_type = std::any::type_name::<C>(),
-            offer = ?&offer,
+            offer = ?&offers,
             "deserializing offers"
         );
 
-        let caps: Result<Vec<Vec<C>>, Report> = offer
+        let caps: Result<Vec<Vec<C>>, Report> = offers
             .iter()
             .map(|o| {
                 let c: Vec<C> = bincode::deserialize(&o.available).wrap_err(eyre!(
@@ -399,11 +345,13 @@ where
             })
             .collect();
         let mut caps = caps?;
+
         debug!(
             cap_type = std::any::type_name::<C>(),
             offer = ?&caps,
             "considering offers"
         );
+
         caps.sort_by(|a, b| b.len().cmp(&a.len()));
 
         let t1 = T1::capabilities();
@@ -416,8 +364,8 @@ where
                 if lacking(&co, C::universe()).is_empty() {
                     return Ok((
                         Either::Left(self.0),
-                        Some(vec![caps_co.clone().into()]),
-                        offers.collect(),
+                        Either::Left(once(caps_co.into())),
+                        client_offers,
                     ));
                 }
 
@@ -426,8 +374,8 @@ where
                 if lacking(&co, C::universe()).is_empty() {
                     return Ok((
                         Either::Right(self.1),
-                        Some(vec![caps_co.clone().into()]),
-                        offers.collect(),
+                        Either::Left(once(caps_co.into())),
+                        client_offers,
                     ));
                 }
             } else {
@@ -436,8 +384,8 @@ where
                 if lacking(&co, C::universe()).is_empty() {
                     return Ok((
                         Either::Right(self.1),
-                        Some(vec![caps_co.clone().into()]),
-                        offers.collect(),
+                        Either::Left(once(caps_co.into())),
+                        client_offers,
                     ));
                 }
 
@@ -446,8 +394,8 @@ where
                 if lacking(&co, C::universe()).is_empty() {
                     return Ok((
                         Either::Left(self.0),
-                        Some(vec![caps_co.clone().into()]),
-                        offers.collect(),
+                        Either::Left(once(caps_co.into())),
+                        client_offers,
                     ));
                 }
             }
@@ -458,6 +406,15 @@ where
             std::any::type_name::<C>()
         ))
     }
+}
+
+fn group_offers(offers: Vec<Offer>) -> HashMap<u64, Vec<Offer>> {
+    let mut map = HashMap::<_, Vec<Offer>>::new();
+    for o in offers {
+        map.entry(o.capability_guid).or_default().push(o);
+    }
+
+    map
 }
 
 pub struct InjectWithChannel<C, D>(C, Arc<AtomicBool>, Arc<TokioMutex<oneshot::Receiver<D>>>);
@@ -519,7 +476,7 @@ where
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NegotiateMsg {
-    ClientOffer(Vec<Vec<Offer>>),
+    ClientOffer(Vec<Offer>),
     ServerReply(Vec<Offer>),
     ServerNonce { addr: Vec<u8>, picked: Vec<Offer> },
     ServerNonceAck,
@@ -558,6 +515,7 @@ where
     <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Connection: Send + Sync + 'static,
     <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Error: Into<Report> + Send + Sync + 'static,
     <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Stream: Unpin + Send + 'static,
+    <Srv as Pick>::Iter: Send,
     // nonce branch: Apply stack from nonce on indicated connections.
     <Srv as Apply>::Applied: Serve<ServeInput<C, A>> + Clone + Send + 'static,
     <<Srv as Apply>::Applied as Serve<ServeInput<C, A>>>::Connection: Send + Sync + 'static,
@@ -602,13 +560,9 @@ where
                         guard.get(&a).map(Clone::clone)
                     };
                     if let Some(picked) = opt_picked {
-                        let ofs = stack.offers();
-                        let p = picked.clone();
                         let (mut stack, _) = stack
                             .apply(picked)
-                            .wrap_err("failed to apply semantics to client connection")
-                            .note(format!("tried to apply: {:?}", p))
-                            .note(format!("onto the stack: {:?}", ofs))?;
+                            .wrap_err("failed to apply semantics to client connection")?;
                         let cn_st = futures_util::stream::once(futures_util::future::ready(Ok(cn)));
                         let mut new_st = stack.serve(cn_st).await.map_err(Into::into)?;
                         let new_cn = new_st
@@ -659,29 +613,20 @@ where
                             unreachable!();
                         }
                         ClientOffer(client_offers) => {
-                            debug!(client_offers = ?&client_offers, from = ?&a, "received offer");
-
-                            //if let Err(e) = check_offers(&client_offers) {
-                            //    warn!(err = ?e, "Received invalid offer set from client");
-                            //    // TODO send error response
-                            //    unimplemented!();
-                            //}
-
+                            let client_offers_map = group_offers(client_offers);
+                            debug!(client_offers = ?&client_offers_map, from = ?&a, "received offer");
                             // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve,
                             //    impl Serve>> into a CxList<impl Serve>
-                            let (mut new_stack, picked_offers, leftover) = stack
-                                .pick(client_offers)
+                            let (mut new_stack, picked_offers, _) = stack
+                                .pick(client_offers_map)
                                 .wrap_err(eyre!("error monomorphizing stack",))?;
-                            if !leftover.is_empty() {
-                                return Err(eyre!("Unmatched client offers"));
-                            }
 
-                            let picked_offers = picked_offers.unwrap_or_default();
-                            debug!(picked_client_offers = ?&picked_offers, "monomorphized stack");
+                            let picked_offers_vec: Vec<Offer> = picked_offers.collect();
+                            debug!(picked_client_offers = ?&picked_offers_vec, "monomorphized stack");
                             // tell all the stack elements about the nonce = (client addr, chosen stack)
                             let nonce = NegotiateMsg::ServerNonce {
                                 addr: bincode::serialize(&a)?,
-                                picked: picked_offers.clone(),
+                                picked: picked_offers_vec.clone(),
                             };
                             let nonce_buf = bincode::serialize(&nonce)
                                 .wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
@@ -691,7 +636,7 @@ where
                                 .await;
 
                             // 4. Respond to client with offer choice
-                            let buf = bincode::serialize(&picked_offers)?;
+                            let buf = bincode::serialize(&picked_offers_vec)?;
                             cn.send((a, buf)).await?;
 
                             debug!("negotiation handshake done");
@@ -865,8 +810,8 @@ where
         // 1. get Vec<u8> connection.
         debug!("got negotiation connection");
 
-        // 2. send Vec<Vec<Offer>>
-        let offers = NegotiateMsg::ClientOffer(stack.offers());
+        // 2. send Vec<Offer>
+        let offers = NegotiateMsg::ClientOffer(stack.offers().collect());
         let buf = bincode::serialize(&offers)?;
         debug!(offers = ?&offers, "sending offers");
         cn.send((addr, buf)).await?;
@@ -877,13 +822,9 @@ where
         debug!(picked = ?&picked, "received picked impls");
 
         // 4. monomorphize `stack`, picking received choices
-        let p = picked.clone();
-        let s = stack.clone();
-        let (mut new_stack, leftover) = stack.apply(picked).wrap_err(eyre!(
-            "Could not apply received impls to stack: picked = {:?}, stack = {:?}",
-            &p,
-            &s.offers()
-        ))?;
+        let (mut new_stack, leftover) = stack
+            .apply(picked)
+            .wrap_err(eyre!("Could not apply received impls to stack",))?;
         match leftover {
             Some(x) if x.is_empty() => (),
             _ => {
@@ -909,7 +850,7 @@ mod test {
         chan_transport::Chan, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList,
         Serve,
     };
-    use color_eyre::eyre::{eyre, Report, WrapErr};
+    use color_eyre::eyre::{eyre, Report};
     use futures_util::{
         future::{ready, Ready},
         stream::{Stream, StreamExt},
@@ -1027,7 +968,7 @@ mod test {
 
                 // send the raw Vec<Vec<Offer>>
                 // [ [Offer{guid: A, vec:[]}], [Offer{guid: B, vec:[]}], [Offer{guid: C, vec:[]}] ]
-                let offers = NegotiateMsg::ClientOffer(stack.offers());
+                let offers = NegotiateMsg::ClientOffer(stack.offers().collect());
                 debug!(offers = ?&offers, "starting negotiation handshake");
                 let buf = bincode::serialize(&offers)?;
                 cn.send(((), buf)).await?;
@@ -1037,10 +978,7 @@ mod test {
                 debug!(resp = ?&resp, "got negotiation response");
 
                 let expected: Vec<Offer> = match offers {
-                    NegotiateMsg::ClientOffer(os) => os
-                        .into_iter()
-                        .map(|o| o.into_iter().next().unwrap())
-                        .collect(),
+                    NegotiateMsg::ClientOffer(os) => os.into_iter().collect(),
                     _ => unreachable!(),
                 };
 
@@ -1115,162 +1053,24 @@ mod test {
         let stack = CxList::from(ChunnelA)
             .wrap(Select(ChunnelB, ChunnelBAlt))
             .wrap(ChunnelC);
-        let offers = stack.offers();
+        let offers = super::group_offers(stack.offers().collect());
         info!(offers = ?&offers, "select_offers");
 
+        assert!(matches!(offers.get(
+            &<<ChunnelB as Negotiate>::Capability as CapabilitySet>::guid()),
+            Some(x) if x.len() == 2,
+        ));
+
         let stack1 = CxList::from(ChunnelA).wrap(ChunnelB).wrap(ChunnelC);
-        let offers1 = stack1.offers();
+        let offers1 = super::group_offers(stack1.offers().collect());
         info!(offers = ?&offers1, "no_select_offers");
 
+        assert!(matches!(offers1.get(
+            &<<ChunnelB as Negotiate>::Capability as CapabilitySet>::guid()),
+            Some(x) if x.len() == 1,
+        ));
+
         assert_eq!(offers.len(), offers1.len());
-    }
-
-    #[test]
-    fn serve_select() {
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(tracing_subscriber::EnvFilter::from_default_env())
-            .with(ErrorLayer::default());
-        let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-
-        rt.block_on(
-            async move {
-                info!("starting");
-                let (mut srv, mut cln) = Chan::default().split();
-                let stack = CxList::from(ChunnelA)
-                    .wrap(Select(ChunnelB, ChunnelBAlt))
-                    .wrap(ChunnelC);
-                let srv_stack = stack.clone();
-
-                let (s, r) = tokio::sync::oneshot::channel();
-                tokio::spawn(
-                    async move {
-                        info!("starting");
-                        let raw_st = srv.listen(()).await?;
-                        let srv_stream = negotiate_server(srv_stack, raw_st)
-                            .await
-                            .wrap_err("negotiate_server failed")?;
-                        s.send(()).unwrap();
-                        // shadow the original variable so it can't accidentally be used after the pin,
-                        // making this safe
-                        //let mut srv_stream =
-                        //    unsafe { std::pin::Pin::new_unchecked(&mut srv_stream) };
-                        tokio::pin!(srv_stream);
-                        //let mut srv_stream = Box::pin(srv_stream);
-                        srv_stream
-                            .next()
-                            .await
-                            .ok_or_else(|| eyre!("srv_stream returned none"))?
-                            .wrap_err("negotiation failed")?;
-                        info!("done");
-                        Ok::<_, Report>(())
-                    }
-                    .instrument(debug_span!("server")),
-                );
-
-                r.await.unwrap();
-
-                // make a Vec<u8> client
-                let cn = cln.connect(()).await?;
-
-                // send the raw Vec<Vec<Offer>>
-                // [ [Offer{guid: A, vec:[]}], [Offer{guid: B, vec:[]}], [Offer{guid: C, vec:[]}] ]
-                let offers = NegotiateMsg::ClientOffer(stack.offers());
-                info!(offers = ?&offers, "starting negotiation handshake");
-                let buf = bincode::serialize(&offers)?;
-                cn.send(((), buf)).await?;
-
-                let (_, resp) = cn.recv().await?;
-                let resp: Vec<Offer> = bincode::deserialize(&resp)?;
-                info!(resp = ?&resp, "got negotiation response");
-
-                let expected: Vec<Offer> = match offers {
-                    NegotiateMsg::ClientOffer(os) => os
-                        .into_iter()
-                        .map(|o| o.into_iter().next().unwrap())
-                        .collect(),
-                    _ => unreachable!(),
-                };
-
-                assert_eq!(resp, expected);
-                info!("done");
-                Ok::<_, Report>(())
-            }
-            .instrument(info_span!("serve_select")),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn client_select() {
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(tracing_subscriber::EnvFilter::from_default_env())
-            .with(ErrorLayer::default());
-        let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-
-        rt.block_on(
-            async move {
-                info!("starting");
-                let (mut srv, mut cln) = Chan::<(_, Vec<u8>), _>::default().split();
-                let stack = CxList::from(ChunnelA)
-                    .wrap(Select(ChunnelB, ChunnelBAlt))
-                    .wrap(ChunnelC);
-
-                let (s, r) = tokio::sync::oneshot::channel();
-                tokio::spawn(
-                    async move {
-                        info!("starting");
-                        let mut st = srv.listen(()).await?;
-                        s.send(()).unwrap();
-
-                        let cn = st.next().await.unwrap()?;
-                        let (_, buf) = cn.recv().await?;
-                        let offers = bincode::deserialize(&buf)?;
-
-                        // Pick something fake, the first idx for each of them
-                        let picked: Vec<Offer> = match offers {
-                            NegotiateMsg::ClientOffer(os) => os
-                                .into_iter()
-                                .map(|o| o.into_iter().next().unwrap())
-                                .collect(),
-                            _ => unreachable!(),
-                        };
-
-                        let buf = bincode::serialize(&picked)?;
-                        cn.send(((), buf)).await?;
-
-                        Ok::<_, Report>(())
-                    }
-                    .instrument(debug_span!("server")),
-                );
-
-                r.await.unwrap();
-
-                let raw_cn = cln.connect(()).await?;
-                let _cn = negotiate_client(stack, raw_cn, ())
-                    .instrument(info_span!("negotiate_client"))
-                    .await?;
-
-                info!("done");
-
-                Ok::<_, Report>(())
-            }
-            .instrument(info_span!("client_select")),
-        )
-        .unwrap();
     }
 
     #[test]

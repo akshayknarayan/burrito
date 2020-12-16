@@ -22,9 +22,6 @@ pub struct TaggerChunnel;
 
 impl Negotiate for TaggerChunnel {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<D, InS, InC, InE> Serve<InS> for TaggerChunnel
@@ -73,9 +70,6 @@ pub struct TaggerProjChunnel;
 
 impl Negotiate for TaggerProjChunnel {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<A, D, InS, InC, InE> Serve<InS> for TaggerProjChunnel
@@ -191,9 +185,6 @@ impl OrderedChunnel {
 
 impl Negotiate for OrderedChunnel {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<D, InS, InC, InE> Serve<InS> for OrderedChunnel
@@ -260,9 +251,6 @@ impl Default for OrderedChunnelProj {
 
 impl Negotiate for OrderedChunnelProj {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl<A, D, InS, InC, InE> Serve<InS> for OrderedChunnelProj

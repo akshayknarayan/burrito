@@ -92,9 +92,6 @@ pub struct ReliabilityProjChunnel {
 
 impl Negotiate for ReliabilityProjChunnel {
     type Capability = ();
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![]
-    }
 }
 
 impl Default for ReliabilityProjChunnel {
