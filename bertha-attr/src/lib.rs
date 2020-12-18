@@ -101,10 +101,6 @@ pub fn pick_semantics(arg: TokenStream) -> TokenStream {
         });
     };
 
-    let filename = format!("{}.bertha", kind);
-    let p = Path::new(STATE_PATH).join(filename);
-    std::fs::remove_file(&p).unwrap();
-
     imp.parse().unwrap()
 }
 
