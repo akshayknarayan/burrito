@@ -56,7 +56,7 @@ pub async fn serve(
         rdy.push(r);
     }
 
-    let mut offers: Vec<Vec<Vec<bertha::negotiate::Offer>>> = rdy.try_collect().await.unwrap();
+    let mut offers: Vec<Vec<bertha::negotiate::Offer>> = rdy.try_collect().await.unwrap();
 
     let st = raw_listener
         .listen(si.canonical_addr)
@@ -85,7 +85,7 @@ async fn serve_canonical(
         + 'static,
     internal_cli: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Cln>,
     redis_addr: SocketAddr,
-    offer: Vec<Vec<bertha::negotiate::Offer>>,
+    offer: Vec<bertha::negotiate::Offer>,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
 ) -> Result<(), Report> {
     // 3. start canonical server
@@ -148,7 +148,7 @@ async fn single_shard(
         Error = impl Into<Report> + Send + Sync + 'static,
     >,
     internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
-    s: tokio::sync::oneshot::Sender<Vec<Vec<bertha::negotiate::Offer>>>,
+    s: tokio::sync::oneshot::Sender<Vec<bertha::negotiate::Offer>>,
 ) {
     let external = CxList::from(OrderedChunnelProj::default())
         .wrap(ReliabilityProjChunnel::default())
@@ -163,7 +163,7 @@ async fn single_shard(
     let st = bertha::negotiate::negotiate_server(external, st)
         .await
         .unwrap();
-    s.send(stack.offers()).unwrap();
+    s.send(stack.offers().collect()).unwrap();
 
     // initialize the kv store.
     let store = Store::default();
