@@ -13,7 +13,7 @@ use std::any::TypeId;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, trace};
 
 // Layout copied from https://doc.rust-lang.org/src/core/any.rs.html#417-419
 //
@@ -61,9 +61,13 @@ impl<A, D: 'static> Negotiate for SerializeChunnelProject<A, D> {
         // code!"
         //
         // D: 'static currently needed to make TypeId::of work.
-        vec![NegotiateSerialization(
-            AccessibleTypeId::from(std::any::TypeId::of::<D>()).type_id,
-        )]
+        let type_id = AccessibleTypeId::from(std::any::TypeId::of::<D>()).type_id;
+        trace!(
+            data_type = std::any::type_name::<D>(),
+            ?type_id,
+            "bincode serialization capability"
+        );
+        vec![NegotiateSerialization(type_id)]
     }
 }
 
