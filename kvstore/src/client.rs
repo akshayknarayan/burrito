@@ -3,8 +3,6 @@
 use crate::msg::Msg;
 use bertha::{
     bincode::SerializeChunnelProject,
-    reliable::ReliabilityProjChunnel,
-    tagger::OrderedChunnelProj,
     util::ProjectLeft,
     util::{MsgIdMatcher, NeverCn},
     ChunnelConnection, CxList,
@@ -32,9 +30,9 @@ impl KvClient<NeverCn> {
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
 
+        extern crate self as kvstore;
         let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
-            .wrap(OrderedChunnelProj::default())
-            .wrap(ReliabilityProjChunnel::default())
+            .wrap(bertha_attr::pick_semantics!((Reliability, RequestResponse)))
             .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");

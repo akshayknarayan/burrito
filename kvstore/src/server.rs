@@ -3,8 +3,7 @@
 use crate::kv::Store;
 use crate::msg::Msg;
 use bertha::{
-    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel,
-    reliable::ReliabilityProjChunnel, select::SelectListener, tagger::OrderedChunnelProj,
+    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel, select::SelectListener,
     ChunnelConnection, ChunnelListener, CxList, GetOffers,
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
@@ -88,14 +87,14 @@ async fn serve_canonical(
     offer: Vec<bertha::negotiate::Offer>,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
 ) -> Result<(), Report> {
+    extern crate self as kvstore;
     // 3. start canonical server
     // TODO Ebpf chunnel
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
     let cnsrv = ShardCanonicalServer::new(
         si.clone(),
         internal_cli,
-        CxList::from(OrderedChunnelProj::default())
-            .wrap(ReliabilityProjChunnel::default())
+        CxList::from(bertha_attr::pick_semantics!((Reliability, RequestResponse)))
             .wrap(SerializeChunnelProject::default()),
         offer,
         &redis_addr,
@@ -104,8 +103,7 @@ async fn serve_canonical(
     .wrap_err("Create ShardCanonicalServer")?;
 
     let external = CxList::from(cnsrv)
-        .wrap(OrderedChunnelProj::default())
-        .wrap(ReliabilityProjChunnel::default())
+        .wrap(bertha_attr::pick_semantics!((Reliability, RequestResponse)))
         .wrap(SerializeChunnelProject::default());
     info!(shard_info = ?&si, "start canonical server");
     let st = bertha::negotiate::negotiate_server(external, st)
@@ -150,8 +148,8 @@ async fn single_shard(
     internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
     s: tokio::sync::oneshot::Sender<Vec<bertha::negotiate::Offer>>,
 ) {
-    let external = CxList::from(OrderedChunnelProj::default())
-        .wrap(ReliabilityProjChunnel::default())
+    extern crate self as kvstore;
+    let external = CxList::from(bertha_attr::pick_semantics!((Reliability, RequestResponse)))
         .wrap(SerializeChunnelProject::default());
     let stack = external.clone();
     info!(addr = ?&addr, "listening");

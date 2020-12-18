@@ -2,7 +2,7 @@ use bertha::{util::MsgId, ChunnelConnection, Client, Negotiate, Serve};
 use color_eyre::eyre;
 use futures_util::{
     future::{ready, Ready},
-    stream::{Stream, TryStreamExt},
+    stream::Stream,
 };
 use std::future::Future;
 use std::hash::Hash;
@@ -64,16 +64,12 @@ where
     D: MsgId + Clone + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = KvReliability<InC, A, D>;
+    type Connection = InC;
     type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Stream = InS;
 
     fn serve(&mut self, inner: InS) -> Self::Future {
-        let cfg = self.timeout;
-        ready(Ok(
-            Box::pin(inner.and_then(move |cn| async move { Ok(KvReliability::new(cn, cfg)) })) as _,
-        ))
+        ready(Ok(inner))
     }
 }
 
