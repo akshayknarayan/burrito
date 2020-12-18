@@ -8,18 +8,117 @@ use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
+use serde::{Deserialize, Serialize};
+use std::any::TypeId;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
+
+// Layout copied from https://doc.rust-lang.org/src/core/any.rs.html#417-419
+//
+// `std::any::TypeId` is opaque, but contains a u64. We use this hack to access the u64 for
+// serialization. If the `type_id_layout` test below fails, rust probably changed the memory
+// layout.
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct AccessibleTypeId {
+    type_id: u64,
+}
+
+impl From<TypeId> for AccessibleTypeId {
+    fn from(t: TypeId) -> Self {
+        // Safety: As long as AccessibleTypeId has the same memory layout as `std::any::TypeId`.
+        // Why needed: Want to use the underlying u64.
+        unsafe { std::mem::transmute(t) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NegotiateSerialization(u64);
+
+impl crate::negotiate::CapabilitySet for NegotiateSerialization {
+    fn guid() -> u64 {
+        0xc2c5645480fd91b9
+    }
+
+    fn universe() -> Option<Vec<Self>> {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SerializeChunnelProject<A, D> {
+    _data: std::marker::PhantomData<(A, D)>,
+}
+
+impl<A, D: 'static> Negotiate for SerializeChunnelProject<A, D> {
+    type Capability = NegotiateSerialization;
+
+    fn capabilities() -> Vec<Self::Capability> {
+        // https://doc.rust-lang.org/std/any/struct.TypeId.html says:
+        // "While TypeId implements Hash, PartialOrd, and Ord, it is worth noting that the hashes
+        // and ordering will vary between Rust releases. Beware of relying on them inside of your
+        // code!"
+        //
+        // D: 'static currently needed to make TypeId::of work.
+        vec![NegotiateSerialization(
+            AccessibleTypeId::from(std::any::TypeId::of::<D>()).type_id,
+        )]
+    }
+}
+
+impl<A, D> Default for SerializeChunnelProject<A, D> {
+    fn default() -> Self {
+        SerializeChunnelProject {
+            _data: Default::default(),
+        }
+    }
+}
+
+impl<A, D, InS, InC, InE> Serve<InS> for SerializeChunnelProject<A, D>
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = SerializeProject<A, D, InC>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        ready(Ok(Box::pin(inner.map_ok(SerializeProject::from)) as _))
+    }
+}
+
+impl<A, D, InC> Client<InC> for SerializeChunnelProject<A, D>
+where
+    InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = SerializeProject<A, D, InC>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(SerializeProject::from(cn)))
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct SerializeChunnel<D> {
     _data: std::marker::PhantomData<D>,
 }
 
-impl<D> Negotiate for SerializeChunnel<D> {
-    type Capability = ();
+impl<D: 'static> Negotiate for SerializeChunnel<D> {
+    type Capability = NegotiateSerialization;
+    fn capabilities() -> Vec<Self::Capability> {
+        SerializeChunnelProject::<(), D>::capabilities()
+    }
 }
 
 impl<D, InS, InC, InE> Serve<InS> for SerializeChunnel<D>
@@ -63,57 +162,6 @@ where
             Ok(cn) => ProjectLeft::from(()).connect_wrap(cn),
             Err(e) => ready(Err(e)),
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SerializeChunnelProject<A, D> {
-    _data: std::marker::PhantomData<(A, D)>,
-}
-
-impl<A, D> Negotiate for SerializeChunnelProject<A, D> {
-    type Capability = ();
-}
-
-impl<A, D> Default for SerializeChunnelProject<A, D> {
-    fn default() -> Self {
-        SerializeChunnelProject {
-            _data: Default::default(),
-        }
-    }
-}
-
-impl<A, D, InS, InC, InE> Serve<InS> for SerializeChunnelProject<A, D>
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    A: Send + Sync + 'static,
-    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = SerializeProject<A, D, InC>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(SerializeProject::from)) as _))
-    }
-}
-
-impl<A, D, InC> Client<InC> for SerializeChunnelProject<A, D>
-where
-    InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    A: Send + Sync + 'static,
-    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = SerializeProject<A, D, InC>;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(SerializeProject::from(cn)))
     }
 }
 
@@ -175,7 +223,7 @@ mod test {
         util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList,
         Serve,
     };
-    use futures_util::StreamExt;
+    use futures_util::{StreamExt, TryStreamExt};
     use tracing::trace;
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
@@ -283,5 +331,104 @@ mod test {
             }
             .instrument(tracing::info_span!("send_struct")),
         );
+    }
+
+    #[test]
+    fn serialize_negotiate() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or_else(|_| ());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
+        struct Foo {
+            a: u32,
+            b: u64,
+            c: String,
+        }
+
+        rt.block_on(
+            async move {
+                let (mut srv, mut cln) = Chan::default().split();
+                let stack = CxList::from(SerializeChunnel::default()).wrap(ProjectLeft::from(()));
+
+                let srv_stack = stack.clone();
+                tokio::spawn(async move {
+                    let rcv_st = srv.listen(()).await.unwrap();
+                    let st = crate::negotiate::negotiate_server(srv_stack, rcv_st)
+                        .await
+                        .unwrap();
+                    st.try_for_each_concurrent(None, |cn| async move {
+                        loop {
+                            let buf = cn.recv().await?;
+                            cn.send(buf).await?;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                });
+
+                let raw_cn = cln.connect(()).await.unwrap();
+                let cn = crate::negotiate::negotiate_client(stack, raw_cn, ())
+                    .await
+                    .unwrap();
+
+                let obj = Foo {
+                    a: 4,
+                    b: 5,
+                    c: "hello".to_owned(),
+                };
+
+                cn.send(obj.clone()).await.unwrap();
+                let r = cn.recv().await.unwrap();
+                assert_eq!(r, obj);
+            }
+            .instrument(tracing::info_span!("serialize_negotiate")),
+        );
+    }
+
+    #[test]
+    fn type_id_layout() {
+        use super::AccessibleTypeId;
+        fn check_type<T: 'static>() {
+            let type_id = std::any::TypeId::of::<T>();
+            let accessible_type_id = AccessibleTypeId::from(type_id);
+
+            let type_id_str = format!("{:?}", type_id);
+            let accessible_type_id_str = format!("{:?}", accessible_type_id);
+
+            println!(
+                "{:?} type ids: {:?} vs {:?}",
+                std::any::type_name::<T>(),
+                type_id_str,
+                accessible_type_id_str
+            );
+
+            fn num(tstr: &str) -> &str {
+                tstr.split(':')
+                    .skip(1)
+                    .next()
+                    .unwrap()
+                    .split(' ')
+                    .skip(1)
+                    .next()
+                    .unwrap()
+            }
+
+            let tid: &str = num(&type_id_str);
+            let atid: &str = num(&accessible_type_id_str);
+            assert_eq!(tid, atid);
+        }
+
+        check_type::<Option<Vec<u8>>>();
+        use crate::reliable::Pkt;
+        check_type::<(std::net::SocketAddr, Option<Pkt<Vec<u8>>>)>();
     }
 }
