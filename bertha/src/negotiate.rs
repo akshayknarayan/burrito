@@ -269,13 +269,20 @@ where
                     .collect();
                 let caps = caps?;
                 for caps_co in caps.iter() {
+                    trace!(?self_caps, check = ?&caps_co, "checking client offer");
                     if have_all(&self_caps, &caps_co) {
                         return Ok((self, Either::Left(once(caps_co.into())), client_offers));
                     }
                 }
-            }
 
-            debug!("Did not find matching client offer");
+                debug!(?self_caps, available = ?&caps, "Did not find matching client offer");
+            } else {
+                debug!(
+                    ?self_caps,
+                    available = "None",
+                    "Did not find matching client offer"
+                );
+            }
 
             Err(eyre!(
                 "Could not find satisfying client/server capability set for {:?}",
@@ -337,7 +344,7 @@ fn lacks<T: PartialEq>(a: &[T], univ: &[T]) -> bool {
 }
 
 fn have_all<T: PartialEq>(client: &[T], server: &[T]) -> bool {
-    server.iter().any(|x| !client.contains(x)) && client.iter().any(|x| !server.contains(x))
+    server.iter().all(|x| client.contains(x)) && client.iter().all(|x| server.contains(x))
 }
 
 impl<T1, T2, C> Pick for Select<T1, T2>

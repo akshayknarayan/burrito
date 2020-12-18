@@ -105,7 +105,7 @@ pub struct ShardCanonicalServer<A, S, Ss> {
     addr: ShardInfo<A>,
     shards_inner: S,
     shards_inner_stack: Ss,
-    shards_extern_nonce: Vec<Vec<bertha::negotiate::Offer>>,
+    shards_extern_nonce: Vec<bertha::negotiate::Offer>,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
 }
 
@@ -116,7 +116,7 @@ impl<A, S, Ss> ShardCanonicalServer<A, S, Ss> {
         addr: ShardInfo<A>,
         shards_inner: S,
         shards_inner_stack: Ss,
-        shards_extern_nonce: Vec<Vec<bertha::negotiate::Offer>>,
+        shards_extern_nonce: Vec<bertha::negotiate::Offer>,
         redis_addr: &str,
     ) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)?;
@@ -153,11 +153,7 @@ where
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
         let addrs = self.addr.shard_addrs.clone();
         let ctr = self.shards_inner.clone();
-        let offer: Vec<bertha::negotiate::Offer> = self
-            .shards_extern_nonce
-            .iter()
-            .map(|o| o[0].clone())
-            .collect();
+        let offer: Vec<bertha::negotiate::Offer> = self.shards_extern_nonce.clone();
         let msg: bertha::negotiate::NegotiateMsg = match bincode::deserialize(nonce) {
             Err(e) => {
                 warn!(err = ?e, "deserialize failed");
@@ -688,7 +684,7 @@ mod test {
     async fn start_shard(
         addr: SocketAddr,
         internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
-        s: tokio::sync::oneshot::Sender<Vec<Vec<bertha::negotiate::Offer>>>,
+        s: tokio::sync::oneshot::Sender<Vec<bertha::negotiate::Offer>>,
     ) {
         let external = CxList::from(TaggerProjChunnel)
             .wrap(ReliabilityProjChunnel::default())
@@ -704,7 +700,7 @@ mod test {
             .await
             .unwrap();
         use bertha::GetOffers;
-        s.send(stack.offers()).unwrap();
+        s.send(stack.offers().collect()).unwrap();
 
         if let Err(e) = st
             .try_for_each_concurrent(None, |cn| {
@@ -853,7 +849,7 @@ mod test {
             rdy.push(r);
         }
 
-        let mut offers: Vec<Vec<Vec<bertha::negotiate::Offer>>> = rdy.try_collect().await.unwrap();
+        let mut offers: Vec<Vec<bertha::negotiate::Offer>> = rdy.try_collect().await.unwrap();
 
         // 4. start canonical server
         let cnsrv = ShardCanonicalServer::new(
