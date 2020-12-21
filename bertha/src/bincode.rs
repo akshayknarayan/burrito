@@ -15,56 +15,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
 
-// Layout copied from https://doc.rust-lang.org/src/core/any.rs.html#417-419
-//
-// `std::any::TypeId` is opaque, but contains a u64. We use this hack to access the u64 for
-// serialization. If the `type_id_layout` test below fails, rust probably changed the memory
-// layout.
-#[derive(Debug, PartialEq, Clone, Copy)]
-struct AccessibleTypeId {
-    type_id: u64,
-}
-
-impl From<TypeId> for AccessibleTypeId {
-    fn from(t: TypeId) -> Self {
-        // Safety: As long as AccessibleTypeId has the same memory layout as `std::any::TypeId`.
-        // Why needed: Want to use the underlying u64.
-        unsafe { std::mem::transmute(t) }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct NegotiateSerialization(u64);
-
-impl crate::negotiate::CapabilitySet for NegotiateSerialization {
-    fn guid() -> u64 {
-        0xc2c5645480fd91b9
-    }
-
-    fn universe() -> Option<Vec<Self>> {
-        None
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SerializeChunnelProject<A, D> {
     _data: std::marker::PhantomData<(A, D)>,
 }
 
 impl<A, D: 'static> Negotiate for SerializeChunnelProject<A, D> {
-    type Capability = NegotiateSerialization;
-
-    fn capabilities() -> Vec<Self::Capability> {
-        // https://doc.rust-lang.org/std/any/struct.TypeId.html says:
-        // "While TypeId implements Hash, PartialOrd, and Ord, it is worth noting that the hashes
-        // and ordering will vary between Rust releases. Beware of relying on them inside of your
-        // code!"
-        //
-        // D: 'static currently needed to make TypeId::of work.
-        vec![NegotiateSerialization(
-            AccessibleTypeId::from(std::any::TypeId::of::<D>()).type_id,
-        )]
-    }
+    type Capability = ();
 }
 
 impl<A, D> Default for SerializeChunnelProject<A, D> {
@@ -115,10 +72,7 @@ pub struct SerializeChunnel<D> {
 }
 
 impl<D: 'static> Negotiate for SerializeChunnel<D> {
-    type Capability = NegotiateSerialization;
-    fn capabilities() -> Vec<Self::Capability> {
-        SerializeChunnelProject::<(), D>::capabilities()
-    }
+    type Capability = ();
 }
 
 impl<D, InS, InC, InE> Serve<InS> for SerializeChunnel<D>
