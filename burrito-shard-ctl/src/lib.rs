@@ -587,7 +587,7 @@ where
     C: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
 {
-    type Data = D;
+    type Data = (A, D);
 
     fn send(
         &self,
@@ -595,9 +595,9 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         // figure out which shard to send to.
-        let shard_idx = (self.shard_fn)(&data);
+        let shard_idx = (self.shard_fn)(&data.1);
         let a = self.shard_addrs[shard_idx].clone();
-        Box::pin(async move { inner.send((a, data)).await })
+        Box::pin(async move { inner.send((a, data.1)).await })
     }
 
     fn recv(
@@ -605,8 +605,8 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
-            let (_, d) = inner.recv().await?;
-            Ok(d)
+            let p = inner.recv().await?;
+            Ok(p)
         })
     }
 }
@@ -621,13 +621,13 @@ mod ebpf;
 mod test {
     use super::{ClientShardChunnelClient, Kv, ShardCanonicalServer, ShardInfo};
     use bertha::{
-        bincode::{SerializeChunnel, SerializeChunnelProject},
+        bincode::SerializeChunnelProject,
         chan_transport::RendezvousChannel,
-        reliable::{ReliabilityChunnel, ReliabilityProjChunnel},
+        reliable::ReliabilityProjChunnel,
         select::SelectListener,
-        tagger::{TaggerChunnel, TaggerProjChunnel},
+        tagger::TaggerProjChunnel,
         udp::{UdpReqChunnel, UdpSkChunnel},
-        util::ProjectLeft,
+        util::{Nothing, ProjectLeft},
         ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     };
     use color_eyre::eyre;
@@ -757,10 +757,9 @@ mod test {
                 );
 
                 let _ = r.await.wrap_err("shard thread crashed").unwrap();
-                let stack = CxList::from(TaggerChunnel)
-                    .wrap(ReliabilityChunnel::default())
-                    .wrap(SerializeChunnel::default())
-                    .wrap(ProjectLeft::from(addr));
+                let stack = CxList::from(TaggerProjChunnel)
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default());
 
                 async fn do_msg(cn: impl ChunnelConnection<Data = Msg>) {
                     debug!("send request");
@@ -789,6 +788,7 @@ mod test {
                     let cn = bertha::negotiate::negotiate_client(stack.clone(), cn, addr)
                         .await
                         .unwrap();
+                    let cn = ProjectLeft::new(addr, cn);
                     do_msg(cn).await;
                 }
                 .instrument(tracing::info_span!("udp client"))
@@ -805,6 +805,7 @@ mod test {
                     let cn = bertha::negotiate::negotiate_client(stack.clone(), cn, addr)
                         .await
                         .unwrap();
+                    let cn = ProjectLeft::new(addr, cn);
                     do_msg(cn).await;
                 }
                 .instrument(tracing::info_span!("chan client"))
@@ -929,8 +930,7 @@ mod test {
                 // 5. make client
                 info!("make client");
 
-                let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
-                    .wrap(TaggerProjChunnel)
+                let neg_stack = CxList::from(TaggerProjChunnel)
                     .wrap(ReliabilityProjChunnel::default())
                     .wrap(SerializeChunnelProject::default());
 
@@ -938,6 +938,7 @@ mod test {
                 let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
                     .await
                     .unwrap();
+                let cn = ProjectLeft::new(canonical_addr, cn);
 
                 // 6. issue a request
                 info!("send request");
@@ -986,18 +987,16 @@ mod test {
                     .await
                     .unwrap();
 
-                let neg_stack = CxList::from(bertha::negotiate::Select(
-                    cl,
-                    ProjectLeft::from(canonical_addr),
-                ))
-                .wrap(TaggerProjChunnel)
-                .wrap(ReliabilityProjChunnel::default())
-                .wrap(SerializeChunnelProject::default());
+                let neg_stack = CxList::from(bertha::negotiate::Select(cl, Nothing::default()))
+                    .wrap(TaggerProjChunnel)
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default());
 
                 let raw_cn = UdpSkChunnel::default().connect(()).await.unwrap();
                 let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
                     .await
                     .unwrap();
+                let cn = ProjectLeft::new(canonical_addr, cn);
 
                 // 6. issue a request
                 info!("send request");

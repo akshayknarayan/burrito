@@ -183,8 +183,7 @@ where
 mod test {
     use super::KvReliabilityChunnel;
     use bertha::{
-        chan_transport::Chan, util::ProjectLeft, ChunnelConnection, ChunnelConnector,
-        ChunnelListener, Client, CxList, Serve,
+        chan_transport::Chan, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
     };
     use futures_util::StreamExt;
     use tracing::{debug, info};
@@ -235,13 +234,10 @@ mod test {
 
                 let (mut srv, mut cln) = t.split();
 
-                let mut l = ProjectLeft::from(());
-                let rcv_st = srv.listen(()).await.unwrap();
-                let mut rcv_st = l.serve(rcv_st).await.unwrap();
+                let mut rcv_st = srv.listen(()).await.unwrap();
                 let rcv = rcv_st.next().await.unwrap().unwrap();
 
-                let mut l =
-                    CxList::from(KvReliabilityChunnel::default()).wrap(ProjectLeft::from(()));
+                let mut l = KvReliabilityChunnel::default();
                 let cln = cln.connect(()).await.unwrap();
                 let snd = l.connect_wrap(cln).await.unwrap();
 

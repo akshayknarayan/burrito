@@ -1,6 +1,6 @@
 //! Helper Chunnel types to transform Data types, etc.
 
-use super::{ChunnelConnection, ChunnelConnector, Client, Serve};
+use super::{ChunnelConnection, Client, Serve};
 use ahash::AHashMap;
 use color_eyre::eyre::{eyre, Report};
 use dashmap::DashMap;
@@ -283,69 +283,20 @@ where
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ProjectLeft<A, N = ()>(A, std::marker::PhantomData<N>);
+/// Projects a given address over a connection's data.
+///
+/// Given a `impl ChunnelConnection`s which expect `(addr, data)`, expose an interface which
+/// accepts just the `data`.
+/// On `send`, wraps the data in the addr provided in `new()`. On `recv`, ignores the addr.
+pub struct ProjectLeft<A, C>(A, C);
 
-impl<A> From<A> for ProjectLeft<A> {
-    fn from(a: A) -> Self {
-        ProjectLeft(a, Default::default())
-    }
-}
-
-impl<A, N> crate::negotiate::Negotiate for ProjectLeft<A, N>
-where
-    N: crate::negotiate::CapabilitySet,
-{
-    type Capability = N;
-}
-
-impl<N, A, D, InS, InC, InE> Serve<InS> for ProjectLeft<A, N>
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    A: Clone + Send + 'static,
-    D: 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ProjectLeftCn<A, InC>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let a = self.0.clone();
-        ready(Ok(
-            Box::pin(inner.map_ok(move |cn| ProjectLeftCn::new(a.clone(), cn))) as _,
-        ))
-    }
-}
-
-impl<A, D, InC> Client<InC> for ProjectLeft<A>
-where
-    InC: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
-    A: Clone + Send + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = ProjectLeftCn<A, InC>;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        let a = self.0.clone();
-        ready(Ok(ProjectLeftCn::new(a, cn)))
-    }
-}
-
-pub struct ProjectLeftCn<A, C>(A, C);
-
-impl<A, C> ProjectLeftCn<A, C> {
+impl<A, C> ProjectLeft<A, C> {
     pub fn new(a: A, c: C) -> Self {
-        ProjectLeftCn(a, c)
+        ProjectLeft(a, c)
     }
 }
 
-impl<A, C, D> ChunnelConnection for ProjectLeftCn<A, C>
+impl<A, C, D> ChunnelConnection for ProjectLeft<A, C>
 where
     A: Clone + Send + 'static,
     D: 'static,

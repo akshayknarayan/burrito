@@ -1,7 +1,7 @@
 //! Serialization chunnel with bincode.
 
 use crate::{
-    util::{ProjectLeft, ProjectLeftCn, Unproject},
+    util::{ProjectLeft, Unproject},
     ChunnelConnection, Client, Negotiate, Serve,
 };
 use color_eyre::eyre::{eyre, Report, WrapErr};
@@ -129,7 +129,7 @@ where
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ProjectLeftCn<(), SerializeProject<(), D, Unproject<InC>>>;
+    type Connection = ProjectLeft<(), SerializeProject<(), D, Unproject<InC>>>;
     type Error = InE;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -137,7 +137,7 @@ where
     fn serve(&mut self, inner: InS) -> Self::Future {
         let st = inner.map_ok(Unproject);
         match SerializeChunnelProject::default().serve(st).into_inner() {
-            Ok(st) => ProjectLeft::from(()).serve(st),
+            Ok(st) => ready(Ok(Box::pin(st.map_ok(|cn| ProjectLeft::new((), cn))) as _)),
             Err(e) => ready(Err(e)),
         }
     }
@@ -148,20 +148,18 @@ where
     InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    type Future = <ProjectLeft<()> as Client<
-        <SerializeChunnelProject<(), D> as Client<Unproject<InC>>>::Connection,
-    >>::Future;
-    type Connection = ProjectLeftCn<(), SerializeProject<(), D, Unproject<InC>>>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = ProjectLeft<(), SerializeProject<(), D, Unproject<InC>>>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        match SerializeChunnelProject::default()
-            .connect_wrap(Unproject(cn))
-            .into_inner()
-        {
-            Ok(cn) => ProjectLeft::from(()).connect_wrap(cn),
-            Err(e) => ready(Err(e)),
-        }
+        Box::pin(async move {
+            let cn = SerializeChunnelProject::default()
+                .connect_wrap(Unproject(cn))
+                .await?;
+            Ok(ProjectLeft::new((), cn))
+        })
     }
 }
 
@@ -217,11 +215,10 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::SerializeChunnel;
+    use super::{SerializeChunnel, SerializeChunnelProject};
     use crate::chan_transport::Chan;
     use crate::{
-        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList,
-        Serve,
+        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, Serve,
     };
     use futures_util::{StreamExt, TryStreamExt};
     use tracing::trace;
@@ -269,8 +266,7 @@ mod test {
                 let (mut srv, mut cln) = Chan::default().split();
 
                 let rcv_st = srv.listen(()).await.unwrap();
-                let mut stack =
-                    CxList::from(SerializeChunnel::default()).wrap(ProjectLeft::from(()));
+                let mut stack = SerializeChunnel::default();
 
                 let mut rcv_st = stack.serve(rcv_st).await.unwrap();
                 let rcv = rcv_st.next().await.unwrap().unwrap();
@@ -308,8 +304,7 @@ mod test {
         rt.block_on(
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
-                let mut stack =
-                    CxList::from(SerializeChunnel::default()).wrap(ProjectLeft::from(()));
+                let mut stack = SerializeChunnel::default();
 
                 let rcv_st = srv.listen(()).await.unwrap();
                 let mut rcv_st = stack.serve(rcv_st).await.unwrap();
@@ -357,7 +352,7 @@ mod test {
         rt.block_on(
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
-                let stack = CxList::from(SerializeChunnel::default()).wrap(ProjectLeft::from(()));
+                let stack = SerializeChunnelProject::default();
 
                 let srv_stack = stack.clone();
                 tokio::spawn(async move {
@@ -366,6 +361,7 @@ mod test {
                         .await
                         .unwrap();
                     st.try_for_each_concurrent(None, |cn| async move {
+                        let cn = ProjectLeft::new((), cn);
                         loop {
                             let buf = cn.recv().await?;
                             cn.send(buf).await?;
@@ -379,6 +375,7 @@ mod test {
                 let cn = crate::negotiate::negotiate_client(stack, raw_cn, ())
                     .await
                     .unwrap();
+                let cn = ProjectLeft::new((), cn);
 
                 let obj = Foo {
                     a: 4,

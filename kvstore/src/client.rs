@@ -6,7 +6,7 @@ use bertha::{
     reliable::ReliabilityProjChunnel,
     tagger::OrderedChunnelProj,
     util::ProjectLeft,
-    util::{MsgIdMatcher, NeverCn},
+    util::{MsgIdMatcher, NeverCn, Nothing},
     ChunnelConnection, CxList,
 };
 use burrito_shard_ctl::ClientShardChunnelClient;
@@ -31,8 +31,7 @@ impl KvClient<NeverCn> {
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
-        let neg_stack = CxList::from(ProjectLeft::from(canonical_addr))
-            .wrap(OrderedChunnelProj::default())
+        let neg_stack = CxList::from(OrderedChunnelProj::default())
             .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default());
 
@@ -40,6 +39,7 @@ impl KvClient<NeverCn> {
         let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
             .instrument(debug_span!("client_negotiate"))
             .await?;
+        let cn = ProjectLeft::new(canonical_addr, cn);
         Ok(Self::new_from_cn(cn))
     }
 
@@ -52,19 +52,16 @@ impl KvClient<NeverCn> {
         debug!("make client");
 
         let cl = ClientShardChunnelClient::new(canonical_addr, &redis_addr).await?;
-
-        let neg_stack = CxList::from(bertha::negotiate::Select(
-            cl,
-            ProjectLeft::from(canonical_addr),
-        ))
-        .wrap(OrderedChunnelProj::default())
-        .wrap(ReliabilityProjChunnel::default())
-        .wrap(SerializeChunnelProject::default());
+        let neg_stack = CxList::from(bertha::negotiate::Select(cl, Nothing::default()))
+            .wrap(OrderedChunnelProj::default())
+            .wrap(ReliabilityProjChunnel::default())
+            .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
             .instrument(debug_span!("client_negotiate"))
             .await?;
+        let cn = ProjectLeft::new(canonical_addr, cn);
         Ok(Self::new_from_cn(cn))
     }
 

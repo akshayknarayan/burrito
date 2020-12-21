@@ -1,7 +1,7 @@
 //! Chunnel which tags Data to provide at-most-once delivery.
 
 use crate::{
-    util::{ProjectLeft, ProjectLeftCn, Unproject},
+    util::{ProjectLeft, Unproject},
     ChunnelConnection, Client, Negotiate, Serve,
 };
 use color_eyre::eyre;
@@ -16,54 +16,6 @@ use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc};
 use tracing::trace;
 use tracing_futures::Instrument;
-
-#[derive(Clone, Debug, Default)]
-pub struct TaggerChunnel;
-
-impl Negotiate for TaggerChunnel {
-    type Capability = ();
-}
-
-impl<D, InS, InC, InE> Serve<InS> for TaggerChunnel
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ProjectLeftCn<(), TaggerProj<Unproject<InC>>>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let st = inner.map_ok(Unproject);
-        match TaggerProjChunnel.serve(st).into_inner() {
-            Ok(st) => ProjectLeft::from(()).serve(st),
-            Err(e) => ready(Err(e)),
-        }
-    }
-}
-
-impl<D, InC> Client<InC> for TaggerChunnel
-where
-    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = <ProjectLeft<()> as Client<
-        <TaggerProjChunnel as Client<Unproject<InC>>>::Connection,
-    >>::Future;
-    type Connection = ProjectLeftCn<(), TaggerProj<Unproject<InC>>>;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        match TaggerProjChunnel.connect_wrap(Unproject(cn)).into_inner() {
-            Ok(cn) => ProjectLeft::from(()).connect_wrap(cn),
-            Err(e) => ready(Err(e)),
-        }
-    }
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct TaggerProjChunnel;
@@ -103,6 +55,53 @@ where
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
         ready(Ok(TaggerProj::from(cn)))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TaggerChunnel;
+
+impl Negotiate for TaggerChunnel {
+    type Capability = ();
+}
+
+impl<D, InS, InC, InE> Serve<InS> for TaggerChunnel
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = ProjectLeft<(), TaggerProj<Unproject<InC>>>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        let st = inner.map_ok(Unproject);
+        match TaggerProjChunnel.serve(st).into_inner() {
+            Ok(st) => ready(Ok(Box::pin(st.map_ok(|cn| ProjectLeft::new((), cn))) as _)),
+            Err(e) => ready(Err(e)),
+        }
+    }
+}
+
+impl<D, InC> Client<InC> for TaggerChunnel
+where
+    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = ProjectLeft<(), TaggerProj<Unproject<InC>>>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        Box::pin(async move {
+            let cn = TaggerProjChunnel.connect_wrap(Unproject(cn)).await?;
+            Ok(ProjectLeft::new((), cn))
+        })
     }
 }
 
@@ -168,66 +167,6 @@ where
     }
 }
 
-/// `OrderedChunnel` takes in Data segments and tags them for use with `(u32, D)` Chunnels.
-///
-/// It returns data segments in the order they were sent.
-#[derive(Clone, Debug, Default)]
-pub struct OrderedChunnel {
-    inner: OrderedChunnelProj,
-}
-
-impl OrderedChunnel {
-    pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
-        self.inner.hole_thresh = Some(thresh);
-        self
-    }
-}
-
-impl Negotiate for OrderedChunnel {
-    type Capability = ();
-}
-
-impl<D, InS, InC, InE> Serve<InS> for OrderedChunnel
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ProjectLeftCn<(), OrderedProj<(), Unproject<InC>, D>>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let st = inner.map_ok(Unproject);
-        match self.inner.serve(st).into_inner() {
-            Ok(st) => ProjectLeft::from(()).serve(st),
-            Err(e) => ready(Err(e)),
-        }
-    }
-}
-
-impl<D, InC> Client<InC> for OrderedChunnel
-where
-    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = <ProjectLeft<()> as Client<
-        <OrderedChunnelProj as Client<Unproject<InC>>>::Connection,
-    >>::Future;
-    type Connection = ProjectLeftCn<(), OrderedProj<(), Unproject<InC>, D>>;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        match self.inner.connect_wrap(Unproject(cn)).into_inner() {
-            Ok(cn) => ProjectLeft::from(()).connect_wrap(cn),
-            Err(e) => ready(Err(e)),
-        }
-    }
-}
-
 /// `OrderedChunnelProj` takes in Data segments and tags them for use with `(A, (u32, D))` Chunnels.
 ///
 /// It returns data segments in the order they were sent.
@@ -287,6 +226,63 @@ where
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
         ready(Ok(OrderedProj::new(cn, self.hole_thresh)))
+    }
+}
+
+/// `OrderedChunnel` takes in Data segments and tags them for use with `(u32, D)` Chunnels.
+///
+/// It returns data segments in the order they were sent.
+#[derive(Clone, Debug, Default)]
+pub struct OrderedChunnel {
+    inner: OrderedChunnelProj,
+}
+
+impl OrderedChunnel {
+    pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
+        self.inner.hole_thresh = Some(thresh);
+        self
+    }
+}
+
+impl Negotiate for OrderedChunnel {
+    type Capability = ();
+}
+
+impl<D, InS, InC, InE> Serve<InS> for OrderedChunnel
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = ProjectLeft<(), OrderedProj<(), Unproject<InC>, D>>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        let st = inner.map_ok(Unproject);
+        match self.inner.serve(st).into_inner() {
+            Ok(st) => ready(Ok(Box::pin(st.map_ok(|cn| ProjectLeft::new((), cn))) as _)),
+            Err(e) => ready(Err(e)),
+        }
+    }
+}
+
+impl<D, InC> Client<InC> for OrderedChunnel
+where
+    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = ProjectLeft<(), OrderedProj<(), Unproject<InC>, D>>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        let fut = self.inner.connect_wrap(Unproject(cn));
+        Box::pin(async move { Ok(ProjectLeft::new((), fut.await?)) })
     }
 }
 
@@ -535,10 +531,7 @@ where
 mod test {
     use super::{OrderedChunnel, SeqUnreliableChunnel, TaggerChunnel};
     use crate::chan_transport::Chan;
-    use crate::{
-        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList,
-        Serve,
-    };
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList, Serve};
     use color_eyre::Report;
     use futures_util::StreamExt;
     use tracing::{debug, info};
@@ -563,9 +556,7 @@ mod test {
         rt.block_on(
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
-                let mut stack = CxList::from(TaggerChunnel)
-                    .wrap(SeqUnreliableChunnel)
-                    .wrap(ProjectLeft::from(()));
+                let mut stack = CxList::from(TaggerChunnel).wrap(SeqUnreliableChunnel);
 
                 let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;
@@ -589,7 +580,6 @@ mod test {
     {
         let msgs: Vec<_> = (0..10).map(|i| vec![i; 10]).collect();
 
-        // recv side
         let ms = msgs.clone();
         tokio::spawn(
             async move {
@@ -639,9 +629,7 @@ mod test {
         rt.block_on(
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
-                let mut stack = CxList::from(OrderedChunnel::default())
-                    .wrap(SeqUnreliableChunnel)
-                    .wrap(ProjectLeft::from(()));
+                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
 
                 let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;
@@ -679,7 +667,7 @@ mod test {
         rt.block_on(
             async move {
                 let mut t = Chan::default();
-                let staged: Arc<Mutex<(usize, Vec<((), Vec<u8>)>)>> = Default::default();
+                let staged: Arc<Mutex<(usize, Vec<Vec<u8>>)>> = Default::default();
                 t.link_conditions(move |x| {
                     let mut s = staged.lock().unwrap();
                     let (c, st) = &mut s.deref_mut();
@@ -703,9 +691,7 @@ mod test {
 
                 let (mut srv, mut cln) = t.split();
 
-                let mut stack = CxList::from(OrderedChunnel::default())
-                    .wrap(SeqUnreliableChunnel)
-                    .wrap(ProjectLeft::from(()));
+                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
 
                 let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;

@@ -4,7 +4,7 @@
 //! segment, the `Vec<u8>`.
 
 use crate::{
-    util::{ProjectLeft, ProjectLeftCn, Unproject},
+    util::{ProjectLeft, Unproject},
     ChunnelConnection, Client, Negotiate, Serve,
 };
 use color_eyre::eyre;
@@ -22,68 +22,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tracing::{debug, instrument, trace};
 use tracing_futures::Instrument;
-
-#[derive(Clone, Debug)]
-pub struct ReliabilityChunnel {
-    inner: ReliabilityProjChunnel,
-}
-
-impl Default for ReliabilityChunnel {
-    fn default() -> Self {
-        Self {
-            inner: Default::default(),
-        }
-    }
-}
-
-impl Negotiate for ReliabilityChunnel {
-    type Capability = ();
-}
-
-impl ReliabilityChunnel {
-    pub fn set_timeout_factor(&mut self, to: usize) -> &mut Self {
-        self.inner.timeout = to;
-        self
-    }
-}
-
-impl<InS, InC, InE, D> Serve<InS> for ReliabilityChunnel
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    D: Clone + Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ProjectLeftCn<(), ReliabilityProj<(), D, Unproject<InC>>>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let st = inner.map_ok(Unproject);
-        match self.inner.serve(st).into_inner() {
-            Ok(st) => ProjectLeft::from(()).serve(st),
-            Err(e) => ready(Err(e)),
-        }
-    }
-}
-
-impl<InC, D> Client<InC> for ReliabilityChunnel
-where
-    InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
-    D: Clone + Send + Sync + 'static,
-{
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Connection = ProjectLeftCn<(), ReliabilityProj<(), D, Unproject<InC>>>;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        let fut = self.inner.connect_wrap(Unproject(cn));
-        Box::pin(async move { ProjectLeft::from(()).connect_wrap(fut.await?).await })
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct ReliabilityProjChunnel {
@@ -151,6 +89,68 @@ where
             tokio::spawn(nagler(Arc::clone(&r.inner), Arc::clone(&r.state)));
             Ok(r)
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ReliabilityChunnel {
+    inner: ReliabilityProjChunnel,
+}
+
+impl Default for ReliabilityChunnel {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+        }
+    }
+}
+
+impl Negotiate for ReliabilityChunnel {
+    type Capability = ();
+}
+
+impl ReliabilityChunnel {
+    pub fn set_timeout_factor(&mut self, to: usize) -> &mut Self {
+        self.inner.timeout = to;
+        self
+    }
+}
+
+impl<InS, InC, InE, D> Serve<InS> for ReliabilityChunnel
+where
+    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+    InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
+    InE: Send + Sync + 'static,
+    D: Clone + Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Connection = ProjectLeft<(), ReliabilityProj<(), D, Unproject<InC>>>;
+    type Error = InE;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn serve(&mut self, inner: InS) -> Self::Future {
+        let st = inner.map_ok(Unproject);
+        match self.inner.serve(st).into_inner() {
+            Ok(st) => ready(Ok(Box::pin(st.map_ok(|cn| ProjectLeft::new((), cn))) as _)),
+            Err(e) => ready(Err(e)),
+        }
+    }
+}
+
+impl<InC, D> Client<InC> for ReliabilityChunnel
+where
+    InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
+    D: Clone + Send + Sync + 'static,
+{
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = ProjectLeft<(), ReliabilityProj<(), D, Unproject<InC>>>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        let fut = self.inner.connect_wrap(Unproject(cn));
+        Box::pin(async move { Ok(ProjectLeft::new((), fut.await?)) })
     }
 }
 
@@ -543,8 +543,8 @@ mod test {
     use super::ReliabilityChunnel;
     use crate::chan_transport::Chan;
     use crate::{
-        bincode::SerializeChunnel, util::ProjectLeft, ChunnelConnection, ChunnelConnector,
-        ChunnelListener, Client, CxList, Serve,
+        bincode::SerializeChunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
+        CxList, Serve,
     };
     use futures_util::StreamExt;
     use tracing::{debug, info};
@@ -599,9 +599,8 @@ mod test {
         rt.block_on(
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
-                let mut l = CxList::from(ReliabilityChunnel::default())
-                    .wrap(SerializeChunnel::default())
-                    .wrap(ProjectLeft::from(()));
+                let mut l =
+                    CxList::from(ReliabilityChunnel::default()).wrap(SerializeChunnel::default());
 
                 let rcv_st = srv.listen(()).await.unwrap();
                 let mut rcv_st = l.serve(rcv_st).await.unwrap();
@@ -647,9 +646,8 @@ mod test {
                 });
 
                 let (mut srv, mut cln) = t.split();
-                let mut l = CxList::from(ReliabilityChunnel::default())
-                    .wrap(SerializeChunnel::default())
-                    .wrap(ProjectLeft::from(()));
+                let mut l =
+                    CxList::from(ReliabilityChunnel::default()).wrap(SerializeChunnel::default());
 
                 let rcv_st = srv.listen(()).await.unwrap();
                 let mut rcv_st = l.serve(rcv_st).await.unwrap();
@@ -728,8 +726,7 @@ mod test {
                 let (mut srv, mut cln) = t.split();
                 let mut stack = CxList::from(TaggerChunnel)
                     .wrap(ReliabilityChunnel::default())
-                    .wrap(SerializeChunnel::default())
-                    .wrap(ProjectLeft::from(()));
+                    .wrap(SerializeChunnel::default());
 
                 let rcv_st = srv.listen(()).await.unwrap();
                 let mut rcv_st = stack.serve(rcv_st).await.unwrap();
