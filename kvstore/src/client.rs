@@ -31,6 +31,7 @@ impl KvClient<NeverCn> {
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
+        // deliberately don't add any selects
         let neg_stack = CxList::from(OrderedChunnelProj::default())
             .wrap(ReliabilityProjChunnel::default())
             .wrap(SerializeChunnelProject::default());
@@ -51,10 +52,15 @@ impl KvClient<NeverCn> {
         let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
         debug!("make client");
 
+        use crate::reliability::KvReliabilityChunnel;
+        use bertha::negotiate::Select;
+
         let cl = ClientShardChunnelClient::new(canonical_addr, &redis_addr).await?;
-        let neg_stack = CxList::from(bertha::negotiate::Select(cl, Nothing::default()))
-            .wrap(OrderedChunnelProj::default())
-            .wrap(ReliabilityProjChunnel::default())
+        let neg_stack = CxList::from(Select(cl, Nothing::default()))
+            .wrap(Select(
+                KvReliabilityChunnel::default(),
+                CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
+            ))
             .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
