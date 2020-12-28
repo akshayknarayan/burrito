@@ -336,5 +336,10 @@ mod test {
         let rev = cxlist.rev();
         let compare = CxList::from(false);
         assert_eq!(rev, compare);
+
+        let cxlist = CxList::from("15").wrap(15);
+        let rev = cxlist.rev();
+        let compare = CxList::from(15).wrap("15");
+        assert_eq!(rev, compare);
     }
 }

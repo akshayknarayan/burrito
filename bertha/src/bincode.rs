@@ -228,7 +228,7 @@ mod test {
     };
     use std::future::Future;
     use std::pin::Pin;
-    use tracing::trace;
+    use tracing::{debug, trace};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -416,27 +416,30 @@ mod test {
         InS: Stream<Item = Result<InC, InE>> + Send + 'static,
         InC: ChunnelConnection<Data = (A, Foo)> + Send + Sync + 'static,
         InE: Send + Sync + 'static,
+        A: 'static,
     {
         type Future = Ready<Result<Self::Stream, Self::Error>>;
-        type Connection = InC;
+        type Connection = BarCn<InC>;
         type Error = InE;
-        type Stream = InS;
+        type Stream =
+            Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
         fn serve(&mut self, inner: InS) -> Self::Future {
-            ready(Ok(inner))
+            ready(Ok(Box::pin(inner.map_ok(|i| BarCn(i))) as _))
         }
     }
 
     impl<A, InC> Client<InC> for BarChunnel
     where
+        A: 'static,
         InC: ChunnelConnection<Data = (A, Foo)> + Send + Sync + 'static,
     {
         type Future = Ready<Result<Self::Connection, Self::Error>>;
-        type Connection = InC;
+        type Connection = BarCn<InC>;
         type Error = Report;
 
         fn connect_wrap(&mut self, inner: InC) -> Self::Future {
-            ready(Ok(inner))
+            ready(Ok(BarCn(inner)))
         }
     }
 
@@ -524,14 +527,15 @@ mod test {
                     .unwrap();
                 let cn = ProjectLeft::new((), cn);
 
-                //let obj = Bar {
-                //    d: 9,
-                //    c: "hello".to_owned(),
-                //};
-                let obj = Foo {
-                    a: 42,
-                    b: 1000,
-                    c: "blah".to_owned(),
+                fn dump_type<T>(_: &T) {
+                    debug!(conn = ?std::any::type_name::<T>(), "got connection");
+                }
+
+                dump_type(&cn);
+
+                let obj = Bar {
+                    d: 9,
+                    c: "hello".to_owned(),
                 };
 
                 cn.send(obj.clone()).await.unwrap();
