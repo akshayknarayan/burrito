@@ -8,23 +8,70 @@ use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
 use futures_util::stream::TryStreamExt;
-use serde::{Deserialize, Serialize};
-use std::any::TypeId;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
 
-#[derive(Debug, Clone)]
-pub struct SerializeChunnelProject<A, D> {
-    _data: std::marker::PhantomData<(A, D)>,
+#[derive(Clone, Debug)]
+pub struct SerializeSelect<T1, T2>(SerializeChunnelProject<T1>, SerializeChunnelProject<T2>);
+
+impl<T1, T2> Default for SerializeSelect<T1, T2>
+where
+    SerializeChunnelProject<T1>: Default,
+    SerializeChunnelProject<T2>: Default,
+{
+    fn default() -> Self {
+        Self(
+            SerializeChunnelProject::<T1>::default(),
+            SerializeChunnelProject::<T2>::default(),
+        )
+    }
 }
 
-impl<A, D: 'static> Negotiate for SerializeChunnelProject<A, D> {
+impl<T1: 'static, T2: 'static, Inp: 'static> crate::negotiate::Apply<Inp>
+    for SerializeSelect<T1, T2>
+{
+    // the only place this D could come from is the trait itself, Apply<D>.
+    type Applied = SerializeChunnelProject<Inp>;
+
+    fn apply(
+        self,
+        picked_offers: HashMap<u64, Vec<crate::negotiate::Offer>>,
+    ) -> Result<(Self::Applied, HashMap<u64, Vec<crate::negotiate::Offer>>), Report> {
+        let datatype = std::any::TypeId::of::<Inp>();
+        match datatype {
+            // safety: we know the types are equivalent because TypeId tells us.
+            x if x == std::any::TypeId::of::<T1>() => {
+                Ok((unsafe { std::mem::transmute(self.0) }, picked_offers))
+            }
+            x if x == std::any::TypeId::of::<T2>() => {
+                Ok((unsafe { std::mem::transmute(self.1) }, picked_offers))
+            }
+            _ => Err(eyre!("No match on serialization")),
+        }
+    }
+}
+
+use crate::negotiate::GetOffers;
+impl<T1, T2> GetOffers for SerializeSelect<T1, T2> {
+    type Iter = std::iter::Empty<crate::negotiate::Offer>;
+    fn offers(&self) -> Self::Iter {
+        std::iter::empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SerializeChunnelProject<D> {
+    _data: std::marker::PhantomData<D>,
+}
+
+impl<D> Negotiate for SerializeChunnelProject<D> {
     type Capability = ();
 }
 
-impl<A, D> Default for SerializeChunnelProject<A, D> {
+impl<D> Default for SerializeChunnelProject<D> {
     fn default() -> Self {
         SerializeChunnelProject {
             _data: Default::default(),
@@ -32,7 +79,7 @@ impl<A, D> Default for SerializeChunnelProject<A, D> {
     }
 }
 
-impl<A, D, InS, InC, InE> Serve<InS> for SerializeChunnelProject<A, D>
+impl<A, D, InS, InC, InE> Serve<InS> for SerializeChunnelProject<D>
 where
     InS: Stream<Item = Result<InC, InE>> + Send + 'static,
     InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
@@ -51,7 +98,7 @@ where
     }
 }
 
-impl<A, D, InC> Client<InC> for SerializeChunnelProject<A, D>
+impl<A, D, InC> Client<InC> for SerializeChunnelProject<D>
 where
     InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     A: Send + Sync + 'static,
@@ -174,7 +221,13 @@ mod test {
     use crate::{
         util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, Serve,
     };
-    use futures_util::{StreamExt, TryStreamExt};
+    use color_eyre::eyre::Report;
+    use futures_util::{
+        future::{ready, Ready},
+        stream::{Stream, StreamExt, TryStreamExt},
+    };
+    use std::future::Future;
+    use std::pin::Pin;
     use tracing::trace;
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
@@ -282,8 +335,15 @@ mod test {
         );
     }
 
+    #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
+    struct Foo {
+        a: u32,
+        b: u64,
+        c: String,
+    }
+
     #[test]
-    fn serialize_negotiate() {
+    fn serialize_negotiate_one() {
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -295,13 +355,6 @@ mod test {
             .enable_time()
             .build()
             .unwrap();
-
-        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
-        struct Foo {
-            a: u32,
-            b: u64,
-            c: String,
-        }
 
         rt.block_on(
             async move {
@@ -345,41 +398,147 @@ mod test {
         );
     }
 
-    #[test]
-    fn type_id_layout() {
-        use super::AccessibleTypeId;
-        fn check_type<T: 'static>() {
-            let type_id = std::any::TypeId::of::<T>();
-            let accessible_type_id = AccessibleTypeId::from(type_id);
+    #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
+    struct Bar {
+        d: u64,
+        c: String,
+    }
 
-            let type_id_str = format!("{:?}", type_id);
-            let accessible_type_id_str = format!("{:?}", accessible_type_id);
+    #[derive(Clone, Copy, Debug, Default)]
+    struct BarChunnel;
 
-            println!(
-                "{:?} type ids: {:?} vs {:?}",
-                std::any::type_name::<T>(),
-                type_id_str,
-                accessible_type_id_str
-            );
+    impl crate::negotiate::Negotiate for BarChunnel {
+        type Capability = ();
+    }
 
-            fn num(tstr: &str) -> &str {
-                tstr.split(':')
-                    .skip(1)
-                    .next()
-                    .unwrap()
-                    .split(' ')
-                    .skip(1)
-                    .next()
-                    .unwrap()
-            }
+    impl<A, InS, InC, InE> Serve<InS> for BarChunnel
+    where
+        InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+        InC: ChunnelConnection<Data = (A, Foo)> + Send + Sync + 'static,
+        InE: Send + Sync + 'static,
+    {
+        type Future = Ready<Result<Self::Stream, Self::Error>>;
+        type Connection = InC;
+        type Error = InE;
+        type Stream = InS;
 
-            let tid: &str = num(&type_id_str);
-            let atid: &str = num(&accessible_type_id_str);
-            assert_eq!(tid, atid);
+        fn serve(&mut self, inner: InS) -> Self::Future {
+            ready(Ok(inner))
+        }
+    }
+
+    impl<A, InC> Client<InC> for BarChunnel
+    where
+        InC: ChunnelConnection<Data = (A, Foo)> + Send + Sync + 'static,
+    {
+        type Future = Ready<Result<Self::Connection, Self::Error>>;
+        type Connection = InC;
+        type Error = Report;
+
+        fn connect_wrap(&mut self, inner: InC) -> Self::Future {
+            ready(Ok(inner))
+        }
+    }
+
+    struct BarCn<C>(C);
+
+    impl<A, C> ChunnelConnection for BarCn<C>
+    where
+        C: ChunnelConnection<Data = (A, Foo)>,
+        A: 'static,
+    {
+        type Data = (A, Bar);
+
+        fn send(
+            &self,
+            data: Self::Data,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+            let foo = Foo {
+                a: 0,
+                b: data.1.d,
+                c: data.1.c,
+            };
+
+            self.0.send((data.0, foo))
         }
 
-        check_type::<Option<Vec<u8>>>();
-        use crate::reliable::Pkt;
-        check_type::<(std::net::SocketAddr, Option<Pkt<Vec<u8>>>)>();
+        fn recv(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+            let fut = self.0.recv();
+            Box::pin(async move {
+                let foo = fut.await?;
+                Ok((
+                    foo.0,
+                    Bar {
+                        d: foo.1.a as u64 + foo.1.b,
+                        c: foo.1.c,
+                    },
+                ))
+            })
+        }
+    }
+
+    #[test]
+    fn serialize_negotiate_multi() {
+        use crate::CxList;
+
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or_else(|_| ());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let (mut srv, mut cln) = Chan::default().split();
+                let stack = CxList::from(BarChunnel).wrap(SerializeChunnelProject::default());
+
+                let srv_stack = stack.clone();
+                tokio::spawn(async move {
+                    let rcv_st = srv.listen(()).await.unwrap();
+                    let st = crate::negotiate::negotiate_server(srv_stack, rcv_st)
+                        .await
+                        .unwrap();
+                    st.try_for_each_concurrent(None, |cn| async move {
+                        let cn = ProjectLeft::new((), cn);
+                        loop {
+                            let buf = cn.recv().await?;
+                            cn.send(buf).await?;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                });
+
+                let stack = CxList::from(SerializeChunnelProject::default()).wrap(BarChunnel);
+                let raw_cn = cln.connect(()).await.unwrap();
+                let cn = crate::negotiate::negotiate_client(stack, raw_cn, ())
+                    .await
+                    .unwrap();
+                let cn = ProjectLeft::new((), cn);
+
+                //let obj = Bar {
+                //    d: 9,
+                //    c: "hello".to_owned(),
+                //};
+                let obj = Foo {
+                    a: 42,
+                    b: 1000,
+                    c: "blah".to_owned(),
+                };
+
+                cn.send(obj.clone()).await.unwrap();
+                let r = cn.recv().await.unwrap();
+                assert_eq!(r, obj);
+            }
+            .instrument(tracing::info_span!("serialize_negotiate")),
+        );
     }
 }

@@ -104,11 +104,15 @@ async fn serve_canonical(
     .wrap_err("Create ShardCanonicalServer")?;
 
     use bertha::{negotiate::Select, util::Nothing};
+    //let external = CxList::from(cnsrv)
+    //    .wrap(Select(
+    //        CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
+    //        Nothing::default(),
+    //    ))
+    //    .wrap(SerializeChunnelProject::default());
     let external = CxList::from(cnsrv)
-        .wrap(Select(
-            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-            Nothing,
-        ))
+        .wrap(OrderedChunnelProj::default())
+        .wrap(ReliabilityProjChunnel::default())
         .wrap(SerializeChunnelProject::default());
     info!(shard_info = ?&si, "start canonical server");
     let st = bertha::negotiate::negotiate_server(external, st)

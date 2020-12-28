@@ -2,7 +2,7 @@
 
 use crate::msg::Msg;
 use bertha::{
-    bincode::SerializeChunnelProject,
+    bincode::{SerializeChunnelProject, SerializeSelect},
     reliable::ReliabilityProjChunnel,
     tagger::OrderedChunnelProj,
     util::ProjectLeft,
@@ -56,12 +56,19 @@ impl KvClient<NeverCn> {
         use bertha::negotiate::Select;
 
         let cl = ClientShardChunnelClient::new(canonical_addr, &redis_addr).await?;
-        let neg_stack = CxList::from(Select(cl, Nothing::default()))
-            .wrap(Select(
-                KvReliabilityChunnel::default(),
-                CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-            ))
-            .wrap(SerializeChunnelProject::default());
+        let neg_stack = CxList::from(SerializeSelect::<
+            (SocketAddr, bertha::reliable::Pkt<Msg>),
+            (SocketAddr, Msg),
+        >::default())
+        .wrap(Select(
+            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
+            KvReliabilityChunnel::default(),
+        ))
+        .wrap(Select(cl, Nothing::<()>::default()));
+        //let neg_stack = CxList::from(Select(cl, Nothing::default()))
+        //    .wrap(CxList::from(OrderedChunnelProj::default()))
+        //    .wrap(ReliabilityProjChunnel::default())
+        //    .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
@@ -139,5 +146,60 @@ where
     pub async fn get(&self, key: String) -> Result<Option<String>, Report> {
         let req = Msg::get_req(key);
         self.do_req(req).await
+    }
+}
+
+#[cfg(test)]
+mod t {
+    use crate::reliability::KvReliabilityChunnel;
+    use bertha::negotiate::Select;
+    use bertha::{
+        bincode::{SerializeChunnelProject, SerializeSelect},
+        reliable::ReliabilityProjChunnel,
+        tagger::OrderedChunnelProj,
+        util::Nothing,
+        ChunnelConnection, Client, CxList,
+    };
+    use burrito_shard_ctl::ClientShardChunnelClient;
+    use std::net::SocketAddr;
+    use tracing_error::ErrorLayer;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    #[test]
+    fn select_types() {
+        // this test won't run, just check compilation
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        // 0. Make rt.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let x: SocketAddr = "127.0.0.1:1414".parse().unwrap();
+            let cl = ClientShardChunnelClient::<_, SocketAddr>::new(x, "127.0.0.1:1414")
+                .await
+                .unwrap();
+            let stack = CxList::from(Select(cl, Nothing::<()>::default()))
+                .wrap(Select(
+                    CxList::from(OrderedChunnelProj::default())
+                        .wrap(ReliabilityProjChunnel::default()),
+                    KvReliabilityChunnel::default(),
+                ))
+                .wrap(SerializeSelect::<
+                    bertha::reliable::Pkt<crate::msg::Msg>,
+                    crate::msg::Msg,
+                >::default());
+
+            use bertha::negotiate::{Apply, GetOffers};
+            //let stack: Box<dyn Apply<(SocketAddr, Vec<u8>), Applied = _>> = Box::new(stack) as _;
+            //let stack: Box<dyn GetOffers<Iter = _>> = Box::new(stack) as _;
+        });
     }
 }

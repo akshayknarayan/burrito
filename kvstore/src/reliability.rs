@@ -22,7 +22,8 @@ use tracing_futures::Instrument;
 ///
 /// These assumptions allow us to forego seqno generation and explicit acks.  As a result, however,
 /// this will only work on the client side, since we assume that `send`s and `recv`s are paired and
-/// that the `send` is first. Waiting on a `recv` without a prior `send` will block forever.
+/// that the `send` is first. Waiting on a `recv` without a prior `send` will block forever. So,
+/// the `Serve` implementation does nothing.
 #[derive(Debug, Clone)]
 pub struct KvReliabilityChunnel {
     timeout: Duration,

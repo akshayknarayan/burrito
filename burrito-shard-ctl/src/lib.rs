@@ -249,12 +249,17 @@ where
         + 'static,
     S: ChunnelConnector<Addr = A, Error = E> + Clone + Send + Sync + 'static,
     S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    Ss: bertha::negotiate::Apply + bertha::negotiate::GetOffers + Clone + Send + Sync + 'static,
-    <Ss as bertha::negotiate::Apply>::Applied:
+    Ss: bertha::negotiate::Apply<(A, Vec<u8>)>
+        + bertha::negotiate::GetOffers
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    <Ss as bertha::negotiate::Apply<(A, Vec<u8>)>>::Applied:
         Client<S::Connection> + Clone + std::fmt::Debug + Send + 'static,
-    <<Ss as bertha::negotiate::Apply>::Applied as Client<S::Connection>>::Connection:
+    <<Ss as bertha::negotiate::Apply<(A, Vec<u8>)>>::Applied as Client<S::Connection>>::Connection:
         ChunnelConnection<Data = D> + Send + Sync + 'static,
-    <<Ss as bertha::negotiate::Apply>::Applied as Client<S::Connection>>::Error:
+    <<Ss as bertha::negotiate::Apply<(A, Vec<u8>)>>::Applied as Client<S::Connection>>::Error:
         Into<Error> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
     <D as Kv>::Key: AsRef<str>,
@@ -262,7 +267,7 @@ where
 {
     type Connection = ShardCanonicalServerConnection<
         Ic,
-        <<Ss as bertha::negotiate::Apply>::Applied as Client<S::Connection>>::Connection,
+        <<Ss as bertha::negotiate::Apply<<S::Connection as ChunnelConnection>::Data>>::Applied as Client<S::Connection>>::Connection,
     >;
     type Error = Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;

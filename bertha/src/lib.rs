@@ -75,7 +75,7 @@ where
 }
 
 /// Chain multiple chunnels together with the `Serve` and `Client` traits.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CxList<Head, Tail> {
     pub head: Head,
     pub tail: Tail,
@@ -99,6 +99,59 @@ impl<T, L> From<(T, L)> for CxList<T, CxList<L, CxNil>> {
 impl<H, L> CxList<H, L> {
     pub fn wrap<T>(self, head: T) -> CxList<T, CxList<H, L>> {
         CxList { head, tail: self }
+    }
+}
+
+pub trait AppendBack<T> {
+    type Appended;
+    fn append(self, it: T) -> Self::Appended;
+}
+
+impl<T> AppendBack<T> for CxNil {
+    type Appended = CxList<T, CxNil>;
+
+    fn append(self, it: T) -> Self::Appended {
+        CxList {
+            head: it,
+            tail: self,
+        }
+    }
+}
+
+impl<H, T, I> AppendBack<I> for CxList<H, T>
+where
+    T: AppendBack<I>,
+{
+    type Appended = CxList<H, <T as AppendBack<I>>::Appended>;
+    fn append(self, it: I) -> Self::Appended {
+        CxList {
+            head: self.head,
+            tail: self.tail.append(it),
+        }
+    }
+}
+
+pub trait CxListReverse {
+    type Reversed;
+    fn rev(self) -> Self::Reversed;
+}
+
+impl<N: Negotiate> CxListReverse for N {
+    type Reversed = Self;
+    fn rev(self) -> Self::Reversed {
+        self
+    }
+}
+
+impl<H, T> CxListReverse for CxList<H, T>
+where
+    T: CxListReverse,
+    <T as CxListReverse>::Reversed: AppendBack<H>,
+{
+    type Reversed = <<T as CxListReverse>::Reversed as AppendBack<H>>::Appended;
+
+    fn rev(self) -> Self::Reversed {
+        self.tail.rev().append(self.head)
     }
 }
 
@@ -268,5 +321,20 @@ mod test {
             .instrument(tracing::info_span!("cxnil")),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn cxlist_reverse() {
+        use super::CxListReverse;
+
+        let cxlist = CxList::from(true).wrap(42).wrap("foo").wrap(3.14);
+        let rev = cxlist.rev();
+        let compare = CxList::from(3.14).wrap("foo").wrap(42).wrap(true);
+        assert_eq!(rev, compare);
+
+        let cxlist = CxList::from(false);
+        let rev = cxlist.rev();
+        let compare = CxList::from(false);
+        assert_eq!(rev, compare);
     }
 }
