@@ -1,6 +1,6 @@
 //! Helper Chunnel types to transform Data types, etc.
 
-use super::{ChunnelConnection, Client, Serve};
+use super::{ChunnelConnection, Client};
 use ahash::AHashMap;
 use color_eyre::eyre::{eyre, Report};
 use dashmap::DashMap;
@@ -8,7 +8,6 @@ use futures_util::future::{
     TryFutureExt, {ready, Ready},
 };
 use futures_util::stream::Stream;
-use futures_util::stream::TryStreamExt;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::Hash;
@@ -327,24 +326,6 @@ where
     type Capability = N;
 }
 
-impl<N, D, InS, InC, InE> Serve<InS> for Nothing<N>
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    D: 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = InC;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner) as _))
-    }
-}
-
 impl<D, InC> Client<InC> for Nothing
 where
     InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
@@ -363,22 +344,6 @@ where
 /// returns data.
 #[derive(Debug, Clone, Default)]
 pub struct Never;
-
-impl<InS, InC, InE> Serve<InS> for Never
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InE: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = NeverCn;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(|_| Default::default())) as _))
-    }
-}
 
 impl<D, InC> Client<InC> for Never
 where

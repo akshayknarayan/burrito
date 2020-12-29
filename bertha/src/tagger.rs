@@ -2,12 +2,11 @@
 
 use crate::{
     util::{ProjectLeft, Unproject},
-    ChunnelConnection, Client, Negotiate, Serve,
+    ChunnelConnection, Client, Negotiate,
 };
 use color_eyre::eyre;
 use dashmap::DashMap;
 use futures_util::future::{ready, Ready};
-use futures_util::stream::{Stream, TryStreamExt};
 use std::collections::BinaryHeap;
 use std::convert::TryInto;
 use std::future::Future;
@@ -22,25 +21,6 @@ pub struct TaggerProjChunnel;
 
 impl Negotiate for TaggerProjChunnel {
     type Capability = ();
-}
-
-impl<A, D, InS, InC, InE> Serve<InS> for TaggerProjChunnel
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    A: Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = TaggerProj<InC>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(TaggerProj::from)) as _))
-    }
 }
 
 impl<A, D, InC> Client<InC> for TaggerProjChunnel
@@ -63,28 +43,6 @@ pub struct TaggerChunnel;
 
 impl Negotiate for TaggerChunnel {
     type Capability = ();
-}
-
-impl<D, InS, InC, InE> Serve<InS> for TaggerChunnel
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ProjectLeft<(), TaggerProj<Unproject<InC>>>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let st = inner.map_ok(Unproject);
-        match TaggerProjChunnel.serve(st).into_inner() {
-            Ok(st) => ready(Ok(Box::pin(st.map_ok(|cn| ProjectLeft::new((), cn))) as _)),
-            Err(e) => ready(Err(e)),
-        }
-    }
 }
 
 impl<D, InC> Client<InC> for TaggerChunnel
@@ -192,28 +150,6 @@ impl Negotiate for OrderedChunnelProj {
     type Capability = ();
 }
 
-impl<A, D, InS, InC, InE> Serve<InS> for OrderedChunnelProj
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = OrderedProj<A, InC, D>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let cfg = self.hole_thresh;
-        ready(Ok(
-            Box::pin(inner.map_ok(move |cn| OrderedProj::new(cn, cfg))) as _,
-        ))
-    }
-}
-
 impl<A, D, InC> Client<InC> for OrderedChunnelProj
 where
     InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
@@ -246,28 +182,6 @@ impl OrderedChunnel {
 
 impl Negotiate for OrderedChunnel {
     type Capability = ();
-}
-
-impl<D, InS, InC, InE> Serve<InS> for OrderedChunnel
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ProjectLeft<(), OrderedProj<(), Unproject<InC>, D>>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let st = inner.map_ok(Unproject);
-        match self.inner.serve(st).into_inner() {
-            Ok(st) => ready(Ok(Box::pin(st.map_ok(|cn| ProjectLeft::new((), cn))) as _)),
-            Err(e) => ready(Err(e)),
-        }
-    }
 }
 
 impl<D, InC> Client<InC> for OrderedChunnel
@@ -443,23 +357,6 @@ impl<D> Ord for DataPair<D> {
 #[derive(Debug, Clone)]
 pub struct SeqUnreliableChunnel;
 
-impl<InS, InC, InE> Serve<InS> for SeqUnreliableChunnel
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = SeqUnreliable<InC>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(SeqUnreliable::from)) as _))
-    }
-}
-
 impl<InC> Client<InC> for SeqUnreliableChunnel
 where
     InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
@@ -531,7 +428,8 @@ where
 mod test {
     use super::{OrderedChunnel, SeqUnreliableChunnel, TaggerChunnel};
     use crate::chan_transport::Chan;
-    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList, Serve};
+    use crate::test::Serve;
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList};
     use color_eyre::Report;
     use futures_util::StreamExt;
     use tracing::{debug, info};

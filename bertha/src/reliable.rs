@@ -5,13 +5,10 @@
 
 use crate::{
     util::{ProjectLeft, Unproject},
-    ChunnelConnection, Client, Negotiate, Serve,
+    ChunnelConnection, Client, Negotiate,
 };
 use color_eyre::eyre;
 use dashmap::DashMap;
-use futures_util::future::{ready, Ready};
-use futures_util::stream::Stream;
-use futures_util::stream::TryStreamExt;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -42,32 +39,6 @@ impl ReliabilityProjChunnel {
     pub fn set_timeout_factor(&mut self, to: usize) -> &mut Self {
         self.timeout = to;
         self
-    }
-}
-
-impl<A, InS, InC, InE, D> Serve<InS> for ReliabilityProjChunnel
-where
-    A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    D: Clone + Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ReliabilityProj<A, D, InC>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let cfg = self.timeout;
-        ready(Ok(Box::pin(inner.and_then(move |cn| async move {
-            let mut r = ReliabilityProj::from(cn);
-            r.set_timeout_factor(cfg);
-            // spawn the delayed ack thingy
-            tokio::spawn(nagler(Arc::clone(&r.inner), Arc::clone(&r.state)));
-            Ok(r)
-        })) as _))
     }
 }
 
@@ -113,28 +84,6 @@ impl ReliabilityChunnel {
     pub fn set_timeout_factor(&mut self, to: usize) -> &mut Self {
         self.inner.timeout = to;
         self
-    }
-}
-
-impl<InS, InC, InE, D> Serve<InS> for ReliabilityChunnel
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    D: Clone + Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ProjectLeft<(), ReliabilityProj<(), D, Unproject<InC>>>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let st = inner.map_ok(Unproject);
-        match self.inner.serve(st).into_inner() {
-            Ok(st) => ready(Ok(Box::pin(st.map_ok(|cn| ProjectLeft::new((), cn))) as _)),
-            Err(e) => ready(Err(e)),
-        }
     }
 }
 
@@ -542,9 +491,10 @@ async fn nagler<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
 mod test {
     use super::ReliabilityChunnel;
     use crate::chan_transport::Chan;
+    use crate::test::Serve;
     use crate::{
         bincode::SerializeChunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
-        CxList, Serve,
+        CxList,
     };
     use futures_util::StreamExt;
     use tracing::{debug, info};

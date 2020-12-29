@@ -23,16 +23,6 @@ pub mod util;
 pub use either::*;
 pub use negotiate::*;
 
-/// `Serve`s transform the semantics of the data flowing through them in some way.
-pub trait Serve<I> {
-    type Future: Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static;
-    type Connection: ChunnelConnection + 'static;
-    type Error: Send + Sync + 'static;
-    type Stream: Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static;
-
-    fn serve(&mut self, inner: I) -> Self::Future;
-}
-
 /// `Client`s transform semantics of the data flowing through them in some way.
 pub trait Client<I> {
     type Future: Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static;
@@ -44,22 +34,6 @@ pub trait Client<I> {
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub struct CxNil;
-
-impl<I, C, E> Serve<I> for CxNil
-where
-    I: Stream<Item = Result<C, E>> + Send + 'static,
-    C: ChunnelConnection + 'static,
-    E: Send + Sync + 'static,
-{
-    type Future = futures_util::future::Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = C;
-    type Error = E;
-    type Stream = I;
-
-    fn serve(&mut self, inner: I) -> Self::Future {
-        futures_util::future::ready(Ok(inner))
-    }
-}
 
 impl<C> Client<C> for CxNil
 where
@@ -74,7 +48,7 @@ where
     }
 }
 
-/// Chain multiple chunnels together with the `Serve` and `Client` traits.
+/// Chain multiple chunnels together with the `Client` trait.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CxList<Head, Tail> {
     pub head: Head,
@@ -152,28 +126,6 @@ where
 
     fn rev(self) -> Self::Reversed {
         self.tail.rev().append(self.head)
-    }
-}
-
-impl<H, T, I> Serve<I> for CxList<H, T>
-where
-    H: Serve<I>,
-    T: Serve<<H as Serve<I>>::Stream> + Clone + Send + 'static,
-    <T as Serve<<H as Serve<I>>::Stream>>::Error: From<<H as Serve<I>>::Error>,
-{
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
-    type Connection = T::Connection;
-    type Error = T::Error;
-    type Stream = T::Stream;
-
-    fn serve(&mut self, inner: I) -> Self::Future {
-        let st_fut = self.head.serve(inner);
-        let mut tail = self.tail.clone();
-        Box::pin(async move {
-            let st = st_fut.await?;
-            let st = tail.serve(st).await?;
-            Ok(st)
-        })
     }
 }
 
@@ -276,14 +228,51 @@ pub enum Endedness {
 #[cfg(test)]
 mod test {
     use crate::chan_transport::Chan;
-    use crate::{
-        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList, CxNil, Serve,
-    };
+    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList, CxNil};
     use color_eyre::Report;
-    use futures_util::StreamExt;
+    use futures_util::{
+        future::{ready, Ready, TryFutureExt},
+        stream::Stream,
+        StreamExt, TryStreamExt,
+    };
+    use std::{future::Future, pin::Pin};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    pub(crate) trait Serve<I> {
+        type Future: Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static;
+        type Connection: ChunnelConnection + 'static;
+        type Error: Send + Sync + 'static;
+        type Stream: Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static;
+
+        fn serve(&mut self, inner: I) -> Self::Future;
+    }
+
+    impl<InS, InC, InE, C> Serve<InS> for C
+    where
+        C: Client<InC> + Clone + Send + 'static,
+        <C as Client<InC>>::Error: Into<Report> + Send + Sync + 'static,
+        InS: Stream<Item = Result<InC, InE>> + Send + 'static,
+        InC: Send + 'static,
+        InE: Into<Report> + Send + Sync + 'static,
+    {
+        type Future = Ready<Result<Self::Stream, Self::Error>>;
+        type Connection = C::Connection;
+        type Error = Report;
+        type Stream =
+            Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+        fn serve(&mut self, inner: InS) -> Self::Future {
+            use crate::and_then_concurrent::TryStreamExtExt;
+            let mut this = self.clone();
+            ready(Ok(Box::pin(
+                inner
+                    .map_err(Into::into)
+                    .and_then_concurrent(move |cn| this.connect_wrap(cn).map_err(Into::into)),
+            ) as _))
+        }
+    }
 
     #[test]
     fn cxnil() {

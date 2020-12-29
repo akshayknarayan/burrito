@@ -2,12 +2,10 @@
 
 use crate::{
     util::{ProjectLeft, Unproject},
-    ChunnelConnection, Client, Negotiate, Serve,
+    ChunnelConnection, Client, Negotiate,
 };
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
-use futures_util::stream::Stream;
-use futures_util::stream::TryStreamExt;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -79,25 +77,6 @@ impl<D> Default for SerializeChunnelProject<D> {
     }
 }
 
-impl<A, D, InS, InC, InE> Serve<InS> for SerializeChunnelProject<D>
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    A: Send + Sync + 'static,
-    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = SerializeProject<A, D, InC>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        ready(Ok(Box::pin(inner.map_ok(SerializeProject::from)) as _))
-    }
-}
-
 impl<A, D, InC> Client<InC> for SerializeChunnelProject<D>
 where
     InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
@@ -120,28 +99,6 @@ pub struct SerializeChunnel<D> {
 
 impl<D: 'static> Negotiate for SerializeChunnel<D> {
     type Capability = ();
-}
-
-impl<D, InS, InC, InE> Serve<InS> for SerializeChunnel<D>
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = ProjectLeft<(), SerializeProject<(), D, Unproject<InC>>>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let st = inner.map_ok(Unproject);
-        match SerializeChunnelProject::default().serve(st).into_inner() {
-            Ok(st) => ready(Ok(Box::pin(st.map_ok(|cn| ProjectLeft::new((), cn))) as _)),
-            Err(e) => ready(Err(e)),
-        }
-    }
 }
 
 impl<D, InC> Client<InC> for SerializeChunnel<D>
@@ -218,13 +175,12 @@ where
 mod test {
     use super::{SerializeChunnel, SerializeChunnelProject};
     use crate::chan_transport::Chan;
-    use crate::{
-        util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, Serve,
-    };
+    use crate::test::Serve;
+    use crate::{util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client};
     use color_eyre::eyre::Report;
     use futures_util::{
         future::{ready, Ready},
-        stream::{Stream, StreamExt, TryStreamExt},
+        stream::{StreamExt, TryStreamExt},
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -411,24 +367,6 @@ mod test {
         type Capability = ();
     }
 
-    impl<A, InS, InC, InE> Serve<InS> for BarChunnel
-    where
-        InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-        InC: ChunnelConnection<Data = (A, Foo)> + Send + Sync + 'static,
-        InE: Send + Sync + 'static,
-        A: 'static,
-    {
-        type Future = Ready<Result<Self::Stream, Self::Error>>;
-        type Connection = BarCn<InC>;
-        type Error = InE;
-        type Stream =
-            Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-        fn serve(&mut self, inner: InS) -> Self::Future {
-            ready(Ok(Box::pin(inner.map_ok(|i| BarCn(i))) as _))
-        }
-    }
-
     impl<A, InC> Client<InC> for BarChunnel
     where
         A: 'static,
@@ -501,7 +439,7 @@ mod test {
         rt.block_on(
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
-                let stack = CxList::from(BarChunnel).wrap(SerializeChunnelProject::default());
+                let stack = CxList::from(SerializeChunnelProject::default()).wrap(BarChunnel);
 
                 let srv_stack = stack.clone();
                 tokio::spawn(async move {
@@ -520,7 +458,6 @@ mod test {
                     .unwrap();
                 });
 
-                let stack = CxList::from(SerializeChunnelProject::default()).wrap(BarChunnel);
                 let raw_cn = cln.connect(()).await.unwrap();
                 let cn = crate::negotiate::negotiate_client(stack, raw_cn, ())
                     .await

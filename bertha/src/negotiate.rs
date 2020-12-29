@@ -1,10 +1,10 @@
 //! Chunnel wrapper types to negotiate between multiple implementations.
 
-use crate::{ChunnelConnection, Client, CxList, CxListReverse, CxNil, Either, Serve};
+use crate::{ChunnelConnection, Client, CxList, CxListReverse, CxNil, Either};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
-    future::{select, FutureExt, Ready},
-    stream::{Once, Stream, TryStreamExt},
+    future::{select, FutureExt},
+    stream::{Stream, TryStreamExt},
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
@@ -226,7 +226,7 @@ where
     }
 }
 
-/// Trait to monomorphize a CxList with possible `Select`s into something that impls Serve
+/// Trait to monomorphize a CxList with possible `Select`s into something that impls Client
 pub trait Pick {
     type Picked;
     type Iter: Iterator<Item = Offer>;
@@ -552,7 +552,7 @@ pub enum NegotiateMsg {
     ServerNonceAck,
 }
 
-type ServeInput<C, A> = Once<Ready<Result<InjectWithChannel<C, (A, Vec<u8>)>, Report>>>;
+type ClientInput<C, A> = InjectWithChannel<C, (A, Vec<u8>)>;
 
 use crate::and_then_concurrent::TryStreamExtExt;
 
@@ -565,8 +565,8 @@ pub fn negotiate_server<Srv, Sc, Se, C, A>(
         impl Stream<
                 Item = Result<
                     Either<
-                        <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Connection,
-                        <<Srv as Apply<(A, Vec<u8>)>>::Applied as Serve<ServeInput<C, A>>>::Connection,
+                        <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection,
+                        <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection,
                     >,
                     Report,
                 >,
@@ -582,19 +582,18 @@ where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     Srv: Pick + Apply<(A, Vec<u8>)> + GetOffers + Clone + Send + 'static,
 // main-line branch: Pick on incoming negotiation handshake.
-    <Srv as Pick>::Picked: NegotiatePicked + Serve<ServeInput<C, A>> + Clone + Send + 'static,
-    <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Connection: Send + Sync + 'static,
-    <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Error: Into<Report> + Send + Sync + 'static,
-    <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Stream: Unpin + Send + 'static,
+    <Srv as Pick>::Picked: CxListReverse + Send + 'static,
+    <<Srv as Pick>::Picked as CxListReverse>::Reversed: NegotiatePicked + Client<ClientInput<C, A>> + Clone + Send + 'static,
+    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Error: Into<Report> + Send + Sync + 'static,
     <Srv as Pick>::Iter: Send,
 // nonce branch: Apply stack from nonce on indicated connections.
-    <Srv as Apply<(A, Vec<u8>)>>::Applied: Serve<ServeInput<C, A>> + Clone + Send + 'static,
-    <<Srv as Apply<(A, Vec<u8>)>>::Applied as Serve<ServeInput<C, A>>>::Connection:
+    <Srv as Apply<(A, Vec<u8>)>>::Applied: CxListReverse + Send + 'static,
+    <<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed: Client<ClientInput<C, A>> + Clone + Send + 'static,
+    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection:
         Send + Sync + 'static,
-    <<Srv as Apply<(A, Vec<u8>)>>::Applied as Serve<ServeInput<C, A>>>::Error:
+    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Error:
         Into<Report> + Send + Sync + 'static,
-    <<Srv as Apply<(A, Vec<u8>)>>::Applied as Serve<ServeInput<C, A>>>::Stream:
-        Unpin + Send + 'static,
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
 {
     async move {
@@ -611,9 +610,7 @@ where
             .and_then_concurrent(move |cn| {
                 let stack = stack.clone();
                 let pending_negotiated_connections = Arc::clone(&pending_negotiated_connections);
-                async move {
-                    negotiate_server_connection(cn, stack, pending_negotiated_connections).await
-                }
+                negotiate_server_connection(cn, stack, pending_negotiated_connections)
             })
             .try_filter_map(|v| futures_util::future::ready(Ok(v))))
     }
@@ -624,59 +621,56 @@ async fn negotiate_server_connection<C, A, Srv>(
     stack: Srv,
     pending_negotiated_connections: Arc<Mutex<HashMap<A, Vec<Offer>>>>,
 ) -> Result<
-    Option<
-        Either<
-            <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Connection,
-            <<Srv as Apply<(A, Vec<u8>)>>::Applied as Serve<ServeInput<C, A>>>::Connection,
-        >,
-    >,
+    Option<Either<
+        <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection,
+        <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection,
+    >>,
     Report,
 >
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     Srv: Pick + Apply<(A, Vec<u8>)> + GetOffers + Clone + Send + 'static,
-    // main-line branch: Pick on incoming negotiation handshake.
-    <Srv as Pick>::Picked: NegotiatePicked + Serve<ServeInput<C, A>> + Clone + Send + 'static,
-    <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Connection: Send + Sync + 'static,
-    <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Error: Into<Report> + Send + Sync + 'static,
-    <<Srv as Pick>::Picked as Serve<ServeInput<C, A>>>::Stream: Unpin + Send + 'static,
-    <Srv as Pick>::Iter: Send,
-    // nonce branch: Apply stack from nonce on indicated connections.
-    <Srv as Apply<(A, Vec<u8>)>>::Applied: Serve<ServeInput<C, A>> + Clone + Send + 'static,
-    <<Srv as Apply<(A, Vec<u8>)>>::Applied as Serve<ServeInput<C, A>>>::Connection:
+// main-line branch: Pick on incoming negotiation handshake.
+    <Srv as Pick>::Picked: CxListReverse + Send + 'static,
+    <<Srv as Pick>::Picked as CxListReverse>::Reversed:
+        NegotiatePicked + Client<ClientInput<C, A>> + Clone + Send + 'static,
+    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection:
         Send + Sync + 'static,
-    <<Srv as Apply<(A, Vec<u8>)>>::Applied as Serve<ServeInput<C, A>>>::Error:
+    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Error:
         Into<Report> + Send + Sync + 'static,
-    <<Srv as Apply<(A, Vec<u8>)>>::Applied as Serve<ServeInput<C, A>>>::Stream:
-        Unpin + Send + 'static,
+    <Srv as Pick>::Iter: Send,
+// nonce branch: Apply stack from nonce on indicated connections.
+    <Srv as Apply<(A, Vec<u8>)>>::Applied: CxListReverse + Send + 'static,
+    <<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed:
+        Client<ClientInput<C, A>> + Clone + Send + 'static,
+    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<
+        ClientInput<C, A>,
+    >>::Connection: Send + Sync + 'static,
+    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<
+        ClientInput<C, A>,
+    >>::Error: Into<Report> + Send + Sync + 'static,
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
 {
     debug!("new connection");
     let (cn, s) = InjectWithChannel::make(cn);
     loop {
-        // 2. on new connection, read off Vec<Vec<Offer>> from
-        //    client
+        // 2. on new connection, read off Vec<Vec<Offer>> from client
         let (a, buf): (_, Vec<u8>) = cn.recv().await?;
         trace!("got offer pkt");
 
-        // if `a` is in pending_negotiated_connections, this is a post-negotiation
-        // message and we should return the applied connection.
+        // if `a` is in pending_negotiated_connections, this is a post-negotiation message and we
+        // should return the applied connection.
         let opt_picked = {
             let guard = pending_negotiated_connections.lock().unwrap();
             guard.get(&a).map(Clone::clone)
         };
 
         if let Some(picked) = opt_picked {
-            let (mut stack, _) = stack
+            let (stack, _) = stack
                 .apply(group_offers(picked))
                 .wrap_err("failed to apply semantics to client connection")?;
-            let cn_st = futures_util::stream::once(futures_util::future::ready(Ok(cn)));
-            let mut new_st = stack.serve(cn_st).await.map_err(Into::into)?;
-            let new_cn = new_st
-                .try_next()
-                .await // -> Result<Option<T>, E>
-                .map_err(Into::into)?
-                .ok_or_else(|| eyre!("No connection returned"))?;
+            let mut stack = stack.rev();
+            let new_cn = stack.connect_wrap(cn).await.map_err(Into::into)?;
 
             debug!(addr = ?&a, "returning pre-negotiated connection");
             s.send((a, buf)).map_err(|_| eyre!("Send failed"))?;
@@ -737,13 +731,7 @@ where
                     debug!("negotiation handshake done");
 
                     // 5. new_stack.serve(vec_u8_stream)
-                    let cn_st = futures_util::stream::once(futures_util::future::ready(Ok(cn)));
-                    let mut new_st = new_stack.serve(cn_st).await.map_err(Into::into)?;
-                    let new_cn = new_st
-                        .try_next()
-                        .await // -> Result<Option<T>, E>
-                        .map_err(Into::into)?
-                        .ok_or_else(|| eyre!("No connection returned"))?;
+                    let new_cn = new_stack.connect_wrap(cn).await.map_err(Into::into)?;
 
                     debug!("returning connection");
                     return Ok(Some(Either::Left(new_cn)));
@@ -794,11 +782,18 @@ async fn monomorphize<Srv, A>(
     stack: Srv,
     client_offers: Vec<Offer>,
     from_addr: &A,
-) -> Result<(<Srv as Pick>::Picked, Vec<Offer>), Report>
+) -> Result<
+    (
+        <<Srv as Pick>::Picked as CxListReverse>::Reversed,
+        Vec<Offer>,
+    ),
+    Report,
+>
 where
     Srv: Pick + GetOffers + Clone + Send + 'static,
     // main-line branch: Pick on incoming negotiation handshake.
-    <Srv as Pick>::Picked: NegotiatePicked + Clone + Send + 'static,
+    <Srv as Pick>::Picked: CxListReverse + Send + 'static,
+    <<Srv as Pick>::Picked as CxListReverse>::Reversed: NegotiatePicked + Clone + Send + 'static,
     <Srv as Pick>::Iter: Send,
     A: Serialize + DeserializeOwned + Debug + Send + Sync + 'static,
 {
@@ -806,7 +801,7 @@ where
     debug!(client_offers = ?&client_offers_map, ?from_addr, "received offer");
     // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve,
     //    impl Serve>> into a CxList<impl Serve>
-    let (mut new_stack, picked_offers, _) = stack
+    let (new_stack, picked_offers, _) = stack
         .pick(client_offers_map)
         .wrap_err(eyre!("error monomorphizing stack",))?;
 
@@ -819,6 +814,7 @@ where
     };
     let nonce_buf =
         bincode::serialize(&nonce).wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
+    let mut new_stack = new_stack.rev();
     new_stack
         .call_negotiate_picked(&nonce_buf)
         .instrument(debug_span!("call_negotiate_picked"))
@@ -927,18 +923,15 @@ where
     }
 }
 
+pub type NegotiatedConn<C, A, S> =
+    <<<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<C>>::Connection;
+
 /// Return a connection with `stack`'s semantics, connecting to `a`.
 pub fn negotiate_client<C, A, S>(
     stack: S,
     cn: C,
     addr: A,
-) -> impl Future<
-    Output = Result<
-        <<<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<C>>::Connection,
-        Report,
-    >,
-> + Send
-       + 'static
+) -> impl Future<Output = Result<NegotiatedConn<C, A, S>, Report>> + Send + 'static
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     S: Apply<(A, Vec<u8>)> + GetOffers + Clone + Send + 'static,
@@ -992,12 +985,11 @@ mod test {
     };
     use crate::{
         chan_transport::Chan, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList,
-        Serve,
     };
     use color_eyre::eyre::{eyre, Report};
     use futures_util::{
         future::{ready, Ready},
-        stream::{Stream, StreamExt},
+        stream::StreamExt,
     };
     use tracing::{debug, debug_span, info, info_span};
     use tracing_error::ErrorLayer;
@@ -1009,23 +1001,6 @@ mod test {
         (StructDef==>$name:ident) => {
             #[derive(Debug, Clone, Copy)]
             struct $name;
-
-            impl<D, InS, InC, InE> Serve<InS> for $name
-            where
-                InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-                InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
-                InE: Send + Sync + 'static,
-                D: Send + Sync + 'static,
-            {
-                type Future = Ready<Result<Self::Stream, Self::Error>>;
-                type Connection = InC;
-                type Error = InE;
-                type Stream = InS;
-
-                fn serve(&mut self, inner: InS) -> Self::Future {
-                    ready(Ok(inner))
-                }
-            }
 
             impl<D, InC> Client<InC> for $name
             where

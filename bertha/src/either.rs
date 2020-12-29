@@ -1,12 +1,9 @@
 //! The `Either` type implements traits where both variants implement the trait with the same
 //! output type.
 
-use super::{ChunnelConnection, Client, Serve};
+use super::{ChunnelConnection, Client};
 use color_eyre::eyre::Report;
-use futures_util::{
-    future::FutureExt,
-    stream::{Stream, StreamExt},
-};
+use futures_util::{future::FutureExt, stream::Stream};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -80,52 +77,6 @@ where
         match self {
             Either::Left(a) => a.recv(),
             Either::Right(b) => b.recv(),
-        }
-    }
-}
-
-impl<A, B, I, C, E, Din, Dout> Serve<I> for Either<A, B>
-where
-    Din: Send + Sync + 'static,
-    Dout: Send + Sync + 'static,
-    I: Stream<Item = Result<C, E>> + Send + 'static,
-    C: ChunnelConnection<Data = Din>,
-    E: Into<Report> + Send + Sync + 'static,
-    A: Serve<I> + Send + 'static,
-    B: Serve<I> + Send + 'static,
-    <A as Serve<I>>::Connection: ChunnelConnection<Data = Dout>,
-    <B as Serve<I>>::Connection: ChunnelConnection<Data = Dout>,
-    <A as Serve<I>>::Error: Into<Report> + Send + Sync + 'static,
-    <B as Serve<I>>::Error: Into<Report> + Send + Sync + 'static,
-{
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
-    type Connection = Either<A::Connection, B::Connection>;
-    type Error = Report;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: I) -> Self::Future {
-        match self {
-            Either::Left(a) => {
-                let fut = a.serve(inner);
-                Box::pin(async move {
-                    Ok(Box::pin(
-                        fut.await
-                            .map_err(Into::into)?
-                            .map(|cn| Ok(Either::Left(cn.map_err(Into::into)?))),
-                    ) as _)
-                })
-            }
-            Either::Right(b) => {
-                let fut = b.serve(inner);
-                Box::pin(async move {
-                    Ok(Box::pin(
-                        fut.await
-                            .map_err(Into::into)?
-                            .map(|cn| Ok(Either::Right(cn.map_err(Into::into)?))),
-                    ) as _)
-                })
-            }
         }
     }
 }
