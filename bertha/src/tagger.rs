@@ -2,7 +2,7 @@
 
 use crate::{
     util::{ProjectLeft, Unproject},
-    ChunnelConnection, Client, Negotiate,
+    Chunnel, ChunnelConnection, Negotiate,
 };
 use color_eyre::eyre;
 use dashmap::DashMap;
@@ -23,7 +23,7 @@ impl Negotiate for TaggerProjChunnel {
     type Capability = ();
 }
 
-impl<A, D, InC> Client<InC> for TaggerProjChunnel
+impl<A, D, InC> Chunnel<InC> for TaggerProjChunnel
 where
     InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
     A: Send + Sync + 'static,
@@ -45,7 +45,7 @@ impl Negotiate for TaggerChunnel {
     type Capability = ();
 }
 
-impl<D, InC> Client<InC> for TaggerChunnel
+impl<D, InC> Chunnel<InC> for TaggerChunnel
 where
     InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
@@ -150,7 +150,7 @@ impl Negotiate for OrderedChunnelProj {
     type Capability = ();
 }
 
-impl<A, D, InC> Client<InC> for OrderedChunnelProj
+impl<A, D, InC> Chunnel<InC> for OrderedChunnelProj
 where
     InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
     A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
@@ -184,7 +184,7 @@ impl Negotiate for OrderedChunnel {
     type Capability = ();
 }
 
-impl<D, InC> Client<InC> for OrderedChunnel
+impl<D, InC> Chunnel<InC> for OrderedChunnel
 where
     InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
@@ -357,7 +357,7 @@ impl<D> Ord for DataPair<D> {
 #[derive(Debug, Clone)]
 pub struct SeqUnreliableChunnel;
 
-impl<InC> Client<InC> for SeqUnreliableChunnel
+impl<InC> Chunnel<InC> for SeqUnreliableChunnel
 where
     InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
 {
@@ -429,7 +429,7 @@ mod test {
     use super::{OrderedChunnel, SeqUnreliableChunnel, TaggerChunnel};
     use crate::chan_transport::Chan;
     use crate::test::Serve;
-    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList};
+    use crate::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList};
     use color_eyre::Report;
     use futures_util::StreamExt;
     use tracing::{debug, info};

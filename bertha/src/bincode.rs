@@ -2,7 +2,7 @@
 
 use crate::{
     util::{ProjectLeft, Unproject},
-    ChunnelConnection, Client, Negotiate,
+    Chunnel, ChunnelConnection, Negotiate,
 };
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
@@ -77,7 +77,7 @@ impl<D> Default for SerializeChunnelProject<D> {
     }
 }
 
-impl<A, D, InC> Client<InC> for SerializeChunnelProject<D>
+impl<A, D, InC> Chunnel<InC> for SerializeChunnelProject<D>
 where
     InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     A: Send + Sync + 'static,
@@ -101,7 +101,7 @@ impl<D: 'static> Negotiate for SerializeChunnel<D> {
     type Capability = ();
 }
 
-impl<D, InC> Client<InC> for SerializeChunnel<D>
+impl<D, InC> Chunnel<InC> for SerializeChunnel<D>
 where
     InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
@@ -176,7 +176,7 @@ mod test {
     use super::{SerializeChunnel, SerializeChunnelProject};
     use crate::chan_transport::Chan;
     use crate::test::Serve;
-    use crate::{util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener, Client};
+    use crate::{util::ProjectLeft, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener};
     use color_eyre::eyre::Report;
     use futures_util::{
         future::{ready, Ready},
@@ -367,7 +367,7 @@ mod test {
         type Capability = ();
     }
 
-    impl<A, InC> Client<InC> for BarChunnel
+    impl<A, InC> Chunnel<InC> for BarChunnel
     where
         A: 'static,
         InC: ChunnelConnection<Data = (A, Foo)> + Send + Sync + 'static,

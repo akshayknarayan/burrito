@@ -5,7 +5,7 @@
 
 use crate::{
     util::{ProjectLeft, Unproject},
-    ChunnelConnection, Client, Negotiate,
+    Chunnel, ChunnelConnection, Negotiate,
 };
 use color_eyre::eyre;
 use dashmap::DashMap;
@@ -42,7 +42,7 @@ impl ReliabilityProjChunnel {
     }
 }
 
-impl<A, InC, D> Client<InC> for ReliabilityProjChunnel
+impl<A, InC, D> Chunnel<InC> for ReliabilityProjChunnel
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
     InC: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
@@ -87,7 +87,7 @@ impl ReliabilityChunnel {
     }
 }
 
-impl<InC, D> Client<InC> for ReliabilityChunnel
+impl<InC, D> Chunnel<InC> for ReliabilityChunnel
 where
     InC: ChunnelConnection<Data = Pkt<D>> + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
@@ -493,7 +493,7 @@ mod test {
     use crate::chan_transport::Chan;
     use crate::test::Serve;
     use crate::{
-        bincode::SerializeChunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
+        bincode::SerializeChunnel, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener,
         CxList,
     };
     use futures_util::StreamExt;

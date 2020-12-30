@@ -1,9 +1,5 @@
-use bertha::{util::MsgId, ChunnelConnection, Client, Negotiate, Serve};
+use bertha::{util::MsgId, Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre;
-use futures_util::{
-    future::{ready, Ready},
-    stream::{Stream, TryStreamExt},
-};
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
@@ -22,8 +18,7 @@ use tracing_futures::Instrument;
 ///
 /// These assumptions allow us to forego seqno generation and explicit acks.  As a result, however,
 /// this will only work on the client side, since we assume that `send`s and `recv`s are paired and
-/// that the `send` is first. Waiting on a `recv` without a prior `send` will block forever. So,
-/// the `Serve` implementation does nothing.
+/// that the `send` is first. Waiting on a `recv` without a prior `send` will block forever.
 #[derive(Debug, Clone)]
 pub struct KvReliabilityChunnel {
     timeout: Duration,
@@ -51,29 +46,7 @@ impl KvReliabilityChunnel {
     }
 }
 
-impl<A, InS, InC, InE, D> Serve<InS> for KvReliabilityChunnel
-where
-    InS: Stream<Item = Result<InC, InE>> + Send + 'static,
-    InC: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
-    InE: Send + Sync + 'static,
-    A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
-    D: MsgId + Clone + Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Stream, Self::Error>>;
-    type Connection = KvReliability<InC, A, D>;
-    type Error = InE;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-
-    fn serve(&mut self, inner: InS) -> Self::Future {
-        let cfg = self.timeout;
-        ready(Ok(
-            Box::pin(inner.and_then(move |cn| async move { Ok(KvReliability::new(cn, cfg)) })) as _,
-        ))
-    }
-}
-
-impl<A, InC, D> Client<InC> for KvReliabilityChunnel
+impl<A, InC, D> Chunnel<InC> for KvReliabilityChunnel
 where
     InC: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
@@ -184,7 +157,7 @@ where
 mod test {
     use super::KvReliabilityChunnel;
     use bertha::{
-        chan_transport::Chan, ChunnelConnection, ChunnelConnector, ChunnelListener, Client,
+        chan_transport::Chan, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener,
     };
     use futures_util::StreamExt;
     use tracing::{debug, info};

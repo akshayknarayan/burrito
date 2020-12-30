@@ -23,8 +23,8 @@ pub mod util;
 pub use either::*;
 pub use negotiate::*;
 
-/// `Client`s transform semantics of the data flowing through them in some way.
-pub trait Client<I> {
+/// `Chunnel`s transform semantics of the data flowing through them in some way.
+pub trait Chunnel<I> {
     type Future: Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static;
     type Connection: ChunnelConnection + 'static;
     type Error: Send + Sync + 'static;
@@ -35,7 +35,7 @@ pub trait Client<I> {
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub struct CxNil;
 
-impl<C> Client<C> for CxNil
+impl<C> Chunnel<C> for CxNil
 where
     C: ChunnelConnection + Send + 'static,
 {
@@ -48,7 +48,7 @@ where
     }
 }
 
-/// Chain multiple chunnels together with the `Client` trait.
+/// Chain multiple chunnels together with the `Chunnel` trait.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CxList<Head, Tail> {
     pub head: Head,
@@ -129,12 +129,12 @@ where
     }
 }
 
-impl<H, T, I> Client<I> for CxList<H, T>
+impl<H, T, I> Chunnel<I> for CxList<H, T>
 where
-    H: Client<I>,
-    <H as Client<I>>::Connection: Send + 'static,
-    T: Client<<H as Client<I>>::Connection> + Clone + Send + 'static,
-    <T as Client<<H as Client<I>>::Connection>>::Error: From<<H as Client<I>>::Error>,
+    H: Chunnel<I>,
+    <H as Chunnel<I>>::Connection: Send + 'static,
+    T: Chunnel<<H as Chunnel<I>>::Connection> + Clone + Send + 'static,
+    <T as Chunnel<<H as Chunnel<I>>::Connection>>::Error: From<<H as Chunnel<I>>::Error>,
 {
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -228,7 +228,7 @@ pub enum Endedness {
 #[cfg(test)]
 mod test {
     use crate::chan_transport::Chan;
-    use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList, CxNil};
+    use crate::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, CxNil};
     use color_eyre::Report;
     use futures_util::{
         future::{ready, Ready, TryFutureExt},
@@ -251,8 +251,8 @@ mod test {
 
     impl<InS, InC, InE, C> Serve<InS> for C
     where
-        C: Client<InC> + Clone + Send + 'static,
-        <C as Client<InC>>::Error: Into<Report> + Send + Sync + 'static,
+        C: Chunnel<InC> + Clone + Send + 'static,
+        <C as Chunnel<InC>>::Error: Into<Report> + Send + Sync + 'static,
         InS: Stream<Item = Result<InC, InE>> + Send + 'static,
         InC: Send + 'static,
         InE: Into<Report> + Send + Sync + 'static,

@@ -1,6 +1,6 @@
 //! Helper Chunnel types to transform Data types, etc.
 
-use super::{ChunnelConnection, Client};
+use super::{Chunnel, ChunnelConnection};
 use ahash::AHashMap;
 use color_eyre::eyre::{eyre, Report};
 use dashmap::DashMap;
@@ -326,7 +326,7 @@ where
     type Capability = N;
 }
 
-impl<D, InC> Client<InC> for Nothing
+impl<D, InC> Chunnel<InC> for Nothing
 where
     InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Send + Sync + 'static,
@@ -345,7 +345,7 @@ where
 #[derive(Debug, Clone, Default)]
 pub struct Never;
 
-impl<D, InC> Client<InC> for Never
+impl<D, InC> Chunnel<InC> for Never
 where
     InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Send + Sync + 'static,

@@ -94,26 +94,25 @@ async fn serve_canonical(
     let cnsrv = ShardCanonicalServer::new(
         si.clone(),
         internal_cli,
-        CxList::from(OrderedChunnelProj::default())
+        CxList::from(SerializeChunnelProject::default())
             .wrap(ReliabilityProjChunnel::default())
-            .wrap(SerializeChunnelProject::default()),
+            .wrap(OrderedChunnelProj::default()),
         offer,
         &redis_addr,
     )
     .await
     .wrap_err("Create ShardCanonicalServer")?;
 
-    use bertha::{negotiate::Select, util::Nothing};
     //let external = CxList::from(cnsrv)
     //    .wrap(Select(
     //        CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
     //        Nothing::default(),
     //    ))
     //    .wrap(SerializeChunnelProject::default());
-    let external = CxList::from(cnsrv)
-        .wrap(OrderedChunnelProj::default())
+    let external = CxList::from(SerializeChunnelProject::default())
         .wrap(ReliabilityProjChunnel::default())
-        .wrap(SerializeChunnelProject::default());
+        .wrap(OrderedChunnelProj::default())
+        .wrap(cnsrv);
     info!(shard_info = ?&si, "start canonical server");
     let st = bertha::negotiate::negotiate_server(external, st)
         .instrument(tracing::info_span!("negotiate_server"))
@@ -157,9 +156,9 @@ async fn single_shard(
     internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
     s: tokio::sync::oneshot::Sender<Vec<bertha::negotiate::Offer>>,
 ) {
-    let external = CxList::from(OrderedChunnelProj::default())
+    let external = CxList::from(SerializeChunnelProject::default())
         .wrap(ReliabilityProjChunnel::default())
-        .wrap(SerializeChunnelProject::default());
+        .wrap(OrderedChunnelProj::default());
     let stack = external.clone();
     info!(addr = ?&addr, "listening");
     let st = SelectListener::new(raw_listener, internal_srv)

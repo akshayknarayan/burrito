@@ -32,9 +32,9 @@ impl KvClient<NeverCn> {
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         debug!("make client");
         // deliberately don't add any selects
-        let neg_stack = CxList::from(OrderedChunnelProj::default())
+        let neg_stack = CxList::from(SerializeChunnelProject::default())
             .wrap(ReliabilityProjChunnel::default())
-            .wrap(SerializeChunnelProject::default());
+            .wrap(OrderedChunnelProj::default());
 
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
@@ -56,19 +56,19 @@ impl KvClient<NeverCn> {
         use bertha::negotiate::Select;
 
         let cl = ClientShardChunnelClient::new(canonical_addr, &redis_addr).await?;
-        let neg_stack = CxList::from(SerializeSelect::<
-            (SocketAddr, bertha::reliable::Pkt<Msg>),
-            (SocketAddr, Msg),
-        >::default())
-        .wrap(Select(
-            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-            KvReliabilityChunnel::default(),
-        ))
-        .wrap(Select(cl, Nothing::<()>::default()));
-        //let neg_stack = CxList::from(Select(cl, Nothing::default()))
-        //    .wrap(CxList::from(OrderedChunnelProj::default()))
-        //    .wrap(ReliabilityProjChunnel::default())
-        //    .wrap(SerializeChunnelProject::default());
+        //let neg_stack = CxList::from(SerializeSelect::<
+        //    (SocketAddr, bertha::reliable::Pkt<Msg>),
+        //    (SocketAddr, Msg),
+        //>::default())
+        //.wrap(Select(
+        //    CxList::from(ReliabilityProjChunnel::default()).wrap(OrderedChunnelProj::default()),
+        //    KvReliabilityChunnel::default(),
+        //))
+        //.wrap(Select(cl, Nothing::<()>::default()));
+        let neg_stack = CxList::from(SerializeChunnelProject::default())
+            .wrap(ReliabilityProjChunnel::default())
+            .wrap(CxList::from(OrderedChunnelProj::default()))
+            .wrap(Select(cl, Nothing::default()));
 
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
@@ -155,12 +155,14 @@ mod t {
     use bertha::negotiate::Select;
     use bertha::{
         bincode::{SerializeChunnelProject, SerializeSelect},
+        negotiate::Offer,
         reliable::ReliabilityProjChunnel,
         tagger::OrderedChunnelProj,
         util::Nothing,
-        ChunnelConnection, Client, CxList,
+        Chunnel, ChunnelConnection, CxList,
     };
     use burrito_shard_ctl::ClientShardChunnelClient;
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use tracing_error::ErrorLayer;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -182,24 +184,46 @@ mod t {
             .unwrap();
 
         rt.block_on(async move {
-            let x: SocketAddr = "127.0.0.1:1414".parse().unwrap();
-            let cl = ClientShardChunnelClient::<_, SocketAddr>::new(x, "127.0.0.1:1414")
-                .await
-                .unwrap();
-            let stack = CxList::from(Select(cl, Nothing::<()>::default()))
-                .wrap(Select(
-                    CxList::from(OrderedChunnelProj::default())
-                        .wrap(ReliabilityProjChunnel::default()),
-                    KvReliabilityChunnel::default(),
-                ))
-                .wrap(SerializeSelect::<
-                    bertha::reliable::Pkt<crate::msg::Msg>,
-                    crate::msg::Msg,
-                >::default());
+            //let x: SocketAddr = "127.0.0.1:1414".parse().unwrap();
+            //let cl = ClientShardChunnelClient::<_, SocketAddr>::new(x, "127.0.0.1:1414")
+            //    .await
+            //    .unwrap();
 
-            use bertha::negotiate::{Apply, GetOffers};
+            use crate::msg::Msg;
+            //let stack = CxList::from(SerializeSelect::<
+            //    (SocketAddr, bertha::reliable::Pkt<Msg>),
+            //    (SocketAddr, Msg),
+            //>::default())
+            let stack = CxList::from(SerializeChunnelProject::default()).wrap(Select(
+                CxList::from(ReliabilityProjChunnel::default()).wrap(OrderedChunnelProj::default()),
+                KvReliabilityChunnel::default(),
+            ));
+            //.wrap(Select(cl, Nothing::<()>::default()));
+
+            use bertha::{
+                negotiate::{Apply, GetOffers},
+                ChunnelConnector, CxListReverse,
+            };
             //let stack: Box<dyn Apply<(SocketAddr, Vec<u8>), Applied = _>> = Box::new(stack) as _;
             //let stack: Box<dyn GetOffers<Iter = _>> = Box::new(stack) as _;
+
+            let picked = stack.offers();
+
+            fn group_offers(offers: impl IntoIterator<Item = Offer>) -> HashMap<u64, Vec<Offer>> {
+                let mut map = HashMap::<_, Vec<Offer>>::new();
+                for o in offers {
+                    map.entry(o.capability_guid).or_default().push(o);
+                }
+
+                map
+            }
+
+            let (new_stack, _) = stack.apply(group_offers(picked))?;
+            let mut new_stack = new_stack.rev();
+            let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
+            let _cn = new_stack.connect_wrap(raw_cn).await?;
+
+            Ok(())
         });
     }
 }

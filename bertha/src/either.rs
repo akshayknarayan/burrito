@@ -1,7 +1,7 @@
 //! The `Either` type implements traits where both variants implement the trait with the same
 //! output type.
 
-use super::{ChunnelConnection, Client};
+use super::{Chunnel, ChunnelConnection};
 use color_eyre::eyre::Report;
 use futures_util::{future::FutureExt, stream::Stream};
 use std::future::Future;
@@ -81,17 +81,17 @@ where
     }
 }
 
-impl<A, B, C, Din, Dout> Client<C> for Either<A, B>
+impl<A, B, C, Din, Dout> Chunnel<C> for Either<A, B>
 where
     Din: Send + Sync + 'static,
     Dout: Send + Sync + 'static,
     C: ChunnelConnection<Data = Din>,
-    A: Client<C> + Send + 'static,
-    B: Client<C> + Send + 'static,
-    <A as Client<C>>::Connection: ChunnelConnection<Data = Dout>,
-    <B as Client<C>>::Connection: ChunnelConnection<Data = Dout>,
-    <A as Client<C>>::Error: Into<Report> + Send + Sync + 'static,
-    <B as Client<C>>::Error: Into<Report> + Send + Sync + 'static,
+    A: Chunnel<C> + Send + 'static,
+    B: Chunnel<C> + Send + 'static,
+    <A as Chunnel<C>>::Connection: ChunnelConnection<Data = Dout>,
+    <B as Chunnel<C>>::Connection: ChunnelConnection<Data = Dout>,
+    <A as Chunnel<C>>::Error: Into<Report> + Send + Sync + 'static,
+    <B as Chunnel<C>>::Error: Into<Report> + Send + Sync + 'static,
 {
     // have to box - the Either strategy doesn't work.
     // future::Map type that goes in the Either includes the closures, which are different

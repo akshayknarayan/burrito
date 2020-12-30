@@ -1,6 +1,6 @@
 //! Chunnel wrapper types to negotiate between multiple implementations.
 
-use crate::{ChunnelConnection, Client, CxList, CxListReverse, CxNil, Either};
+use crate::{Chunnel, ChunnelConnection, CxList, CxListReverse, CxNil, Either};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
     future::{select, FutureExt},
@@ -164,8 +164,8 @@ pub struct Select<T1, T2>(pub T1, pub T2);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Offer {
-    capability_guid: u64,
-    available: Vec<u8>,
+    pub capability_guid: u64,
+    pub available: Vec<u8>,
 }
 
 fn get_offer<T>() -> Option<Offer>
@@ -226,7 +226,7 @@ where
     }
 }
 
-/// Trait to monomorphize a CxList with possible `Select`s into something that impls Client
+/// Trait to monomorphize a CxList with possible `Select`s into something that impls Chunnel
 pub trait Pick {
     type Picked;
     type Iter: Iterator<Item = Offer>;
@@ -478,7 +478,7 @@ where
     }
 }
 
-fn group_offers(offers: Vec<Offer>) -> HashMap<u64, Vec<Offer>> {
+fn group_offers(offers: impl IntoIterator<Item = Offer>) -> HashMap<u64, Vec<Offer>> {
     let mut map = HashMap::<_, Vec<Offer>>::new();
     for o in offers {
         map.entry(o.capability_guid).or_default().push(o);
@@ -565,8 +565,8 @@ pub fn negotiate_server<Srv, Sc, Se, C, A>(
         impl Stream<
                 Item = Result<
                     Either<
-                        <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection,
-                        <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection,
+                        <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection,
+                        <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection,
                     >,
                     Report,
                 >,
@@ -583,16 +583,16 @@ where
     Srv: Pick + Apply<(A, Vec<u8>)> + GetOffers + Clone + Send + 'static,
 // main-line branch: Pick on incoming negotiation handshake.
     <Srv as Pick>::Picked: CxListReverse + Send + 'static,
-    <<Srv as Pick>::Picked as CxListReverse>::Reversed: NegotiatePicked + Client<ClientInput<C, A>> + Clone + Send + 'static,
-    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
-    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Error: Into<Report> + Send + Sync + 'static,
+    <<Srv as Pick>::Picked as CxListReverse>::Reversed: NegotiatePicked + Chunnel<ClientInput<C, A>> + Clone + Send + 'static,
+    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Error: Into<Report> + Send + Sync + 'static,
     <Srv as Pick>::Iter: Send,
 // nonce branch: Apply stack from nonce on indicated connections.
     <Srv as Apply<(A, Vec<u8>)>>::Applied: CxListReverse + Send + 'static,
-    <<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed: Client<ClientInput<C, A>> + Clone + Send + 'static,
-    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection:
+    <<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed: Chunnel<ClientInput<C, A>> + Clone + Send + 'static,
+    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection:
         Send + Sync + 'static,
-    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Error:
+    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Error:
         Into<Report> + Send + Sync + 'static,
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
 {
@@ -622,8 +622,8 @@ async fn negotiate_server_connection<C, A, Srv>(
     pending_negotiated_connections: Arc<Mutex<HashMap<A, Vec<Offer>>>>,
 ) -> Result<
     Option<Either<
-        <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection,
-        <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection,
+        <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection,
+        <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection,
     >>,
     Report,
 >
@@ -633,20 +633,20 @@ where
 // main-line branch: Pick on incoming negotiation handshake.
     <Srv as Pick>::Picked: CxListReverse + Send + 'static,
     <<Srv as Pick>::Picked as CxListReverse>::Reversed:
-        NegotiatePicked + Client<ClientInput<C, A>> + Clone + Send + 'static,
-    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Connection:
+        NegotiatePicked + Chunnel<ClientInput<C, A>> + Clone + Send + 'static,
+    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection:
         Send + Sync + 'static,
-    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Client<ClientInput<C, A>>>::Error:
+    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Error:
         Into<Report> + Send + Sync + 'static,
     <Srv as Pick>::Iter: Send,
 // nonce branch: Apply stack from nonce on indicated connections.
     <Srv as Apply<(A, Vec<u8>)>>::Applied: CxListReverse + Send + 'static,
     <<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed:
-        Client<ClientInput<C, A>> + Clone + Send + 'static,
-    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<
+        Chunnel<ClientInput<C, A>> + Clone + Send + 'static,
+    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<
         ClientInput<C, A>,
     >>::Connection: Send + Sync + 'static,
-    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<
+    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<
         ClientInput<C, A>,
     >>::Error: Into<Report> + Send + Sync + 'static,
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
@@ -924,7 +924,7 @@ where
 }
 
 pub type NegotiatedConn<C, A, S> =
-    <<<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<C>>::Connection;
+    <<<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<C>>::Connection;
 
 /// Return a connection with `stack`'s semantics, connecting to `a`.
 pub fn negotiate_client<C, A, S>(
@@ -937,8 +937,8 @@ where
     S: Apply<(A, Vec<u8>)> + GetOffers + Clone + Send + 'static,
     <S as Apply<(A, Vec<u8>)>>::Applied: CxListReverse + Send + 'static,
     <<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed:
-        Client<C> + Clone + Debug + Send + 'static,
-    <<<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Client<C>>::Error:
+        Chunnel<C> + Clone + Debug + Send + 'static,
+    <<<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<C>>::Error:
         Into<Report> + Send + Sync + 'static,
     A: Send + Sync + 'static,
 {
@@ -984,7 +984,7 @@ mod test {
         Offer, Select,
     };
     use crate::{
-        chan_transport::Chan, ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxList,
+        chan_transport::Chan, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     };
     use color_eyre::eyre::{eyre, Report};
     use futures_util::{
@@ -1002,7 +1002,7 @@ mod test {
             #[derive(Debug, Clone, Copy)]
             struct $name;
 
-            impl<D, InC> Client<InC> for $name
+            impl<D, InC> Chunnel<InC> for $name
             where
                 InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
                 D: Send + Sync + 'static,
