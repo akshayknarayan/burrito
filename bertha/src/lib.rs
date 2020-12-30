@@ -76,6 +76,29 @@ impl<H, L> CxList<H, L> {
     }
 }
 
+impl<H, T, I> Chunnel<I> for CxList<H, T>
+where
+    H: Chunnel<I>,
+    <H as Chunnel<I>>::Connection: Send + 'static,
+    T: Chunnel<<H as Chunnel<I>>::Connection> + Clone + Send + 'static,
+    <T as Chunnel<<H as Chunnel<I>>::Connection>>::Error: From<<H as Chunnel<I>>::Error>,
+{
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = T::Connection;
+    type Error = T::Error;
+
+    fn connect_wrap(&mut self, inner: I) -> Self::Future {
+        let cn_fut = self.head.connect_wrap(inner);
+        let mut tail = self.tail.clone();
+        Box::pin(async move {
+            let cn = cn_fut.await?;
+            let cn = tail.connect_wrap(cn).await?;
+            Ok(cn)
+        })
+    }
+}
+
 pub trait AppendBack<T> {
     type Appended;
     fn append(self, it: T) -> Self::Appended;
@@ -126,29 +149,6 @@ where
 
     fn rev(self) -> Self::Reversed {
         self.tail.rev().append(self.head)
-    }
-}
-
-impl<H, T, I> Chunnel<I> for CxList<H, T>
-where
-    H: Chunnel<I>,
-    <H as Chunnel<I>>::Connection: Send + 'static,
-    T: Chunnel<<H as Chunnel<I>>::Connection> + Clone + Send + 'static,
-    <T as Chunnel<<H as Chunnel<I>>::Connection>>::Error: From<<H as Chunnel<I>>::Error>,
-{
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Connection = T::Connection;
-    type Error = T::Error;
-
-    fn connect_wrap(&mut self, inner: I) -> Self::Future {
-        let cn_fut = self.head.connect_wrap(inner);
-        let mut tail = self.tail.clone();
-        Box::pin(async move {
-            let cn = cn_fut.await?;
-            let cn = tail.connect_wrap(cn).await?;
-            Ok(cn)
-        })
     }
 }
 
