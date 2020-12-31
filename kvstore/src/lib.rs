@@ -13,6 +13,7 @@ pub use server::serve;
 #[cfg(test)]
 mod tests {
     use super::{serve, KvClient};
+    use bertha::ChunnelConnector;
     use color_eyre::eyre::{eyre, Report, WrapErr};
     use std::net::SocketAddr;
     use tracing::{info, info_span};
@@ -62,28 +63,56 @@ mod tests {
 
                 r.await?;
 
-                info!("make client");
-                use bertha::ChunnelConnector;
-                let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
-                let client = KvClient::new_shardclient(raw_cn, redis_sk_addr, srv_addr.parse()?)
-                    .instrument(info_span!("make kvclient"))
-                    .await
-                    .wrap_err("make KvClient")?;
+                async fn putget<
+                    C: bertha::ChunnelConnection<Data = super::Msg> + Send + Sync + 'static,
+                >(
+                    client: KvClient<C>,
+                ) -> Result<(), Report> {
+                    info!("do put");
+                    match client
+                        .update(String::from("fooo"), String::from("barr"))
+                        .await?
+                    {
+                        None => {}
+                        x => Err(eyre!("unexpected value from put {:?}", x))?,
+                    }
 
-                info!("do put");
-                match client
-                    .update(String::from("fooo"), String::from("barr"))
-                    .await?
-                {
-                    None => {}
-                    x => Err(eyre!("unexpected value from put {:?}", x))?,
+                    info!("do get");
+                    match client.get(String::from("fooo")).await? {
+                        Some(x) if x == "barr" => {}
+                        x => Err(eyre!("unexpected value from get {:?}", x))?,
+                    }
+
+                    info!("client done");
+                    Ok(())
                 }
 
-                info!("do get");
-                match client.get(String::from("fooo")).await? {
-                    Some(x) if x == "barr" => {}
-                    x => Err(eyre!("unexpected value from get {:?}", x))?,
+                //async {
+                //    info!("make client");
+                //    let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
+                //    let client = KvClient::new_basicclient(raw_cn, srv_addr.parse()?)
+                //        .instrument(info_span!("make kvclient"))
+                //        .await
+                //        .wrap_err("make KvClient")?;
+                //    putget(client).await?;
+                //    Ok::<_, Report>(())
+                //}
+                //.instrument(info_span!("basic client"))
+                //.await?;
+
+                async {
+                    info!("make shardclient");
+                    let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
+                    let client =
+                        KvClient::new_shardclient(raw_cn, redis_sk_addr, srv_addr.parse()?)
+                            .instrument(info_span!("make shard kvclient"))
+                            .await
+                            .wrap_err("make KvClient")?;
+                    putget(client).await?;
+                    Ok::<_, Report>(())
                 }
+                .instrument(info_span!("shard client"))
+                .await?;
 
                 Ok(())
             }

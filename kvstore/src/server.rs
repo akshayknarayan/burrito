@@ -2,14 +2,16 @@
 
 use crate::kv::Store;
 use crate::msg::Msg;
+use crate::reliability::KvReliabilityServerChunnel;
 use bertha::{
-    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel,
-    reliable::ReliabilityProjChunnel, select::SelectListener, tagger::OrderedChunnelProj,
-    ChunnelConnection, ChunnelListener, CxList, GetOffers,
+    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel, either::DataEither,
+    negotiate::Offer, reliable::ReliabilityProjChunnel, select::SelectListener,
+    tagger::OrderedChunnelProj, ChunnelConnection, ChunnelListener, CxList, GetOffers, Select,
 };
 use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{atomic::AtomicUsize, Arc};
 use tracing::{debug, debug_span, info, trace, warn};
@@ -56,7 +58,7 @@ pub async fn serve(
         rdy.push(r);
     }
 
-    let mut offers: Vec<Vec<bertha::negotiate::Offer>> = rdy.try_collect().await.unwrap();
+    let mut offers: Vec<Vec<HashMap<u64, Offer>>> = rdy.try_collect().await.unwrap();
 
     let st = raw_listener
         .listen(si.canonical_addr)
@@ -85,34 +87,43 @@ async fn serve_canonical(
         + 'static,
     internal_cli: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Cln>,
     redis_addr: SocketAddr,
-    offer: Vec<bertha::negotiate::Offer>,
+    mut offer: Vec<HashMap<u64, Offer>>,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
 ) -> Result<(), Report> {
     // 3. start canonical server
     // TODO Ebpf chunnel
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
+    let shard_stack = CxList::from(
+        Select::from((
+            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
+            KvReliabilityServerChunnel::default(),
+        ))
+        .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
+        .prefer_right(),
+    )
+    .wrap(SerializeChunnelProject::default());
+
+    // TODO check offer
     let cnsrv = ShardCanonicalServer::new(
         si.clone(),
         internal_cli,
-        CxList::from(SerializeChunnelProject::default())
-            .wrap(ReliabilityProjChunnel::default())
-            .wrap(OrderedChunnelProj::default()),
-        offer,
+        shard_stack,
+        offer.pop().unwrap(),
         &redis_addr,
     )
     .await
     .wrap_err("Create ShardCanonicalServer")?;
 
-    //let external = CxList::from(cnsrv)
-    //    .wrap(Select(
-    //        CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-    //        Nothing::default(),
-    //    ))
-    //    .wrap(SerializeChunnelProject::default());
-    let external = CxList::from(SerializeChunnelProject::default())
-        .wrap(ReliabilityProjChunnel::default())
-        .wrap(OrderedChunnelProj::default())
-        .wrap(cnsrv);
+    let external = CxList::from(cnsrv)
+        .wrap(
+            Select::from((
+                CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
+                KvReliabilityServerChunnel::default(),
+            ))
+            .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
+            .prefer_right(),
+        )
+        .wrap(SerializeChunnelProject::default());
     info!(shard_info = ?&si, "start canonical server");
     let st = bertha::negotiate::negotiate_server(external, st)
         .instrument(tracing::info_span!("negotiate_server"))
@@ -154,11 +165,17 @@ async fn single_shard(
         Error = impl Into<Report> + Send + Sync + 'static,
     >,
     internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
-    s: tokio::sync::oneshot::Sender<Vec<bertha::negotiate::Offer>>,
+    s: tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>,
 ) {
-    let external = CxList::from(SerializeChunnelProject::default())
-        .wrap(ReliabilityProjChunnel::default())
-        .wrap(OrderedChunnelProj::default());
+    let external = CxList::from(
+        Select::from((
+            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
+            KvReliabilityServerChunnel::default(),
+        ))
+        .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
+        .prefer_right(),
+    )
+    .wrap(SerializeChunnelProject::default());
     let stack = external.clone();
     info!(addr = ?&addr, "listening");
     let st = SelectListener::new(raw_listener, internal_srv)

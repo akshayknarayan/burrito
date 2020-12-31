@@ -1,16 +1,18 @@
 //! Chunnel wrapper types to negotiate between multiple implementations.
 
-use crate::{Chunnel, ChunnelConnection, CxList, CxListReverse, CxNil, Either};
+use crate::{
+    either::MakeEither, Chunnel, ChunnelConnection, CxList, CxNil, DataEither, Either, FlipEither,
+};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
     future::{select, FutureExt},
     stream::{Stream, TryStreamExt},
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::future::Future;
-use std::iter::{empty, once, Chain, Empty, Once as IterOnce};
+use std::iter::{once, Chain, Once as IterOnce};
 use std::pin::Pin;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
@@ -88,6 +90,8 @@ macro_rules! enumerate_enum {
 pub trait Negotiate {
     type Capability: CapabilitySet;
 
+    fn guid() -> u64;
+
     fn capabilities() -> Vec<Self::Capability> {
         vec![]
     }
@@ -103,6 +107,10 @@ pub trait Negotiate {
 
 impl Negotiate for CxNil {
     type Capability = ();
+
+    fn guid() -> u64 {
+        0xa1f4d15a09462192
+    }
 }
 
 impl<T1, T2, C> Negotiate for Either<T1, T2>
@@ -112,6 +120,10 @@ where
     C: CapabilitySet,
 {
     type Capability = C;
+
+    fn guid() -> u64 {
+        T1::guid() ^ T2::guid()
+    }
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
         match self {
@@ -158,14 +170,82 @@ where
     }
 }
 
-/// Negotiation type to choose between `T1` and `T2`.
-#[derive(Clone)]
-pub struct Select<T1, T2>(pub T1, pub T2);
+impl<L, R> NegotiatePicked for DataEither<L, R>
+where
+    L: NegotiatePicked,
+    R: NegotiatePicked,
+{
+    fn call_negotiate_picked<'s>(
+        &mut self,
+        nonce: &'s [u8],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        let f = match self {
+            DataEither::Left(l) => l.call_negotiate_picked(nonce),
+            DataEither::Right(r) => r.call_negotiate_picked(nonce),
+        };
 
+        Box::pin(f)
+    }
+}
+
+/// Negotiation type to choose between `T1` and `T2`.
+#[derive(Clone, Debug)]
+pub struct Select<T1, T2, Inner = Either<T1, T2>> {
+    pub left: T1,
+    pub right: T2,
+    prefer: Either<(), ()>,
+    _inner: std::marker::PhantomData<Inner>,
+}
+
+impl<T1, T2> From<(T1, T2)> for Select<T1, T2> {
+    fn from(f: (T1, T2)) -> Self {
+        Self {
+            left: f.0,
+            right: f.1,
+            prefer: Either::Left(()),
+            _inner: Default::default(),
+        }
+    }
+}
+
+impl<T1, T2, I> Select<T1, T2, I> {
+    /// Change the inner type.
+    pub fn inner_type<I1>(self) -> Select<T1, T2, I1> {
+        Select {
+            left: self.left,
+            right: self.right,
+            prefer: self.prefer,
+            _inner: Default::default(),
+        }
+    }
+
+    /// Change the left/right preference.
+    fn prefer(self, prefer: Either<(), ()>) -> Select<T1, T2, I> {
+        Select { prefer, ..self }
+    }
+
+    /// Prefer the left side.
+    pub fn prefer_left(self) -> Select<T1, T2, I> {
+        self.prefer(Either::Left(()))
+    }
+
+    /// Prefer the right side.
+    pub fn prefer_right(self) -> Select<T1, T2, I> {
+        self.prefer(Either::Right(()))
+    }
+}
+
+/// available is a Vec<T::Capability> where T is a negotiation type.
+/// capability_guid identifies T::Capability.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Offer {
     pub capability_guid: u64,
-    pub available: Vec<u8>,
+    pub impl_guid: u64,
+    /// None => two-sided, Some(Vec<offers>) => one-sided with universe
+    pub sidedness: Option<Vec<Vec<u8>>>,
+    /// Each serialized T::Capability is the inner Vec<u8>, and the list of them is the list of
+    /// capabilities.
+    pub available: Vec<Vec<u8>>,
 }
 
 fn get_offer<T>() -> Option<Offer>
@@ -176,68 +256,185 @@ where
     if T::Capability::guid() != 0 {
         Some(Offer {
             capability_guid: T::Capability::guid(),
-            available: bincode::serialize(&T::capabilities()).unwrap(),
+            impl_guid: T::guid(),
+            sidedness: T::Capability::universe().map(|univ| {
+                univ.iter()
+                    .map(|c| bincode::serialize(c).unwrap())
+                    .collect()
+            }),
+            available: T::capabilities()
+                .iter()
+                .map(|c| bincode::serialize(c).unwrap())
+                .collect(),
         })
     } else {
         None
     }
 }
 
+/// Get an iterator of possible stacks this stack could produce.
+///
+/// Each stack is represented by a map collecting unique negotiation-capabilities it contains in
+/// guid form (u64) -> a list of Offer, which contain in serialized form the capabilities
+/// available.
+///
+/// The number of enumerated stacks will be 2^(number of selects).
+///
+/// ```rust
+/// # use bertha::{reliable::ReliabilityProjChunnel, tagger::OrderedChunnelProj, CxList,
+/// negotiate::GetOffers};
+/// let ls = CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default());
+/// let offers: Vec<_> = ls.offers().collect();
+/// println!("{:?}", offers);
+/// ```
 pub trait GetOffers {
-    type Iter: Iterator<Item = Offer>;
+    type Iter: Iterator<Item = HashMap<u64, Offer>>;
     fn offers(&self) -> Self::Iter;
+}
+
+impl<N, C> GetOffers for N
+where
+    N: Negotiate<Capability = C>,
+    C: CapabilitySet + Serialize + DeserializeOwned,
+{
+    type Iter = IterOnce<HashMap<u64, Offer>>;
+
+    fn offers(&self) -> Self::Iter {
+        let mut h = HashMap::default();
+        if let Some(o) = get_offer::<N>() {
+            h.insert(C::guid(), o);
+        }
+
+        once(h)
+    }
 }
 
 impl<H, T> GetOffers for CxList<H, T>
 where
     H: GetOffers,
+    <H as GetOffers>::Iter: Clone,
     T: GetOffers,
 {
-    type Iter = Chain<H::Iter, T::Iter>;
-    fn offers(&self) -> Self::Iter {
-        self.head.offers().chain(self.tail.offers())
-    }
-}
-
-impl<N> GetOffers for N
-where
-    N: Negotiate,
-    <N as Negotiate>::Capability: Serialize + DeserializeOwned,
-{
-    type Iter = Either<IterOnce<Offer>, Empty<Offer>>;
+    type Iter = std::vec::IntoIter<HashMap<u64, Offer>>;
 
     fn offers(&self) -> Self::Iter {
-        if let Some(o) = get_offer::<N>() {
-            Either::Left(once(o))
-        } else {
-            Either::Right(empty())
+        let tail_iter = self.tail.offers();
+        let head_iter = self.head.offers();
+
+        fn merge(l: HashMap<u64, Offer>, mut r: HashMap<u64, Offer>) -> HashMap<u64, Offer> {
+            for (guid, o) in l {
+                if let Some(ent) = r.get_mut(&guid) {
+                    ent.impl_guid ^= o.impl_guid;
+                    ent.available.extend(o.available);
+                } else {
+                    r.insert(guid, o);
+                }
+            }
+
+            r
         }
+
+        let mut opts = vec![];
+        for tail_opt in tail_iter {
+            for head_opt in head_iter.clone() {
+                opts.push(merge(head_opt, tail_opt.clone()));
+            }
+        }
+
+        opts.into_iter()
     }
 }
 
-impl<T1, T2> GetOffers for Select<T1, T2>
+impl<T1, T2, I> GetOffers for Select<T1, T2, I>
 where
     T1: GetOffers,
     T2: GetOffers,
 {
     type Iter = Chain<T1::Iter, T2::Iter>;
+
     fn offers(&self) -> Self::Iter {
-        self.0.offers().chain(self.1.offers())
+        let left = self.left.offers();
+        let right = self.right.offers();
+        left.chain(right)
     }
+}
+
+fn have_all(univ: &[Vec<u8>], joint: &[Vec<u8>]) -> bool {
+    univ.iter().all(|x| joint.contains(x))
+}
+
+fn stack_pair_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, Offer>) -> bool {
+    for (guid, offer) in client.iter() {
+        // sidedness
+        if let Some(univ) = &offer.sidedness {
+            let mut joint = offer.available.clone();
+            if let Some(srv_offer) = server.get(&guid) {
+                joint.extend(srv_offer.available.clone());
+            }
+
+            if !have_all(univ, &joint) {
+                return false;
+            }
+        } else {
+            // two-sided, they must be equal
+            if let Some(srv_offer) = server.get(&guid) {
+                if offer.impl_guid != srv_offer.impl_guid
+                    || !have_all(&offer.available, &srv_offer.available)
+                    || !have_all(&srv_offer.available, &offer.available)
+                {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+// returns (client, server) stack pairs to use.
+fn compare_offers(
+    client: Vec<HashMap<u64, Offer>>,
+    server: Vec<HashMap<u64, Offer>>,
+) -> Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)> {
+    let mut valid_pairs = vec![];
+    for client_stack_candidate in client.iter() {
+        for server_stack_candidate in server.iter() {
+            if stack_pair_valid(client_stack_candidate, server_stack_candidate) {
+                valid_pairs.push((
+                    client_stack_candidate.clone(),
+                    server_stack_candidate.clone(),
+                ));
+            }
+        }
+    }
+
+    valid_pairs
+}
+
+/// Result of a `Pick`.
+///
+/// `filtered_pairs` is a set of pairs that is consistent with `P`.
+/// `touched_cap_guids` enumerates the capability guids that this operation touched.
+#[derive(Debug, Clone)]
+pub struct PickResult<P> {
+    stack: P,
+    filtered_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+    touched_cap_guids: HashSet<u64>,
 }
 
 /// Trait to monomorphize a CxList with possible `Select`s into something that impls Chunnel
 pub trait Pick {
     type Picked;
-    type Iter: Iterator<Item = Offer>;
 
-    /// input: set of offers from a client (`client_offers`), grouped by capability_guid
+    /// input: set of valid (client, server) offer pairs
     ///
-    /// Returns (new_stack, picked_offers, leftover)
+    /// Returns (new_stack, mutated_pairs, handled_cap_guids).
     fn pick(
         self,
-        client_offers: HashMap<u64, Vec<Offer>>,
-    ) -> Result<(Self::Picked, Self::Iter, HashMap<u64, Vec<Offer>>), Report>;
+        offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+    ) -> Result<PickResult<Self::Picked>, Report>;
 }
 
 impl<N, C> Pick for N
@@ -246,58 +443,58 @@ where
     C: CapabilitySet + Serialize + DeserializeOwned + Clone,
 {
     type Picked = Self;
-    type Iter = Either<IterOnce<Offer>, Empty<Offer>>;
 
     fn pick(
         self,
-        mut client_offers: HashMap<u64, Vec<Offer>>,
-    ) -> Result<(Self::Picked, Self::Iter, HashMap<u64, Vec<Offer>>), Report> {
-        if N::Capability::universe().is_none() {
-            let self_caps = N::capabilities();
-            if let Some(os) = client_offers.remove(&N::Capability::guid()) {
-                let caps: Result<Vec<Vec<N::Capability>>, Report> = os
-                    .iter()
-                    .map(|o| {
-                        let c: Vec<N::Capability> =
-                            bincode::deserialize(&o.available).wrap_err(eyre!(
-                                "Could not deserialize capability set: {:?} to type {:?}",
-                                o,
-                                std::any::type_name::<C>()
-                            ))?;
-                        Ok(c)
-                    })
-                    .collect();
-                let caps = caps?;
-                for caps_co in caps.iter() {
-                    trace!(?self_caps, check = ?&caps_co, "checking client offer");
-                    if have_all(&self_caps, &caps_co) {
-                        return Ok((self, Either::Left(once(caps_co.into())), client_offers));
+        offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+    ) -> Result<PickResult<Self::Picked>, Report> {
+        if C::guid() == 0 {
+            return Ok(PickResult {
+                stack: self,
+                filtered_pairs: offer_pairs,
+                touched_cap_guids: Default::default(),
+            });
+        }
+
+        let filtered_pairs = offer_pairs
+            .into_iter()
+            .filter_map(|(client, mut server)| {
+                let cap_guid = C::guid();
+                if let Some(offer) = server.get_mut(&cap_guid) {
+                    // one-sided checked in `check_touched`
+                    if offer.sidedness.is_none() {
+                        // check client matches:
+                        if let Some(cl_of) = client.get(&cap_guid) {
+                            // client and server must have the same set.
+                            if !have_all(&cl_of.available, &offer.available)
+                                || !have_all(&offer.available, &cl_of.available)
+                            {
+                                return None;
+                            }
+
+                            offer.impl_guid ^= N::guid();
+                        } else {
+                            // if this cap_guid is not in the client list, it's not valid because
+                            // they must match
+                            return None;
+                        }
+                    }
+                } else {
+                    // if client has it and we don't, no match.
+                    if client.contains_key(&cap_guid) {
+                        return None;
                     }
                 }
 
-                debug!(?self_caps, available = ?&caps, "Did not find matching client offer");
-            } else {
-                debug!(
-                    ?self_caps,
-                    available = "None",
-                    "Did not find matching client offer"
-                );
-            }
+                Some((client, server))
+            })
+            .collect();
 
-            Err(eyre!(
-                "Could not find satisfying client/server capability set for {:?}",
-                std::any::type_name::<C>()
-            ))
-        } else {
-            if N::Capability::guid() == 0 {
-                Ok((self, Either::Right(empty()), client_offers))
-            } else if let Some(os) = client_offers.remove(&N::Capability::guid()) {
-                let o = os.into_iter().next().unwrap();
-                Ok((self, Either::Left(once(o)), client_offers))
-            } else {
-                Ok((self, Either::Right(empty()), client_offers))
-            }
-        }
+        Ok(PickResult {
+            stack: self,
+            filtered_pairs,
+            touched_cap_guids: [C::guid()].iter().map(|x| *x).collect(),
+        })
     }
 }
 
@@ -307,184 +504,163 @@ where
     T: Pick,
 {
     type Picked = CxList<H::Picked, T::Picked>;
-    type Iter = Chain<H::Iter, T::Iter>;
 
     fn pick(
         self,
-        client_offers: HashMap<u64, Vec<Offer>>,
-    ) -> Result<(Self::Picked, Self::Iter, HashMap<u64, Vec<Offer>>), Report> {
-        let (head_pick, cl_pick, client_offers) = self.head.pick(client_offers)?;
-        let (tail_pick, rest_cl_pick, client_offers) = self.tail.pick(client_offers)?;
-        let pick = cl_pick.chain(rest_cl_pick);
-        Ok((
-            CxList {
+        offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+    ) -> Result<PickResult<Self::Picked>, Report> {
+        let PickResult {
+            stack: head_pick,
+            filtered_pairs,
+            touched_cap_guids: head_caps,
+        } = self.head.pick(offer_pairs)?;
+        let PickResult {
+            stack: tail_pick,
+            filtered_pairs,
+            touched_cap_guids: tail_caps,
+        } = self.tail.pick(filtered_pairs)?;
+
+        Ok(PickResult {
+            stack: CxList {
                 head: head_pick,
                 tail: tail_pick,
             },
-            pick,
-            client_offers,
-        ))
+            filtered_pairs,
+            touched_cap_guids: head_caps.union(&tail_caps).map(|x| *x).collect(),
+        })
     }
 }
 
-impl<C> From<&Vec<C>> for Offer
+fn check_touched<T: Pick>(
+    t: T,
+    pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+) -> Result<PickResult<T::Picked>, Report>
 where
-    C: CapabilitySet + Serialize,
+    T::Picked: Debug,
 {
-    fn from(f: &Vec<C>) -> Self {
-        Offer {
-            capability_guid: C::guid(),
-            available: bincode::serialize(f).unwrap(),
-        }
+    let pr = t.pick(pairs)?;
+    trace!(?pr, "try pick");
+    let touched = &pr.touched_cap_guids;
+    let pairs: Vec<_> = pr
+        .filtered_pairs
+        .into_iter()
+        .filter(|(client, server)| {
+            touched.iter().all(|t| {
+                let of = server.get(t).unwrap();
+                trace!(offer = ?&of, cap = ?t, "checking");
+                match of {
+                    Offer { impl_guid, .. } if *impl_guid == 0 => true,
+                    Offer {
+                        sidedness: Some(univ),
+                        available,
+                        ..
+                    } => {
+                        if let Some(cl_of) = client.get(t) {
+                            let h: HashSet<&[u8]> = cl_of
+                                .available
+                                .iter()
+                                .map(Vec::as_slice)
+                                .chain(available.iter().map(Vec::as_slice))
+                                .collect();
+                            h.len() == univ.len()
+                        } else {
+                            available.len() == univ.len()
+                        }
+                    }
+                    _ => false,
+                }
+            })
+        })
+        .collect();
+
+    if pairs.is_empty() {
+        Err(eyre!("No remaining valid (client, server) offer pairs"))
+    } else {
+        Ok(PickResult {
+            filtered_pairs: pairs,
+            ..pr
+        })
     }
 }
 
-fn lacks<T: PartialEq>(a: &[T], univ: &[T]) -> bool {
-    univ.iter().any(|x| !a.contains(x))
-}
-
-fn have_all<T: PartialEq>(client: &[T], server: &[T]) -> bool {
-    server.iter().all(|x| client.contains(x)) && client.iter().all(|x| server.contains(x))
-}
-
-impl<T1, T2, C> Pick for Select<T1, T2>
+impl<T1, T2, Inner, E> Pick for Select<T1, T2, Inner>
 where
-    T1: Negotiate<Capability = C>,
-    T2: Negotiate<Capability = C>,
-    C: CapabilitySet + Serialize + DeserializeOwned + Clone,
+    T1: Pick,
+    T2: Pick,
+    <T1 as Pick>::Picked: Debug,
+    <T2 as Pick>::Picked: Debug,
+    Inner: MakeEither<T1::Picked, T2::Picked, Either = E> + MakeEither<T2::Picked, T1::Picked>,
+    <Inner as MakeEither<T2::Picked, T1::Picked>>::Either: FlipEither<Flipped = E>,
 {
-    type Picked = Either<T1, T2>;
-    type Iter = Either<IterOnce<Offer>, Empty<Offer>>;
+    type Picked = E;
 
     fn pick(
         self,
-        mut client_offers: HashMap<u64, Vec<Offer>>,
-    ) -> Result<(Self::Picked, Self::Iter, HashMap<u64, Vec<Offer>>), Report> {
-        if C::guid() == 0 {
-            return Ok((Either::Left(self.0), Either::Right(empty()), client_offers));
-        }
-
-        let offers = match client_offers.remove(&C::guid()) {
-            None => {
-                return Err(eyre!(
-                    "Missing offer for type {:?}",
-                    std::any::type_name::<C>()
-                ));
-            }
-            Some(o) => o,
-        };
-
-        trace!(
-            cap_type = std::any::type_name::<C>(),
-            offer = ?&offers,
-            "deserializing offers"
-        );
-
-        let caps: Result<Vec<Vec<C>>, Report> = offers
-            .iter()
-            .map(|o| {
-                let c: Vec<C> = bincode::deserialize(&o.available).wrap_err(eyre!(
-                    "Could not deserialize capability set: {:?} to type {:?}",
-                    o,
-                    std::any::type_name::<C>()
-                ))?;
-                Ok(c)
-            })
-            .collect();
-        let mut caps = caps?;
-
-        debug!(
-            cap_type = std::any::type_name::<C>(),
-            offer = ?&caps,
-            "considering offers"
-        );
-
-        caps.sort_by(|a, b| b.len().cmp(&a.len()));
-
-        let t1 = T1::capabilities();
-        let t2 = T2::capabilities();
-
-        let univ = C::universe();
-        if let Some(univ) = univ {
-            // one-sided. Compare the sum of the two sets to the universe
-            for caps_co in caps.iter() {
-                if t1.len() <= t2.len() {
-                    let mut co: Vec<C> = caps_co.clone();
-                    co.extend_from_slice(&t1);
-                    if !lacks(&co, &univ) {
-                        return Ok((
-                            Either::Left(self.0),
-                            Either::Left(once(caps_co.into())),
-                            client_offers,
-                        ));
-                    }
-
-                    let mut co = caps_co.clone();
-                    co.extend_from_slice(&t2);
-                    if !lacks(&co, &univ) {
-                        return Ok((
-                            Either::Right(self.1),
-                            Either::Left(once(caps_co.into())),
-                            client_offers,
-                        ));
-                    }
-                } else {
-                    let mut co = caps_co.clone();
-                    co.extend_from_slice(&t2);
-                    if !lacks(&co, &univ) {
-                        return Ok((
-                            Either::Right(self.1),
-                            Either::Left(once(caps_co.into())),
-                            client_offers,
-                        ));
-                    }
-
-                    let mut co = caps_co.clone();
-                    co.extend_from_slice(&t1);
-                    if !lacks(&co, &univ) {
-                        return Ok((
-                            Either::Left(self.0),
-                            Either::Left(once(caps_co.into())),
-                            client_offers,
-                        ));
-                    }
+        offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+    ) -> Result<PickResult<Self::Picked>, Report> {
+        fn pick_in_preference_order<T1, T2, Inner>(
+            first_pick: T1,
+            second_pick: T2,
+            offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+        ) -> Result<PickResult<Inner::Either>, Report>
+        where
+            T1: Pick,
+            T2: Pick,
+            <T1 as Pick>::Picked: Debug,
+            <T2 as Pick>::Picked: Debug,
+            Inner: MakeEither<T1::Picked, T2::Picked>,
+        {
+            let first_err = match check_touched(first_pick, offer_pairs.clone()) {
+                Ok(PickResult {
+                    stack,
+                    filtered_pairs,
+                    touched_cap_guids,
+                }) if !filtered_pairs.is_empty() => {
+                    return Ok(PickResult {
+                        stack: Inner::left(stack),
+                        filtered_pairs,
+                        touched_cap_guids,
+                    })
                 }
-            }
-        } else {
-            // both-sided. Try both T1 and T2.
-            for caps_co in caps.iter() {
-                if have_all(&t1, &caps_co) {
-                    return Ok((
-                        Either::Left(self.0),
-                        Either::Left(once(caps_co.into())),
-                        client_offers,
-                    ));
-                } else {
-                    if have_all(&t2, &caps_co) {
-                        return Ok((
-                            Either::Right(self.1),
-                            Either::Left(once(caps_co.into())),
-                            client_offers,
-                        ));
-                    }
-                }
+                Ok(_) => eyre!("first choice pick left no options"),
+                Err(e) => e.wrap_err(eyre!("first choice pick erred")),
+            };
+
+            match check_touched(second_pick, offer_pairs.clone()) {
+                Ok(PickResult {
+                    stack,
+                    filtered_pairs,
+                    touched_cap_guids,
+                }) if filtered_pairs.is_empty() => Ok(PickResult {
+                    stack: Inner::right(stack),
+                    filtered_pairs,
+                    touched_cap_guids,
+                }),
+                Ok(_) => Err(eyre!("both select sides not satisfied").wrap_err(first_err)),
+                Err(e) => Err(e
+                    .wrap_err(eyre!("second choice pick erred"))
+                    .wrap_err(first_err)),
             }
         }
 
-        Err(eyre!(
-            "Could not find satisfying client/server capability set for {:?}",
-            std::any::type_name::<C>()
-        ))
+        match self.prefer {
+            Either::Left(_) => {
+                pick_in_preference_order::<T1, T2, Inner>(self.left, self.right, offer_pairs)
+            }
+            Either::Right(_) => {
+                let PickResult {
+                    stack,
+                    filtered_pairs,
+                    touched_cap_guids,
+                } = pick_in_preference_order::<T2, T1, Inner>(self.right, self.left, offer_pairs)?;
+                Ok(PickResult {
+                    stack: stack.flip(),
+                    filtered_pairs,
+                    touched_cap_guids,
+                })
+            }
+        }
     }
-}
-
-fn group_offers(offers: impl IntoIterator<Item = Offer>) -> HashMap<u64, Vec<Offer>> {
-    let mut map = HashMap::<_, Vec<Offer>>::new();
-    for o in offers {
-        map.entry(o.capability_guid).or_default().push(o);
-    }
-
-    map
 }
 
 pub struct InjectWithChannel<C, D>(C, Arc<AtomicBool>, Arc<TokioMutex<oneshot::Receiver<D>>>);
@@ -546,9 +722,12 @@ where
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NegotiateMsg {
-    ClientOffer(Vec<Offer>),
-    ServerReply(Result<Vec<Offer>, String>),
-    ServerNonce { addr: Vec<u8>, picked: Vec<Offer> },
+    ClientOffer(Vec<HashMap<u64, Offer>>),
+    ServerReply(Result<Vec<HashMap<u64, Offer>>, String>),
+    ServerNonce {
+        addr: Vec<u8>,
+        picked: HashMap<u64, Offer>,
+    },
     ServerNonceAck,
 }
 
@@ -565,8 +744,8 @@ pub fn negotiate_server<Srv, Sc, Se, C, A>(
         impl Stream<
                 Item = Result<
                     Either<
-                        <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection,
-                        <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection,
+                        <<Srv as Pick>::Picked as Chunnel<ClientInput<C, A>>>::Connection,
+                        <<Srv as Apply>::Applied as Chunnel<ClientInput<C, A>>>::Connection,
                     >,
                     Report,
                 >,
@@ -580,26 +759,25 @@ where
     Sc: Stream<Item = Result<C, Se>> + Send + 'static,
     Se: Into<Report> + Send + Sync + 'static,
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    Srv: Pick + Apply<(A, Vec<u8>)> + GetOffers + Clone + Send + 'static,
-// main-line branch: Pick on incoming negotiation handshake.
-    <Srv as Pick>::Picked: CxListReverse + Send + 'static,
-    <<Srv as Pick>::Picked as CxListReverse>::Reversed: NegotiatePicked + Chunnel<ClientInput<C, A>> + Clone + Send + 'static,
-    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
-    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Error: Into<Report> + Send + Sync + 'static,
-    <Srv as Pick>::Iter: Send,
-// nonce branch: Apply stack from nonce on indicated connections.
-    <Srv as Apply<(A, Vec<u8>)>>::Applied: CxListReverse + Send + 'static,
-    <<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed: Chunnel<ClientInput<C, A>> + Clone + Send + 'static,
-    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection:
-        Send + Sync + 'static,
-    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Error:
+    Srv: Pick + Apply + GetOffers + Clone + Debug + Send + 'static,
+    // main-line branch: Pick on incoming negotiation handshake.
+    <Srv as Pick>::Picked:
+        NegotiatePicked + Chunnel<ClientInput<C, A>> + Clone + Debug + Send + 'static,
+    <<Srv as Pick>::Picked as Chunnel<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<Srv as Pick>::Picked as Chunnel<ClientInput<C, A>>>::Error:
+        Into<Report> + Send + Sync + 'static,
+    // nonce branch: Apply stack from nonce on indicated connections.
+    <Srv as Apply>::Applied: Chunnel<ClientInput<C, A>> + Clone + Debug + Send + 'static,
+    <<Srv as Apply>::Applied as Chunnel<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<Srv as Apply>::Applied as Chunnel<ClientInput<C, A>>>::Error:
         Into<Report> + Send + Sync + 'static,
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
 {
     async move {
         // 1. serve (A, Vec<u8>) connections.
         let st = raw_cn_st.map_err(Into::into); // stream of incoming Vec<u8> conns.
-        let pending_negotiated_connections: Arc<Mutex<HashMap<A, Vec<Offer>>>> = Default::default();
+        let pending_negotiated_connections: Arc<Mutex<HashMap<A, HashMap<u64, Offer>>>> =
+            Default::default();
         Ok(st
             .map_err(Into::into)
             // and_then_concurrent will concurrently poll the stream, and any futures returned by
@@ -619,36 +797,30 @@ where
 async fn negotiate_server_connection<C, A, Srv>(
     cn: C,
     stack: Srv,
-    pending_negotiated_connections: Arc<Mutex<HashMap<A, Vec<Offer>>>>,
+    pending_negotiated_connections: Arc<Mutex<HashMap<A, HashMap<u64, Offer>>>>,
 ) -> Result<
-    Option<Either<
-        <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection,
-        <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection,
-    >>,
+    Option<
+        Either<
+            <<Srv as Pick>::Picked as Chunnel<ClientInput<C, A>>>::Connection,
+            <<Srv as Apply>::Applied as Chunnel<ClientInput<C, A>>>::Connection,
+        >,
+    >,
     Report,
 >
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    Srv: Pick + Apply<(A, Vec<u8>)> + GetOffers + Clone + Send + 'static,
-// main-line branch: Pick on incoming negotiation handshake.
-    <Srv as Pick>::Picked: CxListReverse + Send + 'static,
-    <<Srv as Pick>::Picked as CxListReverse>::Reversed:
-        NegotiatePicked + Chunnel<ClientInput<C, A>> + Clone + Send + 'static,
-    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Connection:
-        Send + Sync + 'static,
-    <<<Srv as Pick>::Picked as CxListReverse>::Reversed as Chunnel<ClientInput<C, A>>>::Error:
+    Srv: Pick + Apply + GetOffers + Clone + Debug + Send + 'static,
+    // main-line branch: Pick on incoming negotiation handshake.
+    <Srv as Pick>::Picked:
+        NegotiatePicked + Chunnel<ClientInput<C, A>> + Clone + Debug + Send + 'static,
+    <<Srv as Pick>::Picked as Chunnel<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<Srv as Pick>::Picked as Chunnel<ClientInput<C, A>>>::Error:
         Into<Report> + Send + Sync + 'static,
-    <Srv as Pick>::Iter: Send,
-// nonce branch: Apply stack from nonce on indicated connections.
-    <Srv as Apply<(A, Vec<u8>)>>::Applied: CxListReverse + Send + 'static,
-    <<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed:
-        Chunnel<ClientInput<C, A>> + Clone + Send + 'static,
-    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<
-        ClientInput<C, A>,
-    >>::Connection: Send + Sync + 'static,
-    <<<Srv as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<
-        ClientInput<C, A>,
-    >>::Error: Into<Report> + Send + Sync + 'static,
+    // nonce branch: Apply stack from nonce on indicated connections.
+    <Srv as Apply>::Applied: Chunnel<ClientInput<C, A>> + Clone + Debug + Send + 'static,
+    <<Srv as Apply>::Applied as Chunnel<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<Srv as Apply>::Applied as Chunnel<ClientInput<C, A>>>::Error:
+        Into<Report> + Send + Sync + 'static,
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
 {
     debug!("new connection");
@@ -666,13 +838,12 @@ where
         };
 
         if let Some(picked) = opt_picked {
-            let (stack, _) = stack
-                .apply(group_offers(picked))
+            let (mut stack, _, _) = stack
+                .apply(picked)
                 .wrap_err("failed to apply semantics to client connection")?;
-            let mut stack = stack.rev();
             let new_cn = stack.connect_wrap(cn).await.map_err(Into::into)?;
 
-            debug!(addr = ?&a, "returning pre-negotiated connection");
+            debug!(addr = ?&a, stack = ?&stack, "returning pre-negotiated connection");
             s.send((a, buf)).map_err(|_| eyre!("Send failed"))?;
             return Ok(Some(Either::Right(new_cn)));
         }
@@ -687,7 +858,7 @@ where
         match negotiate_msg {
             ServerNonce { addr, picked } => {
                 let addr: A = bincode::deserialize(&addr).wrap_err("mismatched addr types")?;
-                debug!(client_addr = ?&addr, nonce = ?&picked, "got nonce");
+                trace!(client_addr = ?&addr, nonce = ?&picked, "got nonce");
                 pending_negotiated_connections
                     .lock()
                     .unwrap()
@@ -725,10 +896,12 @@ where
 
                 // 4. Respond to client with offer choice
                 let buf = bincode::serialize(&client_resp)?;
+                // response has to fit in a packet
+                assert!(buf.len() < 1500);
                 cn.send((a, buf)).await?;
 
                 if let Some(mut new_stack) = new_stack {
-                    debug!("negotiation handshake done");
+                    debug!(stack = ?&new_stack, "handshake done, picked stack");
 
                     // 5. new_stack.serve(vec_u8_stream)
                     let new_cn = new_stack.connect_wrap(cn).await.map_err(Into::into)?;
@@ -747,7 +920,7 @@ where
 #[instrument(level = "debug", skip(cn, pending_negotiated_connections))]
 async fn process_nonces_connection<A>(
     cn: impl ChunnelConnection<Data = (A, Vec<u8>)>,
-    pending_negotiated_connections: Arc<Mutex<HashMap<A, Vec<Offer>>>>,
+    pending_negotiated_connections: Arc<Mutex<HashMap<A, HashMap<u64, Offer>>>>,
 ) -> Result<(), Report>
 where
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
@@ -762,7 +935,7 @@ where
         match negotiate_msg {
             ServerNonce { addr, picked } => {
                 let addr: A = bincode::deserialize(&addr).wrap_err("mismatched addr types")?;
-                debug!(client_addr = ?&addr, nonce = ?&picked, "got nonce");
+                trace!(client_addr = ?&addr, nonce = ?&picked, "got nonce");
                 pending_negotiated_connections
                     .lock()
                     .unwrap()
@@ -780,58 +953,79 @@ where
 
 async fn monomorphize<Srv, A>(
     stack: Srv,
-    client_offers: Vec<Offer>,
+    client_offers: Vec<HashMap<u64, Offer>>,
     from_addr: &A,
-) -> Result<
-    (
-        <<Srv as Pick>::Picked as CxListReverse>::Reversed,
-        Vec<Offer>,
-    ),
-    Report,
->
+) -> Result<(<Srv as Pick>::Picked, Vec<HashMap<u64, Offer>>), Report>
 where
-    Srv: Pick + GetOffers + Clone + Send + 'static,
+    Srv: Pick + GetOffers + Clone + Debug + Send + 'static,
     // main-line branch: Pick on incoming negotiation handshake.
-    <Srv as Pick>::Picked: CxListReverse + Send + 'static,
-    <<Srv as Pick>::Picked as CxListReverse>::Reversed: NegotiatePicked + Clone + Send + 'static,
-    <Srv as Pick>::Iter: Send,
+    <Srv as Pick>::Picked: NegotiatePicked + Clone + Debug + Send + 'static,
     A: Serialize + DeserializeOwned + Debug + Send + Sync + 'static,
 {
-    let client_offers_map = group_offers(client_offers);
-    debug!(client_offers = ?&client_offers_map, ?from_addr, "received offer");
+    // enumerate possible offer groups from `stack`.
+    let possibilities: Vec<_> = stack.offers().collect();
+    let saved_possibilities = possibilities.clone();
+
+    let valid_pairs = compare_offers(client_offers, possibilities);
+
     // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve,
     //    impl Serve>> into a CxList<impl Serve>
-    let (new_stack, picked_offers, _) = stack
-        .pick(client_offers_map)
-        .wrap_err(eyre!("error monomorphizing stack",))?;
+    let PickResult {
+        stack: mut new_stack,
+        filtered_pairs,
+        ..
+    } = check_touched(stack, valid_pairs).wrap_err(eyre!("error monomorphizing stack"))?;
+    assert!(!filtered_pairs.is_empty());
 
-    let picked_offers_vec: Vec<Offer> = picked_offers.collect();
-    debug!(picked_client_offers = ?&picked_offers_vec, "monomorphized stack");
+    let (client_choices, mut server_choices): (Vec<_>, Vec<_>) = filtered_pairs.into_iter().unzip();
+    let server_choice = server_choices.pop().unwrap();
+
+    fn check_possibilities(
+        picked: HashMap<u64, Offer>,
+        choices: Vec<HashMap<u64, Offer>>,
+    ) -> HashMap<u64, Offer> {
+        choices
+            .into_iter()
+            .skip_while(|option| {
+                option.iter().any(|(cap_guid, offer)| {
+                    if let Some(picked_offer) = picked.get(&cap_guid) {
+                        picked_offer.available != offer.available
+                    } else {
+                        true
+                    }
+                })
+            })
+            .next()
+            .expect("picked must be in choices")
+    }
+
+    let server_choice = check_possibilities(server_choice, saved_possibilities);
+
     // tell all the stack elements about the nonce = (client addr, chosen stack)
     let nonce = NegotiateMsg::ServerNonce {
         addr: bincode::serialize(from_addr)?,
-        picked: picked_offers_vec.clone(),
+        picked: server_choice,
     };
     let nonce_buf =
         bincode::serialize(&nonce).wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
-    let mut new_stack = new_stack.rev();
+
     new_stack
         .call_negotiate_picked(&nonce_buf)
         .instrument(debug_span!("call_negotiate_picked"))
         .await;
 
-    Ok((new_stack, picked_offers_vec))
+    Ok((new_stack, client_choices))
 }
 
-pub trait Apply<D> {
+pub trait Apply {
     type Applied;
     fn apply(
         self,
-        picked_offers: HashMap<u64, Vec<Offer>>,
-    ) -> Result<(Self::Applied, HashMap<u64, Vec<Offer>>), Report>;
+        picked_offers: HashMap<u64, Offer>,
+    ) -> Result<(Self::Applied, HashMap<u64, Offer>, usize), Report>;
 }
 
-impl<N, D> Apply<D> for N
+impl<N> Apply for N
 where
     N: Negotiate,
     <N as Negotiate>::Capability: DeserializeOwned + Ord,
@@ -839,14 +1033,14 @@ where
     type Applied = Self;
     fn apply(
         self,
-        mut picked_offers: HashMap<u64, Vec<Offer>>,
-    ) -> Result<(Self::Applied, HashMap<u64, Vec<Offer>>), Report> {
+        mut picked_offers: HashMap<u64, Offer>,
+    ) -> Result<(Self::Applied, HashMap<u64, Offer>, usize), Report> {
         let cap_guid = N::Capability::guid();
         if cap_guid == 0 {
-            return Ok((self, picked_offers));
+            return Ok((self, picked_offers, 0));
         }
 
-        let mut offers = match picked_offers.remove(&cap_guid) {
+        let offer = match picked_offers.remove(&cap_guid) {
             None => {
                 return Err(eyre!(
                     "Missing offer for type {:?}",
@@ -856,13 +1050,14 @@ where
             Some(o) => o,
         };
 
-        if offers.is_empty() {
-            return Err(eyre!("Got empty offer set"));
-        }
-
-        let o = offers.pop().unwrap();
-        let mut cs: Vec<N::Capability> = bincode::deserialize(&o.available)
-            .wrap_err(eyre!("Failed deserializing offer capabilities"))?;
+        let cs: Result<Vec<N::Capability>, _> = offer
+            .available
+            .iter()
+            .map(|o| {
+                bincode::deserialize(&o).wrap_err(eyre!("Failed deserializing offer capabilities"))
+            })
+            .collect();
+        let mut cs = cs?;
         cs.sort();
         let mut this = N::capabilities();
         this.sort();
@@ -874,97 +1069,133 @@ where
             ));
         }
 
-        Ok((self, picked_offers))
+        Ok((self, picked_offers, 0))
     }
 }
 
-impl<H, T, D> Apply<D> for CxList<H, T>
+impl<H, T> Apply for CxList<H, T>
 where
-    H: Apply<D>,
-    T: Apply<D>,
+    H: Apply,
+    T: Apply,
 {
     type Applied = CxList<H::Applied, T::Applied>;
 
     fn apply(
         self,
-        picked_offers: HashMap<u64, Vec<Offer>>,
-    ) -> Result<(Self::Applied, HashMap<u64, Vec<Offer>>), Report> {
-        let (head_pick, picked_offers) = self.head.apply(picked_offers)?;
-        let (tail_pick, picked_offers) = self.tail.apply(picked_offers)?;
+        picked_offers: HashMap<u64, Offer>,
+    ) -> Result<(Self::Applied, HashMap<u64, Offer>, usize), Report> {
+        let (head_pick, picked_offers, h_score) = self.head.apply(picked_offers)?;
+        let (tail_pick, picked_offers, t_score) = self.tail.apply(picked_offers)?;
         Ok((
             CxList {
                 head: head_pick,
                 tail: tail_pick,
             },
             picked_offers,
+            h_score + t_score,
         ))
     }
 }
 
-impl<T1, T2, D> Apply<D> for Select<T1, T2>
+impl<T1, T2, Inner, E> Apply for Select<T1, T2, Inner>
 where
-    T1: Apply<D>,
-    T2: Apply<D>,
+    T1: Apply,
+    T2: Apply,
+    Inner: MakeEither<<T1 as Apply>::Applied, <T2 as Apply>::Applied, Either = E>
+        + MakeEither<<T2 as Apply>::Applied, <T1 as Apply>::Applied>,
+    <Inner as MakeEither<<T2 as Apply>::Applied, <T1 as Apply>::Applied>>::Either:
+        FlipEither<Flipped = E>,
 {
-    type Applied = Either<<T1 as Apply<D>>::Applied, <T2 as Apply<D>>::Applied>;
+    type Applied = E;
 
     fn apply(
         self,
-        picked_offers: HashMap<u64, Vec<Offer>>,
-    ) -> Result<(Self::Applied, HashMap<u64, Vec<Offer>>), Report> {
-        match self.0.apply(picked_offers.clone()) {
-            Ok((t1_applied, r)) => Ok((Either::Left(t1_applied), r)),
-            Err(e) => {
-                debug!(t1 = std::any::type_name::<T1>(), err = ?e, "Select::T1 mismatched");
-                let (t2_applied, r) = self.1.apply(picked_offers)?;
-                Ok((Either::Right(t2_applied), r))
+        picked_offers: HashMap<u64, Offer>,
+    ) -> Result<(Self::Applied, HashMap<u64, Offer>, usize), Report> {
+        fn apply_in_preference_order<T1, T2, Inner>(
+            first_pick: T1,
+            second_pick: T2,
+            picked_offers: HashMap<u64, Offer>,
+        ) -> Result<(Inner::Either, HashMap<u64, Offer>, usize), Report>
+        where
+            T1: Apply,
+            T2: Apply,
+            Inner: MakeEither<<T1 as Apply>::Applied, <T2 as Apply>::Applied>,
+        {
+            match first_pick.apply(picked_offers.clone()) {
+                Ok((t1_applied, r, sc)) => Ok((Inner::left(t1_applied), r, sc + 1)),
+                Err(e) => {
+                    debug!(t1 = std::any::type_name::<T1>(), err = %format!("{:#}", &e), "Select::T1 mismatched");
+                    let (t2_applied, r, sc) = second_pick.apply(picked_offers)?;
+                    Ok((Inner::right(t2_applied), r, sc))
+                }
+            }
+        }
+
+        match self.prefer {
+            Either::Left(_) => {
+                apply_in_preference_order::<T1, T2, Inner>(self.left, self.right, picked_offers)
+            }
+            Either::Right(_) => {
+                let (eit, hm, sc) = apply_in_preference_order::<T2, T1, Inner>(
+                    self.right,
+                    self.left,
+                    picked_offers,
+                )?;
+                Ok((eit.flip(), hm, sc))
             }
         }
     }
 }
 
-pub type NegotiatedConn<C, A, S> =
-    <<<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<C>>::Connection;
+pub type NegotiatedConn<C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
 
 /// Return a connection with `stack`'s semantics, connecting to `a`.
 pub fn negotiate_client<C, A, S>(
     stack: S,
     cn: C,
     addr: A,
-) -> impl Future<Output = Result<NegotiatedConn<C, A, S>, Report>> + Send + 'static
+) -> impl Future<Output = Result<NegotiatedConn<C, S>, Report>> + Send + 'static
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    S: Apply<(A, Vec<u8>)> + GetOffers + Clone + Send + 'static,
-    <S as Apply<(A, Vec<u8>)>>::Applied: CxListReverse + Send + 'static,
-    <<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed:
-        Chunnel<C> + Clone + Debug + Send + 'static,
-    <<<S as Apply<(A, Vec<u8>)>>::Applied as CxListReverse>::Reversed as Chunnel<C>>::Error:
-        Into<Report> + Send + Sync + 'static,
+    S: Apply + GetOffers + Clone + Send + 'static,
+    <S as Apply>::Applied: Chunnel<C> + Clone + Debug + Send + 'static,
+    <<S as Apply>::Applied as Chunnel<C>>::Error: Into<Report> + Send + Sync + 'static,
     A: Send + Sync + 'static,
 {
     async move {
         // 1. get Vec<u8> connection.
-        debug!("got negotiation connection");
+        debug!("client negotiation starting");
 
-        // 2. send Vec<Offer>
+        // 2. send offers
         let offers = NegotiateMsg::ClientOffer(stack.offers().collect());
         let buf = bincode::serialize(&offers)?;
-        debug!(offers = ?&offers, "sending offers");
         cn.send((addr, buf)).await?;
 
-        // 3. receive Vec<Offer>
+        // 3. receive picked
         let (_, buf) = cn.recv().await?;
-        let resp: NegotiateMsg = bincode::deserialize(&buf)?;
+        let resp: NegotiateMsg = bincode::deserialize(&buf).wrap_err(eyre!(
+            "Could not deserialize negotiate_server response: {:?}",
+            buf
+        ))?;
         match resp {
             NegotiateMsg::ServerReply(Ok(picked)) => {
-                debug!(picked = ?&picked, "received picked impls");
-
                 // 4. monomorphize `stack`, picking received choices
-                let (new_stack, _) = stack
-                    .apply(group_offers(picked))
-                    .wrap_err(eyre!("Could not apply received impls to stack"))?;
-                let mut new_stack = new_stack.rev();
+                let mut sc = 0;
+                let mut new_stack = None;
+                for p in picked {
+                    let (ns, _, p_sc) = stack
+                        .clone()
+                        .apply(p)
+                        .wrap_err(eyre!("Could not apply received impls to stack"))?;
+                    // TODO what if two options are tied? This will arbitrarily pick the first.
+                    if p_sc > sc || new_stack.is_none() {
+                        sc = p_sc;
+                        new_stack = Some(ns);
+                    }
+                }
 
+                let mut new_stack = new_stack.unwrap();
                 debug!(applied = ?&new_stack, "applied to stack");
 
                 // 5. return new_stack.connect_wrap(vec_u8_conn)
@@ -979,10 +1210,7 @@ where
 #[allow(non_upper_case_globals)]
 #[cfg(test)]
 mod test {
-    use super::{
-        negotiate_client, negotiate_server, CapabilitySet, GetOffers, Negotiate, NegotiateMsg,
-        Offer, Select,
-    };
+    use super::{negotiate_client, negotiate_server, CapabilitySet, Negotiate, Select};
     use crate::{
         chan_transport::Chan, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     };
@@ -1020,6 +1248,7 @@ mod test {
             paste::paste! {
                 lazy_static::lazy_static! {
                     static ref [<$name CapGuid>]: u64 = rand::random();
+                    static ref [<$name ImplGuid>]: u64 = rand::random();
                 }
 
                 enumerate_enum!([<$name Cap>], *[<$name CapGuid>], A, B, C);
@@ -1030,6 +1259,7 @@ mod test {
             paste::paste! {
             impl Negotiate for $name {
                 type Capability = [<$name Cap>];
+                fn guid() -> u64 { *[<$name ImplGuid>] }
                 fn capabilities() -> Vec<Self::Capability> {
                     [<$name Cap>]::universe().unwrap()
                 }
@@ -1042,90 +1272,19 @@ mod test {
     mock_serve_impl!(ChunnelB);
     mock_serve_impl!(ChunnelC);
 
-    #[test]
-    fn serve_no_select() {
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(tracing_subscriber::EnvFilter::from_default_env())
-            .with(ErrorLayer::default());
-        let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-
-        rt.block_on(
-            async move {
-                info!("starting");
-                let (mut srv, mut cln) = Chan::default().split();
-                let stack = CxList::from(ChunnelA).wrap(ChunnelB).wrap(ChunnelC);
-                let srv_stack = stack.clone();
-
-                let (s, r) = tokio::sync::oneshot::channel();
-                tokio::spawn(
-                    async move {
-                        info!("starting");
-                        let raw_st = srv.listen(()).await?;
-                        let mut srv_stream = negotiate_server(srv_stack, raw_st).await?;
-                        s.send(()).unwrap();
-                        // shadow the original variable so it can't accidentally be used after the pin,
-                        // making this safe
-                        let mut srv_stream =
-                            unsafe { std::pin::Pin::new_unchecked(&mut srv_stream) };
-                        srv_stream
-                            .next()
-                            .await
-                            .ok_or_else(|| eyre!("srv_stream returned none"))??;
-                        Ok::<_, Report>(())
-                    }
-                    .instrument(debug_span!("server")),
-                );
-
-                r.await.unwrap();
-
-                // make a Vec<u8> client
-                let cn = cln.connect(()).await?;
-
-                // send the raw Vec<Vec<Offer>>
-                // [ [Offer{guid: A, vec:[]}], [Offer{guid: B, vec:[]}], [Offer{guid: C, vec:[]}] ]
-                let offers = NegotiateMsg::ClientOffer(stack.offers().collect());
-                debug!(offers = ?&offers, "starting negotiation handshake");
-                let buf = bincode::serialize(&offers)?;
-                cn.send(((), buf)).await?;
-
-                let (_, resp) = cn.recv().await?;
-                let resp: NegotiateMsg = bincode::deserialize(&resp)?;
-                debug!(resp = ?&resp, "got negotiation response");
-
-                let resp = match resp {
-                    NegotiateMsg::ServerReply(Ok(os)) => os,
-                    x => panic!("Bad negotiation server response: {:?}", x),
-                };
-
-                let expected: Vec<Offer> = match offers {
-                    NegotiateMsg::ClientOffer(os) => os.into_iter().collect(),
-                    _ => unreachable!(),
-                };
-
-                assert_eq!(resp, expected);
-                info!("done");
-                Ok::<_, Report>(())
-            }
-            .instrument(info_span!("serve_no_select")),
-        )
-        .unwrap();
-    }
-
     #[allow(non_upper_case_globals)]
     macro_rules! mock_alt_impl {
         ($name:ident) => {
             paste::paste! {
             mock_serve_impl!(StructDef==>[< $name Alt >]);
 
+            lazy_static::lazy_static! {
+                static ref [<$name ImplGuidAlt>]: u64 = rand::random();
+            }
+
             impl Negotiate for [< $name Alt >] {
                 type Capability = [<$name Cap>];
+                fn guid() -> u64 { *[<$name ImplGuidAlt>] }
                 fn capabilities() -> Vec<Self::Capability> {
                     [<$name Cap>]::universe().unwrap()
                 }
@@ -1135,38 +1294,6 @@ mod test {
     }
 
     mock_alt_impl!(ChunnelB);
-
-    #[test]
-    fn get_offers() {
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(tracing_subscriber::EnvFilter::from_default_env())
-            .with(ErrorLayer::default());
-        let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
-
-        let stack = CxList::from(ChunnelA)
-            .wrap(Select(ChunnelB, ChunnelBAlt))
-            .wrap(ChunnelC);
-        let offers = super::group_offers(stack.offers().collect());
-        info!(offers = ?&offers, "select_offers");
-
-        assert!(matches!(offers.get(
-            &<<ChunnelB as Negotiate>::Capability as CapabilitySet>::guid()),
-            Some(x) if x.len() == 2,
-        ));
-
-        let stack1 = CxList::from(ChunnelA).wrap(ChunnelB).wrap(ChunnelC);
-        let offers1 = super::group_offers(stack1.offers().collect());
-        info!(offers = ?&offers1, "no_select_offers");
-
-        assert!(matches!(offers1.get(
-            &<<ChunnelB as Negotiate>::Capability as CapabilitySet>::guid()),
-            Some(x) if x.len() == 1,
-        ));
-
-        assert_eq!(offers.len(), offers1.len());
-    }
 
     #[test]
     fn both_select() {
@@ -1187,7 +1314,7 @@ mod test {
                 info!("starting");
                 let (mut srv, mut cln) = Chan::default().split();
                 let stack = CxList::from(ChunnelA)
-                    .wrap(Select(ChunnelB, ChunnelBAlt))
+                    .wrap(Select::from((ChunnelB, ChunnelBAlt)))
                     .wrap(ChunnelC);
                 let srv_stack = stack.clone();
 
@@ -1253,7 +1380,7 @@ mod test {
             async move {
                 info!("starting");
                 let stack = CxList::from(ChunnelA)
-                    .wrap(Select(ChunnelB, ChunnelBAlt))
+                    .wrap(Select::from((ChunnelB, ChunnelBAlt)))
                     .wrap(ChunnelC);
                 let srv_stack = stack.clone();
                 let addr = "127.0.0.1:42184".to_socket_addrs().unwrap().next().unwrap();
@@ -1316,6 +1443,7 @@ mod test {
             paste::paste! {
             lazy_static::lazy_static! {
                 static ref [<$name CapGuid>]: u64 = rand::random();
+                static ref [<$name ImplGuid>]: u64 = rand::random();
             }
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -1337,6 +1465,7 @@ mod test {
             paste::paste! {
             impl Negotiate for $name {
                 type Capability = [<$name Cap>];
+                fn guid() -> u64 { *[<$name ImplGuid>] }
                 fn capabilities() -> Vec<Self::Capability> {
                     vec![ [<$name Cap>]::A ]
                 }
@@ -1368,8 +1497,8 @@ mod test {
         rt.block_on(
             async move {
                 info!("starting");
-                //let stack = ChunnelA;
                 let stack = CxList::from(ChunnelA).wrap(ChunnelD);
+                debug!(chunnelA = ?*ChunnelACapGuid, chunnelD = ?*ChunnelDCapGuid, "guids");
                 let srv_stack = stack.clone();
                 let addr = "127.0.0.1:52184".to_socket_addrs().unwrap().next().unwrap();
                 let (s, r) = tokio::sync::oneshot::channel();

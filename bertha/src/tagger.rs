@@ -1,6 +1,7 @@
 //! Chunnel which tags Data to provide at-most-once delivery.
 
 use crate::{
+    reliable::ReliabilityNeg,
     util::{ProjectLeft, Unproject},
     Chunnel, ChunnelConnection, Negotiate,
 };
@@ -21,6 +22,9 @@ pub struct TaggerProjChunnel;
 
 impl Negotiate for TaggerProjChunnel {
     type Capability = ();
+    fn guid() -> u64 {
+        0xbe302cd0abed5800
+    }
 }
 
 impl<A, D, InC> Chunnel<InC> for TaggerProjChunnel
@@ -43,6 +47,9 @@ pub struct TaggerChunnel;
 
 impl Negotiate for TaggerChunnel {
     type Capability = ();
+    fn guid() -> u64 {
+        0xbe302cd0abed5800
+    }
 }
 
 impl<D, InC> Chunnel<InC> for TaggerChunnel
@@ -147,7 +154,15 @@ impl Default for OrderedChunnelProj {
 }
 
 impl Negotiate for OrderedChunnelProj {
-    type Capability = ();
+    type Capability = ReliabilityNeg;
+
+    fn guid() -> u64 {
+        0xc93fad8b01f04036
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![ReliabilityNeg::Ordering]
+    }
 }
 
 impl<A, D, InC> Chunnel<InC> for OrderedChunnelProj
@@ -181,7 +196,15 @@ impl OrderedChunnel {
 }
 
 impl Negotiate for OrderedChunnel {
-    type Capability = ();
+    type Capability = ReliabilityNeg;
+
+    fn guid() -> u64 {
+        0xc93fad8b01f04036
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![ReliabilityNeg::Ordering]
+    }
 }
 
 impl<D, InC> Chunnel<InC> for OrderedChunnel

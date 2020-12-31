@@ -1,4 +1,8 @@
-use bertha::{util::MsgId, Chunnel, ChunnelConnection, Negotiate};
+use bertha::{
+    reliable::ReliabilityNeg,
+    util::{MsgId, Nothing},
+    Chunnel, ChunnelConnection, Negotiate,
+};
 use color_eyre::eyre;
 use std::future::Future;
 use std::hash::Hash;
@@ -25,9 +29,14 @@ pub struct KvReliabilityChunnel {
 }
 
 impl Negotiate for KvReliabilityChunnel {
-    type Capability = ();
+    type Capability = ReliabilityNeg;
+
+    fn guid() -> u64 {
+        0xa84943c6f0ce1b78
+    }
+
     fn capabilities() -> Vec<Self::Capability> {
-        vec![]
+        vec![ReliabilityNeg::Reliability, ReliabilityNeg::Ordering]
     }
 }
 
@@ -63,6 +72,35 @@ where
             let r = KvReliability::new(cn, to);
             Ok(r)
         })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KvReliabilityServerChunnel(Nothing<ReliabilityNeg>);
+
+impl Negotiate for KvReliabilityServerChunnel {
+    type Capability = ReliabilityNeg;
+
+    fn guid() -> u64 {
+        0xa84943c6f0ce1b78
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![ReliabilityNeg::Reliability, ReliabilityNeg::Ordering]
+    }
+}
+
+impl<D, InC> Chunnel<InC> for KvReliabilityServerChunnel
+where
+    InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = <Nothing<ReliabilityNeg> as Chunnel<InC>>::Future;
+    type Connection = <Nothing<ReliabilityNeg> as Chunnel<InC>>::Connection;
+    type Error = <Nothing<ReliabilityNeg> as Chunnel<InC>>::Error;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        self.0.connect_wrap(cn)
     }
 }
 

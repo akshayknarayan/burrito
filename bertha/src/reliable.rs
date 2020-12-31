@@ -25,8 +25,35 @@ pub struct ReliabilityProjChunnel {
     timeout: usize,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum ReliabilityNeg {
+    Reliability,
+    Ordering,
+}
+
+impl crate::negotiate::CapabilitySet for ReliabilityNeg {
+    fn guid() -> u64 {
+        0x9209a313d34f3ce4
+    }
+
+    // return None to force both sides to match
+    fn universe() -> Option<Vec<Self>> {
+        None
+    }
+}
+
 impl Negotiate for ReliabilityProjChunnel {
-    type Capability = ();
+    type Capability = ReliabilityNeg;
+
+    fn guid() -> u64 {
+        0xcdf794776e9c6ca1
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![ReliabilityNeg::Reliability]
+    }
 }
 
 impl Default for ReliabilityProjChunnel {
@@ -77,7 +104,15 @@ impl Default for ReliabilityChunnel {
 }
 
 impl Negotiate for ReliabilityChunnel {
-    type Capability = ();
+    type Capability = ReliabilityNeg;
+
+    fn guid() -> u64 {
+        0xcdf794776e9c6ca1
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![ReliabilityNeg::Reliability]
+    }
 }
 
 impl ReliabilityChunnel {

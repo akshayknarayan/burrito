@@ -6,59 +6,10 @@ use crate::{
 };
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
-
-#[derive(Clone, Debug)]
-pub struct SerializeSelect<T1, T2>(SerializeChunnelProject<T1>, SerializeChunnelProject<T2>);
-
-impl<T1, T2> Default for SerializeSelect<T1, T2>
-where
-    SerializeChunnelProject<T1>: Default,
-    SerializeChunnelProject<T2>: Default,
-{
-    fn default() -> Self {
-        Self(
-            SerializeChunnelProject::<T1>::default(),
-            SerializeChunnelProject::<T2>::default(),
-        )
-    }
-}
-
-impl<T1: 'static, T2: 'static, Inp: 'static> crate::negotiate::Apply<Inp>
-    for SerializeSelect<T1, T2>
-{
-    // the only place this D could come from is the trait itself, Apply<D>.
-    type Applied = SerializeChunnelProject<Inp>;
-
-    fn apply(
-        self,
-        picked_offers: HashMap<u64, Vec<crate::negotiate::Offer>>,
-    ) -> Result<(Self::Applied, HashMap<u64, Vec<crate::negotiate::Offer>>), Report> {
-        let datatype = std::any::TypeId::of::<Inp>();
-        match datatype {
-            // safety: we know the types are equivalent because TypeId tells us.
-            x if x == std::any::TypeId::of::<T1>() => {
-                Ok((unsafe { std::mem::transmute(self.0) }, picked_offers))
-            }
-            x if x == std::any::TypeId::of::<T2>() => {
-                Ok((unsafe { std::mem::transmute(self.1) }, picked_offers))
-            }
-            _ => Err(eyre!("No match on serialization")),
-        }
-    }
-}
-
-use crate::negotiate::GetOffers;
-impl<T1, T2> GetOffers for SerializeSelect<T1, T2> {
-    type Iter = std::iter::Empty<crate::negotiate::Offer>;
-    fn offers(&self) -> Self::Iter {
-        std::iter::empty()
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct SerializeChunnelProject<D> {
@@ -67,6 +18,10 @@ pub struct SerializeChunnelProject<D> {
 
 impl<D> Negotiate for SerializeChunnelProject<D> {
     type Capability = ();
+
+    fn guid() -> u64 {
+        0xd5263bf239e761c3
+    }
 }
 
 impl<D> Default for SerializeChunnelProject<D> {
@@ -99,6 +54,9 @@ pub struct SerializeChunnel<D> {
 
 impl<D: 'static> Negotiate for SerializeChunnel<D> {
     type Capability = ();
+    fn guid() -> u64 {
+        0xd5263bf239e761c3
+    }
 }
 
 impl<D, InC> Chunnel<InC> for SerializeChunnel<D>
@@ -354,132 +312,132 @@ mod test {
         );
     }
 
-    #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
-    struct Bar {
-        d: u64,
-        c: String,
-    }
+    //#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
+    //struct Bar {
+    //    d: u64,
+    //    c: String,
+    //}
 
-    #[derive(Clone, Copy, Debug, Default)]
-    struct BarChunnel;
+    //#[derive(Clone, Copy, Debug, Default)]
+    //struct BarChunnel;
 
-    impl crate::negotiate::Negotiate for BarChunnel {
-        type Capability = ();
-    }
+    //impl crate::negotiate::Negotiate for BarChunnel {
+    //    type Capability = ();
+    //}
 
-    impl<A, InC> Chunnel<InC> for BarChunnel
-    where
-        A: 'static,
-        InC: ChunnelConnection<Data = (A, Foo)> + Send + Sync + 'static,
-    {
-        type Future = Ready<Result<Self::Connection, Self::Error>>;
-        type Connection = BarCn<InC>;
-        type Error = Report;
+    //impl<A, InC> Chunnel<InC> for BarChunnel
+    //where
+    //    A: 'static,
+    //    InC: ChunnelConnection<Data = (A, Foo)> + Send + Sync + 'static,
+    //{
+    //    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    //    type Connection = BarCn<InC>;
+    //    type Error = Report;
 
-        fn connect_wrap(&mut self, inner: InC) -> Self::Future {
-            ready(Ok(BarCn(inner)))
-        }
-    }
+    //    fn connect_wrap(&mut self, inner: InC) -> Self::Future {
+    //        ready(Ok(BarCn(inner)))
+    //    }
+    //}
 
-    struct BarCn<C>(C);
+    //struct BarCn<C>(C);
 
-    impl<A, C> ChunnelConnection for BarCn<C>
-    where
-        C: ChunnelConnection<Data = (A, Foo)>,
-        A: 'static,
-    {
-        type Data = (A, Bar);
+    //impl<A, C> ChunnelConnection for BarCn<C>
+    //where
+    //    C: ChunnelConnection<Data = (A, Foo)>,
+    //    A: 'static,
+    //{
+    //    type Data = (A, Bar);
 
-        fn send(
-            &self,
-            data: Self::Data,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-            let foo = Foo {
-                a: 0,
-                b: data.1.d,
-                c: data.1.c,
-            };
+    //    fn send(
+    //        &self,
+    //        data: Self::Data,
+    //    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+    //        let foo = Foo {
+    //            a: 0,
+    //            b: data.1.d,
+    //            c: data.1.c,
+    //        };
 
-            self.0.send((data.0, foo))
-        }
+    //        self.0.send((data.0, foo))
+    //    }
 
-        fn recv(
-            &self,
-        ) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-            let fut = self.0.recv();
-            Box::pin(async move {
-                let foo = fut.await?;
-                Ok((
-                    foo.0,
-                    Bar {
-                        d: foo.1.a as u64 + foo.1.b,
-                        c: foo.1.c,
-                    },
-                ))
-            })
-        }
-    }
+    //    fn recv(
+    //        &self,
+    //    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+    //        let fut = self.0.recv();
+    //        Box::pin(async move {
+    //            let foo = fut.await?;
+    //            Ok((
+    //                foo.0,
+    //                Bar {
+    //                    d: foo.1.a as u64 + foo.1.b,
+    //                    c: foo.1.c,
+    //                },
+    //            ))
+    //        })
+    //    }
+    //}
 
-    #[test]
-    fn serialize_negotiate_multi() {
-        use crate::CxList;
+    //#[test]
+    //fn serialize_negotiate_multi() {
+    //    use crate::CxList;
 
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(tracing_subscriber::EnvFilter::from_default_env())
-            .with(ErrorLayer::default());
-        let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .enable_time()
-            .build()
-            .unwrap();
+    //    let subscriber = tracing_subscriber::registry()
+    //        .with(tracing_subscriber::fmt::layer())
+    //        .with(tracing_subscriber::EnvFilter::from_default_env())
+    //        .with(ErrorLayer::default());
+    //    let _guard = subscriber.set_default();
+    //    color_eyre::install().unwrap_or_else(|_| ());
+    //    let rt = tokio::runtime::Builder::new_current_thread()
+    //        .enable_time()
+    //        .enable_time()
+    //        .build()
+    //        .unwrap();
 
-        rt.block_on(
-            async move {
-                let (mut srv, mut cln) = Chan::default().split();
-                let stack = CxList::from(SerializeChunnelProject::default()).wrap(BarChunnel);
+    //    rt.block_on(
+    //        async move {
+    //            let (mut srv, mut cln) = Chan::default().split();
+    //            let stack = CxList::from(BarChunnel).wrap(SerializeChunnelProject::default());
 
-                let srv_stack = stack.clone();
-                tokio::spawn(async move {
-                    let rcv_st = srv.listen(()).await.unwrap();
-                    let st = crate::negotiate::negotiate_server(srv_stack, rcv_st)
-                        .await
-                        .unwrap();
-                    st.try_for_each_concurrent(None, |cn| async move {
-                        let cn = ProjectLeft::new((), cn);
-                        loop {
-                            let buf = cn.recv().await?;
-                            cn.send(buf).await?;
-                        }
-                    })
-                    .await
-                    .unwrap();
-                });
+    //            let srv_stack = stack.clone();
+    //            tokio::spawn(async move {
+    //                let rcv_st = srv.listen(()).await.unwrap();
+    //                let st = crate::negotiate::negotiate_server(srv_stack, rcv_st)
+    //                    .await
+    //                    .unwrap();
+    //                st.try_for_each_concurrent(None, |cn| async move {
+    //                    let cn = ProjectLeft::new((), cn);
+    //                    loop {
+    //                        let buf = cn.recv().await?;
+    //                        cn.send(buf).await?;
+    //                    }
+    //                })
+    //                .await
+    //                .unwrap();
+    //            });
 
-                let raw_cn = cln.connect(()).await.unwrap();
-                let cn = crate::negotiate::negotiate_client(stack, raw_cn, ())
-                    .await
-                    .unwrap();
-                let cn = ProjectLeft::new((), cn);
+    //            let raw_cn = cln.connect(()).await.unwrap();
+    //            let cn = crate::negotiate::negotiate_client(stack, raw_cn, ())
+    //                .await
+    //                .unwrap();
+    //            let cn = ProjectLeft::new((), cn);
 
-                fn dump_type<T>(_: &T) {
-                    debug!(conn = ?std::any::type_name::<T>(), "got connection");
-                }
+    //            fn dump_type<T>(_: &T) {
+    //                debug!(conn = ?std::any::type_name::<T>(), "got connection");
+    //            }
 
-                dump_type(&cn);
+    //            dump_type(&cn);
 
-                let obj = Bar {
-                    d: 9,
-                    c: "hello".to_owned(),
-                };
+    //            let obj = Bar {
+    //                d: 9,
+    //                c: "hello".to_owned(),
+    //            };
 
-                cn.send(obj.clone()).await.unwrap();
-                let r = cn.recv().await.unwrap();
-                assert_eq!(r, obj);
-            }
-            .instrument(tracing::info_span!("serialize_negotiate")),
-        );
-    }
+    //            cn.send(obj.clone()).await.unwrap();
+    //            let r = cn.recv().await.unwrap();
+    //            assert_eq!(r, obj);
+    //        }
+    //        .instrument(tracing::info_span!("serialize_negotiate")),
+    //    );
+    //}
 }

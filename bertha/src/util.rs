@@ -316,17 +316,26 @@ where
 }
 
 /// Does nothing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Nothing<N = ()>(std::marker::PhantomData<N>);
+
+impl<N> Default for Nothing<N> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
 
 impl<N> crate::negotiate::Negotiate for Nothing<N>
 where
     N: crate::negotiate::CapabilitySet,
 {
     type Capability = N;
+    fn guid() -> u64 {
+        0xa0c77d6bd6bef98c
+    }
 }
 
-impl<D, InC> Chunnel<InC> for Nothing
+impl<D, InC, N> Chunnel<InC> for Nothing<N>
 where
     InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Send + Sync + 'static,

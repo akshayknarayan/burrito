@@ -100,7 +100,7 @@ where
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; 2048];
         let sk = Arc::clone(&self.sk);
 
         Box::pin(async move {
