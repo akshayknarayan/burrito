@@ -10,7 +10,6 @@ members = [
     "shenango-chunnel",
     "test-util",
     "xdp-shard",
-    "echo-test",
 ]
 
 [profile.release]
