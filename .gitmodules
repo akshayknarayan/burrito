@@ -5,3 +5,6 @@
 [submodule "src/libbpf"]
 	path = xdp-shard/src/libbpf
 	url = https://github.com/libbpf/libbpf
+[submodule "shenango-chunnel/caladan"]
+	path = shenango-chunnel/caladan
+	url = https://github.com/akshayknarayan/caladan
