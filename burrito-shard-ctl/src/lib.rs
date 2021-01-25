@@ -634,6 +634,7 @@ mod test {
     use bertha::{
         bincode::SerializeChunnelProject,
         chan_transport::RendezvousChannel,
+        negotiate::Offer,
         reliable::ReliabilityProjChunnel,
         select::SelectListener,
         tagger::TaggerProjChunnel,
@@ -645,8 +646,8 @@ mod test {
     use eyre::{eyre, WrapErr};
     use futures_util::TryStreamExt;
     use serde::{Deserialize, Serialize};
-    use std::net::SocketAddr;
-    use tracing::{debug, debug_span, info, warn};
+    use std::{collections::HashMap, net::SocketAddr};
+    use tracing::{debug, debug_span, info, trace, warn};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -671,7 +672,7 @@ mod test {
     async fn start_shard(
         addr: SocketAddr,
         internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
-        s: tokio::sync::oneshot::Sender<Vec<bertha::negotiate::Offer>>,
+        s: tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>,
     ) {
         let external = CxList::from(TaggerProjChunnel)
             .wrap(ReliabilityProjChunnel::default())
@@ -682,7 +683,7 @@ mod test {
             .listen(addr)
             .await
             .unwrap();
-        debug!("got raw connection");
+        trace!("got raw connection");
         let st = bertha::negotiate::negotiate_server(external, st)
             .await
             .unwrap();
@@ -837,7 +838,7 @@ mod test {
             rdy.push(r);
         }
 
-        let mut offers: Vec<Vec<bertha::negotiate::Offer>> = rdy.try_collect().await.unwrap();
+        let mut offers: Vec<Vec<HashMap<u64, Offer>>> = rdy.try_collect().await.unwrap();
 
         // 4. start canonical server
         let cnsrv = ShardCanonicalServer::new(
@@ -846,7 +847,7 @@ mod test {
             CxList::from(TaggerProjChunnel)
                 .wrap(ReliabilityProjChunnel::default())
                 .wrap(SerializeChunnelProject::default()),
-            offers.pop().unwrap(),
+            offers.pop().unwrap().pop().unwrap(),
             &redis_addr,
         )
         .await
@@ -973,11 +974,11 @@ mod test {
                     .await
                     .unwrap();
 
-                let neg_stack =
-                    CxList::from(bertha::negotiate::Select::from((cl, Nothing::default())))
-                        .wrap(TaggerProjChunnel)
-                        .wrap(ReliabilityProjChunnel::default())
-                        .wrap(SerializeChunnelProject::default());
+                use bertha::negotiate::Select;
+                let neg_stack = CxList::from(Select::from((cl, Nothing::<()>::default())))
+                    .wrap(TaggerProjChunnel)
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default());
 
                 let raw_cn = UdpSkChunnel::default().connect(()).await.unwrap();
                 let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
