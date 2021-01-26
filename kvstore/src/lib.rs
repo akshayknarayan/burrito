@@ -67,19 +67,17 @@ mod tests {
                     C: bertha::ChunnelConnection<Data = super::Msg> + Send + Sync + 'static,
                 >(
                     client: KvClient<C>,
+                    op: (String, String),
                 ) -> Result<(), Report> {
                     info!("do put");
-                    match client
-                        .update(String::from("fooo"), String::from("barr"))
-                        .await?
-                    {
+                    match client.update(op.0.clone(), op.1.clone()).await? {
                         None => {}
                         x => Err(eyre!("unexpected value from put {:?}", x))?,
                     }
 
                     info!("do get");
-                    match client.get(String::from("fooo")).await? {
-                        Some(x) if x == "barr" => {}
+                    match client.get(op.0).await? {
+                        Some(x) if x == op.1 => {}
                         x => Err(eyre!("unexpected value from get {:?}", x))?,
                     }
 
@@ -87,18 +85,18 @@ mod tests {
                     Ok(())
                 }
 
-                //async {
-                //    info!("make client");
-                //    let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
-                //    let client = KvClient::new_basicclient(raw_cn, srv_addr.parse()?)
-                //        .instrument(info_span!("make kvclient"))
-                //        .await
-                //        .wrap_err("make KvClient")?;
-                //    putget(client).await?;
-                //    Ok::<_, Report>(())
-                //}
-                //.instrument(info_span!("basic client"))
-                //.await?;
+                async {
+                    info!("make client");
+                    let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
+                    let client = KvClient::new_basicclient(raw_cn, srv_addr.parse()?)
+                        .instrument(info_span!("make kvclient"))
+                        .await
+                        .wrap_err("make basic KvClient")?;
+                    putget(client, ("foooo".into(), "barrrr".into())).await?;
+                    Ok::<_, Report>(())
+                }
+                .instrument(info_span!("basic client"))
+                .await?;
 
                 async {
                     info!("make shardclient");
@@ -107,8 +105,8 @@ mod tests {
                         KvClient::new_shardclient(raw_cn, redis_sk_addr, srv_addr.parse()?)
                             .instrument(info_span!("make shard kvclient"))
                             .await
-                            .wrap_err("make KvClient")?;
-                    putget(client).await?;
+                            .wrap_err("make shard KvClient")?;
+                    putget(client, ("bazzzzzz".into(), "quxxxxx".into())).await?;
                     Ok::<_, Report>(())
                 }
                 .instrument(info_span!("shard client"))

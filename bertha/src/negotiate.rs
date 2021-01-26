@@ -631,7 +631,7 @@ where
                     stack,
                     filtered_pairs,
                     touched_cap_guids,
-                }) if filtered_pairs.is_empty() => Ok(PickResult {
+                }) if !filtered_pairs.is_empty() => Ok(PickResult {
                     stack: Inner::right(stack),
                     filtered_pairs,
                     touched_cap_guids,
@@ -838,8 +838,10 @@ where
         };
 
         if let Some(picked) = opt_picked {
-            let (mut stack, _, _) = stack
-                .apply(picked)
+            let ApplyResult {
+                applied: mut stack, ..
+            } = stack
+                .apply(picked) // use check_apply or no?
                 .wrap_err("failed to apply semantics to client connection")?;
             let new_cn = stack.connect_wrap(cn).await.map_err(Into::into)?;
 
@@ -1017,12 +1019,20 @@ where
     Ok((new_stack, client_choices))
 }
 
+#[derive(Debug, Clone)]
+pub struct ApplyResult<A> {
+    applied: A,
+    picked: HashMap<u64, Offer>,
+    touched: HashSet<u64>,
+    score: usize,
+}
+
 pub trait Apply {
     type Applied;
     fn apply(
         self,
         picked_offers: HashMap<u64, Offer>,
-    ) -> Result<(Self::Applied, HashMap<u64, Offer>, usize), Report>;
+    ) -> Result<ApplyResult<Self::Applied>, Report>;
 }
 
 impl<N> Apply for N
@@ -1034,42 +1044,34 @@ where
     fn apply(
         self,
         mut picked_offers: HashMap<u64, Offer>,
-    ) -> Result<(Self::Applied, HashMap<u64, Offer>, usize), Report> {
+    ) -> Result<ApplyResult<Self::Applied>, Report> {
         let cap_guid = N::Capability::guid();
         if cap_guid == 0 {
-            return Ok((self, picked_offers, 0));
+            return Ok(ApplyResult {
+                applied: self,
+                picked: picked_offers,
+                touched: Default::default(),
+                score: 0,
+            });
         }
 
-        let offer = match picked_offers.remove(&cap_guid) {
-            None => {
-                return Err(eyre!(
-                    "Missing offer for type {:?}",
-                    std::any::type_name::<N::Capability>()
-                ));
+        if let Some(offer) = picked_offers.get_mut(&cap_guid) {
+            if offer.sidedness.is_none() {
+                offer.impl_guid ^= N::guid();
             }
-            Some(o) => o,
-        };
-
-        let cs: Result<Vec<N::Capability>, _> = offer
-            .available
-            .iter()
-            .map(|o| {
-                bincode::deserialize(&o).wrap_err(eyre!("Failed deserializing offer capabilities"))
-            })
-            .collect();
-        let mut cs = cs?;
-        cs.sort();
-        let mut this = N::capabilities();
-        this.sort();
-        if cs != this {
+        } else {
             return Err(eyre!(
-                "Capability offers mismatch: offer={:?}, this={:?}",
-                cs,
-                this
+                "Offer didn't contain needed capability guid: guid={:?}",
+                cap_guid,
             ));
         }
 
-        Ok((self, picked_offers, 0))
+        Ok(ApplyResult {
+            applied: self,
+            picked: picked_offers,
+            touched: [N::Capability::guid()].iter().map(|x| *x).collect(),
+            score: 0,
+        })
     }
 }
 
@@ -1083,17 +1085,52 @@ where
     fn apply(
         self,
         picked_offers: HashMap<u64, Offer>,
-    ) -> Result<(Self::Applied, HashMap<u64, Offer>, usize), Report> {
-        let (head_pick, picked_offers, h_score) = self.head.apply(picked_offers)?;
-        let (tail_pick, picked_offers, t_score) = self.tail.apply(picked_offers)?;
-        Ok((
-            CxList {
+    ) -> Result<ApplyResult<Self::Applied>, Report> {
+        let ApplyResult {
+            applied: head_pick,
+            picked,
+            score: h_score,
+            touched: h_touched,
+        } = self.head.apply(picked_offers)?;
+        let ApplyResult {
+            applied: tail_pick,
+            picked,
+            score: t_score,
+            touched: t_touched,
+        } = self.tail.apply(picked)?;
+        Ok(ApplyResult {
+            applied: CxList {
                 head: head_pick,
                 tail: tail_pick,
             },
-            picked_offers,
-            h_score + t_score,
-        ))
+            picked,
+            touched: h_touched.union(&t_touched).map(|x| *x).collect(),
+            score: h_score + t_score,
+        })
+    }
+}
+
+fn check_apply<T: Apply>(
+    t: T,
+    picked: HashMap<u64, Offer>,
+) -> Result<ApplyResult<T::Applied>, Report> {
+    let ar = t.apply(picked)?;
+    let p = &ar.picked;
+    trace!(checking = ?p, "checking apply");
+    if ar.touched.iter().all(|c| match p.get(c) {
+        Some(Offer {
+            sidedness: None,
+            impl_guid,
+            ..
+        }) if *impl_guid == 0 => true,
+        Some(Offer {
+            sidedness: Some(_), ..
+        }) => true,
+        _ => false,
+    }) {
+        Ok(ar)
+    } else {
+        Err(eyre!("Offers mismatched"))
     }
 }
 
@@ -1111,23 +1148,43 @@ where
     fn apply(
         self,
         picked_offers: HashMap<u64, Offer>,
-    ) -> Result<(Self::Applied, HashMap<u64, Offer>, usize), Report> {
+    ) -> Result<ApplyResult<Self::Applied>, Report> {
         fn apply_in_preference_order<T1, T2, Inner>(
             first_pick: T1,
             second_pick: T2,
             picked_offers: HashMap<u64, Offer>,
-        ) -> Result<(Inner::Either, HashMap<u64, Offer>, usize), Report>
+        ) -> Result<ApplyResult<Inner::Either>, Report>
         where
             T1: Apply,
             T2: Apply,
             Inner: MakeEither<<T1 as Apply>::Applied, <T2 as Apply>::Applied>,
         {
-            match first_pick.apply(picked_offers.clone()) {
-                Ok((t1_applied, r, sc)) => Ok((Inner::left(t1_applied), r, sc + 1)),
+            match check_apply(first_pick, picked_offers.clone()) {
+                Ok(ApplyResult {
+                    applied: t1_applied,
+                    picked,
+                    touched,
+                    score,
+                }) => Ok(ApplyResult {
+                    applied: Inner::left(t1_applied),
+                    picked,
+                    touched,
+                    score: score + 1,
+                }),
                 Err(e) => {
                     debug!(t1 = std::any::type_name::<T1>(), err = %format!("{:#}", &e), "Select::T1 mismatched");
-                    let (t2_applied, r, sc) = second_pick.apply(picked_offers)?;
-                    Ok((Inner::right(t2_applied), r, sc))
+                    let ApplyResult {
+                        applied: t2_applied,
+                        picked,
+                        touched,
+                        score,
+                    } = check_apply(second_pick, picked_offers).wrap_err(e)?;
+                    Ok(ApplyResult {
+                        applied: Inner::right(t2_applied),
+                        picked,
+                        touched,
+                        score,
+                    })
                 }
             }
         }
@@ -1137,12 +1194,22 @@ where
                 apply_in_preference_order::<T1, T2, Inner>(self.left, self.right, picked_offers)
             }
             Either::Right(_) => {
-                let (eit, hm, sc) = apply_in_preference_order::<T2, T1, Inner>(
+                let ApplyResult {
+                    applied,
+                    picked,
+                    touched,
+                    score,
+                } = apply_in_preference_order::<T2, T1, Inner>(
                     self.right,
                     self.left,
                     picked_offers,
                 )?;
-                Ok((eit.flip(), hm, sc))
+                Ok(ApplyResult {
+                    applied: applied.flip(),
+                    picked,
+                    touched,
+                    score,
+                })
             }
         }
     }
@@ -1181,21 +1248,36 @@ where
         match resp {
             NegotiateMsg::ServerReply(Ok(picked)) => {
                 // 4. monomorphize `stack`, picking received choices
+                trace!(?picked, "received server pairs, applying");
                 let mut sc = 0;
                 let mut new_stack = None;
+                let mut apply_err = eyre!("Apply error");
                 for p in picked {
-                    let (ns, _, p_sc) = stack
-                        .clone()
-                        .apply(p)
-                        .wrap_err(eyre!("Could not apply received impls to stack"))?;
-                    // TODO what if two options are tied? This will arbitrarily pick the first.
-                    if p_sc > sc || new_stack.is_none() {
-                        sc = p_sc;
-                        new_stack = Some(ns);
+                    match check_apply(stack.clone(), p)
+                        .wrap_err(eyre!("Could not apply received impls to stack"))
+                    {
+                        Ok(ApplyResult {
+                            applied: ns,
+                            score: p_sc,
+                            ..
+                        }) => {
+                            // TODO what if two options are tied? This will arbitrarily pick the first.
+                            if p_sc > sc || new_stack.is_none() {
+                                sc = p_sc;
+                                new_stack = Some(ns);
+                            }
+                        }
+                        Err(e) => {
+                            debug!(err = %format!("{:#}", e), "Apply attempt failed");
+                            apply_err = apply_err.wrap_err(e);
+                            continue;
+                        }
                     }
                 }
 
-                let mut new_stack = new_stack.unwrap();
+                let mut new_stack = new_stack.ok_or_else(|| {
+                    apply_err.wrap_err(eyre!("All received options failed to apply"))
+                })?;
                 debug!(applied = ?&new_stack, "applied to stack");
 
                 // 5. return new_stack.connect_wrap(vec_u8_conn)
