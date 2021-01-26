@@ -1,5 +1,5 @@
 use bertha::{ChunnelConnection, ChunnelConnector};
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{Report, WrapErr};
 use kvstore::KvClient;
 use kvstore_ycsb::{ops, Op};
 use std::collections::HashMap;

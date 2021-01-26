@@ -135,14 +135,8 @@ mod test {
     use crate::chan_transport::Chan;
     use crate::test::Serve;
     use crate::{util::ProjectLeft, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener};
-    use color_eyre::eyre::Report;
-    use futures_util::{
-        future::{ready, Ready},
-        stream::{StreamExt, TryStreamExt},
-    };
-    use std::future::Future;
-    use std::pin::Pin;
-    use tracing::{debug, trace};
+    use futures_util::stream::{StreamExt, TryStreamExt};
+    use tracing::trace;
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
