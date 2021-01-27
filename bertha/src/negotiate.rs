@@ -1228,11 +1228,11 @@ where
     S: Apply + GetOffers + Clone + Send + 'static,
     <S as Apply>::Applied: Chunnel<C> + Clone + Debug + Send + 'static,
     <<S as Apply>::Applied as Chunnel<C>>::Error: Into<Report> + Send + Sync + 'static,
-    A: Send + Sync + 'static,
+    A: Debug + Send + Sync + 'static,
 {
     async move {
         // 1. get Vec<u8> connection.
-        debug!("client negotiation starting");
+        debug!(?addr, "client negotiation starting");
 
         // 2. send offers
         let offers = NegotiateMsg::ClientOffer(stack.offers().collect());

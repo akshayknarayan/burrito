@@ -318,7 +318,7 @@ mod test {
                 assert_eq!(m.key(), "aaaaaaaa");
                 assert_eq!(m.val(), "bbbbbbbb");
             }
-            .instrument(debug_span!("negotiate_bothsides")),
+            .instrument(debug_span!("negotiate_ebpf")),
         );
     }
 
