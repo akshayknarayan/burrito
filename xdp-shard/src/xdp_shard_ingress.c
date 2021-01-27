@@ -86,13 +86,13 @@ static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
         offset = shards->rules.msg_offset;
     }
 
-    if (((void*) (offset + 4 + ((char*) app_data))) > data_end) {
+    if (app_data + offset + 4 > data_end) {
         bpf_printk("Packet not large enough for msg: %u\n", (data_end - app_data));
         return XDP_ABORTED;
     }
-    
+
     // value start
-    pkt_val = ((u8*) app_data) + offset;
+    pkt_val = app_data + offset;
 
     // compute FNV hash
     #pragma clang loop unroll(full)
