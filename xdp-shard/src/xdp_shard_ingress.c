@@ -86,12 +86,13 @@ static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
         offset = shards->rules.msg_offset;
     }
 
+    // This tends to break the verifier. The key seems to be getting the compiler to 
+    // reuse the same register for both the comparison here and pkt_val = app_data + offset below.
     if (app_data + offset + 4 > data_end) {
         bpf_printk("Packet not large enough for msg: %u\n", (data_end - app_data));
         return XDP_ABORTED;
     }
 
-    // value start
     pkt_val = app_data + offset;
 
     // compute FNV hash
