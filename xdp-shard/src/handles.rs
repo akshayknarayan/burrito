@@ -1,7 +1,7 @@
 use crate::bindings::*;
 use crate::*;
 use eyre::{eyre, Report};
-use tracing::debug;
+use tracing::{debug, trace};
 use xdp_shard_prog::{AvailableShards, ShardRules};
 
 pub struct Ingress;
@@ -123,6 +123,7 @@ impl BpfHandles<Ingress> {
     /// Load xdp_shard XDP program onto the given interface id.
     pub fn load_on_interface_id(interface_id: u32) -> Result<Self, Report> {
         let bpf_filename = concat!(env!("OUT_DIR"), "/xdp_shard_ingress.o\0");
+        trace!(?bpf_filename, ?interface_id, "loading bpf program");
 
         let bpf_filename_cstr = std::ffi::CStr::from_bytes_with_nul(bpf_filename.as_bytes())?;
         let attr = libbpf::bpf_prog_load_attr {
