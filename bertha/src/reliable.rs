@@ -142,7 +142,7 @@ where
 pub struct ReliabilityProj<A: Eq + Hash, D, C> {
     timeout: usize,
     inner: Arc<C>,
-    state: Arc<DashMap<A, ReliabilityState<A, D>>>,
+    state: Arc<DashMap<u64, ReliabilityState<A, D>>>,
 }
 
 impl<A: Eq + Hash, C, D> ReliabilityProj<A, D, C> {
@@ -175,6 +175,7 @@ impl<A: Eq + Hash, C, D> Clone for ReliabilityProj<A, D, C> {
 /// Message format for reliability chunnel
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pkt<D> {
+    pub flow_id: u64,
     pub acks: Vec<u32>,
     pub payload: Option<(u32, D)>,
 }
@@ -182,6 +183,7 @@ pub struct Pkt<D> {
 impl<D> Default for Pkt<D> {
     fn default() -> Self {
         Pkt {
+            flow_id: 0,
             acks: Default::default(),
             payload: None,
         }
@@ -189,10 +191,17 @@ impl<D> Default for Pkt<D> {
 }
 
 impl<D> Pkt<D> {
+    pub fn with_flow_id(flow_id: u64) -> Self {
+        Self {
+            flow_id,
+            ..Default::default()
+        }
+    }
+
     pub fn payload(seq: u32, payload: D) -> Self {
         Pkt {
-            acks: Default::default(),
             payload: Some((seq, payload)),
+            ..Default::default()
         }
     }
 
@@ -219,6 +228,7 @@ impl<D> Pkt<D> {
 impl<D> std::fmt::Debug for Pkt<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut p = f.debug_struct("Pkt");
+        p.field("flow", &self.flow_id);
         if let Some((s, _)) = self.payload {
             p.field("seq", &s);
         }
@@ -231,6 +241,7 @@ impl<D> std::fmt::Debug for Pkt<D> {
 
 #[derive(Debug)]
 struct ReliabilityState<A, D> {
+    addr: Option<A>,
     inflight: HashMap<
         u32,
         (
@@ -238,7 +249,7 @@ struct ReliabilityState<A, D> {
             Option<oneshot::Sender<Result<(), eyre::Report>>>,
             Instant,
         ),
-    >, // list of inflight seqs
+    >, // inflight seq num -> (payload, completion notifier, sent time)
     pending_payload: VecDeque<(A, Pkt<D>)>, // payloads we have received that are waiting for a recv() call
     pending_acks: Pkt<D>,
     rtt_est: Duration,
@@ -275,6 +286,7 @@ impl<A, D> ReliabilityState<A, D> {
 impl<A, D> Default for ReliabilityState<A, D> {
     fn default() -> Self {
         ReliabilityState {
+            addr: None,
             inflight: HashMap::new(),
             pending_payload: VecDeque::new(),
             pending_acks: Default::default(),
@@ -293,6 +305,20 @@ impl<A, D> Drop for ReliabilityState<A, D> {
     }
 }
 
+fn calculate_hash<T: Hash>(t: &T) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut s = DefaultHasher::new();
+    t.hash(&mut s);
+    s.finish()
+}
+
+// make sure we set pending_acks.flow_id, because it'll get mem::replaced out and sent if transmit gets
+// called.
+fn init_entry_in_state<A, D>(state: &Arc<DashMap<u64, ReliabilityState<A, D>>>, flow_id: u64) {
+    state.entry(flow_id).or_default().pending_acks.flow_id = flow_id;
+}
+
 impl<A, C, D> ChunnelConnection for ReliabilityProj<A, D, C>
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
@@ -306,7 +332,8 @@ where
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let (addr, data) = data;
-        self.state.entry(addr.clone()).or_default();
+        let flow_id = calculate_hash(&addr);
+        init_entry_in_state(&self.state, flow_id);
         let seq = data.0;
         let a = addr.clone();
 
@@ -317,10 +344,12 @@ where
             async move {
                 let (s, r) = oneshot::channel();
                 let (mut pkt, to) = {
-                    let mut st = state.get_mut(&addr).unwrap();
+                    // unwrap ok because of .or_default() above
+                    let mut st = state.get_mut(&flow_id).unwrap();
+                    st.addr = Some(addr.clone());
                     st.inflight
                         .insert(seq, (data.1.clone(), Some(s), Instant::now()));
-                    let new_p: Pkt<D> = Pkt::default();
+                    let new_p: Pkt<D> = Pkt::with_flow_id(flow_id);
                     let p = std::mem::replace(&mut st.pending_acks, new_p);
                     trace!(inflight = st.inflight.len(), "sending");
                     (p, st.rtt_est * (timeout as _))
@@ -362,9 +391,16 @@ where
     }
 }
 
+/// Makes sure `segment` is acked, and retransmits it at the right times otherwise.
+///
+/// `inner`: Inner connection
+/// `state`: flow_id -> state map
+/// `segment`: the packet: (dst_addr, packet_with_payload).
+/// `r`: Done-ness notification
+/// `timeout`.
 async fn transmit<A, C, D>(
     inner: Arc<C>,
-    state: Arc<DashMap<A, ReliabilityState<A, D>>>,
+    state: Arc<DashMap<u64, ReliabilityState<A, D>>>,
     segment: (A, Pkt<D>),
     mut r: tokio::sync::oneshot::Receiver<Result<(), eyre::Report>>,
     timeout: Duration,
@@ -386,9 +422,9 @@ where
                     tokio::select!(
                         done = &mut r => {
                             done??;
-                            let (addr, pkt) = segment;
+                            let (_, pkt) = segment;
                             trace!(?pkt, ?retx_ctr, "transmit done");
-                            let mut st = state.get_mut(&addr).expect("conn not found");
+                            let mut st = state.get_mut(&pkt.flow_id).expect("conn not found");
                             st.retx_ctrs.saturating_record(retx_ctr);
                             return Ok::<_, eyre::Report>(());
                         }
@@ -401,7 +437,7 @@ where
                             trace!(?addr, ?pkt, ?retx_ctr, ?to, "retransmitted");
 
                             // send_time is the time since the last transmission
-                            let mut st = state.get_mut(addr).expect("conn not found");
+                            let mut st = state.get_mut(&pkt.flow_id).expect("conn not found");
                             let seq = pkt.payload.as_ref().unwrap().0;
                             let (_, _, ref mut send_time) = st.inflight.get_mut(&seq).expect("pkt state not found");
                             *send_time = Instant::now();
@@ -417,7 +453,13 @@ where
                 let mut state = state1;
                 loop {
                     let (addr, pkt) = do_recv(&mut inner, &mut state).await?;
-                    let mut st = state.entry(addr.clone()).or_default();
+                    init_entry_in_state(&state, pkt.flow_id);
+                    // init_entry_in_state guarantees the entry is present
+                    let mut st = state.get_mut(&pkt.flow_id).unwrap();
+                    if st.addr.is_none() {
+                        st.addr = Some(addr.clone());
+                    }
+
                     st.pending_payload.push_back((addr, pkt));
                 }
             }
@@ -429,9 +471,14 @@ where
     .0
 }
 
+/// Receive a packet and ack it. If there was a payload, return it.
+///
+/// `inner`: Inner connection
+/// `state`: flow_id -> state map
+/// returns -> (src_addr, packet_with_payload)
 async fn do_recv<A, C, D>(
     inner: &mut Arc<C>,
-    state: &mut Arc<DashMap<A, ReliabilityState<A, D>>>,
+    state: &mut Arc<DashMap<u64, ReliabilityState<A, D>>>,
 ) -> Result<(A, Pkt<D>), eyre::Report>
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
@@ -440,19 +487,22 @@ where
 {
     loop {
         let (addr, mut pkt) = inner.recv().await?;
+        let flow_id = pkt.flow_id;
         trace!("called inner recv");
-        let mut st = state.get_mut(&addr);
-        if st.is_none() && !pkt.acks.is_empty() {
+        if !pkt.acks.is_empty() && !state.contains_key(&flow_id) {
             trace!(pkt = ?&pkt, from = ?&addr, event = "bad ack, unknown addr", "got pkt");
             continue;
-        } else if st.is_none() {
-            // there are no acks so we don't expect there to be state, but we need to init state to
-            // handle delayed acks.
-            state.insert(addr.clone(), Default::default());
-            st = state.get_mut(&addr);
         }
 
-        let mut st = st.unwrap();
+        // there are no acks so we don't expect there to be state, but we need to init state to
+        // handle delayed acks.
+        init_entry_in_state(state, flow_id);
+        // init_entry_in_state guarantees the entry is present
+        let mut st = state.get_mut(&pkt.flow_id).unwrap();
+        if st.addr.is_none() {
+            st.addr = Some(addr.clone());
+        }
+
         let acks = pkt.take_acks();
         for seq in acks {
             if let Some((_, Some(s), send_time)) = st.inflight.remove(&seq) {
@@ -502,16 +552,17 @@ where
 #[instrument(skip(inner, state))]
 async fn nagler<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
     inner: Arc<C>,
-    state: Arc<DashMap<A, ReliabilityState<A, D>>>,
+    state: Arc<DashMap<u64, ReliabilityState<A, D>>>,
 ) where
     C: ChunnelConnection<Data = (A, Pkt<D>)> + Send + Sync + 'static,
 {
     loop {
         tokio::time::sleep(Duration::from_millis(10)).await;
         for mut entry in state.iter_mut() {
-            let (addr, st) = entry.pair_mut();
+            let (flow_id, st) = entry.pair_mut();
             if !st.pending_acks.acks.is_empty() {
-                let mut send_p = Default::default();
+                let addr = st.addr.clone().unwrap();
+                let mut send_p = Pkt::with_flow_id(*flow_id);
                 std::mem::swap(&mut send_p, &mut st.pending_acks);
                 trace!(?addr, ?send_p, "sent delayed acks");
                 if let Err(e) = inner.send((addr.clone(), send_p)).await {
