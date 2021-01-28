@@ -74,6 +74,7 @@ fn main() {
             .derive_default(true)
             .blacklist_type(r#"u\d+"#)
             .whitelist_type(r#"datarec"#)
+            .whitelist_type(r#"active_client"#)
             .whitelist_var(r#"NUM_PORTS"#)
             .whitelist_type(r#"available_shards"#)
             .generate()

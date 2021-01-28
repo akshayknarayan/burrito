@@ -1,9 +1,10 @@
-use super::eyre::Report;
+use super::eyre::{eyre, Report, WrapErr};
 use super::ShardCanonicalServer;
 use crate::ShardInfo;
 use bertha::{negotiate::Offer, Chunnel, ChunnelConnection, IpPort, Negotiate};
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -66,6 +67,21 @@ impl<A, S, Ss> ShardCanonicalServerEbpf<A, S, Ss> {
     }
 }
 
+fn get_addr_from_nonce(nonce: &[u8]) -> Result<SocketAddrV4, Report> {
+    use bertha::negotiate::NegotiateMsg;
+    let msg: NegotiateMsg = bincode::deserialize(nonce).wrap_err("Deserialize nonce")?;
+    match msg {
+        NegotiateMsg::ServerNonce { addr, .. } => {
+            match bincode::deserialize(&addr).wrap_err("Deserialize socket addr") {
+                Ok(SocketAddr::V4(addr)) => Ok(addr),
+                Ok(a) => Err(eyre!("ipv6 addrs not supported: {}", a)),
+                _ => Err(eyre!("Deserialize addr from nonce")),
+            }
+        }
+        _ => Err(eyre!("malformed nonce")),
+    }
+}
+
 impl<A, S, Ss, Cap> Negotiate for ShardCanonicalServerEbpf<A, S, Ss>
 where
     Cap: bertha::negotiate::CapabilitySet,
@@ -82,7 +98,29 @@ where
     }
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
-        self.inner.picked(nonce)
+        let addr = get_addr_from_nonce(nonce);
+
+        let inner_fut = self.inner.picked(nonce);
+        let handles = Arc::clone(&self.handles);
+        Box::pin(async move {
+            match addr {
+                Ok(addr) => {
+                    let client_addr = addr.ip();
+                    let client_port = addr.port();
+                    let mut h = handles.lock().await;
+                    for (_, iface_handle) in h.iter_mut() {
+                        if let Err(e) = iface_handle.register_client(*client_addr, client_port) {
+                            debug!(err = %format!("{:#}", e), ?client_addr, ?client_port, "client not registered");
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(err = %format!("{:#}", e), "client not registered");
+                }
+            }
+
+            inner_fut.await
+        })
     }
 }
 
@@ -145,7 +183,7 @@ pub(crate) async fn register_shardinfo<A: IpPort + Clone>(
             let handle = match l {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!(err = ?e, ifn = ?&ifn, "Error loading xdp-shard");
+                    warn!(err = %format!("{:#}", e), ifn = ?&ifn, "Error loading xdp-shard");
                     return;
                 }
             };
@@ -252,15 +290,15 @@ pub(crate) async fn read_shard_stats(
 mod test {
     use super::ShardCanonicalServerEbpf;
     use crate::test::{start_shard, Msg};
-    use crate::{ClientShardChunnelClient, Kv, ShardCanonicalServer, ShardInfo};
+    use crate::{Kv, ShardInfo};
     use bertha::{
         bincode::SerializeChunnelProject,
         chan_transport::RendezvousChannel,
-        negotiate::{Offer, Select},
+        negotiate::Offer,
         reliable::ReliabilityProjChunnel,
         tagger::TaggerProjChunnel,
         udp::{UdpReqChunnel, UdpSkChunnel},
-        util::{Nothing, ProjectLeft},
+        util::ProjectLeft,
         ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     };
     use futures_util::TryStreamExt;
@@ -288,11 +326,8 @@ mod test {
 
         rt.block_on(
             async move {
-                let (redis_h, canonical_addr) = shard_setup_ebpf(45215, 41421).await;
-                let redis_addr = redis_h.get_addr();
-
+                let (_redis_h, canonical_addr) = shard_setup_ebpf(45215, 41421).await;
                 info!("make client");
-
                 let udp_addr = canonical_addr;
                 let neg_stack = CxList::from(TaggerProjChunnel)
                     .wrap(ReliabilityProjChunnel::default())

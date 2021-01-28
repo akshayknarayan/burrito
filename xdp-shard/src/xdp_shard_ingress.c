@@ -47,6 +47,13 @@ struct bpf_map_def SEC("maps") rx_queue_index_map = {
 	.max_entries	= MAX_RXQs + 1,
 };
 
+struct bpf_map_def SEC("maps") active_clients_map = {
+	.type		 = BPF_MAP_TYPE_HASH,
+	.key_size	 = sizeof(struct active_client),
+    .value_size  = sizeof(__u8),
+	.max_entries = 64,
+};
+
 /* Dest. port -> available_shards map for sharding on that port */
 struct bpf_map_def SEC("maps") available_shards_map = {
 	.type		= BPF_MAP_TYPE_HASH,
@@ -184,17 +191,29 @@ static inline int record_icmp(u32 rxq)
     return XDP_PASS;
 }
 
-static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
+static inline int parse_tcp(void *tcp_data, void *data_end, u32 src_addr, u32 rxq)
 {
     struct tcphdr *th;
     int res;
     u8 data_offset;
+    u8 *val;
     void *payload;
+    struct active_client client;
 
     th = (struct tcphdr *)tcp_data;
     // check the TCP header itself
     if ((th + 1) > (struct tcphdr*) data_end)
         return XDP_ABORTED;
+
+    __builtin_memset(&client, 0, sizeof(struct active_client));
+    client.saddr = src_addr;
+    client.sport = ntohs(th->dest);
+	val = bpf_map_lookup_elem(&active_clients_map, &client);
+    if (!val) {
+        bpf_printk("client not registered %u:%u\n", client.saddr, client.sport);
+        return XDP_PASS;
+    }
+
     data_offset = ntohs(th->doff);
     if (data_offset > 0xf) {
         return XDP_ABORTED; // 4-bit bitfield
@@ -211,13 +230,25 @@ static inline int parse_tcp(void *tcp_data, void *data_end, u32 rxq)
     return record_port(ntohs(th->dest), rxq);
 }
 
-static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
+static inline int parse_udp(void *udp_data, void *data_end, u32 src_addr, u32 rxq)
 {
     int res;
     struct udphdr *uh;
+    u8 *val;
+    struct active_client client;
+    __builtin_memset(&client, 0, sizeof(struct active_client));
+
     uh = (struct udphdr *)udp_data;
     if ((uh + 1) > (struct udphdr*) data_end)
         return XDP_ABORTED;
+    
+    client.saddr = src_addr;
+    client.sport = uh->dest;
+	val = bpf_map_lookup_elem(&active_clients_map, &client);
+    if (!val) {
+        bpf_printk("client not registered %u:%u\n", client.saddr, client.sport);
+        return XDP_PASS;
+    }
 
     res = shard_generic((void*) (uh + 1), data_end, &(uh->dest));
     if (res == XDP_ABORTED) { return res; }
@@ -228,16 +259,19 @@ static inline int parse_udp(void *udp_data, void *data_end, u32 rxq)
 
 static inline int parse_ipv4(void *data, void *data_end, u32 rxq)
 {
+    u32 src_addr;
     void *trans_data;
     struct iphdr *iph = data;
     trans_data = iph + 1;
     if (trans_data > data_end)
         return XDP_ABORTED;
 
+    src_addr = iph->saddr;
+
     if (iph->protocol == IPPROTO_TCP) {
-        return parse_tcp(trans_data, data_end, rxq);
+        return parse_tcp(trans_data, data_end, src_addr, rxq);
     } else if (iph->protocol ==IPPROTO_UDP) {
-        return parse_udp(trans_data, data_end, rxq);
+        return parse_udp(trans_data, data_end, src_addr, rxq);
     } else if (iph->protocol == IPPROTO_ICMP) {
         record_icmp(rxq);
         return XDP_PASS;
@@ -263,6 +297,7 @@ static inline int parse_eth(void *data, void *data_end, u32 rxq)
         return XDP_PASS;
     }
     
+    // TODO ipv6
     if (h_proto == htons(ETH_P_IP)) {
         return parse_ipv4(((char*)data) + nh_off, data_end, rxq);
     }

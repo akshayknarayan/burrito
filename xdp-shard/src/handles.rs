@@ -2,7 +2,7 @@ use crate::bindings::*;
 use crate::*;
 use eyre::{eyre, Report};
 use tracing::{debug, trace};
-use xdp_shard_prog::{AvailableShards, ShardRules};
+use xdp_shard_prog::{ActiveClient, AvailableShards, ShardRules};
 
 pub struct Ingress;
 
@@ -15,6 +15,7 @@ pub struct BpfHandles<T> {
     ifindex: u32,
     ifindex_map: std::os::raw::c_int,
     rx_queue_index_map: std::os::raw::c_int,
+    active_clients_map: std::os::raw::c_int,
     available_shards_map: std::os::raw::c_int,
     num_rxqs: usize,
     curr_record: StatsRecord,
@@ -25,9 +26,11 @@ pub struct BpfHandles<T> {
 impl<T> BpfHandles<T> {
     /// Define the set of sharding ports.
     ///
-    /// By default, the shards map is empty and xdp_port will not rewrite port numbers, only log.
-    /// Setting this will define a set of ports that xdp_port will shard between.
+    /// By default, the shards map is empty and the xdp program will not rewrite port numbers, only log.
+    /// Setting this will define a set of `ports` that xdp_port will shard the `orig_port` between.
     /// Both the TCP and UDP `orig_port`s will be sharded to the respective ports.
+    ///
+    /// Only packets from clients registered in `register_client` will be sharded.
     ///
     /// Note: It is not safe to call this concurrently, so it takes `&mut` self even though it would
     /// compile (unsafely) taking `&self`.
@@ -39,13 +42,13 @@ impl<T> BpfHandles<T> {
         field_size: u8,
     ) -> Result<(), Report> {
         if ports.len() > 16 {
-            Err(eyre!("Too many ports to shard (max 16): {:?}", ports.len()))?;
+            return Err(eyre!("Too many ports to shard (max 16): {:?}", ports.len()));
         }
 
         if field_size != 4 {
-            Err(eyre!(
+            return Err(eyre!(
                 "field_size != 4 currently doesn't pass the bpf verifier :("
-            ))?;
+            ));
         }
 
         let mut av = AvailableShards {
@@ -60,46 +63,104 @@ impl<T> BpfHandles<T> {
         av.ports[0..ports.len()].copy_from_slice(ports);
 
         // now set it
-        let ok = unsafe {
-            bpf::bpf_map_update_elem(
-                self.available_shards_map,
-                &orig_port as *const _ as *const _,
-                &av as *const _ as *const _,
-                0,
-            )
-        };
-        if ok < 0 {
-            let errno = nix::errno::Errno::last();
-            Err(eyre!("available_shards_map update elem failed: {}", errno))?;
-        }
+        check_err(
+            unsafe {
+                bpf::bpf_map_update_elem(
+                    self.available_shards_map,
+                    &orig_port as *const _ as *const _,
+                    &av as *const _ as *const _,
+                    0,
+                )
+            },
+            "available_shards_map update",
+        )?;
 
         Ok(())
     }
 
+    /// Clear the sharded port.
     pub fn clear_port(&mut self, port: u16) -> Result<(), Report> {
-        let ok = unsafe {
-            bpf::bpf_map_delete_elem(self.available_shards_map, &port as *const _ as *const _)
+        clear_check_err(
+            unsafe {
+                bpf::bpf_map_delete_elem(self.available_shards_map, &port as *const _ as *const _)
+            },
+            "available_shards_map delete",
+        )
+    }
+
+    /// Enable sharding for a client.
+    ///
+    /// Only dst ports regstered in `shard_ports` will be sharded.
+    pub fn register_client(
+        &mut self,
+        src_addr: std::net::Ipv4Addr,
+        src_port: u16,
+    ) -> Result<(), Report> {
+        let val = 1u8;
+        let client = ActiveClient {
+            saddr: u32::from_be_bytes(src_addr.octets()),
+            sport: src_port,
         };
-        if ok < 0 {
-            let errno = nix::errno::Errno::last();
-            if let nix::errno::Errno::ENOENT = errno {
-                // it is ok to clear_port on a value not in the map
-                return Ok(());
-            }
+        check_err(
+            unsafe {
+                bpf::bpf_map_update_elem(
+                    self.active_clients_map,
+                    &client as *const _ as *const _,
+                    &val as *const _ as *const _,
+                    0,
+                )
+            },
+            "active_clients_map update",
+        )
+    }
 
-            Err(eyre!("available_shards_map delete elem failed: {}", errno))?;
-        }
+    /// Clear the active client.
+    pub fn clear_client(
+        &mut self,
+        src_addr: std::net::Ipv4Addr,
+        src_port: u16,
+    ) -> Result<(), Report> {
+        let client = ActiveClient {
+            saddr: u32::from_be_bytes(src_addr.octets()),
+            sport: src_port,
+        };
 
-        Ok(())
+        clear_check_err(
+            unsafe {
+                bpf::bpf_map_delete_elem(self.active_clients_map, &client as *const _ as *const _)
+            },
+            "active_clients_map delete",
+        )
     }
 
     fn activate(&mut self) -> Result<(), Report> {
         let xdp_flags = if_link::XDP_FLAGS_SKB_MODE | if_link::XDP_FLAGS_UPDATE_IF_NOEXIST;
-        let ok = unsafe { libbpf::bpf_set_link_xdp_fd(self.ifindex as _, self.prog_fd, xdp_flags) };
-        if ok < 0 {
-            Err(eyre!("bpf_set_link_xdp_fd failed: {}", ok))?;
+        check_err(
+            unsafe { libbpf::bpf_set_link_xdp_fd(self.ifindex as _, self.prog_fd, xdp_flags) },
+            "bpf_set_link_xdp_fd",
+        )
+    }
+}
+
+fn check_err(ok: i32, msg: &str) -> Result<(), Report> {
+    if ok < 0 {
+        let errno = nix::errno::Errno::last();
+        Err(eyre!("ebpf error: {} msg: {}", errno, msg))
+    } else {
+        Ok(())
+    }
+}
+
+fn clear_check_err(ok: i32, msg: &str) -> Result<(), Report> {
+    if ok < 0 {
+        let errno = nix::errno::Errno::last();
+        if let nix::errno::Errno::ENOENT = errno {
+            // it is ok to clear_port on a value not in the map
+            return Ok(());
         }
 
+        Err(eyre!("ebpf error: {} msg: {}", errno, msg))
+    } else {
         Ok(())
     }
 }
@@ -138,23 +199,23 @@ impl BpfHandles<Ingress> {
         let mut bpf_obj: *mut libbpf::bpf_object = std::ptr::null_mut();
         let mut prog_fd = 0;
 
-        let ok = unsafe {
-            libbpf::bpf_prog_load_xattr(
-                &attr,
-                &mut bpf_obj as *mut *mut libbpf::bpf_object,
-                &mut prog_fd as *mut _,
-            )
-        };
-        if ok > 0 {
-            Err(eyre!("bpf_prog_load_xattr failed: {}", ok))?;
-        }
+        check_err(
+            unsafe {
+                libbpf::bpf_prog_load_xattr(
+                    &attr,
+                    &mut bpf_obj as *mut *mut libbpf::bpf_object,
+                    &mut prog_fd as *mut _,
+                )
+            },
+            "bpf_prog_load_xattr",
+        )?;
 
         if prog_fd == 0 {
-            Err(eyre!("bpf_prog_load_xattr returned null fd"))?;
+            return Err(eyre!("bpf_prog_load_xattr returned null fd"));
         }
 
         if prog_fd < 0 {
-            Err(eyre!("bpf_prog_load_xattr returned bad fd: {}", prog_fd))?;
+            return Err(eyre!("bpf_prog_load_xattr returned bad fd: {}", prog_fd));
         }
 
         let rx_queue_index_map = get_map_by_name("rx_queue_index_map\0", bpf_obj)?;
@@ -169,9 +230,18 @@ impl BpfHandles<Ingress> {
 
         let rx_queue_index_map = unsafe { libbpf::bpf_map__fd(rx_queue_index_map) };
         if rx_queue_index_map < 0 {
-            Err(eyre!(
+            return Err(eyre!(
                 "rx_queue_index_map returned bad fd: {}",
                 rx_queue_index_map
+            ));
+        }
+
+        let active_clients_map = get_map_by_name("active_clients_map\0", bpf_obj)?;
+        let active_clients_map = unsafe { libbpf::bpf_map__fd(active_clients_map) };
+        if active_clients_map < 0 {
+            Err(eyre!(
+                "active_clients_map returned bad fd: {}",
+                active_clients_map
             ))?;
         }
 
@@ -195,6 +265,7 @@ impl BpfHandles<Ingress> {
             ifindex: interface_id,
             ifindex_map,
             rx_queue_index_map,
+            active_clients_map,
             available_shards_map,
             num_rxqs: num_rxqs as _,
             curr_record: StatsRecord::empty(num_rxqs as _),
@@ -225,19 +296,17 @@ impl BpfHandles<Ingress> {
 
         let key = 0;
         let ifindex = self.ifindex as i32;
-        let ok = unsafe {
-            bpf::bpf_map_update_elem(
-                ifindex_map_fd,
-                &key as *const _ as *const _,
-                &ifindex as *const _ as *const _,
-                0,
-            )
-        };
-        if ok < 0 {
-            Err(eyre!("ifindex_map bpf_map_update_elem failed: {}", ok))?;
-        }
-
-        Ok(())
+        check_err(
+            unsafe {
+                bpf::bpf_map_update_elem(
+                    ifindex_map_fd,
+                    &key as *const _ as *const _,
+                    &ifindex as *const _ as *const _,
+                    0,
+                )
+            },
+            "ifindex_map bpf_map_update_elem",
+        )
     }
 }
 

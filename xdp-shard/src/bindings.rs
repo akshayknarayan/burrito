@@ -31,6 +31,7 @@ pub mod if_link {
 pub mod xdp_shard_prog {
     include!(concat!(env!("OUT_DIR"), "/xdp_shard.rs"));
 
+    pub type ActiveClient = active_client;
     pub type AvailableShards = available_shards;
     pub type ShardRules = shard_rules;
     pub type Datarec = datarec;
