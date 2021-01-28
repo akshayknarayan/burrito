@@ -162,6 +162,10 @@ async fn main() -> Result<(), Report> {
     tracing_subscriber::fmt::init();
     color_eyre::install()?;
 
+    if opt.ports.is_empty() {
+        return Err(eyre!("Must supply at least one port"));
+    }
+
     // listen on ports
     let ctrs: Vec<(u16, Arc<AtomicUsize>)> = opt
         .ports

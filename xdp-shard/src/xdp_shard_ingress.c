@@ -52,7 +52,7 @@ struct bpf_map_def SEC("maps") available_shards_map = {
 	.type		= BPF_MAP_TYPE_HASH,
 	.key_size	= sizeof(__u16),
 	.value_size	= sizeof(struct available_shards),
-	.max_entries	= 4,
+	.max_entries	= 64,
 };
 
 static inline int shard_generic(void *app_data, void *data_end, u16 *port) {
