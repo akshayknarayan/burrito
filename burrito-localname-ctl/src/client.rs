@@ -1,5 +1,5 @@
 use crate::{proto, CONTROLLER_ADDRESS};
-use eyre::{bail, eyre, Error};
+use color_eyre::eyre::{bail, eyre, Error};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;

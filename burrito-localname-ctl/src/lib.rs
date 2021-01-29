@@ -16,8 +16,9 @@ pub mod ctl;
 #[cfg(feature = "docker")]
 pub mod docker_proxy;
 
-use bertha::{Chunnel, ChunnelConnection, ChunnelConnector};
-use eyre::{eyre, Report};
+use bertha::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Negotiate};
+use color_eyre::eyre::{eyre, Report};
+use futures_util::stream::StreamExt;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -32,16 +33,26 @@ use tracing::debug;
 ///
 /// `local_chunnel` is the fast-path chunnel.
 #[derive(Debug, Clone)]
-pub struct LocalNameChunnel<Lch, Lctr> {
+pub struct LocalNameChunnel<Lch, Lr, Ag> {
     cl: Option<Arc<Mutex<client::LocalNameClient>>>,
+    listen_addr: Option<Ag>,
+    local_raw: Lr,
     local_chunnel: Lch,
-    local_connector: Lctr,
 }
 
-impl<Lch, Lctr> LocalNameChunnel<Lch, Lctr> {
+impl<Lch, Lr, Ag> Negotiate for LocalNameChunnel<Lch, Lr, Ag> {
+    type Capability = ();
+
+    fn guid() -> u64 {
+        0xb3fa08967e518987
+    }
+}
+
+impl<Lch, Lr, Ag> LocalNameChunnel<Lch, Lr, Ag> {
     pub async fn new(
         root: impl AsRef<Path>,
-        local_connector: Lctr,
+        listen_addr: Option<Ag>,
+        local_raw: Lr,
         local_chunnel: Lch,
     ) -> Result<Self, Report> {
         let cl = client::LocalNameClient::new(root.as_ref()).await;
@@ -51,25 +62,30 @@ impl<Lch, Lctr> LocalNameChunnel<Lch, Lctr> {
 
         Ok(Self {
             cl: cl.map(Mutex::new).map(Arc::new).ok(),
+            listen_addr,
+            local_raw,
             local_chunnel,
-            local_connector,
         })
     }
 }
 
-impl<Gc, Lctr, LctrCn, LctrErr, Lrd, Lch, Lcn, LchErr, D> Chunnel<Gc>
-    for LocalNameChunnel<Lch, Lctr>
+impl<Gc, Lr, LrCn, LrErr, Lrd, Lch, Lcn, LchErr, D> Chunnel<Gc>
+    for LocalNameChunnel<Lch, Lr, SocketAddr>
 where
     Gc: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
     // Raw local connections. Lrd, local raw data, is probably Vec<u8> (e.g. for Lctr = UDS), but
     // don't assume this.
-    Lctr:
-        ChunnelConnector<Connection = LctrCn, Addr = (), Error = LctrErr> + Clone + Send + 'static,
-    LctrCn: ChunnelConnection<Data = (PathBuf, Lrd)> + Send,
-    LctrErr: Into<Report> + Send + Sync + 'static,
+    Lr: ChunnelConnector<Connection = LrCn, Addr = (), Error = LrErr>
+        + ChunnelListener<Connection = LrCn, Addr = PathBuf, Error = LrErr>
+        + Clone
+        + Send
+        + 'static,
+    <Lr as ChunnelListener>::Stream: Unpin,
+    LrCn: ChunnelConnection<Data = (PathBuf, Lrd)> + Send,
+    LrErr: Into<Report> + Send + Sync + 'static,
     // Local connections with semantics.
-    Lch: Chunnel<LctrCn, Connection = Lcn, Error = LchErr> + Clone + Send + 'static,
+    Lch: Chunnel<LrCn, Connection = Lcn, Error = LchErr> + Clone + Send + 'static,
     Lcn: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
     LchErr: Into<Report> + Send + Sync + 'static,
 {
@@ -79,12 +95,31 @@ where
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn connect_wrap(&mut self, inner: Gc) -> Self::Future {
-        let mut local_connector = self.local_connector.clone();
+        let mut local_raw = self.local_raw.clone();
         let mut local_chunnel = self.local_chunnel.clone();
         let cl = self.cl.as_ref().map(Arc::clone);
+        let gaddr = self.listen_addr.clone();
 
         Box::pin(async move {
-            let local_raw_cn = local_connector.connect(()).await.map_err(Into::into)?;
+            let local_raw_cn = match (gaddr, &cl) {
+                (Some(gaddr), Some(cl)) => match cl.lock().await.query(gaddr).await {
+                    Ok(Some(laddr)) => local_raw
+                        .listen(laddr)
+                        .await
+                        .map_err(Into::into)?
+                        .next()
+                        .await
+                        .unwrap()
+                        .map_err(Into::into)?,
+                    Ok(None) => local_raw.connect(()).await.map_err(Into::into)?,
+                    Err(e) => {
+                        debug!(err = %format!("{:#}", e), "LocalNameClient query failed");
+                        local_raw.connect(()).await.map_err(Into::into)?
+                    }
+                },
+                _ => local_raw.connect(()).await.map_err(Into::into)?,
+            };
+
             let local_cn = local_chunnel
                 .connect_wrap(local_raw_cn)
                 .await
@@ -125,7 +160,6 @@ impl<Gc, Lc> LocalNameCn<Gc, Lc> {
     }
 }
 
-// when actually querying client, we need to use its supported types SocketAddr and PathBuf.
 impl<Gc, Lc, D> ChunnelConnection for LocalNameCn<Gc, Lc>
 where
     Gc: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
@@ -137,7 +171,7 @@ where
     fn send(
         &self,
         (addr, data): Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let addr_cache = Arc::clone(&self.addr_cache);
         let rev_addr_map = Arc::clone(&self.rev_addr_map);
         let cl = self.cl.as_ref().map(Arc::clone);
@@ -225,9 +259,7 @@ where
         })
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         use futures_util::future::{self, Either};
         let rev_addr_map = Arc::clone(&self.rev_addr_map);
         let local_cn = Arc::clone(&self.local_cn);
@@ -248,5 +280,67 @@ where
                 Either::Right((Err(e), _)) => Err(e.wrap_err("local_cn recv erred")),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::LocalNameChunnel;
+    use bertha::{
+        negotiate_client, negotiate_server, udp::UdpSkChunnel, uds::UnixSkChunnel, util::Nothing,
+        ChunnelConnection, ChunnelConnector, ChunnelListener,
+    };
+    use futures_util::stream::TryStreamExt;
+    use tracing_error::ErrorLayer;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    #[test]
+    fn no_ctl() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or_else(|_| ());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let addr = "127.0.0.1:19052".parse().unwrap();
+        let lch = LocalNameChunnel {
+            cl: None,
+            listen_addr: None,
+            local_raw: UnixSkChunnel,
+            local_chunnel: Nothing::<()>::default(),
+        };
+
+        rt.block_on(async move {
+            let lch_s = lch.clone();
+            tokio::spawn(async move {
+                let st = negotiate_server(lch_s, UdpSkChunnel.listen(addr).await.unwrap())
+                    .await
+                    .unwrap();
+                st.try_for_each_concurrent(None, |cn| async move {
+                    loop {
+                        let m = cn.recv().await.unwrap();
+                        cn.send(m).await.unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+            });
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let cn = negotiate_client(lch, UdpSkChunnel.connect(()).await.unwrap(), addr)
+                .await
+                .unwrap();
+
+            cn.send((addr, vec![0u8; 10])).await.unwrap();
+            let m = cn.recv().await.unwrap();
+            assert_eq!(m, (addr, vec![0u8; 10]));
+        });
     }
 }
