@@ -17,7 +17,7 @@ futures-util = "0.3"
 dashmap = "3"
 rand = "0.7"
 serde  = { version = "1", features = ["derive"]}
-tokio = {version = "0.3", features = ["rt", "sync", "macros"]}
+tokio = {version = "1", features = ["rt", "sync", "macros"]}
 tracing = "0.1"
 tracing-futures = "0.2"
 tracing-error = "0.1"

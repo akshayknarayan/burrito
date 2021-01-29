@@ -17,11 +17,11 @@ tracing = "0.1"
 tracing-futures = "0.2"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "0.3", features = ["sync", "time"] }
-redis = { version = "0.18", default-features = false, features = ["aio", "tokio-comp"] }
+tokio = { version = "1", features = ["sync", "time"] }
+redis = { version = "0.19", default-features = false, features = ["aio", "tokio-comp"] }
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
-tokio = { version = "0.3", features = ["rt"] }
+tokio = { version = "1", features = ["rt"] }
 tracing-subscriber = "0.2"
 tracing-error = "0.1"

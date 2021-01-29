@@ -8,6 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 #[derive(Clone, Debug, Copy, Default)]
@@ -78,7 +79,7 @@ where
             let (s, r) = mpsc::channel(1);
             m.insert(a.clone(), s);
             debug!(addr = ?&a, "RendezvousChannel listening");
-            Ok(Box::pin(r.map(move |x| {
+            Ok(Box::pin(ReceiverStream::new(r).map(move |x| {
                 debug!(addr = ?a, "RendezvousChannel returning new connection");
                 Ok(x)
             })) as _)

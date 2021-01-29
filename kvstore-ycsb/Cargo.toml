@@ -14,7 +14,7 @@ burrito-shard-ctl = {path = "../burrito-shard-ctl"}
 kvstore = {path = "../kvstore"}
 futures-util = "0.3"
 structopt = "0.3"
-tokio = {version = "0.3", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = {version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 poisson-ticker = { git = "https://github.com/akshayknarayan/poisson-ticker", branch="debug" }
 tracing = "0.1"
 tracing-futures = "0.2"
