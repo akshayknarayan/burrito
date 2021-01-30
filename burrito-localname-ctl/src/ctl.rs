@@ -1,7 +1,7 @@
 //! SocketAddr -> Path with local scope.
 
 use crate::proto;
-use eyre::Error;
+use color_eyre::eyre::Error;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -62,7 +62,8 @@ pub async fn serve_ctl(root: Option<PathBuf>, force: bool) -> Result<(), Error> 
         e
     })?;
 
-    burrito.serve_on(uc).await;
+    use tokio_stream::wrappers::UnixListenerStream;
+    burrito.serve_on(UnixListenerStream::new(uc)).await;
     Ok(())
 }
 
@@ -177,7 +178,6 @@ impl BurritoNet {
         Ok(p)
     }
 
-    #[allow(clippy::cognitive_complexity)]
     async fn name_table_insert(
         &self,
         service_addr: SocketAddr,
@@ -196,7 +196,6 @@ impl BurritoNet {
         }
     }
 
-    #[allow(clippy::cognitive_complexity)]
     async fn query(&self, dst_addr: &SocketAddr) -> Result<Option<PathBuf>, String> {
         trace!("routetable get start");
         // Look up the service addr to translate.
@@ -217,88 +216,4 @@ fn get_addr() -> String {
         .take(10)
         .collect();
     listen_addr
-}
-
-#[cfg(test)]
-mod test {
-    use crate::ctl::serve_ctl;
-    use crate::{LocalNameCln, LocalNameSrv};
-    use bertha::{
-        chan_transport::RendezvousChannel,
-        udp::{UdpReqAddr, UdpReqChunnel, UdpSkChunnel},
-        util::OptionUnwrapProj,
-        ChunnelConnection, ChunnelConnector, ChunnelListener, Client, CxNil, Serve,
-    };
-    use eyre::Error;
-    use futures_util::stream::TryStreamExt;
-    use std::net::SocketAddr;
-    use std::path::PathBuf;
-    use tracing::{debug, info, trace};
-    use tracing_futures::Instrument;
-
-    #[test]
-    fn local_name() {
-        let _guard = tracing_subscriber::fmt::try_init();
-        color_eyre::install().unwrap();
-
-        let mut rt = tokio::runtime::Builder::new()
-            .basic_scheduler()
-            .enable_time()
-            .enable_io()
-            .build()
-            .unwrap();
-        rt.block_on(
-            async move {
-                let root = PathBuf::from(r"./tmp-test-local-name");
-
-                std::fs::remove_dir_all(&root).unwrap_or_else(|_| ());
-                trace!(dir = ?&root, "create dir");
-                std::fs::create_dir(&root)?;
-                debug!(dir = ?&root, "start ctl");
-                let r1 = root.clone();
-                tokio::spawn(
-                    async move { serve_ctl(Some(r1), false).await.unwrap() }
-                        .instrument(tracing::info_span!("localname-ctl")),
-                );
-
-                tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
-
-                let (rsrv, cln) = RendezvousChannel::new(10).split();
-                // udp |> localnamesrv server
-                let udp_addr: SocketAddr = "127.0.0.1:21987".parse()?;
-                let mut srv =
-                    LocalNameSrv::new(root.clone(), udp_addr, rsrv, OptionUnwrapProj).await?;
-                let raw_st = UdpReqChunnel::default()
-                    .listen(UdpReqAddr(udp_addr))
-                    .await?;
-                let st = srv.serve(raw_st).await?;
-
-                tokio::spawn(
-                    async move {
-                        st.try_for_each_concurrent(None, |cn| async move {
-                            let m = cn.recv().await?;
-                            cn.send(m).await?;
-                            Ok(())
-                        })
-                        .await
-                    }
-                    .instrument(tracing::debug_span!("server")),
-                );
-
-                // udp |> localnamecln client
-                let mut cln = LocalNameCln::new(root.clone(), cln, CxNil).await?;
-                info!("connecting client");
-                let raw_cn = UdpSkChunnel::default().connect(()).await?;
-                let cn = cln.connect_wrap(raw_cn).await?;
-
-                cn.send((udp_addr, vec![1u8; 8])).await?;
-                let (_, d) = cn.recv().await?;
-                assert_eq!(d, vec![1u8; 8]);
-
-                Ok::<_, Error>(())
-            }
-            .instrument(tracing::info_span!("local_name")),
-        )
-        .unwrap();
-    }
 }

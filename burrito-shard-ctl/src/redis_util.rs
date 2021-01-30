@@ -13,7 +13,7 @@ where
     format!("shard:{}", a)
 }
 
-#[tracing::instrument(level = "trace", err, skip(conn))]
+#[tracing::instrument(level = "trace", skip(conn))]
 pub async fn redis_insert<A>(
     conn: Arc<Mutex<redis::aio::Connection>>,
     serv: &ShardInfo<A>,

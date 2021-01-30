@@ -102,8 +102,8 @@ where
 
         Box::pin(async move {
             let local_raw_cn = match (gaddr, &cl) {
-                (Some(gaddr), Some(cl)) => match cl.lock().await.query(gaddr).await {
-                    Ok(Some(laddr)) => local_raw
+                (Some(gaddr), Some(cl)) => match cl.lock().await.register(gaddr).await {
+                    Ok(laddr) => local_raw
                         .listen(laddr)
                         .await
                         .map_err(Into::into)?
@@ -111,9 +111,8 @@ where
                         .await
                         .unwrap()
                         .map_err(Into::into)?,
-                    Ok(None) => local_raw.connect(()).await.map_err(Into::into)?,
                     Err(e) => {
-                        debug!(err = %format!("{:#}", e), "LocalNameClient query failed");
+                        debug!(err = %format!("{:#}", e), "LocalNameClient register failed");
                         local_raw.connect(()).await.map_err(Into::into)?
                     }
                 },
@@ -301,7 +300,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

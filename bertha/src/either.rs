@@ -45,17 +45,11 @@ impl<A, B> Either<A, B> {
     }
 
     pub fn is_left(&self) -> bool {
-        match self {
-            Either::Left(_) => true,
-            _ => false,
-        }
+        matches!(self, Either::Left(_))
     }
 
     pub fn is_right(&self) -> bool {
-        match self {
-            Either::Right(_) => true,
-            _ => false,
-        }
+        matches!(self, Either::Right(_))
     }
 }
 
@@ -211,17 +205,11 @@ impl<A, B> DataEither<A, B> {
     }
 
     pub fn is_left(&self) -> bool {
-        match self {
-            DataEither::Left(_) => true,
-            _ => false,
-        }
+        matches!(self, DataEither::Left(_))
     }
 
     pub fn is_right(&self) -> bool {
-        match self {
-            DataEither::Right(_) => true,
-            _ => false,
-        }
+        matches!(self, DataEither::Right(_))
     }
 }
 

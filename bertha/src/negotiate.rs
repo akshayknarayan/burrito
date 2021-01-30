@@ -493,7 +493,7 @@ where
         Ok(PickResult {
             stack: self,
             filtered_pairs,
-            touched_cap_guids: [C::guid()].iter().map(|x| *x).collect(),
+            touched_cap_guids: [C::guid()].iter().copied().collect(),
         })
     }
 }
@@ -526,7 +526,7 @@ where
                 tail: tail_pick,
             },
             filtered_pairs,
-            touched_cap_guids: head_caps.union(&tail_caps).map(|x| *x).collect(),
+            touched_cap_guids: head_caps.union(&tail_caps).copied().collect(),
         })
     }
 }
@@ -626,7 +626,7 @@ where
                 Err(e) => e.wrap_err(eyre!("first choice pick erred")),
             };
 
-            match check_touched(second_pick, offer_pairs.clone()) {
+            match check_touched(second_pick, offer_pairs) {
                 Ok(PickResult {
                     stack,
                     filtered_pairs,
@@ -736,6 +736,7 @@ type ClientInput<C, A> = InjectWithChannel<C, (A, Vec<u8>)>;
 use crate::and_then_concurrent::TryStreamExtExt;
 
 /// Return a stream of connections with `stack`'s semantics, listening on `raw_cn_st`.
+#[allow(clippy::manual_async_fn)] // we need the + 'static which async fn does not do.
 pub fn negotiate_server<Srv, Sc, Se, C, A>(
     stack: Srv,
     raw_cn_st: Sc,
@@ -988,16 +989,15 @@ where
     ) -> HashMap<u64, Offer> {
         choices
             .into_iter()
-            .skip_while(|option| {
-                option.iter().any(|(cap_guid, offer)| {
+            .find(|option| {
+                option.iter().all(|(cap_guid, offer)| {
                     if let Some(picked_offer) = picked.get(&cap_guid) {
-                        picked_offer.available != offer.available
+                        picked_offer.available == offer.available
                     } else {
-                        true
+                        false
                     }
                 })
             })
-            .next()
             .expect("picked must be in choices")
     }
 
@@ -1069,7 +1069,7 @@ where
         Ok(ApplyResult {
             applied: self,
             picked: picked_offers,
-            touched: [N::Capability::guid()].iter().map(|x| *x).collect(),
+            touched: [N::Capability::guid()].iter().copied().collect(),
             score: 0,
         })
     }
@@ -1104,7 +1104,7 @@ where
                 tail: tail_pick,
             },
             picked,
-            touched: h_touched.union(&t_touched).map(|x| *x).collect(),
+            touched: h_touched.union(&t_touched).copied().collect(),
             score: h_score + t_score,
         })
     }
@@ -1218,6 +1218,7 @@ where
 pub type NegotiatedConn<C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
 
 /// Return a connection with `stack`'s semantics, connecting to `a`.
+#[allow(clippy::manual_async_fn)] // we need the + 'static which async fn does not do.
 pub fn negotiate_client<C, A, S>(
     stack: S,
     cn: C,
@@ -1384,7 +1385,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -1451,7 +1452,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1569,7 +1570,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

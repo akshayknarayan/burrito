@@ -39,12 +39,12 @@ impl Redis {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         if let Ok(Some(_)) = redis.try_wait() {
-            Err(eyre!("Could not start redis"))?;
+            return Err(eyre!("Could not start redis"));
         }
 
         let red_conn_string = format!("redis://localhost:{}", port);
         let cl = redis::Client::open(red_conn_string.as_str())?;
-        while let Err(_) = cl.get_connection() {
+        while cl.get_connection().is_err() {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 

@@ -28,7 +28,7 @@ impl Record {
             )
         };
         if ok != 0 {
-            Err(eyre!("Could not bpf_map_lookup_elem for stats_global_map",))?;
+            return Err(eyre!("Could not bpf_map_lookup_elem for stats_global_map"));
         }
 
         self.timestamp = std::time::Instant::now();

@@ -316,7 +316,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         // 0. Make rt.
         let rt = tokio::runtime::Builder::new_current_thread()

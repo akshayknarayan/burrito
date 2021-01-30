@@ -127,7 +127,7 @@ where
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let (addr, (_, d)) = inner.recv().await?;
-            return Ok((addr, d));
+            Ok((addr, d))
         })
     }
 }
@@ -342,9 +342,9 @@ where
 #[derive(Clone, Copy, Debug)]
 struct DataPair<D>(u32, D);
 
-impl<D> Into<(u32, D)> for DataPair<D> {
-    fn into(self) -> (u32, D) {
-        (self.0, self.1)
+impl<D> From<DataPair<D>> for (u32, D) {
+    fn from(dp: DataPair<D>) -> (u32, D) {
+        (dp.0, dp.1)
     }
 }
 
@@ -466,8 +466,8 @@ mod test {
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
-        let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        let _guard = subscriber.try_init().unwrap_or(());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -539,8 +539,8 @@ mod test {
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
-        let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        let _guard = subscriber.try_init().unwrap_or(());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -574,8 +574,8 @@ mod test {
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
-        let _guard = subscriber.try_init().unwrap_or_else(|_| ());
-        color_eyre::install().unwrap_or_else(|_| ());
+        let _guard = subscriber.try_init().unwrap_or(());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()

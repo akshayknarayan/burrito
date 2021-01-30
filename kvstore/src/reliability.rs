@@ -221,7 +221,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
         let msgs: Vec<_> = (0..10).map(|field| ((), Msg { field })).collect();
 
         let rt = tokio::runtime::Builder::new_current_thread()

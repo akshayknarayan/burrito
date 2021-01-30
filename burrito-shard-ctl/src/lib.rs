@@ -324,7 +324,7 @@ where
                 // we are only responsible for the canonical address here.
                 Ok(ShardCanonicalServerConnection {
                     inner: Arc::new(conn),
-                    shards: conns.clone(),
+                    shards: conns,
                     shard_fn: Arc::new(move |d| {
                         /* xdp_shard version of FNV: take the first 4 bytes of the key
                         * u64 hash = FNV1_64_INIT;
@@ -344,7 +344,7 @@ where
                         */
                         let mut hash = FNV1_64_INIT;
                         for b in d.key().as_ref().as_bytes()[0..4].iter() {
-                            hash = hash ^ (*b as u64);
+                            hash ^= *b as u64;
                             hash = u64::wrapping_mul(hash, FNV_64_PRIME);
                         }
 
@@ -553,7 +553,7 @@ where
                     */
                     let mut hash = FNV1_64_INIT;
                     for b in d.key().as_ref().as_bytes()[0..4].iter() {
-                        hash = hash ^ (*b as u64);
+                        hash ^= *b as u64;
                         hash = u64::wrapping_mul(hash, FNV_64_PRIME);
                     }
 
@@ -722,7 +722,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         // 0. Make rt.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -901,7 +901,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         // 0. Make rt.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -953,7 +953,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         // 0. Make rt.
         let rt = tokio::runtime::Builder::new_current_thread()

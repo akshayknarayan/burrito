@@ -1,6 +1,6 @@
 use crate::bindings::*;
 use crate::*;
-use eyre::{eyre, Report};
+use eyre::{bail, eyre, Report};
 use tracing::{debug, trace};
 use xdp_shard_prog::{ActiveClient, AvailableShards, ShardRules};
 
@@ -42,13 +42,11 @@ impl<T> BpfHandles<T> {
         field_size: u8,
     ) -> Result<(), Report> {
         if ports.len() > 16 {
-            return Err(eyre!("Too many ports to shard (max 16): {:?}", ports.len()));
+            bail!("Too many ports to shard (max 16): {:?}", ports.len());
         }
 
         if field_size != 4 {
-            return Err(eyre!(
-                "field_size != 4 currently doesn't pass the bpf verifier :("
-            ));
+            bail!("field_size != 4 currently doesn't pass the bpf verifier :(");
         }
 
         let mut av = AvailableShards {
@@ -211,18 +209,18 @@ impl BpfHandles<Ingress> {
         )?;
 
         if prog_fd == 0 {
-            return Err(eyre!("bpf_prog_load_xattr returned null fd"));
+            bail!("bpf_prog_load_xattr returned null fd");
         }
 
         if prog_fd < 0 {
-            return Err(eyre!("bpf_prog_load_xattr returned bad fd: {}", prog_fd));
+            bail!("bpf_prog_load_xattr returned bad fd: {}", prog_fd);
         }
 
         let rx_queue_index_map = get_map_by_name("rx_queue_index_map\0", bpf_obj)?;
         let num_rxqs = unsafe {
             let ptr = libbpf::bpf_map__def(rx_queue_index_map);
             if ptr.is_null() {
-                Err(eyre!("Could not get bpf_map_def for rx_queue_index_map",))?;
+                bail!("Could not get bpf_map_def for rx_queue_index_map");
             }
 
             (*ptr).max_entries
@@ -230,34 +228,28 @@ impl BpfHandles<Ingress> {
 
         let rx_queue_index_map = unsafe { libbpf::bpf_map__fd(rx_queue_index_map) };
         if rx_queue_index_map < 0 {
-            return Err(eyre!(
-                "rx_queue_index_map returned bad fd: {}",
-                rx_queue_index_map
-            ));
+            bail!("rx_queue_index_map returned bad fd: {}", rx_queue_index_map);
         }
 
         let active_clients_map = get_map_by_name("active_clients_map\0", bpf_obj)?;
         let active_clients_map = unsafe { libbpf::bpf_map__fd(active_clients_map) };
         if active_clients_map < 0 {
-            Err(eyre!(
-                "active_clients_map returned bad fd: {}",
-                active_clients_map
-            ))?;
+            bail!("active_clients_map returned bad fd: {}", active_clients_map);
         }
 
         let available_shards_map = get_map_by_name("available_shards_map\0", bpf_obj)?;
         let available_shards_map = unsafe { libbpf::bpf_map__fd(available_shards_map) };
         if available_shards_map < 0 {
-            Err(eyre!(
+            bail!(
                 "available_shards_map returned bad fd: {}",
                 available_shards_map
-            ))?;
+            );
         }
 
         let ifindex_map = get_map_by_name("ifindex_map\0", bpf_obj)?;
         let ifindex_map = unsafe { libbpf::bpf_map__fd(ifindex_map) };
         if ifindex_map < 0 {
-            Err(eyre!("ifindex_map_fd returned bad fd: {}", ifindex_map))?;
+            bail!("ifindex_map_fd returned bad fd: {}", ifindex_map);
         }
 
         let mut this = Self {
@@ -313,7 +305,7 @@ impl BpfHandles<Ingress> {
 impl<T> Drop for BpfHandles<T> {
     fn drop(&mut self) {
         tracing::warn!("removing xdp program");
-        unsafe { remove_xdp(self.ifindex) }
+        remove_xdp(self.ifindex);
     }
 }
 
@@ -325,7 +317,7 @@ pub fn remove_xdp_on_address(serv_addr: std::net::IpAddr) -> Result<(), Report> 
             ifid = if_id,
             "Removing XDP from interface"
         );
-        unsafe { remove_xdp(if_id) };
+        remove_xdp(if_id);
     }
 
     Ok(())
@@ -333,14 +325,16 @@ pub fn remove_xdp_on_address(serv_addr: std::net::IpAddr) -> Result<(), Report> 
 
 pub fn remove_xdp_on_ifname(interface: &str) -> Result<(), Report> {
     let id = get_interface_id(interface)?;
-    unsafe { remove_xdp(id) };
+    remove_xdp(id);
     Ok(())
 }
 
 /// Remove any XDP program on the interface.
-pub unsafe fn remove_xdp(interface_id: u32) {
+pub fn remove_xdp(interface_id: u32) {
     let xdp_flags = if_link::XDP_FLAGS_SKB_MODE | if_link::XDP_FLAGS_UPDATE_IF_NOEXIST;
-    libbpf::bpf_set_link_xdp_fd(interface_id as _, -1, xdp_flags);
+    unsafe {
+        libbpf::bpf_set_link_xdp_fd(interface_id as _, -1, xdp_flags);
+    }
 }
 
 fn get_map_by_name(
@@ -351,7 +345,7 @@ fn get_map_by_name(
     let map = unsafe { libbpf::bpf_object__find_map_by_name(bpf_obj, map_name_str.as_ptr()) };
 
     if map.is_null() {
-        Err(eyre!("{} map not found", name))?;
+        bail!("{} map not found", name);
     }
 
     Ok(map)

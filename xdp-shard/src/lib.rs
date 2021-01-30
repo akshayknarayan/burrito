@@ -12,7 +12,7 @@ pub mod handles;
 #[cfg(feature = "ebpf")]
 pub use handles::*;
 
-pub fn sum_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMap<u16, usize>>>) {
+pub fn sum_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &[Vec<HashMap<u16, usize>>]) {
     for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
         for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
             for (port, count) in curr.iter_mut() {
@@ -24,7 +24,7 @@ pub fn sum_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMap
     }
 }
 
-pub fn diff_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &Vec<Vec<HashMap<u16, usize>>>) {
+pub fn diff_maps(curr: &mut Vec<Vec<HashMap<u16, usize>>>, prev: &[Vec<HashMap<u16, usize>>]) {
     for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
         for (curr, prev) in curr.iter_mut().zip(prev.iter()) {
             for (port, count) in curr.iter_mut() {

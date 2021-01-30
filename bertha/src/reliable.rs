@@ -624,7 +624,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
         let msgs = (0..7).map(|i| (i, vec![i as u8; 10])).collect();
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -658,7 +658,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
         let msgs = vec![(0, vec![0u8; 10]), (1, vec![1u8; 10]), (2, vec![2u8; 10])];
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -736,7 +736,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
         let msgs = vec![vec![0u8; 10], vec![1u8; 10], vec![2u8; 10]];
 
         let rt = tokio::runtime::Builder::new_current_thread()

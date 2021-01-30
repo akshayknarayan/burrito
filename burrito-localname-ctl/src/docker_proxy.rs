@@ -1,6 +1,6 @@
 use bollard::container::Config;
+use color_eyre::eyre::{Error, WrapErr};
 use core::task::{Context, Poll};
-use eyre::{Error, WrapErr};
 use futures_util::future::FutureExt;
 use hyper::{Body, Client, Request, Response, StatusCode};
 use hyper_unix_connector::UnixClient;

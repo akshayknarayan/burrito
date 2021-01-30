@@ -189,7 +189,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -197,13 +197,13 @@ mod test {
             .build()
             .unwrap();
 
-        std::fs::remove_file("./tmp-unix-echo-addr").unwrap_or_else(|_| ());
+        std::fs::remove_file("./tmp-unix-echo-addr").unwrap_or(());
 
         rt.block_on(
             async move {
                 let addr = PathBuf::from(r"./tmp-unix-echo-addr");
                 let srv = UnixSkChunnel::default()
-                    .listen(addr.clone().into())
+                    .listen(addr.clone())
                     .await
                     .unwrap()
                     .next()
@@ -220,13 +220,8 @@ mod test {
                     }
                 });
 
-                cli.send((addr.clone().into(), vec![1u8; 12]))
-                    .await
-                    .unwrap();
+                cli.send((addr.clone(), vec![1u8; 12])).await.unwrap();
                 let (from, data) = cli.recv().await.unwrap();
-
-                let from: PathBuf = from.into();
-                let addr: PathBuf = addr.into();
                 assert_eq!(from, addr);
                 assert_eq!(data, vec![1u8; 12]);
             }
@@ -241,7 +236,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -250,7 +245,7 @@ mod test {
             .unwrap();
 
         let path = r"./tmp-unix-req-echo-addr";
-        std::fs::remove_file(path).unwrap_or_else(|_| ());
+        std::fs::remove_file(path).unwrap_or(());
 
         rt.block_on(
             async move {
@@ -268,13 +263,8 @@ mod test {
                 });
 
                 let cli = UnixSkChunnel::default().connect(()).await.unwrap();
-                cli.send((addr.clone().into(), vec![1u8; 12]))
-                    .await
-                    .unwrap();
+                cli.send((addr.clone(), vec![1u8; 12])).await.unwrap();
                 let (from, data) = cli.recv().await.unwrap();
-
-                let from: PathBuf = from.into();
-                let addr: PathBuf = addr.into();
                 assert_eq!(from, addr);
                 assert_eq!(data, vec![1u8; 12]);
             }

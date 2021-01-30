@@ -281,7 +281,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -316,9 +316,9 @@ mod test {
     fn cxlist_reverse() {
         use super::CxListReverse;
 
-        let cxlist = CxList::from(true).wrap(42).wrap("foo").wrap(3.14);
+        let cxlist = CxList::from(true).wrap(42).wrap("foo").wrap(2.14);
         let rev = cxlist.rev();
-        let compare = CxList::from(3.14).wrap("foo").wrap(42).wrap(true);
+        let compare = CxList::from(2.14).wrap("foo").wrap(42).wrap(true);
         assert_eq!(rev, compare);
 
         let cxlist = CxList::from(false);

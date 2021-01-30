@@ -283,7 +283,7 @@ where
         let r = Arc::clone(&self.rcv);
         Box::pin(async move {
             let mut l = r.lock().await;
-            Ok(l.recv().await.ok_or_else(|| eyre!("All senders dropped"))?)
+            l.recv().await.ok_or_else(|| eyre!("All senders dropped"))
         })
     }
 }
@@ -306,7 +306,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -347,7 +347,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()

@@ -190,7 +190,7 @@ mod test {
     use super::{UdpReqChunnel, UdpSkChunnel};
     use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::{StreamExt, TryStreamExt};
-    use std::net::{SocketAddr, ToSocketAddrs};
+    use std::net::ToSocketAddrs;
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -202,7 +202,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -214,7 +214,7 @@ mod test {
             async move {
                 let addr = "127.0.0.1:35133".to_socket_addrs().unwrap().next().unwrap();
                 let srv = UdpSkChunnel::default()
-                    .listen(addr.into())
+                    .listen(addr)
                     .await
                     .unwrap()
                     .next()
@@ -231,11 +231,8 @@ mod test {
                     }
                 });
 
-                cli.send((addr.into(), vec![1u8; 12])).await.unwrap();
+                cli.send((addr, vec![1u8; 12])).await.unwrap();
                 let (from, data) = cli.recv().await.unwrap();
-
-                let from: SocketAddr = from.into();
-                let addr: SocketAddr = addr.into();
                 assert_eq!(from, addr);
                 assert_eq!(data, vec![1u8; 12]);
             }
@@ -250,7 +247,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -274,11 +271,8 @@ mod test {
                 });
 
                 let cli = UdpSkChunnel::default().connect(()).await.unwrap();
-                cli.send((addr.into(), vec![1u8; 12])).await.unwrap();
+                cli.send((addr, vec![1u8; 12])).await.unwrap();
                 let (from, data) = cli.recv().await.unwrap();
-
-                let from: SocketAddr = from.into();
-                let addr: SocketAddr = addr.into();
                 assert_eq!(from, addr);
                 assert_eq!(data, vec![1u8; 12]);
             }
@@ -293,7 +287,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or_else(|_| ());
+        color_eyre::install().unwrap_or(());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -322,22 +316,16 @@ mod test {
                 let cli2 = UdpSkChunnel::default().connect(()).await.unwrap();
 
                 for i in 0..10 {
-                    cli1.send((addr.into(), vec![i as u8; 12])).await.unwrap();
-
-                    cli2.send((addr.into(), vec![i + 1 as u8; 12]))
-                        .await
-                        .unwrap();
+                    cli1.send((addr, vec![i as u8; 12])).await.unwrap();
+                    cli2.send((addr, vec![i + 1; 12])).await.unwrap();
 
                     let (from1, data1) = cli1.recv().await.unwrap();
                     let (from2, data2) = cli2.recv().await.unwrap();
 
-                    let addr: SocketAddr = addr.into();
-                    let from1: SocketAddr = from1.into();
-                    let from2: SocketAddr = from2.into();
                     assert_eq!(from1, addr);
                     assert_eq!(data1, vec![i as u8; 12]);
                     assert_eq!(from2, addr);
-                    assert_eq!(data2, vec![i + 1 as u8; 12]);
+                    assert_eq!(data2, vec![i + 1; 12]);
                 }
             }
             .instrument(tracing::info_span!("udp::rendezvous_multiclient")),

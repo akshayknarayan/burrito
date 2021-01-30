@@ -76,13 +76,10 @@ where
         }
 
         let x = futs.as_mut().poll_next(cx);
-        if let Poll::Pending = x {
+        if x.is_pending() {
             // check stream once more
-            match stream.as_mut().try_poll_next(cx) {
-                Poll::Ready(Some(Ok(n))) => {
-                    futs.push(fun(n));
-                }
-                _ => (),
+            if let Poll::Ready(Some(Ok(n))) = stream.as_mut().try_poll_next(cx) {
+                futs.push(fun(n));
             }
         }
         x
