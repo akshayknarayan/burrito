@@ -32,6 +32,7 @@ impl LocalNameClient {
     }
 
     pub async fn register(&mut self, name: SocketAddr) -> Result<PathBuf, Error> {
+        tracing::trace!(?name, "registering");
         futures_util::future::poll_fn(|cx| self.cl.poll_ready(cx)).await?;
         match self
             .cl

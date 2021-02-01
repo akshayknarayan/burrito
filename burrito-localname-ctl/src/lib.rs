@@ -16,8 +16,10 @@ pub mod ctl;
 #[cfg(feature = "docker")]
 pub mod docker_proxy;
 
-use bertha::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Negotiate};
-use color_eyre::eyre::{eyre, Report};
+use bertha::{
+    either::Either, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Negotiate,
+};
+use color_eyre::eyre::Report;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
 use std::future::Future;
@@ -27,7 +29,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// LocalNameChunnel fast-paths data bound to local destinations.
 ///
@@ -67,6 +69,23 @@ impl<Lch, Lr, Ag> LocalNameChunnel<Lch, Lr, Ag> {
             local_chunnel,
         })
     }
+
+    pub async fn server(
+        root: impl AsRef<Path>,
+        listen_addr: Ag,
+        local_raw: Lr,
+        local_chunnel: Lch,
+    ) -> Result<Self, Report> {
+        Self::new(root, Some(listen_addr), local_raw, local_chunnel).await
+    }
+
+    pub async fn client(
+        root: impl AsRef<Path>,
+        local_raw: Lr,
+        local_chunnel: Lch,
+    ) -> Result<Self, Report> {
+        Self::new(root, None, local_raw, local_chunnel).await
+    }
 }
 
 impl<Gc, Lr, LrCn, LrErr, Lrd, Lch, Lcn, LchErr, D> Chunnel<Gc>
@@ -103,14 +122,17 @@ where
         Box::pin(async move {
             let local_raw_cn = match (gaddr, &cl) {
                 (Some(gaddr), Some(cl)) => match cl.lock().await.register(gaddr).await {
-                    Ok(laddr) => local_raw
-                        .listen(laddr)
-                        .await
-                        .map_err(Into::into)?
-                        .next()
-                        .await
-                        .unwrap()
-                        .map_err(Into::into)?,
+                    Ok(laddr) => {
+                        debug!(?laddr, "LocalNameClient registered");
+                        local_raw
+                            .listen(laddr)
+                            .await
+                            .map_err(Into::into)?
+                            .next()
+                            .await
+                            .unwrap()
+                            .map_err(Into::into)?
+                    }
                     Err(e) => {
                         debug!(err = %format!("{:#}", e), "LocalNameClient register failed");
                         local_raw.connect(()).await.map_err(Into::into)?
@@ -165,7 +187,7 @@ where
     Lc: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    type Data = (SocketAddr, D);
+    type Data = (Either<SocketAddr, PathBuf>, D);
 
     fn send(
         &self,
@@ -177,106 +199,113 @@ where
         let local_cn = Arc::clone(&self.local_cn);
         let global_cn = Arc::clone(&self.global_cn);
         Box::pin(async move {
+            let addr = match addr {
+                Either::Right(pb) => return local_cn.send((pb, data)).await,
+                Either::Left(sk) => sk,
+            };
+
             // 1. check local cache
             let entry = {
                 let c = addr_cache.lock().unwrap();
                 c.get(&addr).map(Clone::clone)
             };
 
-            let update_entry = match entry {
-                None => true,
+            // 2. if match, send on correct connection.
+            match entry {
+                None => (),
                 Some(LocalAddrCacheEntry::Hit { expiry, .. })
                 | Some(LocalAddrCacheEntry::AntiHit {
                     expiry: Some(expiry),
                     ..
-                }) if expiry < std::time::Instant::now() => true,
+                }) if expiry < std::time::Instant::now() => (),
                 Some(LocalAddrCacheEntry::Hit { laddr, .. }) => {
-                    // use local conn. No need to update.
+                    trace!(?laddr, "local send");
                     return local_cn.send((laddr.clone(), data)).await;
                 }
                 Some(LocalAddrCacheEntry::AntiHit { .. }) => {
+                    trace!(?addr, "global send");
                     return global_cn.send((addr, data)).await;
                 }
             };
 
-            if update_entry {
-                if let Some(cl) = cl {
-                    let mut cl_g = cl.lock().await;
-                    let res = cl_g.query(addr).await;
-                    std::mem::drop(cl_g);
-                    match res {
-                        Ok(Some(laddr)) => {
-                            {
-                                let mut c = addr_cache.lock().unwrap();
-                                c.insert(
-                                    addr,
-                                    LocalAddrCacheEntry::Hit {
-                                        laddr: laddr.clone(),
-                                        expiry: std::time::Instant::now()
+            // 3. otherwise, do a lookup and then send accordingly.
+            trace!(?addr, "do lookup");
+            if let Some(cl) = cl {
+                let mut cl_g = cl.lock().await;
+                let res = cl_g.query(addr).await;
+                std::mem::drop(cl_g);
+                match res {
+                    Ok(Some(laddr)) => {
+                        {
+                            let mut c = addr_cache.lock().unwrap();
+                            c.insert(
+                                addr,
+                                LocalAddrCacheEntry::Hit {
+                                    laddr: laddr.clone(),
+                                    expiry: std::time::Instant::now()
+                                        + std::time::Duration::from_millis(100),
+                                },
+                            );
+                        }
+
+                        {
+                            rev_addr_map.lock().unwrap().insert(laddr.clone(), addr);
+                        }
+
+                        trace!(?laddr, "local send");
+                        return local_cn.send((laddr.clone(), data)).await;
+                    }
+                    Ok(None) => {
+                        {
+                            let mut c = addr_cache.lock().unwrap();
+                            c.insert(
+                                addr,
+                                LocalAddrCacheEntry::AntiHit {
+                                    expiry: Some(
+                                        std::time::Instant::now()
                                             + std::time::Duration::from_millis(100),
-                                    },
-                                );
-                            }
-
-                            {
-                                rev_addr_map.lock().unwrap().insert(laddr.clone(), addr);
-                            }
-
-                            return local_cn.send((laddr.clone(), data)).await;
+                                    ),
+                                },
+                            );
                         }
-                        Ok(None) => {
-                            {
-                                let mut c = addr_cache.lock().unwrap();
-                                c.insert(
-                                    addr,
-                                    LocalAddrCacheEntry::AntiHit {
-                                        expiry: Some(
-                                            std::time::Instant::now()
-                                                + std::time::Duration::from_millis(100),
-                                        ),
-                                    },
-                                );
-                            }
 
-                            return global_cn.send((addr, data)).await;
-                        }
-                        Err(_) => {
-                            unimplemented!();
-                        }
+                        trace!(?addr, "global send");
+                        return global_cn.send((addr, data)).await;
                     }
-                } else {
-                    {
-                        let mut c = addr_cache.lock().unwrap();
-                        c.insert(addr, LocalAddrCacheEntry::AntiHit { expiry: None });
+                    Err(e) => {
+                        debug!(err = %format!("{:#}", e), ?addr, "LocalNameClient query failed");
+                        return global_cn.send((addr, data)).await;
                     }
-
-                    return global_cn.send((addr, data)).await;
                 }
-            }
+            } else {
+                {
+                    let mut c = addr_cache.lock().unwrap();
+                    c.insert(addr, LocalAddrCacheEntry::AntiHit { expiry: None });
+                }
 
-            unreachable!()
+                return global_cn.send((addr, data)).await;
+            }
         })
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        use futures_util::future::{self, Either};
+        use futures_util::future::{self, Either as FEither};
         let rev_addr_map = Arc::clone(&self.rev_addr_map);
         let local_cn = Arc::clone(&self.local_cn);
         let global_cn = Arc::clone(&self.global_cn);
         Box::pin(async move {
             match future::select(global_cn.recv(), local_cn.recv()).await {
-                Either::Left((global_recv, _)) => global_recv,
-                Either::Right((Ok((laddr, data)), _)) => {
+                FEither::Left((Ok((gaddr, data)), _)) => Ok((Either::Left(gaddr), data)),
+                FEither::Left((Err(e), _)) => Err(e),
+                FEither::Right((Ok((laddr, data)), _)) => {
+                    trace!(?laddr, "recvd");
                     let c = rev_addr_map.lock().unwrap();
                     match c.get(&laddr) {
-                        Some(addr) => Ok((*addr, data)),
-                        None => Err(eyre!(
-                            "Corresponding addr for local addr {:?} not found",
-                            &laddr
-                        )),
+                        Some(addr) => Ok((Either::Left(*addr), data)),
+                        None => Ok((Either::Right(laddr), data)),
                     }
                 }
-                Either::Right((Err(e), _)) => Err(e.wrap_err("local_cn recv erred")),
+                FEither::Right((Err(e), _)) => Err(e.wrap_err("local_cn recv erred")),
             }
         })
     }
@@ -286,10 +315,11 @@ where
 mod test {
     use super::LocalNameChunnel;
     use bertha::{
-        negotiate_client, negotiate_server, udp::UdpSkChunnel, uds::UnixSkChunnel, util::Nothing,
-        ChunnelConnection, ChunnelConnector, ChunnelListener,
+        either::Either, negotiate_client, negotiate_server, udp::UdpSkChunnel, uds::UnixSkChunnel,
+        util::Nothing, ChunnelConnection, ChunnelConnector, ChunnelListener,
     };
     use futures_util::stream::TryStreamExt;
+    use tracing::info;
     use tracing_error::ErrorLayer;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -324,6 +354,7 @@ mod test {
                 st.try_for_each_concurrent(None, |cn| async move {
                     loop {
                         let m = cn.recv().await.unwrap();
+                        info!(?m, "got msg");
                         cn.send(m).await.unwrap();
                     }
                 })
@@ -337,9 +368,9 @@ mod test {
                 .await
                 .unwrap();
 
-            cn.send((addr, vec![0u8; 10])).await.unwrap();
+            cn.send((Either::Left(addr), vec![0u8; 10])).await.unwrap();
             let m = cn.recv().await.unwrap();
-            assert_eq!(m, (addr, vec![0u8; 10]));
+            assert_eq!(m, (Either::Left(addr), vec![0u8; 10]));
         });
     }
 }
