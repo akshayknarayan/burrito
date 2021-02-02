@@ -1,88 +1,92 @@
-use futures_util::stream::StreamExt;
-use rpcbench::{SPingParams, SPong};
-use slog::{info, warn};
-use std::convert::TryInto;
+use bertha::{
+    bincode::SerializeChunnelProject, negotiate_server, udp::UdpSkChunnel, uds::UnixSkChunnel,
+    ChunnelListener, CxList,
+};
+use burrito_localname_ctl::LocalNameChunnel;
+use color_eyre::eyre::{bail, Report};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use structopt::StructOpt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tracing::info;
+use tracing_error::ErrorLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "ping_server")]
 struct Opt {
     #[structopt(short, long)]
-    unix_addr: Option<std::path::PathBuf>,
-
-    #[structopt(long)]
-    burrito_addr: Option<String>,
+    unix_addr: Option<PathBuf>,
 
     #[structopt(short, long)]
     port: Option<u16>,
 
-    #[structopt(long, default_value = "/tmp/burrito")]
-    burrito_root: String,
+    #[structopt(long)]
+    burrito_root: Option<PathBuf>,
 }
 
-async fn serve(
-    l: impl futures_util::stream::Stream<
-        Item = Result<impl AsyncRead + AsyncWrite + Unpin, impl std::fmt::Debug>,
-    >,
-    srv: rpcbench::Server,
-) -> Result<(), failure::Error> {
-    l.for_each_concurrent(None, |st| async {
-        let mut buf = [0u8; 12000];
-        let mut st = st.expect("accept failed");
-        tracing::trace!("New connection");
-        loop {
-            if let Err(_) = st.read_exact(&mut buf[0..4]).await {
-                tracing::trace!("connection done");
-                return;
-            }
+#[tracing::instrument(skip(srv))]
+async fn unix(srv: rpcbench::Server, addr: PathBuf) -> Result<(), Report> {
+    info!(?addr, "Serving unix-only mode");
+    let st = negotiate_server(
+        SerializeChunnelProject::default(),
+        UnixSkChunnel.listen(addr).await?,
+    )
+    .await?;
+    srv.serve(st).await
+}
 
-            let resp_len = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-            st.read_exact(&mut buf[0..resp_len as usize]).await.unwrap();
-            let p: SPingParams = bincode::deserialize(&buf[..resp_len as usize]).unwrap();
-            let ans: SPong = srv.do_ping(p.into()).await.unwrap().into();
-            let resp = bincode::serialize(&ans).unwrap();
-            let resp_len = resp.len() as u32;
-            st.write(&resp_len.to_be_bytes()).await.unwrap();
-            st.write(&resp).await.unwrap();
-        }
-    })
-    .await;
-    Ok(())
+#[tracing::instrument(skip(srv))]
+async fn burrito(srv: rpcbench::Server, port: u16, root: PathBuf) -> Result<(), Report> {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    let lch = LocalNameChunnel::new(
+        root.clone(),
+        Some(addr),
+        UnixSkChunnel,
+        SerializeChunnelProject::default(),
+    )
+    .await?;
+    let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
+    info!(?port, ?root, "Serving localname mode");
+    let st = negotiate_server(stack, UdpSkChunnel.listen(addr).await?).await?;
+    srv.serve(st).await
+}
+
+#[tracing::instrument(skip(srv))]
+async fn udp(srv: rpcbench::Server, port: u16) -> Result<(), Report> {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    info!(?port, "Serving udp mode");
+    let st = negotiate_server(
+        SerializeChunnelProject::default(),
+        UdpSkChunnel::default().listen(addr).await?,
+    )
+    .await?;
+    srv.serve(st).await
 }
 
 #[tokio::main]
-async fn main() -> Result<(), failure::Error> {
-    let log = burrito_util::logger();
-    tracing_subscriber::fmt::init();
+async fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(ErrorLayer::default());
+    let _guard = subscriber.set_default();
+    color_eyre::install().unwrap();
 
-    let srv_impl = rpcbench::Server::default();
-
+    let srv = rpcbench::Server::default();
     if let Some(path) = opt.unix_addr {
-        info!(&log, "UDS mode"; "addr" => ?&path);
-        let l = tokio::net::UnixListener::bind(&path)?;
-        serve(l, srv_impl).await?;
-        return Ok(());
+        return unix(srv, path).await;
     }
 
     if opt.port.is_none() {
-        warn!(&log, "Must specify port if not using unix address");
-        failure::bail!("Must specify port if not using unix address");
+        bail!("Must specify port if not using unix address");
     }
 
     let port = opt.port.unwrap();
 
-    if let Some(addr) = opt.burrito_addr {
-        info!(&log, "burrito mode";  "burrito_root" => ?&opt.burrito_root, "addr" => ?&addr, "tcp port" => port);
-        let srv = burrito_addr::Server::start(&addr, ("tcp", port), &opt.burrito_root).await?;
-        serve(srv, srv_impl).await?;
-        return Ok(());
+    if let Some(root) = opt.burrito_root {
+        return burrito(srv, port, root).await;
     }
 
-    info!(&log, "TCP mode"; "port" => port);
-    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    let l = tokio::net::TcpListener::bind(addr).await?;
-    serve(l, srv_impl).await?;
-    Ok(())
+    udp(srv, port).await
 }

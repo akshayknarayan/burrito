@@ -117,7 +117,7 @@ where
         let mut local_raw = self.local_raw.clone();
         let mut local_chunnel = self.local_chunnel.clone();
         let cl = self.cl.as_ref().map(Arc::clone);
-        let gaddr = self.listen_addr.clone();
+        let gaddr = self.listen_addr;
 
         Box::pin(async move {
             let local_raw_cn = match (gaddr, &cl) {

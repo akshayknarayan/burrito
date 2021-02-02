@@ -25,9 +25,9 @@ impl From<Result<RegisterReplyOk, String>> for RegisterReply {
     }
 }
 
-impl Into<Result<RegisterReplyOk, String>> for RegisterReply {
-    fn into(self) -> Result<RegisterReplyOk, String> {
-        self.0
+impl From<RegisterReply> for Result<RegisterReplyOk, String> {
+    fn from(rr: RegisterReply) -> Result<RegisterReplyOk, String> {
+        rr.0
     }
 }
 
@@ -49,9 +49,9 @@ impl From<Result<QueryNameReplyOk, String>> for QueryNameReply {
     }
 }
 
-impl Into<Result<QueryNameReplyOk, String>> for QueryNameReply {
-    fn into(self) -> Result<QueryNameReplyOk, String> {
-        self.0
+impl From<QueryNameReply> for Result<QueryNameReplyOk, String> {
+    fn from(qnr: QueryNameReply) -> Result<QueryNameReplyOk, String> {
+        qnr.0
     }
 }
 

@@ -1,7 +1,17 @@
-use slog::{debug, info};
+use bertha::{
+    bincode::SerializeChunnelProject, either::Either, negotiate_client, udp::UdpSkChunnel,
+    uds::UnixSkChunnel, util::ProjectLeft, ChunnelConnector, CxList,
+};
+use burrito_localname_ctl::LocalNameChunnel;
+use color_eyre::eyre::{bail, Report};
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 use structopt::StructOpt;
-use tower::Service;
-use tracing_timing::{Builder, Histogram};
+use tracing::info;
+use tracing_error::ErrorLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "ping_client")]
@@ -9,15 +19,15 @@ struct Opt {
     #[structopt(short, long)]
     burrito_root: Option<String>,
     #[structopt(long)]
-    addr: String,
-    #[structopt(short, long)]
-    work: i32,
+    addr: Option<SocketAddr>,
     #[structopt(long)]
-    amount: i64,
+    unix_addr: Option<PathBuf>,
     #[structopt(short, long)]
-    iters: usize,
+    work: rpcbench::Work,
     #[structopt(short, long)]
     size_of_req: Option<usize>,
+    #[structopt(short, long)]
+    iters: usize,
     #[structopt(long)]
     reqs_per_iter: usize,
     #[structopt(short, long)]
@@ -25,89 +35,147 @@ struct Opt {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), failure::Error> {
-    let log = burrito_util::logger();
+async fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
+    let subscriber = tracing_subscriber::registry();
+    let timing_downcaster = if opt.out_file.is_some() {
+        let timing_layer = tracing_timing::Builder::default()
+            .no_span_recursion()
+            .events(|e: &tracing::Event| {
+                let mut val = String::new();
+                let mut f = |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    if field.name() == "message" {
+                        val.push_str(&format!(" {:?} ", value));
+                    } else if field.name() == "which" {
+                        val.push_str(&format!(" which={:?} ", value));
+                    };
+                };
+                e.record(&mut f);
+                val
+            })
+            .layer(|| tracing_timing::Histogram::new_with_max(1_000_000, 2).unwrap());
+        let timing_downcaster = timing_layer.downcaster();
+        let subscriber = subscriber
+            .with(timing_layer)
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let d = tracing::Dispatch::new(subscriber);
+        d.clone().init();
+        Some((timing_downcaster, d))
+    } else {
+        let subscriber = subscriber
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let d = tracing::Dispatch::new(subscriber);
+        d.init();
+        None
+    };
+
+    color_eyre::install().unwrap();
 
     let pp = rpcbench::PingParams {
-        work: rpcbench::Work::from_i32(opt.work)
-            .ok_or_else(|| failure::format_err!("Invalid work value"))? as i32,
-        amount: opt.amount,
+        work: opt.work,
         padding: vec![0u8; opt.size_of_req.unwrap_or_default()],
     };
 
     let per_iter = opt.reqs_per_iter;
-    let subscriber = Builder::default()
-        .no_span_recursion()
-        .events(|e: &tracing::Event| {
-            let mut val = String::new();
-            let mut f = |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
-                if field.name() == "message" {
-                    val.push_str(&format!(" {:?} ", value));
-                } else if field.name() == "which" {
-                    val.push_str(&format!(" which={:?} ", value));
-                };
+    let durs = match opt {
+        Opt {
+            burrito_root: Some(root),
+            addr: Some(addr),
+            iters,
+            reqs_per_iter,
+            ..
+        } => {
+            let fncl = |addr| {
+                let r = root.clone();
+                async move {
+                    let lch = LocalNameChunnel::new(
+                        r,
+                        None,
+                        UnixSkChunnel,
+                        SerializeChunnelProject::default(),
+                    )
+                    .await?;
+                    let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
+                    let cn = negotiate_client(stack, UdpSkChunnel.connect(()).await?, addr).await?;
+                    Ok(ProjectLeft::new(Either::Left(addr), cn))
+                }
             };
-            e.record(&mut f);
-            val
-        })
-        .build(|| Histogram::new_with_max(10_000_000, 2).unwrap());
-    let sid = subscriber.downcaster();
-    let d = tracing::Dispatch::new(subscriber);
+            info!(?root, ?addr, "Burrito mode");
+            rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
+        }
 
-    if let None = opt.out_file {
-        tracing_subscriber::fmt::init();
-    } else {
-        //tracing_subscriber::fmt::init();
-        tracing::dispatcher::set_global_default(d.clone()).expect("set tracing global default");
-    }
-
-    let durs = if let Some(root) = opt.burrito_root {
-        // burrito mode
-        let addr: hyper::Uri = burrito_addr::Uri::new(&opt.addr).into();
-        info!(&log, "burrito mode"; "burrito_root" => ?root, "addr" => ?&opt.addr);
-        let cl = burrito_addr::Client::new(root).await?;
-        let fncl = |addr| {
-            let mut cl = cl.clone();
-            async move {
-                futures_util::future::poll_fn(|cx| cl.poll_ready(cx))
-                    .await
-                    .map_err(|e| e.compat())?;
-                cl.call(addr).await.map_err(|e| e.compat())
-            }
-        };
-        debug!(&log, "Connecting to rpcserver"; "addr" => ?&addr);
-        rpcbench::bincode_client_ping(addr, fncl, pp.into(), opt.iters, opt.reqs_per_iter).await?
-    } else if opt.addr.starts_with("http://") {
-        let addr = &opt.addr[7..];
-        // raw tcp mode
-        info!(&log, "TCP mode"; "addr" => ?&addr);
-        let addr: std::net::SocketAddr = addr.parse()?;
-        let http = |addr| async move { tokio::net::TcpStream::connect(addr).await };
-        rpcbench::bincode_client_ping(addr, http, pp.into(), opt.iters, opt.reqs_per_iter).await?
-    } else {
-        // raw unix mode
-        info!(&log, "UDS mode"; "addr" => ?&opt.addr);
-        let addr: std::path::PathBuf = opt.addr.parse()?;
-        let ctr = |addr| async move { tokio::net::UnixStream::connect(addr).await };
-        rpcbench::bincode_client_ping(addr, ctr, pp.into(), opt.iters, opt.reqs_per_iter).await?
+        Opt {
+            burrito_root: None,
+            addr: Some(addr),
+            iters,
+            reqs_per_iter,
+            ..
+        } => {
+            // raw udp mode
+            info!(?addr, "UDP mode");
+            let http = |addr| async move {
+                let cn = negotiate_client(
+                    SerializeChunnelProject::default(),
+                    UdpSkChunnel.connect(()).await?,
+                    addr,
+                )
+                .await?;
+                Ok(ProjectLeft::new(addr, cn))
+            };
+            rpcbench::client_ping(addr, http, pp, iters, reqs_per_iter).await?
+        }
+        Opt {
+            unix_addr: Some(addr),
+            iters,
+            reqs_per_iter,
+            ..
+        } => {
+            // raw unix mode
+            info!(?addr, "uds mode");
+            let ctr = |addr: PathBuf| async move {
+                let cn = negotiate_client(
+                    SerializeChunnelProject::default(),
+                    UnixSkChunnel.connect(()).await?,
+                    addr.clone(),
+                )
+                .await?;
+                Ok(ProjectLeft::new(addr, cn))
+            };
+            rpcbench::client_ping(addr, ctr, pp, iters, reqs_per_iter).await?
+        }
+        _ => {
+            bail!("Bad option set");
+        }
     };
-
-    sid.downcast(&d).unwrap().force_synchronize();
 
     tracing::info!("done");
     if let Some(ref path) = opt.out_file {
+        tracing::debug!("writing latencies file");
+        let mut f = std::fs::File::create(path)?;
+        writeln!(&mut f, "Elapsed_us,Total_us,Server_us")?;
+        for (time, t, s) in durs.iter() {
+            writeln!(&mut f, "{},{},{}", time.as_micros(), t, s)?;
+        }
+
+        dump_durs(&durs);
+
         tracing::debug!("writing trace file");
-        use std::io::Write;
+        let (downcaster, d) = timing_downcaster.unwrap();
         let path = path.with_extension("trace");
         let mut f = std::fs::File::create(path)?;
+        let timing = downcaster.downcast(&d).expect("downcast timing layer");
+        timing.force_synchronize();
         // these values are in nanoseconds
-        sid.downcast(&d).unwrap().with_histograms(|hs| {
+        timing.with_histograms(|hs| {
             for (span_group, hs) in hs {
                 for (event_group, h) in hs {
-                    write!(
+                    writeln!(
                         &mut f,
-                        "{} {}:{}: {} {} {} {} {}\n",
+                        "{} {}:{} (ns:min,p25,p50,p75,p95): {} {} {} {} {} {} {}",
                         per_iter,
                         span_group,
                         event_group,
@@ -115,23 +183,27 @@ async fn main() -> Result<(), failure::Error> {
                         h.value_at_quantile(0.25),
                         h.value_at_quantile(0.5),
                         h.value_at_quantile(0.75),
+                        h.value_at_quantile(0.95),
                         h.max(),
+                        h.len(),
                     )
                     .expect("write to trace file");
                 }
             }
         });
     }
-
-    if let Some(path) = opt.out_file {
-        tracing::debug!("writing latencies file");
-        use std::io::Write;
-        let mut f = std::fs::File::create(path)?;
-        write!(&mut f, "Elapsed_us,Total_us,Server_us\n")?;
-        for (time, t, s) in durs {
-            write!(&mut f, "{},{},{}\n", time.as_micros(), t, s)?;
-        }
-    }
-
     Ok(())
+}
+
+fn dump_durs(durs: &[(Duration, i64, i64)]) {
+    let mut just_durs: Vec<_> = durs.iter().map(|(x, _, _)| x).collect();
+    just_durs.sort();
+    let len = just_durs.len() as f64;
+    let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
+    let quantiles: Vec<_> = quantile_idxs
+        .iter()
+        .map(|q| (len * q) as usize)
+        .map(|i| just_durs[i])
+        .collect();
+    info!(?quantiles, "done");
 }
