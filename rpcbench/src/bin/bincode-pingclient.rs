@@ -7,7 +7,6 @@ use color_eyre::eyre::{bail, Report};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
 use structopt::StructOpt;
 use tracing::info;
 use tracing_error::ErrorLayer;
@@ -161,8 +160,6 @@ async fn main() -> Result<(), Report> {
             writeln!(&mut f, "{},{},{}", time.as_micros(), t, s)?;
         }
 
-        dump_durs(&durs);
-
         tracing::debug!("writing trace file");
         let (downcaster, d) = timing_downcaster.unwrap();
         let path = path.with_extension("trace");
@@ -193,17 +190,4 @@ async fn main() -> Result<(), Report> {
         });
     }
     Ok(())
-}
-
-fn dump_durs(durs: &[(Duration, i64, i64)]) {
-    let mut just_durs: Vec<_> = durs.iter().map(|(x, _, _)| x).collect();
-    just_durs.sort();
-    let len = just_durs.len() as f64;
-    let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
-    let quantiles: Vec<_> = quantile_idxs
-        .iter()
-        .map(|q| (len * q) as usize)
-        .map(|i| just_durs[i])
-        .collect();
-    info!(?quantiles, "done");
 }
