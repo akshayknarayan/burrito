@@ -14,26 +14,7 @@ use tokio::sync::RwLock;
 use tower_service as tower;
 use tracing::{error, info};
 
-/// Serve the localname-ctl, with support for communicating inside docker containers.
-#[cfg(feature = "docker")]
-pub async fn serve_ctl_and_docker(
-    root: Option<PathBuf>,
-    force: bool,
-    in_addr_docker: PathBuf,
-    out_addr_docker: PathBuf,
-) {
-    let docker = crate::docker_proxy::serve(in_addr_docker, out_addr_docker);
-    let ctl = serve_ctl(root, force);
-    let both_servers = { futures_util::future::join(docker, ctl).await };
-    match both_servers {
-        (Err(e), _) => {
-            error!(docker_proxy = ?e, "crash" );
-        }
-        _ => (),
-    }
-}
-
-/// Serve just the localname-ctl, without support for docker containers.
+/// Serve localname-ctl.
 ///
 /// See also [`BurritoNet`].
 ///
@@ -46,7 +27,6 @@ pub async fn serve_ctl(root: Option<PathBuf>, force: bool) -> Result<(), Error> 
 
     // if force_burrito, then we are ok with hijacking /controller, potentially from another
     // instance of burrito. Might cause bad things.
-    // TODO docker-proxy might want a similar option, although things are stateless there (except for attached ttys)
     if force {
         std::fs::remove_file(&burrito_addr).unwrap_or_default(); // ignore error if file was not present
     }

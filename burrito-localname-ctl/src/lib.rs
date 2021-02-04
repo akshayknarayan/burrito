@@ -13,9 +13,6 @@ pub mod proto;
 #[cfg(feature = "ctl")]
 pub mod ctl;
 
-#[cfg(feature = "docker")]
-pub mod docker_proxy;
-
 use bertha::{
     either::Either, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Negotiate,
 };

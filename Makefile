@@ -8,7 +8,7 @@ all: sharding localrpc
 .PHONY: sharding localrpc
 
 sharding: ./target/release/ycsb ./target/release/kvserver-ebpf ./target/release/kvserver-noebpf
-localrpc: ./target/release/bincode-pingclient ./target/release/bincode-pingserver
+localrpc: ./target/release/bincode-pingclient ./target/release/bincode-pingserver ./target/release/burrito-localname
 
 ./target/release/ycsb: $(FLS)
 	cd kvstore-ycsb && cargo build --release --features="use-shenango"
@@ -23,3 +23,6 @@ localrpc: ./target/release/bincode-pingclient ./target/release/bincode-pingserve
 
 ./target/release/bincode-pingclient ./target/release/bincode-pingserver: $(FLS)
 	cd rpcbench && cargo build --release
+
+./target/release/burrito-localname: $(FLS)
+	cd burrito-localname-ctl && cargo build --release --features="ctl"
