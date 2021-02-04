@@ -1,5 +1,5 @@
 use bertha::{ChunnelConnection, ChunnelConnector};
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{Report, WrapErr};
 use kvstore::KvClient;
 use kvstore_ycsb::{ops, Op};
 use std::collections::HashMap;
@@ -48,6 +48,7 @@ fn get_raw_connector(
         > + Clone,
     Report,
 > {
+    use color_eyre::eyre::eyre;
     let path = path
         .ok_or_else(|| eyre!("If shenango feature is enabled, shenango_cfg must be specified"))?;
     Ok(shenango_chunnel::ShenangoUdpSkChunnel::new(&path))

@@ -8,7 +8,7 @@ use bertha::{
     negotiate::Offer, reliable::ReliabilityProjChunnel, select::SelectListener,
     tagger::OrderedChunnelProj, ChunnelConnection, ChunnelListener, CxList, GetOffers, Select,
 };
-use burrito_shard_ctl::{ShardCanonicalServer, ShardInfo, SimpleShardPolicy};
+use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
@@ -91,7 +91,6 @@ async fn serve_canonical(
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
 ) -> Result<(), Report> {
     // 3. start canonical server
-    // TODO Ebpf chunnel
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
     let shard_stack = CxList::from(
         Select::from((
@@ -103,8 +102,19 @@ async fn serve_canonical(
     )
     .wrap(SerializeChunnelProject::default());
 
-    // TODO check offer
-    let cnsrv = ShardCanonicalServer::new(
+    #[cfg(not(feature = "ebpf"))]
+    let cnsrv = burrito_shard_ctl::ShardCanonicalServer::new(
+        si.clone(),
+        internal_cli,
+        shard_stack,
+        offer.pop().unwrap(),
+        &redis_addr,
+    )
+    .await
+    .wrap_err("Create ShardCanonicalServer")?;
+
+    #[cfg(feature = "ebpf")]
+    let cnsrv = burrito_shard_ctl::ShardCanonicalServerEbpf::new(
         si.clone(),
         internal_cli,
         shard_stack,

@@ -8,6 +8,7 @@ edition = "2018"
 default = []
 bin = ["tracing-subscriber", "tracing-timing", "structopt", "ctrlc", "tokio/rt-multi-thread", "tracing/release_max_level_trace"]
 use-shenango = ["shenango-chunnel"]
+ebpf = ["burrito-shard-ctl/ebpf"]
 
 [dependencies]
 bertha = { path = "../bertha" }
