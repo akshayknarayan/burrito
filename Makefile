@@ -15,11 +15,11 @@ localrpc: ./target/release/bincode-pingclient ./target/release/bincode-pingserve
 
 ./target/release/kvserver-ebpf: $(FLS)
 	cd kvstore && cargo build --release --features="bin,ebpf,use-shenango"
-	mv ./target/release/kvserver ./target/release/kvserver-ebpf
+	rm ./target/release/kvserver-ebpf && cp ./target/release/kvserver ./target/release/kvserver-ebpf
 
 ./target/release/kvserver-noebpf: $(FLS)
 	cd kvstore && cargo build --release --features="bin,use-shenango"
-	mv ./target/release/kvserver  ./target/release/kvserver-noebpf
+	rm ./target/release/kvserver-noebpf && cp ./target/release/kvserver ./target/release/kvserver-noebpf
 
 ./target/release/bincode-pingclient ./target/release/bincode-pingserver: $(FLS)
 	cd rpcbench && cargo build --release
