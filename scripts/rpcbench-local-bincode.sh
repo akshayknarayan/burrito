@@ -4,6 +4,7 @@
 # $2: request size
 
 set -e
+set -x
 
 if [ -z "$1" ]; then
     echo "Usage: rpcbench-exp.sh <output dir> <req size bytes>"
@@ -35,13 +36,14 @@ sudo pkill -9 burrito || true
 
 ###################################################
 
-echo "==> baremetal tcp"
+echo "==> baremetal udp"
 RUST_LOG=info ./target/release/bincode-pingserver --port "4242" &
 server=$!
 sleep 2
 
-RUST_LOG=info ./target/release/bincode-pingclient --addr "127.0.0.1:4242" --iters 10000 --work "bw:1000" --reqs-per-iter 3 -s "$REQSIZE" \
-    -o $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_tcp_localhost_baremetal.data
+RUST_LOG=info ./target/release/bincode-pingclient --addr "127.0.0.1:4242" \
+    --iters 10000 --work "bw:1000" --reqs-per-iter 3 -s "$REQSIZE" \
+    -o $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_udp_localhost_baremetal.data
 kill -9 $server
 sleep 2
 
@@ -53,14 +55,15 @@ mkdir -p /tmp/burrito/
 RUST_LOG=info ./target/release/bincode-pingserver --unix-addr "/tmp/burrito/server" &
 server=$!
 sleep 2
-RUST_LOG=info ./target/release/bincode-pingclient --unix-addr "/tmp/burrito/server" --burrito-root="/tmp/burrito" --iters 10000 --work "bw:1000" --reqs-per-iter 3 -s "$REQSIZE" \
+RUST_LOG=info ./target/release/bincode-pingclient --unix-addr "/tmp/burrito/server" \
+    --burrito-root="/tmp/burrito" --iters 10000 --work "bw:1000" --reqs-per-iter 3 -s "$REQSIZE" \
     -o $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_unix_localhost_baremetal.data
 kill -9 $server
 sleep 2
 
 ###################################################
 
-echo "==> container tcp"
+echo "==> container udp"
 sudo docker ps -a | awk '{print $1}' | tail -n +2 | xargs sudo docker rm -f || true
 sleep 2
 
@@ -81,8 +84,10 @@ sudo docker run --name lrpcclient -e RUST_LOG=debug -t -d $image_name ./bincode-
 echo "-> wait rpcbench-client"
 sudo docker container wait lrpcclient
 echo "-> rpcbench-client done"
-sudo docker cp lrpcclient:/app/res.data $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.data
-sudo docker cp lrpcclient:/app/res.trace $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_tcp_localhost_docker.trace
+sudo docker cp lrpcclient:/app/res.data \
+    $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_udp_localhost_docker.data
+sudo docker cp lrpcclient:/app/res.trace \
+    $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_udp_localhost_docker.trace
 
 ####################################################
 
@@ -120,8 +125,10 @@ sudo docker run --name lrpcclient \
 echo "-> wait rpcbench-client"
 sudo docker container wait lrpcclient
 echo "-> rpcbench-client done"
-sudo docker cp lrpcclient:/app/res.data $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_unix_localhost_docker.data
-sudo docker cp lrpcclient:/app/res.trace $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_unix_localhost_docker.trace
+sudo docker cp lrpcclient:/app/res.data \
+    $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_unix_localhost_docker.data
+sudo docker cp lrpcclient:/app/res.trace \
+    $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_unix_localhost_docker.trace
 
 ####################################################
 
@@ -188,8 +195,10 @@ echo "-> wait rpcbench-client"
 sudo docker container wait lrpcclient
 echo "-> rpcbench-client done"
 sudo docker logs lrpcclient > $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.log
-sudo docker cp lrpcclient:/app/res.data $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.data
-sudo docker cp lrpcclient:/app/res.trace $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.trace
+sudo docker cp lrpcclient:/app/res.data \
+    $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.data
+sudo docker cp lrpcclient:/app/res.trace \
+    $out/work_"$REQSIZE"B+sqrts_1000-iters_10000_periter_3_burrito_localhost_docker.trace
 
 sudo kill -INT $lburritoctl
 

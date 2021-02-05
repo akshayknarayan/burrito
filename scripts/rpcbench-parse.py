@@ -3,9 +3,11 @@
 import sys
 import re
 
-file_re = re.compile(r"work_(\w+)_([0-9]+)-iters_([0-9]+)_periter_([0-9]+)_(\S+?)_(\w+)_(\w+)\.data")
+file_re = re.compile(r"work_(.+)_([0-9]+)-iters_([0-9]+)_periter_([0-9]+)_(\S+?)_(\w+)_(\w+)\.data")
 def parse_filename(fn: str):
     m = file_re.search(fn)
+    if m is None:
+        print(fn)
     return {
         'work_type': m[1],
         'work_amount': m[2],
