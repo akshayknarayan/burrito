@@ -269,7 +269,7 @@ fn gen_poisson_duration(amt: f64) -> Result<std::time::Duration, Report> {
 }
 
 pub fn dump_durs(durs: &[(Duration, i64, i64)]) {
-    let mut just_durs: Vec<_> = durs.iter().map(|(x, _, _)| x).collect();
+    let mut just_durs: Vec<_> = durs.iter().map(|(_, x, _)| x).collect();
     just_durs.sort();
     let len = just_durs.len() as f64;
     let quantile_idxs = [0.25, 0.5, 0.75, 0.95];

@@ -46,7 +46,7 @@ async fn burrito(srv: rpcbench::Server, port: u16, root: PathBuf) -> Result<(), 
     let lch = LocalNameChunnel::new(
         root.clone(),
         Some(addr),
-        UnixSkChunnel::default(),
+        UnixSkChunnel::with_root(root.clone()),
         SerializeChunnelProject::default(),
     )
     .await?;

@@ -1293,7 +1293,7 @@ where
     let buf = bincode::serialize(&offer)?;
     loop {
         match time::timeout(
-            std::time::Duration::from_millis(1000),
+            std::time::Duration::from_millis(100),
             try_once(cn, addr.clone(), buf.clone()),
         )
         .await

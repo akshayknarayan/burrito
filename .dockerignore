@@ -1,11 +1,5 @@
-.git/
-target/
+**/*
 !target/release/pingserver
 !target/release/pingclient
 !target/release/bincode-pingserver
 !target/release/bincode-pingclient
-retry*/
-ycsb-shenango/target/
-*.txt
-*.data
-*.log

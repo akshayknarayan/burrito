@@ -139,15 +139,16 @@ async fn main() -> Result<(), Report> {
             ..
         } => {
             // raw unix mode
-            let u = if let Some(r) = burrito_root {
-                UnixSkChunnel::with_root(r).connect(()).await?
-            } else {
-                UnixSkChunnel::default().connect(()).await?
-            };
             info!(?addr, "uds mode");
             let ctr = |addr: PathBuf| {
-                let u = u.clone();
+                let br = burrito_root.clone();
                 async move {
+                    let u = if let Some(r) = br {
+                        UnixSkChunnel::with_root(r).connect(()).await?
+                    } else {
+                        UnixSkChunnel::default().connect(()).await?
+                    };
+
                     let cn = negotiate_client(
                         CxList::from(KvReliabilityChunnel::default())
                             .wrap(SerializeChunnelProject::default()),
