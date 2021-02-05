@@ -8,6 +8,7 @@ use tower_service::Service;
 
 #[derive(Debug)]
 pub struct LocalNameClient {
+    root: PathBuf,
     cl: pipeline::Client<
         async_bincode::AsyncBincodeStream<
             UnixStream,
@@ -22,13 +23,14 @@ pub struct LocalNameClient {
 
 impl LocalNameClient {
     pub async fn new(burrito_root: &Path) -> Result<Self, Error> {
+        let root = burrito_root.to_path_buf();
         let controller_addr = burrito_root.join(CONTROLLER_ADDRESS);
         let uc: async_bincode::AsyncBincodeStream<_, proto::Reply, proto::Request, _> =
             UnixStream::connect(controller_addr).await?.into();
         let uc = uc.for_async();
         let cl = pipeline::Client::new(uc);
 
-        Ok(LocalNameClient { cl })
+        Ok(LocalNameClient { root, cl })
     }
 
     pub async fn register(&mut self, name: SocketAddr) -> Result<PathBuf, Error> {
@@ -41,7 +43,8 @@ impl LocalNameClient {
         {
             Ok(proto::Reply::Register(r)) => {
                 let r: Result<proto::RegisterReplyOk, String> = r.into();
-                r.map_err(|s| eyre!("{}", s)).map(|r| r.local_addr)
+                r.map_err(|s| eyre!("{}", s))
+                    .map(|r| self.root.join(r.local_addr))
             }
             _ => bail!("Reply mismatched request type"),
         }
@@ -58,7 +61,7 @@ impl LocalNameClient {
                             bail!("Reply mismatched request address")
                         }
 
-                        Ok(local_addr)
+                        Ok(local_addr.map(|a| self.root.join(a)))
                     },
                 )
             }

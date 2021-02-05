@@ -147,7 +147,7 @@ impl BurritoNet {
 
     async fn assign_insert(&self, service_addr: SocketAddr) -> Result<PathBuf, String> {
         let a = get_addr();
-        let p: PathBuf = [&self.root, &PathBuf::from(a)].iter().collect();
+        let p = PathBuf::from(&a);
         self.name_table_insert(service_addr, p.clone()).await?;
 
         info!(

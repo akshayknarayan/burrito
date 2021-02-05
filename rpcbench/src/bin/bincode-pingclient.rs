@@ -148,7 +148,6 @@ async fn main() -> Result<(), Report> {
                     } else {
                         UnixSkChunnel::default().connect(()).await?
                     };
-
                     let cn = negotiate_client(
                         CxList::from(KvReliabilityChunnel::default())
                             .wrap(SerializeChunnelProject::default()),
