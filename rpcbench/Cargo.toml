@@ -7,6 +7,7 @@ edition = "2018"
 [dependencies]
 bertha = { path = "../bertha" }
 burrito-localname-ctl = { path = "../burrito-localname-ctl", features = ["ctl"] }
+kvstore = { path = "../kvstore" }
 serde = "1"
 bincode = "1"
 color-eyre = "0.5"

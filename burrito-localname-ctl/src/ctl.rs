@@ -209,12 +209,13 @@ mod test {
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+    #[allow(clippy::unit_arg)] // https://github.com/tokio-rs/tracing/issues/1093
     #[tracing::instrument(err)]
     async fn server(addr: SocketAddr, root: PathBuf) -> Result<(), Report> {
         let lch_s = LocalNameChunnel::new(
             root.clone(),
             Some(addr),
-            UnixSkChunnel,
+            UnixSkChunnel::with_root(root.clone()),
             Nothing::<()>::default(),
         )
         .await?;
@@ -259,10 +260,14 @@ mod test {
                 tokio::spawn(server(addr, root.clone()));
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-                let lch =
-                    LocalNameChunnel::new(root, None, UnixSkChunnel, Nothing::<()>::default())
-                        .await
-                        .unwrap();
+                let lch = LocalNameChunnel::new(
+                    root.clone(),
+                    None,
+                    UnixSkChunnel::with_root(root),
+                    Nothing::<()>::default(),
+                )
+                .await
+                .unwrap();
                 let cn = negotiate_client(lch, UdpSkChunnel.connect(()).await.unwrap(), addr)
                     .await
                     .unwrap();

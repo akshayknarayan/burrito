@@ -4,6 +4,7 @@ use bertha::{
 };
 use burrito_localname_ctl::LocalNameChunnel;
 use color_eyre::eyre::{bail, Report};
+use kvstore::reliability::KvReliabilityChunnel;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[structopt(name = "ping_client")]
 struct Opt {
     #[structopt(short, long)]
-    burrito_root: Option<String>,
+    burrito_root: Option<PathBuf>,
     #[structopt(long)]
     addr: Option<SocketAddr>,
     #[structopt(long)]
@@ -92,13 +93,15 @@ async fn main() -> Result<(), Report> {
                 let r = root.clone();
                 async move {
                     let lch = LocalNameChunnel::new(
-                        r,
+                        r.clone(),
                         None,
-                        UnixSkChunnel,
+                        UnixSkChunnel::with_root(r),
                         SerializeChunnelProject::default(),
                     )
                     .await?;
-                    let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
+                    let stack = CxList::from(KvReliabilityChunnel::default())
+                        .wrap(SerializeChunnelProject::default())
+                        .wrap(lch);
                     let cn = negotiate_client(stack, UdpSkChunnel.connect(()).await?, addr).await?;
                     Ok(ProjectLeft::new(Either::Left(addr), cn))
                 }
@@ -118,7 +121,8 @@ async fn main() -> Result<(), Report> {
             info!(?addr, "UDP mode");
             let http = |addr| async move {
                 let cn = negotiate_client(
-                    SerializeChunnelProject::default(),
+                    CxList::from(KvReliabilityChunnel::default())
+                        .wrap(SerializeChunnelProject::default()),
                     UdpSkChunnel.connect(()).await?,
                     addr,
                 )
@@ -129,20 +133,30 @@ async fn main() -> Result<(), Report> {
         }
         Opt {
             unix_addr: Some(addr),
+            burrito_root,
             iters,
             reqs_per_iter,
             ..
         } => {
             // raw unix mode
+            let u = if let Some(r) = burrito_root {
+                UnixSkChunnel::with_root(r).connect(()).await?
+            } else {
+                UnixSkChunnel::default().connect(()).await?
+            };
             info!(?addr, "uds mode");
-            let ctr = |addr: PathBuf| async move {
-                let cn = negotiate_client(
-                    SerializeChunnelProject::default(),
-                    UnixSkChunnel.connect(()).await?,
-                    addr.clone(),
-                )
-                .await?;
-                Ok(ProjectLeft::new(addr, cn))
+            let ctr = |addr: PathBuf| {
+                let u = u.clone();
+                async move {
+                    let cn = negotiate_client(
+                        CxList::from(KvReliabilityChunnel::default())
+                            .wrap(SerializeChunnelProject::default()),
+                        u,
+                        addr.clone(),
+                    )
+                    .await?;
+                    Ok(ProjectLeft::new(addr, cn))
+                }
             };
             rpcbench::client_ping(addr, ctr, pp, iters, reqs_per_iter).await?
         }

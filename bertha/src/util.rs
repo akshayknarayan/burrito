@@ -12,7 +12,10 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::{atomic::AtomicUsize, Arc, Mutex as StdMutex};
+use std::sync::{
+    atomic::{self, AtomicUsize},
+    Arc, Mutex as StdMutex,
+};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::trace;
 use tracing_futures::Instrument;
@@ -210,7 +213,7 @@ where
                         // careful: potential deadlocks since .recv on returned connection blocks
                         // on .listen
                         let (from, data) = sk.recv().await?;
-                        let ctr = pending_inc_ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let ctr = pending_inc_ctr.fetch_add(1, atomic::Ordering::SeqCst);
 
                         let mut done = None;
                         let c = map.entry(from.clone()).or_insert_with(|| {
@@ -230,14 +233,25 @@ where
                         trace!(from = ?&from, pending = &ctr, "received pkt");
 
                         // the send fails only if the receiver stopped listening.
-                        if c.send((from.clone(), data)).is_err() {
-                            pending_dec_ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            map.remove(&from);
+                        // so this becomes a new connection
+                        if let Err(mpsc::error::SendError(data)) = c.send((from.clone(), data)) {
+                            trace!(from = ?&from, "new connection");
+                            let (sch, rch) = mpsc::unbounded_channel();
+                            let cn = make_conn(
+                                from.clone(),
+                                sk.clone(),
+                                Arc::new(Mutex::new(rch)),
+                                Arc::clone(&pending_dec_ctr),
+                            );
+
+                            done = Some(cn);
+                            sch.send(data).unwrap();
+                            map.insert(from.clone(), sch);
                         }
 
                         if last_print.elapsed() > std::time::Duration::from_millis(1000) {
-                            let p_inc = pending_inc_ctr.load(std::sync::atomic::Ordering::SeqCst);
-                            let p_dec = pending_dec_ctr.load(std::sync::atomic::Ordering::SeqCst);
+                            let p_inc = pending_inc_ctr.load(atomic::Ordering::SeqCst);
+                            let p_dec = pending_dec_ctr.load(atomic::Ordering::SeqCst);
                             tracing::info!(
                                 from = ?from,
                                 ?p_inc, ?p_dec,

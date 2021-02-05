@@ -3,6 +3,7 @@
 #![warn(clippy::all)]
 
 use bertha::ChunnelConnection;
+use color_eyre::eyre::WrapErr;
 use color_eyre::eyre::{bail, eyre, Report};
 use futures_util::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,8 @@ use std::future::Future;
 use std::str::FromStr;
 use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::Duration;
-use tracing::{debug, info, instrument, trace};
+use tracing::{debug, debug_span, info, instrument, trace};
+use tracing_futures::Instrument;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Work {
@@ -43,10 +45,19 @@ impl FromStr for Work {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct PingParams {
     pub work: Work,
     pub padding: Vec<u8>,
+}
+
+impl std::fmt::Debug for PingParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PingParams")
+            .field("work", &self.work)
+            .field("padding", &self.padding.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -56,13 +67,40 @@ pub struct Pong {
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Msg {
-    Ping(PingParams),
-    Pong(Pong),
+    Ping(usize, PingParams),
+    Pong(usize, Pong),
 }
 
 impl From<Pong> for Msg {
     fn from(p: Pong) -> Self {
-        Msg::Pong(p)
+        Msg::Pong(get_id(), p)
+    }
+}
+
+impl From<PingParams> for Msg {
+    fn from(p: PingParams) -> Self {
+        Msg::Ping(get_id(), p)
+    }
+}
+
+impl Msg {
+    fn pong_with_id(id: usize, p: Pong) -> Self {
+        Msg::Pong(id, p)
+    }
+}
+
+fn get_id() -> usize {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    rng.gen()
+}
+
+impl bertha::util::MsgId for Msg {
+    fn id(&self) -> usize {
+        use Msg::*;
+        match self {
+            Ping(x, _) | Pong(x, _) => *x,
+        }
     }
 }
 
@@ -123,33 +161,51 @@ impl Server {
         })
     }
 
+    #[allow(clippy::unit_arg)] // https://github.com/tokio-rs/tracing/issues/1093
     #[instrument(skip(l), err)]
-    pub async fn serve<A>(
+    pub async fn serve<A: std::fmt::Debug>(
         self,
         l: impl futures_util::stream::Stream<
             Item = Result<impl ChunnelConnection<Data = (A, crate::Msg)>, Report>,
         >,
     ) -> Result<(), Report> {
+        let mut conn_ctr = 0;
         l.try_for_each_concurrent(None, |cn| {
             let mut srv = self.clone();
+            let ctr = conn_ctr;
+            conn_ctr += 1;
             async move {
                 debug!("New connection");
                 loop {
-                    let (a, p) = match cn.recv().await? {
-                        (a, Msg::Ping(p)) => (a, p),
-                        _ => bail!("Didn't receive PingParams"),
+                    let (a, i, p) = match tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        cn.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((a, Msg::Ping(i, p)))) => (a, i, p),
+                        Ok(Err(e)) => {
+                            debug!(err = %format!("{:#}", e), "Connection recv error, terminating");
+                            return Ok(());
+                        }
+                        Ok(Ok(d)) => bail!("Expected PingParams, got {:?}", d),
+                        Err(_to) => {
+                            debug!("Connection timing out");
+                            return Ok(());
+                        }
                     };
                     let ans: Pong = srv.do_ping(p).await.unwrap();
-                    cn.send((a, ans.into())).await?;
+                    cn.send((a, Msg::pong_with_id(i, ans))).await?;
                 }
             }
+            .instrument(debug_span!("connection", ?ctr))
         })
         .await?;
         Ok(())
     }
 }
 
-#[tracing::instrument(skip(addr, connector))]
+#[instrument(skip(addr, connector), err)]
 pub async fn client_ping<A, C, F, S>(
     addr: A,
     connector: C,
@@ -169,7 +225,9 @@ where
         trace!(iter = i, "start_loop");
 
         let then = std::time::Instant::now();
-        let st = connector(addr.clone()).await?;
+        let st = connector(addr.clone())
+            .await
+            .wrap_err("could not connect")?;
         trace!(iter = i, "connected");
         for j in 0..reqs_per_iter {
             trace!(iter = i, which = j, "ping_start");
@@ -192,9 +250,9 @@ async fn do_one_ping(
     msg: PingParams,
 ) -> Result<(i64, i64), Report> {
     let then = std::time::Instant::now();
-    cn.send(Msg::Ping(msg)).await?;
-    let response = match cn.recv().await? {
-        Msg::Pong(p) => p,
+    cn.send(msg.into()).await.wrap_err("ping send")?;
+    let response = match cn.recv().await.wrap_err("pong recv")? {
+        Msg::Pong(_, p) => p,
         _ => bail!("Didn't receive Pong"),
     };
 
@@ -236,6 +294,7 @@ mod test {
         ChunnelConnector, ChunnelListener, CxList,
     };
     use burrito_localname_ctl::{ctl::serve_ctl, LocalNameChunnel};
+    use color_eyre::eyre::WrapErr;
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use tracing::{info, info_span, instrument};
@@ -267,7 +326,7 @@ mod test {
             let lch = LocalNameChunnel::new(
                 root.clone(),
                 Some(addr),
-                UnixSkChunnel,
+                UnixSkChunnel::with_root(root.clone()),
                 SerializeChunnelProject::default(),
             )
             .await?;
@@ -290,9 +349,9 @@ mod test {
                     let r = root.clone();
                     async move {
                         let lch = LocalNameChunnel::new(
-                            r,
+                            r.clone(),
                             None,
-                            UnixSkChunnel,
+                            UnixSkChunnel::with_root(r),
                             SerializeChunnelProject::default(),
                         )
                         .await?;
@@ -315,6 +374,7 @@ mod test {
                     3, // reqs_per_iter
                 )
                 .await
+                .wrap_err("client_ping")
             }
             .instrument(info_span!("rpcbench_ping")),
         )

@@ -14,8 +14,24 @@ use tracing::trace;
 /// UDP Chunnel connector.
 ///
 /// Carries no state.
-#[derive(Default, Clone, Debug)]
-pub struct UnixSkChunnel;
+#[derive(Clone, Debug)]
+pub struct UnixSkChunnel {
+    root: PathBuf,
+}
+
+impl UnixSkChunnel {
+    pub fn with_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl Default for UnixSkChunnel {
+    fn default() -> Self {
+        Self {
+            root: std::env::temp_dir(),
+        }
+    }
+}
 
 impl ChunnelListener for UnixSkChunnel {
     type Addr = PathBuf;
@@ -45,6 +61,7 @@ impl ChunnelConnector for UnixSkChunnel {
     type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
+        let d = self.root.clone();
         Box::pin(async move {
             use rand::Rng;
             let rng = rand::thread_rng();
@@ -52,7 +69,6 @@ impl ChunnelConnector for UnixSkChunnel {
                 .sample_iter(&rand::distributions::Alphanumeric)
                 .take(10)
                 .collect();
-            let d = std::env::temp_dir();
             let f = d.join(stem);
             let sk = tokio::net::UnixDatagram::bind(f)?;
             Ok(UnixSk::new(sk))

@@ -1,9 +1,13 @@
 use bertha::{
-    bincode::SerializeChunnelProject, negotiate_server, udp::UdpSkChunnel, uds::UnixSkChunnel,
+    bincode::SerializeChunnelProject,
+    negotiate_server,
+    udp::UdpReqChunnel,
+    uds::{UnixReqChunnel, UnixSkChunnel},
     ChunnelListener, CxList,
 };
 use burrito_localname_ctl::LocalNameChunnel;
 use color_eyre::eyre::{bail, Report};
+use kvstore::reliability::KvReliabilityServerChunnel;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -28,8 +32,9 @@ struct Opt {
 async fn unix(srv: rpcbench::Server, addr: PathBuf) -> Result<(), Report> {
     info!(?addr, "Serving unix-only mode");
     let st = negotiate_server(
-        SerializeChunnelProject::default(),
-        UnixSkChunnel.listen(addr).await?,
+        CxList::from(KvReliabilityServerChunnel::default())
+            .wrap(SerializeChunnelProject::default()),
+        UnixReqChunnel.listen(addr).await?,
     )
     .await?;
     srv.serve(st).await
@@ -41,13 +46,15 @@ async fn burrito(srv: rpcbench::Server, port: u16, root: PathBuf) -> Result<(), 
     let lch = LocalNameChunnel::new(
         root.clone(),
         Some(addr),
-        UnixSkChunnel,
+        UnixSkChunnel::default(),
         SerializeChunnelProject::default(),
     )
     .await?;
-    let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
+    let stack = CxList::from(KvReliabilityServerChunnel::default())
+        .wrap(SerializeChunnelProject::default())
+        .wrap(lch);
     info!(?port, ?root, "Serving localname mode");
-    let st = negotiate_server(stack, UdpSkChunnel.listen(addr).await?).await?;
+    let st = negotiate_server(stack, UdpReqChunnel.listen(addr).await?).await?;
     srv.serve(st).await
 }
 
@@ -56,8 +63,9 @@ async fn udp(srv: rpcbench::Server, port: u16) -> Result<(), Report> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     info!(?port, "Serving udp mode");
     let st = negotiate_server(
-        SerializeChunnelProject::default(),
-        UdpSkChunnel::default().listen(addr).await?,
+        CxList::from(KvReliabilityServerChunnel::default())
+            .wrap(SerializeChunnelProject::default()),
+        UdpReqChunnel::default().listen(addr).await?,
     )
     .await?;
     srv.serve(st).await

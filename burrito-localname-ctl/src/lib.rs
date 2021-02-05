@@ -338,7 +338,7 @@ mod test {
         let lch = LocalNameChunnel {
             cl: None,
             listen_addr: None,
-            local_raw: UnixSkChunnel,
+            local_raw: UnixSkChunnel::default(),
             local_chunnel: Nothing::<()>::default(),
         };
 

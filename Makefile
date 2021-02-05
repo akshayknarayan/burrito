@@ -3,12 +3,12 @@ SRCS := $(shell find . -name "*.rs" | grep -v "target" )
 TOMLS := $(shell find . -name "*.toml" )
 FLS := $(SRCS) $(TOMLS)
 
-all: sharding localrpc
+all: sharding rpcbench
 
-.PHONY: sharding localrpc
+.PHONY: sharding rpcbench
 
 sharding: ./target/release/ycsb ./target/release/kvserver-ebpf ./target/release/kvserver-noebpf
-localrpc: ./target/release/bincode-pingclient ./target/release/bincode-pingserver ./target/release/burrito-localname
+rpcbench: ./target/release/bincode-pingclient ./target/release/bincode-pingserver ./target/release/burrito-localname
 
 ./target/release/ycsb: $(FLS)
 	cd kvstore-ycsb && cargo build --release --features="use-shenango"

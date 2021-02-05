@@ -1,8 +1,6 @@
 FROM ubuntu:20.04
 
 WORKDIR /app
-ADD ./target/release/pingserver ./pingserver
-ADD ./target/release/pingclient ./pingclient
 ADD ./target/release/bincode-pingserver ./bincode-pingserver
 ADD ./target/release/bincode-pingclient ./bincode-pingclient
 CMD ["server", "--addr", "0.0.0.0:4242"]

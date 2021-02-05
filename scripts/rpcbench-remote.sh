@@ -32,15 +32,6 @@ echo "=> remote: $1"
 
 ssh $1 mkdir -p ~/burrito/$out
 
-echo "  -> local build"
-cd burrito-discovery-ctl && cargo build --release --features "bin" && cd ..
-cd burrito-localname-ctl && cargo build --release --features "ctl,docker" && cd ..
-cd rpcbench && cargo build --release && cd ..
-echo "  -> remote build"
-ssh $1 "cd ~/burrito/burrito-discovery-ctl && ~/.cargo/bin/cargo build --release --features \"bin\""
-ssh $1 "cd ~/burrito/burrito-localname-ctl && ~/.cargo/bin/cargo build --release --features \"ctl,docker\""
-ssh $1 "cd ~/burrito/rpcbench && ~/.cargo/bin/cargo build --release"
-
 echo "==> Baremetal TCP"
 ssh $1 "sudo pkill -9 pingserver" || true
 echo " -> start server"

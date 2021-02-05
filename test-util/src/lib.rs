@@ -24,7 +24,6 @@ impl Redis {
 
         let mut redis = std::process::Command::new("sudo")
             .args(&[
-                "DOCKER_HOST=unix:///var/run/burrito-docker.sock",
                 "docker",
                 "run",
                 "--name",
@@ -71,13 +70,7 @@ impl Drop for Redis {
 fn kill_redis(port: u16) {
     let name = format!("test-burritoctl-redis-{:?}", port);
     let mut kill = std::process::Command::new("sudo")
-        .args(&[
-            "DOCKER_HOST=unix:///var/run/burrito-docker.sock",
-            "docker",
-            "rm",
-            "-f",
-            &name,
-        ])
+        .args(&["docker", "rm", "-f", &name])
         .spawn()
         .expect("Could not spawn docker rm");
 

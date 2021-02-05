@@ -18,7 +18,7 @@ pub trait MakeEither<A, B> {
 }
 
 #[pin_project::pin_project(project = EitherProj)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Either<A, B> {
     Left(#[pin] A),
     Right(#[pin] B),
@@ -178,7 +178,7 @@ where
 
 /// More expensive version of `Either<A, B>` which doesn't require A and B to have the same data
 /// type.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DataEither<A, B> {
     Left(A),
     Right(B),

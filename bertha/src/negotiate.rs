@@ -1229,23 +1229,12 @@ where
     S: Apply + GetOffers + Clone + Send + 'static,
     <S as Apply>::Applied: Chunnel<C> + Clone + Debug + Send + 'static,
     <<S as Apply>::Applied as Chunnel<C>>::Error: Into<Report> + Send + Sync + 'static,
-    A: Debug + Send + Sync + 'static,
+    A: Clone + Debug + Send + Sync + 'static,
 {
     async move {
-        // 1. get Vec<u8> connection.
         debug!(?addr, "client negotiation starting");
-
-        // 2. send offers
         let offers = NegotiateMsg::ClientOffer(stack.offers().collect());
-        let buf = bincode::serialize(&offers)?;
-        cn.send((addr, buf)).await?;
-
-        // 3. receive picked
-        let (_, buf) = cn.recv().await?;
-        let resp: NegotiateMsg = bincode::deserialize(&buf).wrap_err(eyre!(
-            "Could not deserialize negotiate_server response: {:?}",
-            buf
-        ))?;
+        let resp = try_negotiate_offer_loop(&cn, addr, offers).await?;
         match resp {
             NegotiateMsg::ServerReply(Ok(picked)) => {
                 // 4. monomorphize `stack`, picking received choices
@@ -1287,6 +1276,51 @@ where
             NegotiateMsg::ServerReply(Err(errmsg)) => Err(eyre!("{:?}", errmsg)),
             _ => Err(eyre!("Received unknown message type")),
         }
+    }
+}
+
+#[tracing::instrument(skip(cn, offer), err)]
+async fn try_negotiate_offer_loop<A, C>(
+    cn: &C,
+    addr: A,
+    offer: NegotiateMsg,
+) -> Result<NegotiateMsg, Report>
+where
+    A: Clone + Debug + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+{
+    use tokio::time;
+    let buf = bincode::serialize(&offer)?;
+    loop {
+        match time::timeout(
+            std::time::Duration::from_millis(1000),
+            try_once(cn, addr.clone(), buf.clone()),
+        )
+        .await
+        {
+            Ok(Ok(r)) => return Ok(r),
+            Ok(e) => return e,
+            Err(time::error::Elapsed { .. }) => {
+                debug!("negotiate offer timed out");
+                continue;
+            }
+        }
+    }
+
+    async fn try_once<A, C>(cn: &C, addr: A, buf: Vec<u8>) -> Result<NegotiateMsg, Report>
+    where
+        A: Send + Sync + 'static,
+        C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    {
+        // 2. send offers
+        cn.send((addr, buf)).await?;
+
+        // 3. receive picked
+        let (_, rbuf) = cn.recv().await?;
+        bincode::deserialize(&rbuf).wrap_err(eyre!(
+            "Could not deserialize negotiate_server response: {:?}",
+            rbuf
+        ))
     }
 }
 
