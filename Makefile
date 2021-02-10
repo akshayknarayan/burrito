@@ -21,11 +21,11 @@ endif
 
 ./target/release/kvserver-ebpf: $(FLS) cargo
 	cd kvstore && $(CARGO) build --release --features="bin,ebpf,use-shenango"
-	rm ./target/release/kvserver-ebpf && cp ./target/release/kvserver ./target/release/kvserver-ebpf
+	rm -f ./target/release/kvserver-ebpf && cp ./target/release/kvserver ./target/release/kvserver-ebpf
 
 ./target/release/kvserver-noebpf: $(FLS) cargo
 	cd kvstore && $(CARGO) build --release --features="bin,use-shenango"
-	rm ./target/release/kvserver-noebpf && cp ./target/release/kvserver ./target/release/kvserver-noebpf
+	rm -f ./target/release/kvserver-noebpf && cp ./target/release/kvserver ./target/release/kvserver-noebpf
 
 ./target/release/bincode-pingclient ./target/release/bincode-pingserver: $(FLS) cargo
 	cd rpcbench && $(CARGO) build --release
