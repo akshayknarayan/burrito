@@ -8,6 +8,7 @@ members = [
     "kvstore-ycsb",
     "rpcbench",
     "shenango-chunnel",
+    "sqs",
     "test-util",
     "xdp-shard",
 ]
