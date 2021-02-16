@@ -18,10 +18,13 @@ pub struct SqsChunnel {
 }
 
 impl SqsChunnel {
-    pub fn new(sqs_client: SqsClient, recv_queue_urls: impl Iterator<Item = String>) -> Self {
+    pub fn new<'a>(
+        sqs_client: SqsClient,
+        recv_queue_urls: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
         SqsChunnel {
             sqs_client,
-            recv_queue_urls: recv_queue_urls.collect(),
+            recv_queue_urls: recv_queue_urls.into_iter().map(str::to_owned).collect(),
         }
     }
 }
@@ -132,5 +135,53 @@ impl ChunnelConnection for SqsChunnel {
             .wrap_err(eyre!("sqs.delete_message on {:?}", qid))?;
             Ok((qid, body.unwrap()))
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::SqsChunnel;
+    use bertha::ChunnelConnection;
+    use color_eyre::eyre::WrapErr;
+    use color_eyre::Report;
+    use rusoto_sqs::SqsClient;
+    use tracing_error::ErrorLayer;
+    use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    #[test]
+    fn sqs_send_recv() {
+        // relies on SQS queue "test" being available.
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or(());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                const TEST_QUEUE_URL: &'static str =
+                    "https://sqs.us-east-1.amazonaws.com/413104736560/test";
+                let ch = SqsChunnel::new(sqs_client, vec![TEST_QUEUE_URL]);
+
+                ch.send((TEST_QUEUE_URL.to_string(), "test message".to_string()))
+                    .await
+                    .wrap_err("sqs send")?;
+                let (q, msg) = ch.recv().await.wrap_err("sqs recv")?;
+                assert_eq!(q, TEST_QUEUE_URL);
+                assert_eq!(&msg, "test message");
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::info_span!("sqs_send_recv")),
+        )
+        .unwrap();
     }
 }
