@@ -57,28 +57,7 @@ impl ChunnelConnection for SqsChunnel {
         //    receive_message requests.
         Box::pin(async move {
             tokio::pin!(sqs);
-            let mut futs = recv_queue_urls
-                .iter()
-                .map(|q_url| {
-                    let qu = q_url.to_string();
-                    let sqs = &sqs; // don't move sqs, we need to use it in the other concurrent reqs
-                    Box::pin(async move {
-                        Ok::<_, Report>((
-                            sqs.receive_message(ReceiveMessageRequest {
-                                max_number_of_messages: Some(1),
-                                queue_url: qu.clone(),
-                                visibility_timeout: Some(15),
-                                wait_time_seconds: Some(1),
-                                ..Default::default()
-                            })
-                            .await
-                            .wrap_err(eyre!("sqs.receive_message on {:?}", qu))?,
-                            qu,
-                        ))
-                    })
-                })
-                .collect();
-
+            let mut futs = vec![];
             let (
                 qid,
                 Message {
@@ -87,6 +66,30 @@ impl ChunnelConnection for SqsChunnel {
                     ..
                 },
             ) = loop {
+                if futs.is_empty() {
+                    futs = recv_queue_urls
+                        .iter()
+                        .map(|q_url| {
+                            let qu = q_url.to_string();
+                            let sqs = &sqs; // don't move sqs, we need to use it in the other concurrent reqs
+                            Box::pin(async move {
+                                Ok::<_, Report>((
+                                    sqs.receive_message(ReceiveMessageRequest {
+                                        max_number_of_messages: Some(1),
+                                        queue_url: qu.clone(),
+                                        visibility_timeout: Some(15),
+                                        wait_time_seconds: Some(1),
+                                        ..Default::default()
+                                    })
+                                    .await
+                                    .wrap_err(eyre!("sqs.receive_message on {:?}", qu))?,
+                                    qu,
+                                ))
+                            })
+                        })
+                        .collect();
+                }
+
                 let (
                     (
                         ReceiveMessageResult {
