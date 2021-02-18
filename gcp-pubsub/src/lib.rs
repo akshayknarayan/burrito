@@ -107,3 +107,51 @@ impl ChunnelConnection for PubSubChunnel {
         })
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::PubSubChunnel;
+    use bertha::ChunnelConnection;
+    use color_eyre::eyre::WrapErr;
+    use color_eyre::Report;
+    use google_cloud::pubsub::Client;
+    use tracing_error::ErrorLayer;
+    use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    #[test]
+    fn pubsub_send_recv() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or(());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let project_name =
+                    std::env::var("GCLOUD_PROJECT_NAME").wrap_err("GCLOUD_PROJECT_NAME env var")?;
+                let gcloud_client = Client::new(project_name).await.wrap_err("make client")?;
+                const TEST_TOPIC_URL: &'static str = "my-topic"; // projects/arctic-plate-305119/topics/my-topic ?
+                let ch = PubSubChunnel::new(gcloud_client, vec![TEST_TOPIC_URL]).await?;
+
+                ch.send((TEST_TOPIC_URL.to_string(), "test message".to_string()))
+                    .await
+                    .wrap_err("sqs send")?;
+                let (q, msg) = ch.recv().await.wrap_err("recv")?;
+                assert_eq!(q, TEST_TOPIC_URL);
+                assert_eq!(&msg, "test message");
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::info_span!("pubsub_send_recv")),
+        )
+        .unwrap();
+    }
+}
