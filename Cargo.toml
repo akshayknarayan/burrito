@@ -6,6 +6,7 @@ members = [
     "burrito-shard-ctl",
     "kvstore",
     "kvstore-ycsb",
+    "gcp-pubsub",
     "rpcbench",
     "shenango-chunnel",
     "sqs",
