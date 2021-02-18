@@ -6,6 +6,7 @@
 use bertha::ChunnelConnection;
 use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 use google_cloud::pubsub::{Client, Subscription, SubscriptionConfig};
+use rand::Rng;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -33,11 +34,16 @@ impl PubSubChunnel {
                     }
 
                     let mut topic = topic.unwrap(); // checked above
+                    let rng = rand::thread_rng();
+                    let sub_id: String = rng
+                        .sample_iter(&rand::distributions::Alphanumeric)
+                        .take(10)
+                        .collect();
                     Ok((
                         topic.id().to_owned(),
                         topic
                             .create_subscription(
-                                topic_id,
+                                &sub_id,
                                 SubscriptionConfig::default()
                                     .ack_deadline(chrono::Duration::seconds(15)),
                             )
@@ -54,6 +60,14 @@ impl PubSubChunnel {
             ps_client,
             subscriptions,
         })
+    }
+
+    // no async drop :'(
+    pub async fn cleanup(&mut self) -> Result<(), Report> {
+        futures_util::future::try_join_all(self.subscriptions.drain().map(|(_, sub)| sub.delete()))
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
     }
 }
 
@@ -139,15 +153,19 @@ mod test {
                 let project_name =
                     std::env::var("GCLOUD_PROJECT_NAME").wrap_err("GCLOUD_PROJECT_NAME env var")?;
                 let gcloud_client = Client::new(project_name).await.wrap_err("make client")?;
-                const TEST_TOPIC_URL: &'static str = "my-topic"; // projects/arctic-plate-305119/topics/my-topic ?
-                let ch = PubSubChunnel::new(gcloud_client, vec![TEST_TOPIC_URL]).await?;
+                // this test assumes "my-topic" already exists.
+                const TEST_TOPIC_URL: &'static str = "my-topic";
+                let mut ch = PubSubChunnel::new(gcloud_client, vec![TEST_TOPIC_URL])
+                    .await
+                    .wrap_err("making chunnel")?;
 
                 ch.send((TEST_TOPIC_URL.to_string(), "test message".to_string()))
                     .await
-                    .wrap_err("sqs send")?;
+                    .wrap_err("send")?;
                 let (q, msg) = ch.recv().await.wrap_err("recv")?;
                 assert_eq!(q, TEST_TOPIC_URL);
                 assert_eq!(&msg, "test message");
+                ch.cleanup().await?;
                 Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("pubsub_send_recv")),

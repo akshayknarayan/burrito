@@ -13,6 +13,7 @@ tracing-futures = "0.2"
 futures-util = "0.3"
 google-cloud = { git = "https://github.com/akshayknarayan/google-cloud-rs", features = ["pubsub"] }
 chrono = "0.4"
+rand = "0.7"
 
 [dev-dependencies]
 tracing-subscriber = "0.2"
