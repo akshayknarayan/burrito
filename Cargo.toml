@@ -6,13 +6,14 @@ members = [
     "burrito-shard-ctl",
     "kvstore",
     "kvstore-ycsb",
-    "gcp-pubsub",
-    "az-queues",
     "rpcbench",
     "shenango-chunnel",
-    "sqs",
     "test-util",
     "xdp-shard",
+    "az-queues",
+    "gcp-pubsub",
+    "sqs",
+    "queue-steer",
 ]
 
 [profile.release]

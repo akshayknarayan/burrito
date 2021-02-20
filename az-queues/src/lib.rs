@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
 
+#[derive(Clone)]
 pub struct AzStorageQueueChunnel {
     az_client: Arc<StorageClient>,
     queues: Vec<String>,

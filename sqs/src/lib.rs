@@ -12,6 +12,7 @@ use rusoto_sqs::{
 use std::future::Future;
 use std::pin::Pin;
 
+#[derive(Clone)]
 pub struct SqsChunnel {
     sqs_client: SqsClient,
     recv_queue_urls: Vec<String>,

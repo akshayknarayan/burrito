@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
+#[derive(Clone)]
 pub struct PubSubChunnel {
     ps_client: Client,
     subscriptions: HashMap<String, Subscription>,
