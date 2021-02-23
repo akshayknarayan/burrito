@@ -4,13 +4,95 @@
 //! Chunnel data type = (String, String) -> (queue URL, msg_string)
 
 use bertha::ChunnelConnection;
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use rusoto_sqs::{
     DeleteMessageRequest, Message, ReceiveMessageRequest, ReceiveMessageResult, SendMessageRequest,
     Sqs, SqsClient,
 };
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{atomic::AtomicUsize, Arc};
+
+#[derive(Clone)]
+pub struct OrderedSqsChunnel {
+    inner: SqsChunnel,
+    msg_group_id: String,
+    send_ctr: Arc<AtomicUsize>,
+}
+
+impl OrderedSqsChunnel {
+    pub fn new<'a>(
+        sqs_client: SqsClient,
+        recv_queue_urls: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, Report> {
+        let recv_queue_urls: Result<_, _> = recv_queue_urls
+            .into_iter()
+            .map(|s| {
+                if s.ends_with(".fifo") {
+                    Ok(s.to_owned())
+                } else {
+                    Err(eyre!("OrderedSqsChunnel must use fifo queues"))
+                }
+            })
+            .collect();
+        let recv_queue_urls = recv_queue_urls?;
+        use rand::Rng;
+        let rng = rand::thread_rng();
+        let grp_id = rng
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(10)
+            .collect();
+        Ok(Self {
+            inner: SqsChunnel {
+                sqs_client,
+                recv_queue_urls,
+            },
+            msg_group_id: grp_id,
+            send_ctr: Default::default(),
+        })
+    }
+}
+
+impl ChunnelConnection for OrderedSqsChunnel {
+    type Data = (String, String);
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        let (qid, body) = data;
+        let grp_id = self.msg_group_id.clone();
+        let sqs = self.inner.sqs_client.clone();
+        let ctr = self
+            .send_ctr
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            ensure!(
+                qid.ends_with(".fifo"),
+                "Can only send to a FIFO queue with an OrderedSqsChunnel"
+            );
+
+            // message_deduplication_id is optional if cloud-side "content-based deduplication" is
+            // enabled, but required if it is not.
+            let mut dedup_id = format!("{}", ctr);
+            base64::encode_config_buf(body[..8].as_bytes(), base64::STANDARD, &mut dedup_id);
+            sqs.send_message(SendMessageRequest {
+                message_body: body,
+                queue_url: qid.clone(),
+                message_group_id: Some(grp_id),
+                message_deduplication_id: Some(dedup_id),
+                ..Default::default()
+            })
+            .await
+            .wrap_err(eyre!("sqs.send_message on {:?}", qid))?;
+            Ok(())
+        })
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        self.inner.recv()
+    }
+}
 
 #[derive(Clone)]
 pub struct SqsChunnel {
@@ -141,7 +223,7 @@ impl ChunnelConnection for SqsChunnel {
 
 #[cfg(test)]
 mod test {
-    use super::SqsChunnel;
+    use super::{OrderedSqsChunnel, SqsChunnel};
     use bertha::ChunnelConnection;
     use color_eyre::eyre::WrapErr;
     use color_eyre::Report;
@@ -149,6 +231,108 @@ mod test {
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    const TEST_QUEUE_URL: &'static str = "https://sqs.us-east-1.amazonaws.com/413104736560/test";
+    const FIFO_TEST_QUEUE_URL: &'static str =
+        "https://sqs.us-east-1.amazonaws.com/413104736560/test.fifo";
+
+    #[test]
+    fn sqs_ordering() {
+        // relies on SQS queue "test.fifo" being available.
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or(());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                // each sqs client has its own http client, so make new ones
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                let rch = OrderedSqsChunnel::new(sqs_client, vec![FIFO_TEST_QUEUE_URL])?;
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                let sch1 = OrderedSqsChunnel::new(sqs_client, vec![])?;
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                let sch2 = OrderedSqsChunnel::new(sqs_client, vec![])?;
+
+                const A1: &'static str = "message A1";
+                const A2: &'static str = "message A2";
+                const B1: &'static str = "message B1";
+                const B2: &'static str = "message B2";
+
+                sch1.send((FIFO_TEST_QUEUE_URL.to_string(), A1.to_string()))
+                    .await
+                    .wrap_err("sqs send")?;
+                sch2.send((FIFO_TEST_QUEUE_URL.to_string(), B1.to_string()))
+                    .await
+                    .wrap_err("sqs send")?;
+                sch1.send((FIFO_TEST_QUEUE_URL.to_string(), A2.to_string()))
+                    .await
+                    .wrap_err("sqs send")?;
+                sch2.send((FIFO_TEST_QUEUE_URL.to_string(), B2.to_string()))
+                    .await
+                    .wrap_err("sqs send")?;
+
+                let (q, msg1) = rch.recv().await.wrap_err("sqs recv")?;
+                assert_eq!(q, FIFO_TEST_QUEUE_URL);
+                let (q, msg2) = rch.recv().await.wrap_err("sqs recv")?;
+                assert_eq!(q, FIFO_TEST_QUEUE_URL);
+                let (q, msg3) = rch.recv().await.wrap_err("sqs recv")?;
+                assert_eq!(q, FIFO_TEST_QUEUE_URL);
+                let (q, msg4) = rch.recv().await.wrap_err("sqs recv")?;
+                assert_eq!(q, FIFO_TEST_QUEUE_URL);
+
+                assert_eq!(&msg1, A1);
+                assert_eq!(&msg2, B1);
+                assert_eq!(&msg3, A2);
+                assert_eq!(&msg4, B2);
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::info_span!("sqs_fifo")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sqs_fifo() {
+        // relies on SQS queue "test.fifo" being available.
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or(());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                let ch = OrderedSqsChunnel::new(sqs_client, vec![FIFO_TEST_QUEUE_URL])?;
+
+                ch.send((FIFO_TEST_QUEUE_URL.to_string(), "test message".to_string()))
+                    .await
+                    .wrap_err("sqs send")?;
+                let (q, msg) = ch.recv().await.wrap_err("sqs recv")?;
+                assert_eq!(q, FIFO_TEST_QUEUE_URL);
+                assert_eq!(&msg, "test message");
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::info_span!("sqs_fifo")),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn sqs_send_recv() {
@@ -169,8 +353,6 @@ mod test {
         rt.block_on(
             async move {
                 let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
-                const TEST_QUEUE_URL: &'static str =
-                    "https://sqs.us-east-1.amazonaws.com/413104736560/test";
                 let ch = SqsChunnel::new(sqs_client, vec![TEST_QUEUE_URL]);
 
                 ch.send((TEST_QUEUE_URL.to_string(), "test message".to_string()))
