@@ -225,8 +225,10 @@ impl ChunnelConnection for SqsChunnel {
 mod test {
     use super::{OrderedSqsChunnel, SqsChunnel};
     use bertha::ChunnelConnection;
-    use color_eyre::eyre::WrapErr;
-    use color_eyre::Report;
+    use color_eyre::{
+        eyre::{ensure, WrapErr},
+        Report,
+    };
     use rusoto_sqs::SqsClient;
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
@@ -289,10 +291,21 @@ mod test {
                 let (q, msg4) = rch.recv().await.wrap_err("sqs recv")?;
                 assert_eq!(q, FIFO_TEST_QUEUE_URL);
 
-                assert_eq!(&msg1, A1);
-                assert_eq!(&msg2, B1);
-                assert_eq!(&msg3, A2);
-                assert_eq!(&msg4, B2);
+                let valid_orders = [
+                    [A1, A2, B1, B2],
+                    [A1, B1, A2, B2],
+                    [A1, B1, B2, A2],
+                    [B1, B2, A1, A2],
+                    [B1, A1, A2, B2],
+                    [B1, A1, B2, A2],
+                ];
+
+                ensure!(
+                    valid_orders
+                        .iter()
+                        .any(|o| &[&msg1, &msg2, &msg3, &msg4] == o),
+                    "invalid ordering"
+                );
                 Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("sqs_fifo")),
