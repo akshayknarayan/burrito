@@ -14,6 +14,7 @@ members = [
     "gcp-pubsub",
     "sqs",
     "queue-steer",
+    "round-order",
 ]
 
 [profile.release]
