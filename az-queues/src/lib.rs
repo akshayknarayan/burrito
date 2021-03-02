@@ -9,11 +9,35 @@ use azure_storage::queue::{
     AsPopReceiptClient, AsQueueClient,
 };
 use bertha::ChunnelConnection;
-use color_eyre::eyre::{eyre, Report};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
+
+/// Get an Azure storage account client.
+///
+/// Requires environment variables `AZ_STORAGE_ACCOUNT_NAME` and `AZ_STORAGE_ACCOUNT_KEY` to be set.
+/// For fancy config, call [`StorageAccountClient::new`], etc, yourself.
+pub fn default_azure_storage_client() -> Result<Arc<StorageAccountClient>, Report> {
+    let account_name =
+        std::env::var("AZ_STORAGE_ACCOUNT_NAME").wrap_err("AZ_STORAGE_ACCOUNT_NAME env var")?;
+    let account_key =
+        std::env::var("AZ_STORAGE_ACCOUNT_KEY").wrap_err("AZ_STORAGE_ACCOUNT_KEY env var")?;
+    Ok(azure_storage_client(account_name, account_key))
+}
+
+/// Get an Azure storage account client.
+pub fn azure_storage_client(
+    account_name: String,
+    account_key: String,
+) -> Arc<StorageAccountClient> {
+    StorageAccountClient::new_access_key(
+        Arc::new(Box::new(reqwest::Client::new())),
+        account_name,
+        account_key,
+    )
+}
 
 #[derive(Clone)]
 pub struct AzStorageQueueChunnel {

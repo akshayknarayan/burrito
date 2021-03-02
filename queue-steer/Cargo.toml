@@ -4,10 +4,25 @@ version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
+[features]
+bin = ["structopt", "tracing-subscriber", "tracing-error", "serde"]
+
 [dependencies]
 sqs = { path = "../sqs" }
 gcp-pubsub = { path = "../gcp-pubsub" }
 az-queues = { path = "../az-queues" }
 bertha = { path = "../bertha" }
+futures-util = "0.3"
+base64 = "0.13"
 color-eyre = "=0.5.7"
+tracing = "0.1"
+tracing-futures = "0.2"
+serde = { version = "1", optional = true }
 tokio = { version = "1", features = ["macros"] }
+tracing-error = { version = "0.1", optional = true }
+structopt = { version = "0.3", optional = true }
+tracing-subscriber = { version = "0.2", optional = true }
+
+[[bin]]
+name = "bench"
+required-features = ["bin"]

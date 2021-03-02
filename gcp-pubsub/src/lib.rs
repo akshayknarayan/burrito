@@ -10,6 +10,20 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
+/// Get a Google cloud PubSub client.
+///
+/// Requires the environment variable `GCP_PROJECT_NAME` to be set.
+pub async fn default_gcloud_client() -> Result<Client, Report> {
+    let proj_name =
+        std::env::var("GCP_PROJECT_NAME").wrap_err("expected GCP_PROJECT_NAME env var")?;
+    gcloud_client(proj_name).await
+}
+
+/// Get a Google cloud PubSub client.
+pub async fn gcloud_client(proj_name: String) -> Result<Client, Report> {
+    Client::new(proj_name).await.map_err(Into::into)
+}
+
 #[derive(Clone)]
 pub struct OrderedPubSubChunnel {
     inner: PubSubChunnel,

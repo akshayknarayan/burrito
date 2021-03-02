@@ -110,8 +110,7 @@ where
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let buf = bincode::serialize(&data.1).wrap_err("serialize failed")?;
-            inner.send((data.0, buf)).await?;
-            Ok(())
+            inner.send((data.0, buf)).await
         })
     }
 
@@ -125,6 +124,82 @@ where
                 std::any::type_name::<D>()
             ))?;
             Ok((a, data))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Base64Chunnel;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Base64Capability;
+
+impl crate::negotiate::CapabilitySet for Base64Capability {
+    fn guid() -> u64 {
+        0xd7824464b109ede9
+    }
+
+    fn universe() -> Option<Vec<Self>> {
+        None
+    }
+}
+
+impl Negotiate for Base64Chunnel {
+    type Capability = Base64Capability;
+
+    fn guid() -> u64 {
+        0xd9e3d97519e606e7
+    }
+}
+
+impl<A, InC> Chunnel<InC> for Base64Chunnel
+where
+    InC: ChunnelConnection<Data = (A, String)> + Send + Sync + 'static,
+    A: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = Base64Cn<InC>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(Base64Cn::from(cn)))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Base64Cn<C> {
+    inner: Arc<C>,
+}
+
+impl<C> From<C> for Base64Cn<C> {
+    fn from(inner: C) -> Self {
+        Base64Cn {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+impl<A, C> ChunnelConnection for Base64Cn<C>
+where
+    C: ChunnelConnection<Data = (A, String)> + Send + Sync + 'static,
+    A: Send + Sync + 'static,
+{
+    type Data = (A, Vec<u8>);
+
+    fn send(
+        &self,
+        (a, data): Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        let msg = base64::encode(data);
+        self.inner.send((a, msg))
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let (a, msg) = inner.recv().await.wrap_err("base64 chunnel recv")?;
+            let buf = base64::decode(msg).wrap_err("base64 decode")?;
+            Ok((a, buf))
         })
     }
 }

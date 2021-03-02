@@ -13,6 +13,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc};
 
+pub fn default_sqs_client() -> SqsClient {
+    SqsClient::new(rusoto_core::Region::UsEast1)
+}
+
 #[derive(Clone)]
 pub struct OrderedSqsChunnel {
     inner: SqsChunnel,

@@ -1,29 +1,8 @@
 //! Steer messages to the right queue.
-//!
-//! akshay:aerial_tramway:  12:06 yeah maybe routing topics across providers
-//! 12:06 based on something
-//!
-//! panda:panda_face:  12:06 Yeah. That could be cool too
-//! 12:06 Just based on the topic?
-//!
-//! akshay:aerial_tramway:  12:07 I was thinking like you provide a function to do the routing
-//! 12:07 could be based on arbitrary stuff like pricing (edited)
-//!
-//! panda:panda_face:  12:07 Oh yeah. Sure. Topics is just a very simple.function in this scheme right?
-//!
-//! akshay:aerial_tramway:  12:08 wait what do you mean by topics
-//! 12:08 because google calls a queue a topic
-//!
-//! panda:panda_face:  12:08 Oh so like I have 5 services
-//! 12:08 And 3 of them run in AWS
-//! 12:08 And 2 in Google
-//! 12:09 Client sends messages
-//! 12:09 The router looks at the message to.decide which service it is intended for
-//! 12:09 And then sends it to the right one
 
 use az_queues::AzStorageQueueChunnel;
 use bertha::ChunnelConnection;
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 use gcp_pubsub::PubSubChunnel;
 use sqs::SqsChunnel;
 use std::future::Future;
@@ -34,6 +13,22 @@ pub enum QueueAddr {
     Aws(String),
     Azure(String),
     Gcp(String),
+}
+
+impl std::str::FromStr for QueueAddr {
+    type Err = Report;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let idx = s
+            .find(':')
+            .ok_or_else(|| eyre!("Malformed QueueAddr: {:?}", s))?;
+        let sp = [&s[0..idx], &s[idx + 1..]];
+        match sp {
+            ["aws", g] | ["AWS", g] => Ok(QueueAddr::Aws(g.to_string())),
+            ["az", g] | ["Azure", g] => Ok(QueueAddr::Azure(g.to_string())),
+            ["gcp", g] | ["GCP", g] => Ok(QueueAddr::Gcp(g.to_string())),
+            _ => bail!("Unkown addr {:?} -> {:?}", s, sp),
+        }
+    }
 }
 
 /// A ChunnelConnection that selects on the 3 cloud provider services.
@@ -77,3 +72,55 @@ impl ChunnelConnection for QueueCn {
         })
     }
 }
+
+///// Abstract away the messaging provider behind a name, and allow dynamic migrations of a chunnel between
+///// providers.
+/////
+///// How? Have a meta channel that announces where each service is?
+//pub struct MessageChunnel;
+//
+//impl<A, InC> Chunnel<InC> for MessageChunnel
+//where
+//    A: std::fmt::Debug + Send + Sync + 'static,
+//    InC: ChunnelConnection<Data = (A, String)> + Send + Sync + 'static,
+//{
+//    type Future =
+//        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+//    type Connection = MessageChunnelCn<InC>;
+//    type Error = std::convert::Infallible;
+//
+//    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+//        Box::pin(async move {
+//            let r = MessageChunnelCn::from(cn);
+//            Ok(r)
+//        })
+//    }
+//}
+//
+//pub struct MessageChunnelCn<C> {
+//    inner: C,
+//}
+//
+//impl<C> From<C> for MessageChunnelCn<C> {
+//    fn from(inner: C) -> Self {
+//        Self { inner }
+//    }
+//}
+//
+//impl<C, A> ChunnelConnection for MessageChunnelCn<C>
+//where
+//    C: ChunnelConnection<Data = (A, String)>,
+//{
+//    type Data = (A, String);
+//
+//    fn send(
+//        &self,
+//        (addr, body): Self::Data,
+//    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+//        unimplemented!()
+//    }
+//
+//    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+//        unimplemented!()
+//    }
+//}

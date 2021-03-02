@@ -19,6 +19,7 @@ paste = "1"
 dashmap = "3"
 ahash = "0.5"
 hdrhistogram = "7"
+base64 = "0.13"
 
 [dev-dependencies]
 lazy_static = "1.4"
