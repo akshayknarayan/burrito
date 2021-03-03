@@ -15,28 +15,75 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
 
+/// Uses account name and key.
+///
+/// For fancy config, call [`StorageAccountClient::new`], etc, yourself.
+#[derive(Debug)]
+pub struct AzureAccountBuilder {
+    name: Result<String, Report>,
+    key: Result<String, Report>,
+}
+
+impl Default for AzureAccountBuilder {
+    fn default() -> Self {
+        AzureAccountBuilder {
+            name: Err(eyre!("Azure account name not specified")),
+            key: Err(eyre!("Azure account key not specified")),
+        }
+    }
+}
+
+impl AzureAccountBuilder {
+    pub fn with_name(self, name: impl Into<String>) -> Self {
+        Self {
+            name: Ok(name.into()),
+            ..self
+        }
+    }
+
+    pub fn with_key(self, key: impl Into<String>) -> Self {
+        Self {
+            key: Ok(key.into()),
+            ..self
+        }
+    }
+
+    /// Reads environment variable `AZ_STORAGE_ACCOUNT_NAME`.
+    pub fn name_env_var(self) -> Self {
+        Self {
+            name: std::env::var("AZ_STORAGE_ACCOUNT_NAME")
+                .wrap_err("AZ_STORAGE_ACCOUNT_NAME env var"),
+            ..self
+        }
+    }
+
+    /// Reads environment variable `AZ_STORAGE_ACCOUNT_KEY`.
+    pub fn key_env_var(self) -> Self {
+        Self {
+            key: std::env::var("AZ_STORAGE_ACCOUNT_KEY").wrap_err("AZ_STORAGE_ACCOUNT_KEY env var"),
+            ..self
+        }
+    }
+
+    pub fn from_env_vars(self) -> Self {
+        self.name_env_var().key_env_var()
+    }
+
+    pub fn finish(self) -> Result<Arc<StorageAccountClient>, Report> {
+        Ok(StorageAccountClient::new_access_key(
+            Arc::new(Box::new(reqwest::Client::new())),
+            self.name?,
+            self.key?,
+        ))
+    }
+}
+
 /// Get an Azure storage account client.
 ///
 /// Requires environment variables `AZ_STORAGE_ACCOUNT_NAME` and `AZ_STORAGE_ACCOUNT_KEY` to be set.
 /// For fancy config, call [`StorageAccountClient::new`], etc, yourself.
 pub fn default_azure_storage_client() -> Result<Arc<StorageAccountClient>, Report> {
-    let account_name =
-        std::env::var("AZ_STORAGE_ACCOUNT_NAME").wrap_err("AZ_STORAGE_ACCOUNT_NAME env var")?;
-    let account_key =
-        std::env::var("AZ_STORAGE_ACCOUNT_KEY").wrap_err("AZ_STORAGE_ACCOUNT_KEY env var")?;
-    Ok(azure_storage_client(account_name, account_key))
-}
-
-/// Get an Azure storage account client.
-pub fn azure_storage_client(
-    account_name: String,
-    account_key: String,
-) -> Arc<StorageAccountClient> {
-    StorageAccountClient::new_access_key(
-        Arc::new(Box::new(reqwest::Client::new())),
-        account_name,
-        account_key,
-    )
+    AzureAccountBuilder::default().from_env_vars().finish()
 }
 
 #[derive(Clone)]

@@ -10,18 +10,72 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-/// Get a Google cloud PubSub client.
-///
-/// Requires the environment variable `GCP_PROJECT_NAME` to be set.
-pub async fn default_gcloud_client() -> Result<Client, Report> {
-    let proj_name =
-        std::env::var("GCP_PROJECT_NAME").wrap_err("expected GCP_PROJECT_NAME env var")?;
-    gcloud_client(proj_name).await
+/// Builder for [`Client`].
+#[derive(Debug)]
+pub struct GcpCreds {
+    project_name: Result<String, Report>,
+    creds: Result<google_cloud::authorize::ApplicationCredentials, Report>,
+}
+
+impl Default for GcpCreds {
+    fn default() -> Self {
+        GcpCreds {
+            project_name: Err(eyre!("Must supply project name")),
+            creds: Err(eyre!("Must supply GCP credentials")),
+        }
+    }
+}
+
+impl GcpCreds {
+    /// Reads the environment variables `GOOGLE_APPLICATION_CREDENTIALS` and `GCP_PROJECT_NAME`.
+    pub fn from_env_vars(self) -> Self {
+        self.creds_path_env().project_name_env()
+    }
+
+    /// Reads `GOOGLE_APPLICATION_CREDENTIALS`.
+    pub fn creds_path_env(self) -> Self {
+        let creds = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+            .wrap_err("expected GOOGLE_APPLICATION_CREDENTIALS env var")
+            .and_then(|p| std::fs::File::open(p).map_err(Into::into))
+            .and_then(|f| serde_json::from_reader(f).map_err(Into::into));
+        Self { creds, ..self }
+    }
+
+    pub fn with_creds_path(self, path: impl AsRef<std::path::Path>) -> Self {
+        let creds = std::fs::File::open(path)
+            .map_err(Into::into)
+            .and_then(|f| serde_json::from_reader(f).map_err(Into::into));
+        Self { creds, ..self }
+    }
+
+    /// Reads `GCP_PROJECT_NAME`.
+    pub fn project_name_env(self) -> Self {
+        GcpCreds {
+            project_name: std::env::var("GCP_PROJECT_NAME")
+                .wrap_err("expected GCP_PROJECT_NAME env var"),
+            ..self
+        }
+    }
+
+    pub fn with_project_name(self, project_name: impl Into<String>) -> Self {
+        Self {
+            project_name: Ok(project_name.into()),
+            ..self
+        }
+    }
+
+    pub async fn finish(self) -> Result<Client, Report> {
+        Client::from_credentials(self.project_name?, self.creds?)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 /// Get a Google cloud PubSub client.
-pub async fn gcloud_client(proj_name: String) -> Result<Client, Report> {
-    Client::new(proj_name).await.map_err(Into::into)
+///
+/// Requires the environment variables `GCP_PROJECT_NAME` and `GOOGLE_APPLICATION_CREDENTIALS` to be set.
+pub async fn default_gcloud_client() -> Result<Client, Report> {
+    GcpCreds::default().from_env_vars().finish().await
 }
 
 #[derive(Clone)]
