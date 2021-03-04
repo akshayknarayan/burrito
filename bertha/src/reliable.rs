@@ -698,6 +698,53 @@ mod test {
         );
     }
 
+    #[test]
+    fn at_least_once() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or(());
+        let msgs = vec![(0, vec![0u8; 10]), (1, vec![1u8; 10]), (2, vec![2u8; 10])];
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        use std::sync::{Arc, Mutex};
+
+        rt.block_on(
+            async move {
+                let mut t = Chan::default();
+                // duplicate each packet once
+                let saved: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+                t.link_conditions(move |x: Option<Vec<u8>>| match x {
+                    Some(p) => {
+                        *saved.lock().unwrap() = Some(p.clone());
+                        Some(p)
+                    }
+                    None => saved.lock().unwrap().take(),
+                });
+
+                let (mut srv, mut cln) = t.split();
+                let mut l =
+                    CxList::from(ReliabilityChunnel::default()).wrap(SerializeChunnel::default());
+
+                let rcv_st = srv.listen(()).await.unwrap();
+                let mut rcv_st = l.serve(rcv_st).await.unwrap();
+                let rcv = rcv_st.next().await.unwrap().unwrap();
+
+                let cln = cln.connect(()).await.unwrap();
+                let snd = l.connect_wrap(cln).await.unwrap();
+
+                do_transmit(snd, rcv, msgs).await;
+            }
+            .instrument(tracing::info_span!("at-least-once")),
+        );
+    }
+
     async fn do_transmit_tagged(
         snd_ch: impl ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
         rcv_ch: impl ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
