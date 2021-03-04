@@ -135,21 +135,38 @@ impl ChunnelConnection for AzStorageQueueChunnel {
             .map(|qid| self.az_client.as_queue_client(qid))
             .collect();
         Box::pin(async move {
-            let ((cl, mut msg), _leftover_futs) =
-                futures_util::future::select_ok(queue_clients.into_iter().map(|cl| {
-                    Box::pin(async move {
-                        let GetMessagesResponse { messages, .. } = cl
-                            .get_messages()
-                            .visibility_timeout(std::time::Duration::from_secs(15))
-                            .number_of_messages(1) // TODO get more and cache them?
-                            .execute()
-                            .await
-                            .map_err(|e| eyre!("get_message err: {:?}", e))?;
-                        Ok::<_, Report>((cl, messages))
-                    })
-                }))
-                .await?;
-            let msg = msg.pop().unwrap();
+            let mut futs = vec![];
+            let (cl, msg) = loop {
+                if futs.is_empty() {
+                    futs = queue_clients
+                        .iter()
+                        .map(|cl| {
+                            Box::pin(async move {
+                                let GetMessagesResponse { messages, .. } = cl
+                                    .get_messages()
+                                    .visibility_timeout(std::time::Duration::from_secs(15))
+                                    .number_of_messages(1) // TODO get more and cache them?
+                                    .execute()
+                                    .await
+                                    .map_err(|e| eyre!("get_message err: {:?}", e))?;
+                                Ok::<_, Report>((cl, messages))
+                            })
+                        })
+                        .collect();
+                }
+
+                let ((cl, mut msg), leftover_futs) = futures_util::future::select_ok(futs).await?;
+                if !msg.is_empty() {
+                    assert!(
+                        msg.len() == 1,
+                        "Asked for only 1 message in GetMessagesRequest"
+                    );
+                    break ((cl, msg.pop().unwrap()));
+                } else {
+                    futs = leftover_futs;
+                }
+            };
+
             cl.as_pop_receipt_client(msg.pop_receipt)
                 .delete()
                 .execute()
