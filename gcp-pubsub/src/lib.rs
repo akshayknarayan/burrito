@@ -78,10 +78,24 @@ pub async fn default_gcloud_client() -> Result<Client, Report> {
     GcpCreds::default().from_env_vars().finish().await
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PubSubAddr {
+    pub topic_id: String,
+    pub group: Option<String>,
+}
+
+impl From<(String, String)> for PubSubAddr {
+    fn from((topic_id, group): (String, String)) -> Self {
+        PubSubAddr {
+            topic_id,
+            group: Some(group),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OrderedPubSubChunnel {
     inner: PubSubChunnel,
-    ordering_key: String,
 }
 
 impl OrderedPubSubChunnel {
@@ -90,14 +104,12 @@ impl OrderedPubSubChunnel {
         recv_topics: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, Report> {
         let subscriptions = make_subscriptions(ps_client.clone(), recv_topics, true).await?;
-        let ordering_key = gen_resource_id();
 
         Ok(OrderedPubSubChunnel {
             inner: PubSubChunnel {
                 ps_client,
                 subscriptions,
             },
-            ordering_key,
         })
     }
 
@@ -107,15 +119,22 @@ impl OrderedPubSubChunnel {
 }
 
 impl ChunnelConnection for OrderedPubSubChunnel {
-    type Data = (String, String);
+    type Data = (PubSubAddr, String);
 
     fn send(
         &self,
-        (topic_id, body): Self::Data,
+        (
+            PubSubAddr {
+                topic_id,
+                group: ordering_key,
+            },
+            body,
+        ): Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let mut client = self.inner.ps_client.clone();
-        let ordering_key = self.ordering_key.clone();
         Box::pin(async move {
+            let ordering_key =
+                ordering_key.ok_or(eyre!("Ordered send must include ordering group"))?;
             let topic = client
                 .topic(&topic_id)
                 .await
@@ -166,11 +185,11 @@ impl PubSubChunnel {
 }
 
 impl ChunnelConnection for PubSubChunnel {
-    type Data = (String, String);
+    type Data = (PubSubAddr, String);
 
     fn send(
         &self,
-        (topic_id, body): Self::Data,
+        (PubSubAddr { topic_id, .. }, body): Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let mut client = self.ps_client.clone();
         Box::pin(async move {
@@ -206,12 +225,15 @@ impl ChunnelConnection for PubSubChunnel {
                 })
             });
 
-            let ((topic, mut msg), _) = futures_util::future::select_ok(futs).await?;
+            let ((topic_id, mut msg), _) = futures_util::future::select_ok(futs).await?;
             msg.ack()
                 .await
                 .wrap_err(eyre!("ACKing message {:?}", msg.id()))?;
-            let body = std::str::from_utf8(msg.data())?.to_owned();
-            Ok((topic, body))
+            let body = std::string::String::from_utf8(msg.take_data())?;
+            // ordering_key is empty string if none was set
+            let group = msg.take_ordering_key();
+            let group = if group.is_empty() { None } else { Some(group) };
+            Ok((PubSubAddr { topic_id, group }, body))
         })
     }
 }
@@ -268,7 +290,7 @@ fn gen_resource_id() -> String {
 
 #[cfg(test)]
 mod test {
-    use super::{OrderedPubSubChunnel, PubSubChunnel};
+    use super::{OrderedPubSubChunnel, PubSubAddr, PubSubChunnel};
     use bertha::ChunnelConnection;
     use color_eyre::{
         eyre::{ensure, WrapErr},
@@ -300,7 +322,7 @@ mod test {
                 let project_name =
                     std::env::var("GCLOUD_PROJECT_NAME").wrap_err("GCLOUD_PROJECT_NAME env var")?;
                 // this test assumes "my-topic" already exists.
-                const TEST_TOPIC_URL: &'static str = "my-topic";
+                const TEST_TOPIC_URL: &'static str = "my-topic1";
                 let gcloud_client = Client::new(project_name.clone())
                     .await
                     .wrap_err("make client")?;
@@ -310,48 +332,43 @@ mod test {
                 let gcloud_client = Client::new(project_name.clone())
                     .await
                     .wrap_err("make client")?;
-                let mut sch1 = OrderedPubSubChunnel::new(gcloud_client, vec![])
-                    .await
-                    .wrap_err("making chunnel")?;
-                let gcloud_client = Client::new(project_name.clone())
-                    .await
-                    .wrap_err("make client")?;
-                let mut sch2 = OrderedPubSubChunnel::new(gcloud_client, vec![])
+                let mut sch = OrderedPubSubChunnel::new(gcloud_client, vec![])
                     .await
                     .wrap_err("making chunnel")?;
 
+                const GROUP_A: &'static str = "A";
                 const A1: &'static str = "message A1";
                 const A2: &'static str = "message A2";
+                const GROUP_B: &'static str = "B";
                 const B1: &'static str = "message B1";
                 const B2: &'static str = "message B2";
 
-                sch1.send((TEST_TOPIC_URL.to_string(), A1.to_string()))
-                    .await
-                    .wrap_err("send")?;
-                sch2.send((TEST_TOPIC_URL.to_string(), B1.to_string()))
-                    .await
-                    .wrap_err("send")?;
-                sch1.send((TEST_TOPIC_URL.to_string(), A2.to_string()))
-                    .await
-                    .wrap_err("send")?;
-                sch2.send((TEST_TOPIC_URL.to_string(), B2.to_string()))
-                    .await
-                    .wrap_err("send")?;
+                let addr_a: PubSubAddr = (TEST_TOPIC_URL.to_string(), GROUP_A.to_string()).into();
+                let addr_b: PubSubAddr = (TEST_TOPIC_URL.to_string(), GROUP_B.to_string()).into();
 
-                let (q, msg1) = rch.recv().await.wrap_err("recv")?;
-                assert_eq!(q, TEST_TOPIC_URL);
+                sch.send((addr_a.clone(), A1.to_string()))
+                    .await
+                    .wrap_err("send")?;
+                sch.send((addr_b.clone(), B1.to_string()))
+                    .await
+                    .wrap_err("send")?;
+                sch.send((addr_a, A2.to_string())).await.wrap_err("send")?;
+                sch.send((addr_b, B2.to_string())).await.wrap_err("send")?;
+
+                let (a, msg1) = rch.recv().await.wrap_err("recv")?;
+                assert_eq!(a.topic_id, TEST_TOPIC_URL);
                 info!(?msg1, "recv msg");
 
-                let (q, msg2) = rch.recv().await.wrap_err("recv")?;
-                assert_eq!(q, TEST_TOPIC_URL);
+                let (a, msg2) = rch.recv().await.wrap_err("recv")?;
+                assert_eq!(a.topic_id, TEST_TOPIC_URL);
                 info!(?msg2, "recv msg");
 
-                let (q, msg3) = rch.recv().await.wrap_err("recv")?;
-                assert_eq!(q, TEST_TOPIC_URL);
+                let (a, msg3) = rch.recv().await.wrap_err("recv")?;
+                assert_eq!(a.topic_id, TEST_TOPIC_URL);
                 info!(?msg3, "recv msg");
 
-                let (q, msg4) = rch.recv().await.wrap_err("recv")?;
-                assert_eq!(q, TEST_TOPIC_URL);
+                let (a, msg4) = rch.recv().await.wrap_err("recv")?;
+                assert_eq!(a.topic_id, TEST_TOPIC_URL);
                 info!(?msg4, "recv msg");
 
                 let valid_orders = [
@@ -364,8 +381,7 @@ mod test {
                 ];
 
                 rch.cleanup().await?;
-                sch1.cleanup().await?;
-                sch2.cleanup().await?;
+                sch.cleanup().await?;
 
                 ensure!(
                     valid_orders
@@ -407,11 +423,15 @@ mod test {
                     .await
                     .wrap_err("making chunnel")?;
 
-                ch.send((TEST_TOPIC_URL.to_string(), "test message".to_string()))
+                let a = PubSubAddr {
+                    topic_id: TEST_TOPIC_URL.to_string(),
+                    group: None,
+                };
+                ch.send((a.clone(), "test message".to_string()))
                     .await
                     .wrap_err("send")?;
                 let (q, msg) = ch.recv().await.wrap_err("recv")?;
-                assert_eq!(q, TEST_TOPIC_URL);
+                assert_eq!(q, a);
                 assert_eq!(&msg, "test message");
                 ch.cleanup().await?;
                 Ok::<_, Report>(())
