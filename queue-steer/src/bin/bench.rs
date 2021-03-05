@@ -10,10 +10,18 @@ use bertha::{
     util::ProjectLeft,
     Chunnel, ChunnelConnection, CxList,
 };
-use color_eyre::{eyre::bail, Report};
-use gcp_pubsub::PubSubChunnel;
+use color_eyre::{
+    eyre::{bail, ensure},
+    Report,
+};
+use futures_util::stream::{iter, StreamExt, TryStreamExt};
+use gcp_pubsub::{OrderedPubSubChunnel, PubSubAddr, PubSubChunnel};
 use queue_steer::QueueAddr;
-use sqs::SqsChunnel;
+use sqs::{OrderedSqsChunnel, SqsAddr, SqsChunnel};
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
+use std::io::Write;
 use std::iter::once;
 use std::str::FromStr;
 use std::sync::{
@@ -27,40 +35,6 @@ use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
 
-#[derive(Clone, Copy, Debug)]
-enum Mode {
-    BestEffort,
-    /// if num_groups = Some(1), all keys are in the same group, so there is total ordering.  
-    ///
-    /// if num_groups = Some(n > 1), number of client threads = number of ordering groups (measure
-    /// effect on throughput).  
-    ///
-    /// if num_groups = None, each key is in its own ordering group (so there can be is
-    /// at-most-once delivery without ordering).
-    ///
-    /// Some(0) is invalid.
-    Ordered {
-        num_groups: Option<usize>,
-    },
-}
-
-impl FromStr for Mode {
-    type Err = Report;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let sp: Vec<_> = s.split(':').collect();
-        match sp.as_slice() {
-            ["BestEffort"] | ["besteffort"] | ["be"] => Ok(Mode::BestEffort),
-            ["Ordered", g] | ["ordered", g] | ["ord", g] => {
-                let g: usize = g.parse()?;
-                Ok(Mode::Ordered {
-                    num_groups: if g == 0 { None } else { Some(g) },
-                })
-            }
-            _ => bail!("Unkown mode {:?}", s),
-        }
-    }
-}
-
 #[derive(Clone, Debug, StructOpt)]
 struct Opt {
     #[structopt(short, long)]
@@ -69,6 +43,18 @@ struct Opt {
     num_reqs: usize,
     #[structopt(short, long)]
     queue: QueueAddr,
+    #[structopt(short, long)]
+    inter_request_ms: u64,
+    #[structopt(short, long)]
+    gcp_key_file: Option<std::path::PathBuf>,
+    #[structopt(short, long)]
+    gcp_project_name: Option<String>,
+    #[structopt(short, long)]
+    az_account_name: Option<String>,
+    #[structopt(short, long)]
+    az_key: Option<String>,
+    #[structopt(short, long)]
+    out_file: std::path::PathBuf,
 }
 
 #[tokio::main]
@@ -83,34 +69,8 @@ async fn main() -> Result<(), Report> {
     d.init();
     let opt = Opt::from_args();
     info!(?opt, "starting");
-    let (msgs, elapsed) = match opt.mode {
-        Mode::BestEffort => {
-            match opt.queue {
-                QueueAddr::Aws(a) => {
-                    let sqs_client = sqs::default_sqs_client(); // us-east-1
-                    let send_cn = SqsChunnel::new(sqs_client, once(a.as_str()));
-                    let sqs_client = sqs::default_sqs_client();
-                    let recv_cn = SqsChunnel::new(sqs_client, once(a.as_str()));
-                    do_best_effort_exp(send_cn, recv_cn, a, opt.num_reqs).await?
-                }
-                QueueAddr::Azure(a) => {
-                    let az_client = az_queues::default_azure_storage_client()?;
-                    let send_cn = AzStorageQueueChunnel::new(az_client, once(a.as_str()));
-                    let az_client = az_queues::default_azure_storage_client()?;
-                    let recv_cn = AzStorageQueueChunnel::new(az_client, once(a.as_str()));
-                    do_best_effort_exp(send_cn, recv_cn, a, opt.num_reqs).await?
-                }
-                QueueAddr::Gcp(a) => {
-                    let gcp_client = gcp_pubsub::default_gcloud_client().await?;
-                    let send_cn = PubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                    let gcp_client = gcp_pubsub::default_gcloud_client().await?;
-                    let recv_cn = PubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                    do_best_effort_exp(send_cn, recv_cn, a, opt.num_reqs).await?
-                }
-            }
-        }
-        Mode::Ordered { .. } => unimplemented!(),
-    };
+
+    let (msgs, elapsed) = do_exp(&opt).await?;
 
     let order: Vec<_> = msgs.iter().map(|m| m.req_num).collect();
     let orderedness_val = orderedness(&order);
@@ -135,34 +95,198 @@ async fn main() -> Result<(), Report> {
         ?orderedness_val,
         "done",
     );
+
+    dump_results(opt.out_file, msgs, elapsed, opt.mode)?;
     Ok(())
 }
 
-#[instrument(skip(send_cn, recv_cn))]
-async fn do_best_effort_exp(
-    send_cn: impl ChunnelConnection<Data = (String, String)> + Send + Sync + 'static,
-    recv_cn: impl ChunnelConnection<Data = (String, String)> + Send + Sync + 'static,
-    addr: String,
+async fn do_exp(opt: &Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
+    let get_az_client = |opt: &Opt| match opt {
+        Opt {
+            az_account_name: Some(name),
+            az_key: Some(key),
+            ..
+        } => az_queues::AzureAccountBuilder::default()
+            .with_name(name)
+            .with_key(key)
+            .finish(),
+        Opt { .. } => az_queues::AzureAccountBuilder::default()
+            .from_env_vars()
+            .finish(),
+    };
+
+    let get_gcp_client = |opt: &Opt| match opt {
+        Opt {
+            gcp_key_file: Some(file),
+            gcp_project_name: Some(name),
+            ..
+        } => gcp_pubsub::GcpCreds::default()
+            .with_creds_path(file)
+            .with_project_name(name)
+            .finish(),
+        Opt { .. } => gcp_pubsub::GcpCreds::default().from_env_vars().finish(),
+    };
+
+    Ok(match opt.mode {
+        Mode::BestEffort => {
+            match opt.queue {
+                QueueAddr::Aws(ref a) => {
+                    let sqs_client = sqs::default_sqs_client(); // us-east-1
+                    let cn = SqsChunnel::new(sqs_client, once(a.as_str()));
+                    do_best_effort_exp(
+                        cn,
+                        SqsAddr {
+                            queue_id: a.to_owned(),
+                            group: None,
+                        },
+                        opt.num_reqs,
+                        opt.inter_request_ms,
+                    )
+                    .await?
+                }
+                QueueAddr::Azure(ref a) => {
+                    let az_client = get_az_client(&opt)?;
+                    let cn = AzStorageQueueChunnel::new(az_client, once(a.as_str()));
+                    do_best_effort_exp(cn, a.to_string(), opt.num_reqs, opt.inter_request_ms)
+                        .await?
+                }
+                QueueAddr::Gcp(ref a) => {
+                    let gcp_client = get_gcp_client(&opt).await?;
+                    let cn = PubSubChunnel::new(gcp_client, once(a.as_str())).await?;
+                    do_best_effort_exp(
+                        cn,
+                        PubSubAddr {
+                            topic_id: a.to_string(),
+                            group: None,
+                        },
+                        opt.num_reqs,
+                        opt.inter_request_ms,
+                    )
+                    .await?
+                }
+            }
+        }
+        Mode::Ordered {
+            num_groups: Some(n), // n == 1: total ordering
+        } => {
+            // offloaded impls
+            match opt.queue {
+                QueueAddr::Azure(_) => unimplemented!("no offloaded azure ordering implementaion"),
+                QueueAddr::Aws(ref a) => {
+                    let sqs_client = sqs::default_sqs_client(); // us-east-1
+                    let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
+                    do_ordered_groups_exp(
+                        ch,
+                        SqsAddr {
+                            queue_id: a.to_owned(),
+                            group: None,
+                        },
+                        opt.num_reqs,
+                        n,
+                        opt.inter_request_ms,
+                    )
+                    .await?
+                }
+                QueueAddr::Gcp(ref a) => {
+                    let gcp_client = get_gcp_client(&opt).await?;
+                    let ch = OrderedPubSubChunnel::new(gcp_client, once(a.as_str())).await?;
+                    do_ordered_groups_exp(
+                        ch,
+                        PubSubAddr {
+                            topic_id: a.to_string(),
+                            group: None,
+                        },
+                        opt.num_reqs,
+                        n,
+                        opt.inter_request_ms,
+                    )
+                    .await?
+                }
+            }
+        }
+        // at-most-once mode.
+        Mode::Ordered { num_groups: None } => unimplemented!(),
+    })
+}
+
+#[instrument(skip(cn, addr))]
+async fn do_ordered_groups_exp<A>(
+    cn: impl ChunnelConnection<Data = (A, String)> + Send + Sync + 'static,
+    addr: A,
     num_reqs: usize,
-) -> Result<(Vec<RecvdMsg>, Duration), Report> {
-    let send_cn = ProjectLeft::new(addr.clone(), make_conn(send_cn).await?);
-    let recv_cn = make_conn(recv_cn).await?;
+    num_groups: usize,
+    inter_request_ms: u64,
+) -> Result<(Vec<RecvdMsg>, Duration), Report>
+where
+    A: Clone + queue_steer::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
+{
+    let cn = Arc::new(cn);
+    let send_cns: Vec<_> = iter(0..num_groups)
+        .then(|i| {
+            let mut a = addr.clone();
+            let cn = &cn;
+            async move {
+                a.set_group(i.to_string());
+                Ok::<_, Report>(ProjectLeft::new(a, make_conn(Arc::clone(cn)).await?))
+            }
+        })
+        .try_collect()
+        .await?;
+    let recv_cn = make_conn(cn).await?;
 
     let start = std::time::Instant::now();
     let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, once(recv_cn)));
-    send_reqs(start, num_reqs, &[send_cn]).await?;
+    send_reqs(
+        start,
+        num_reqs,
+        Duration::from_millis(inter_request_ms),
+        &send_cns,
+    )
+    .await?;
     let (msgs, elapsed) = receive_handle.await??;
-    if msgs.iter().any(|(from, _)| from != &addr) {
-        bail!("Received from unexpected queue");
+    // check order
+    let mut groups = HashMap::new();
+    for (a, m) in msgs.iter() {
+        let old_num = groups.entry(a).or_insert(m.req_num);
+        ensure!(
+            *old_num <= m.req_num,
+            "Group order semantics not met: {:?}",
+            msgs
+        );
+        *old_num = m.req_num;
     }
-
     let msgs = msgs.into_iter().map(|(_, m)| m).collect();
     Ok((msgs, elapsed))
 }
 
-async fn make_conn(
-    inner: impl ChunnelConnection<Data = (String, String)> + Send + Sync + 'static,
-) -> Result<impl ChunnelConnection<Data = (String, Msg)>, Report> {
+#[instrument(skip(cn, addr))]
+async fn do_best_effort_exp<A: Clone + Debug + PartialEq + Send + Sync + 'static>(
+    cn: impl ChunnelConnection<Data = (A, String)> + Send + Sync + 'static,
+    addr: A,
+    num_reqs: usize,
+    inter_request_ms: u64,
+) -> Result<(Vec<RecvdMsg>, Duration), Report> {
+    let cn = Arc::new(cn);
+    let send_cn = ProjectLeft::new(addr.clone(), make_conn(Arc::clone(&cn)).await?);
+    let recv_cn = make_conn(cn).await?;
+
+    let start = std::time::Instant::now();
+    let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, once(recv_cn)));
+    send_reqs(
+        start,
+        num_reqs,
+        Duration::from_millis(inter_request_ms),
+        &[send_cn],
+    )
+    .await?;
+    let (msgs, elapsed) = receive_handle.await??;
+    let msgs = msgs.into_iter().map(|(_, m)| m).collect();
+    Ok((msgs, elapsed))
+}
+
+async fn make_conn<A: Send + Sync + 'static>(
+    inner: impl ChunnelConnection<Data = (A, String)> + Send + Sync + 'static,
+) -> Result<impl ChunnelConnection<Data = (A, Msg)>, Report> {
     let mut stack = CxList::from(SerializeChunnelProject::default()).wrap(Base64Chunnel::default());
     stack.connect_wrap(inner).await
 }
@@ -190,10 +314,11 @@ impl RecvdMsg {
 
 /// Each of the `send_chunnels` is an ordering group. Messages are distributed round-robin across
 /// groups.
-#[instrument(skip(send_chunnels))]
+#[instrument(skip(send_chunnels, start))]
 async fn send_reqs(
     start: std::time::Instant,
     num_reqs: usize,
+    inter_request: Duration,
     send_chunnels: &[impl ChunnelConnection<Data = Msg>],
 ) -> Result<(), Report> {
     debug!("starting sends");
@@ -206,7 +331,8 @@ async fn send_reqs(
                 req_num,
             })
             .await?;
-        curr_group = curr_group + 1 % send_chunnels.len();
+        curr_group = (curr_group + 1) % send_chunnels.len();
+        tokio::time::sleep(inter_request).await;
     }
 
     debug!("finished sends");
@@ -216,11 +342,11 @@ async fn send_reqs(
 /// Each of `receive_chunnels` corresponds to one ordering group. We receive on all until a total
 /// of `num_reqs` messages.
 #[instrument(skip(receive_chunnels))]
-async fn receive_reqs(
+async fn receive_reqs<A>(
     start: std::time::Instant,
     num_reqs: usize,
-    receive_chunnels: impl IntoIterator<Item = impl ChunnelConnection<Data = (String, Msg)>>,
-) -> Result<(Vec<(String, RecvdMsg)>, Duration), Report> {
+    receive_chunnels: impl IntoIterator<Item = impl ChunnelConnection<Data = (A, Msg)>>,
+) -> Result<(Vec<(A, RecvdMsg)>, Duration), Report> {
     let tot_rcvd = Arc::new(AtomicUsize::new(0));
     let first_recv_time = Arc::new(AtomicU64::new(0));
     let groups = futures_util::future::try_join_all(receive_chunnels.into_iter().enumerate().map(
@@ -279,4 +405,80 @@ fn orderedness(receive_order: &[usize]) -> usize {
         .enumerate()
         .map(|(i, req_num)| (i as isize - *req_num as isize).abs() as usize)
         .sum()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    BestEffort,
+    /// if num_groups = Some(1), all keys are in the same group, so there is total ordering.  
+    ///
+    /// if num_groups = Some(n > 1), number of client threads = number of ordering groups (measure
+    /// effect on throughput).  
+    ///
+    /// if num_groups = None, each key is in its own ordering group (so there can be is
+    /// at-most-once delivery without ordering).
+    ///
+    /// Some(0) is invalid.
+    Ordered {
+        num_groups: Option<usize>,
+    },
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            Mode::BestEffort => f.write_str("BestEffort")?,
+            Mode::Ordered {
+                num_groups: Some(n),
+            } => write!(f, "Ordered:{}", n)?,
+            Mode::Ordered { num_groups: None } => f.write_str("AtMostOnce")?,
+        };
+
+        Ok(())
+    }
+}
+
+impl FromStr for Mode {
+    type Err = Report;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let sp: Vec<_> = s.split(':').collect();
+        match sp.as_slice() {
+            ["BestEffort"] | ["besteffort"] | ["be"] => Ok(Mode::BestEffort),
+            ["Ordered", g] | ["ordered", g] | ["ord", g] => {
+                let g: usize = g.parse()?;
+                Ok(Mode::Ordered {
+                    num_groups: if g == 0 { None } else { Some(g) },
+                })
+            }
+            _ => bail!("Unkown mode {:?}", s),
+        }
+    }
+}
+
+fn dump_results(
+    path: std::path::PathBuf,
+    msgs: Vec<RecvdMsg>,
+    recv_span: Duration,
+    mode: Mode,
+) -> Result<(), Report> {
+    let mut f = std::fs::File::create(path)?;
+    writeln!(
+        &mut f,
+        "mode num_msgs elapsed_us req_latency_us req_orderedness"
+    )?;
+    let num_msgs = msgs.len();
+    for (i, m) in msgs.into_iter().enumerate() {
+        let orderedness = ((i as isize) - (m.req_num as isize)).abs() as f32 / num_msgs as f32;
+        writeln!(
+            &mut f,
+            "{} {} {} {} {}",
+            mode,
+            num_msgs,
+            recv_span.as_micros(),
+            m.elapsed.as_micros(),
+            orderedness,
+        )?;
+    }
+
+    Ok(())
 }

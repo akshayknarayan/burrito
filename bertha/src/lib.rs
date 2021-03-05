@@ -188,6 +188,27 @@ pub trait ChunnelConnection {
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>>;
 }
 
+impl<T, C, D> ChunnelConnection for T
+where
+    T: std::ops::Deref<Target = C>,
+    C: ChunnelConnection<Data = D>,
+{
+    type Data = D;
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        self.deref().send(data)
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
+        self.deref().recv()
+    }
+}
+
 /// For address types to expose ip and port information for inner addresses.
 pub trait IpPort {
     fn ip(&self) -> std::net::IpAddr;

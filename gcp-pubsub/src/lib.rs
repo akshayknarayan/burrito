@@ -78,7 +78,7 @@ pub async fn default_gcloud_client() -> Result<Client, Report> {
     GcpCreds::default().from_env_vars().finish().await
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PubSubAddr {
     pub topic_id: String,
     pub group: Option<String>,

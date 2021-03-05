@@ -21,7 +21,7 @@ pub fn default_sqs_client() -> SqsClient {
     SqsClient::new(rusoto_core::Region::UsEast1)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SqsAddr {
     pub queue_id: String,
     pub group: Option<String>,
@@ -280,8 +280,6 @@ mod test {
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-    const TEST_QUEUE_URL: &'static str = "https://sqs.us-east-1.amazonaws.com/413104736560/test";
-
     #[test]
     fn sqs_ordered_groups() {
         // relies on SQS queue "test.fifo" being available.
@@ -452,6 +450,8 @@ mod test {
     #[test]
     fn sqs_send_recv() {
         // relies on SQS queue "test" being available.
+        const TEST_QUEUE_URL: &'static str =
+            "https://sqs.us-east-1.amazonaws.com/413104736560/test";
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
