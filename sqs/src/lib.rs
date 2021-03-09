@@ -17,8 +17,66 @@ use std::sync::{atomic::AtomicUsize, Arc};
 use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
 
+#[derive(Clone)]
+pub struct AwsAccess {
+    key_id: Option<String>,
+    key_secret: Option<String>,
+    region: rusoto_core::Region,
+}
+
+impl Default for AwsAccess {
+    fn default() -> Self {
+        AwsAccess {
+            key_id: None,
+            key_secret: None,
+            region: rusoto_core::Region::UsEast1,
+        }
+    }
+}
+
+impl AwsAccess {
+    pub fn key(self, id: String, secret: String) -> Self {
+        Self {
+            key_id: Some(id),
+            key_secret: Some(secret),
+            ..self
+        }
+    }
+
+    pub fn region(self, region: rusoto_core::Region) -> Self {
+        Self { region, ..self }
+    }
+
+    pub fn make_client(self) -> Result<SqsClient, Report> {
+        match self {
+            Self {
+                key_id: Some(id),
+                key_secret: Some(secret),
+                region,
+            } => {
+                let http_client = rusoto_core::request::HttpClient::new()?;
+                let rusoto_client = rusoto_core::Client::new_with(
+                    rusoto_credential::StaticProvider::new_minimal(id, secret),
+                    http_client,
+                );
+                Ok(SqsClient::new_with_client(rusoto_client, region))
+            }
+            Self {
+                key_id: None,
+                key_secret: None,
+                region,
+            } => Ok(SqsClient::new(region)),
+            _ => unreachable!(),
+        }
+    }
+}
+
 pub fn default_sqs_client() -> SqsClient {
-    SqsClient::new(rusoto_core::Region::UsEast1)
+    AwsAccess::default().make_client().unwrap()
+}
+
+pub fn sqs_client_from_creds(key_id: String, key_secret: String) -> Result<SqsClient, Report> {
+    AwsAccess::default().key(key_id, key_secret).make_client()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -46,15 +46,20 @@ struct Opt {
     #[structopt(short, long)]
     inter_request_ms: u64,
     #[structopt(short, long)]
-    gcp_key_file: Option<std::path::PathBuf>,
-    #[structopt(short, long)]
-    gcp_project_name: Option<String>,
-    #[structopt(short, long)]
-    az_account_name: Option<String>,
-    #[structopt(short, long)]
-    az_key: Option<String>,
-    #[structopt(short, long)]
     out_file: std::path::PathBuf,
+
+    #[structopt(long)]
+    gcp_key_file: Option<std::path::PathBuf>,
+    #[structopt(long)]
+    gcp_project_name: Option<String>,
+    #[structopt(long)]
+    az_account_name: Option<String>,
+    #[structopt(long)]
+    az_key: Option<String>,
+    #[structopt(long)]
+    aws_access_key_id: Option<String>,
+    #[structopt(long)]
+    aws_secret_access_key: Option<String>,
 }
 
 #[tokio::main]
@@ -131,7 +136,15 @@ async fn do_exp(opt: &Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
         Mode::BestEffort => {
             match opt.queue {
                 QueueAddr::Aws(ref a) => {
-                    let sqs_client = sqs::default_sqs_client(); // us-east-1
+                    let sqs_client = if opt.aws_access_key_id.is_some() {
+                        sqs::sqs_client_from_creds(
+                            opt.aws_access_key_id.clone().unwrap(),
+                            opt.aws_secret_access_key.clone().unwrap(),
+                        )?
+                    } else {
+                        sqs::default_sqs_client() // us-east-1
+                    };
+
                     let cn = SqsChunnel::new(sqs_client, once(a.as_str()));
                     do_best_effort_exp(
                         cn,
@@ -332,7 +345,9 @@ async fn send_reqs(
             })
             .await?;
         curr_group = (curr_group + 1) % send_chunnels.len();
-        tokio::time::sleep(inter_request).await;
+        if inter_request.as_nanos() > 0 {
+            tokio::time::sleep(inter_request).await;
+        }
     }
 
     debug!("finished sends");
