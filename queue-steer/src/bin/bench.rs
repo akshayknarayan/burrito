@@ -72,10 +72,11 @@ async fn main() -> Result<(), Report> {
         .with(ErrorLayer::default());
     let d = tracing::Dispatch::new(subscriber);
     d.init();
-    let opt = Opt::from_args();
+    let mut opt = Opt::from_args();
+
     info!(?opt, "starting");
 
-    let (msgs, elapsed) = do_exp(&opt).await?;
+    let (msgs, elapsed) = do_exp(&mut opt).await?;
 
     let order: Vec<_> = msgs.iter().map(|m| m.req_num).collect();
     let orderedness_val = orderedness(&order);
@@ -112,7 +113,7 @@ async fn main() -> Result<(), Report> {
     Ok(())
 }
 
-async fn do_exp(opt: &Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
+async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
     let get_az_client = |opt: &Opt| match opt {
         Opt {
             az_account_name: Some(name),
@@ -154,10 +155,22 @@ async fn do_exp(opt: &Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
         }
     };
 
+    let o = opt.clone();
     Ok(match opt.mode {
         Mode::BestEffort => match opt.queue {
-            QueueAddr::Aws(ref a) => {
-                let sqs_client = get_aws_client(&opt)?;
+            QueueAddr::Aws(ref mut a) => {
+                let sqs_client = get_aws_client(&o)?;
+                if a == "gen" {
+                    use rand::Rng;
+                    let rng = rand::thread_rng();
+                    let name = "bertha-"
+                        .chars()
+                        .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
+                        .collect();
+                    debug!(?name, "making aws best-effort queue");
+                    *a = sqs::make_be_queue(&sqs_client, name).await?;
+                }
+
                 let cn = SqsChunnel::new(sqs_client, once(a.as_str()));
                 do_best_effort_exp(
                     cn,
@@ -196,8 +209,20 @@ async fn do_exp(opt: &Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             // offloaded impls
             match opt.queue {
                 QueueAddr::Azure(_) => unimplemented!("no offloaded azure ordering implementaion"),
-                QueueAddr::Aws(ref a) => {
-                    let sqs_client = get_aws_client(&opt)?;
+                QueueAddr::Aws(ref mut a) => {
+                    let sqs_client = get_aws_client(&o)?;
+                    if a == "gen" {
+                        use rand::Rng;
+                        let rng = rand::thread_rng();
+                        let name = "bertha-"
+                            .chars()
+                            .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
+                            .chain(".fifo".chars())
+                            .collect();
+                        debug!(?name, "making aws fifo queue");
+                        *a = sqs::make_fifo_queue(&sqs_client, name).await?;
+                    }
+
                     let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
                     do_ordered_groups_exp(
                         ch,
@@ -229,41 +254,49 @@ async fn do_exp(opt: &Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             }
         }
         // at-most-once mode.
-        Mode::Ordered { num_groups: None } => {
-            match opt.queue {
-                QueueAddr::Azure(_) => unimplemented!("no offloaded azure ordering implementaion"),
-                QueueAddr::Aws(ref a) => {
-                    let sqs_client = sqs::default_sqs_client(); // us-east-1
-                    let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
-                    do_ordered_groups_exp(
-                        ch,
-                        SqsAddr {
-                            queue_id: a.to_owned(),
-                            group: None,
-                        },
-                        opt.num_reqs,
-                        n,
-                        opt.inter_request_ms,
-                    )
-                    .await?
+        Mode::Ordered { num_groups: None } => match opt.queue {
+            QueueAddr::Azure(_) => unimplemented!("no offloaded azure ordering implementaion"),
+            QueueAddr::Aws(ref mut a) => {
+                let sqs_client = get_aws_client(&o)?;
+                if a == "gen" {
+                    use rand::Rng;
+                    let rng = rand::thread_rng();
+                    let name = "bertha-"
+                        .chars()
+                        .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
+                        .chain(".fifo".chars())
+                        .collect();
+                    debug!(?name, "making aws fifo queue");
+                    *a = sqs::make_fifo_queue(&sqs_client, name).await?;
                 }
-                QueueAddr::Gcp(ref a) => {
-                    let gcp_client = get_gcp_client(&opt).await?;
-                    let ch = OrderedPubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                    do_ordered_groups_exp(
-                        ch,
-                        PubSubAddr {
-                            topic_id: a.to_string(),
-                            group: None,
-                        },
-                        opt.num_reqs,
-                        n,
-                        opt.inter_request_ms,
-                    )
-                    .await?
-                }
+
+                let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
+                do_atmostonce_exp(
+                    ch,
+                    SqsAddr {
+                        queue_id: a.to_owned(),
+                        group: None,
+                    },
+                    opt.num_reqs,
+                    opt.inter_request_ms,
+                )
+                .await?
             }
-        }
+            QueueAddr::Gcp(ref a) => {
+                let gcp_client = get_gcp_client(&opt).await?;
+                let ch = OrderedPubSubChunnel::new(gcp_client, once(a.as_str())).await?;
+                do_atmostonce_exp(
+                    ch,
+                    PubSubAddr {
+                        topic_id: a.to_string(),
+                        group: None,
+                    },
+                    opt.num_reqs,
+                    opt.inter_request_ms,
+                )
+                .await?
+            }
+        },
     })
 }
 
@@ -277,16 +310,18 @@ async fn do_atmostonce_exp<A>(
 where
     A: Clone + queue_steer::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
 {
+    let inter_request = Duration::from_millis(inter_request_ms);
     let cn = Arc::new(cn);
-    let recv_cn = make_conn(cn).await?;
+    let recv_cn = make_conn(Arc::clone(&cn)).await?;
+    let cn = make_conn(cn).await?;
+
     let start = std::time::Instant::now();
     let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, once(recv_cn)));
 
     // our local version of send_reqs, which uses a unique ordering key
     debug!("starting sends");
-    let mut curr_group: usize = 0;
     for req_num in 0..num_reqs {
-        trace!(?curr_group, ?req_num, "sending request");
+        trace!(?req_num, "sending request");
         let mut addr = addr.clone();
         addr.set_group(req_num.to_string());
         cn.send((
