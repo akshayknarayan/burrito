@@ -229,8 +229,84 @@ async fn do_exp(opt: &Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             }
         }
         // at-most-once mode.
-        Mode::Ordered { num_groups: None } => unimplemented!(),
+        Mode::Ordered { num_groups: None } => {
+            match opt.queue {
+                QueueAddr::Azure(_) => unimplemented!("no offloaded azure ordering implementaion"),
+                QueueAddr::Aws(ref a) => {
+                    let sqs_client = sqs::default_sqs_client(); // us-east-1
+                    let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
+                    do_ordered_groups_exp(
+                        ch,
+                        SqsAddr {
+                            queue_id: a.to_owned(),
+                            group: None,
+                        },
+                        opt.num_reqs,
+                        n,
+                        opt.inter_request_ms,
+                    )
+                    .await?
+                }
+                QueueAddr::Gcp(ref a) => {
+                    let gcp_client = get_gcp_client(&opt).await?;
+                    let ch = OrderedPubSubChunnel::new(gcp_client, once(a.as_str())).await?;
+                    do_ordered_groups_exp(
+                        ch,
+                        PubSubAddr {
+                            topic_id: a.to_string(),
+                            group: None,
+                        },
+                        opt.num_reqs,
+                        n,
+                        opt.inter_request_ms,
+                    )
+                    .await?
+                }
+            }
+        }
     })
+}
+
+#[instrument(skip(cn, addr))]
+async fn do_atmostonce_exp<A>(
+    cn: impl ChunnelConnection<Data = (A, String)> + Send + Sync + 'static,
+    addr: A,
+    num_reqs: usize,
+    inter_request_ms: u64,
+) -> Result<(Vec<RecvdMsg>, Duration), Report>
+where
+    A: Clone + queue_steer::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
+{
+    let cn = Arc::new(cn);
+    let recv_cn = make_conn(cn).await?;
+    let start = std::time::Instant::now();
+    let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, once(recv_cn)));
+
+    // our local version of send_reqs, which uses a unique ordering key
+    debug!("starting sends");
+    let mut curr_group: usize = 0;
+    for req_num in 0..num_reqs {
+        trace!(?curr_group, ?req_num, "sending request");
+        let mut addr = addr.clone();
+        addr.set_group(req_num.to_string());
+        cn.send((
+            addr,
+            Msg {
+                send_time: start.elapsed(),
+                req_num,
+            },
+        ))
+        .await?;
+        if inter_request.as_nanos() > 0 {
+            tokio::time::sleep(inter_request).await;
+        }
+    }
+
+    debug!("finished sends");
+
+    let (msgs, elapsed) = receive_handle.await??;
+    let msgs = msgs.into_iter().map(|(_, m)| m).collect();
+    Ok((msgs, elapsed))
 }
 
 #[instrument(skip(cn, addr))]
