@@ -101,7 +101,14 @@ async fn main() -> Result<(), Report> {
         "done",
     );
 
-    dump_results(opt.out_file, msgs, elapsed, opt.mode)?;
+    dump_results(
+        opt.out_file,
+        msgs,
+        elapsed,
+        opt.mode,
+        opt.inter_request_ms,
+        &opt.queue,
+    )?;
     Ok(())
 }
 
@@ -132,53 +139,57 @@ async fn do_exp(opt: &Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
         Opt { .. } => gcp_pubsub::GcpCreds::default().from_env_vars().finish(),
     };
 
-    Ok(match opt.mode {
-        Mode::BestEffort => {
-            match opt.queue {
-                QueueAddr::Aws(ref a) => {
-                    let sqs_client = if opt.aws_access_key_id.is_some() {
-                        sqs::sqs_client_from_creds(
-                            opt.aws_access_key_id.clone().unwrap(),
-                            opt.aws_secret_access_key.clone().unwrap(),
-                        )?
-                    } else {
-                        sqs::default_sqs_client() // us-east-1
-                    };
-
-                    let cn = SqsChunnel::new(sqs_client, once(a.as_str()));
-                    do_best_effort_exp(
-                        cn,
-                        SqsAddr {
-                            queue_id: a.to_owned(),
-                            group: None,
-                        },
-                        opt.num_reqs,
-                        opt.inter_request_ms,
-                    )
-                    .await?
-                }
-                QueueAddr::Azure(ref a) => {
-                    let az_client = get_az_client(&opt)?;
-                    let cn = AzStorageQueueChunnel::new(az_client, once(a.as_str()));
-                    do_best_effort_exp(cn, a.to_string(), opt.num_reqs, opt.inter_request_ms)
-                        .await?
-                }
-                QueueAddr::Gcp(ref a) => {
-                    let gcp_client = get_gcp_client(&opt).await?;
-                    let cn = PubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                    do_best_effort_exp(
-                        cn,
-                        PubSubAddr {
-                            topic_id: a.to_string(),
-                            group: None,
-                        },
-                        opt.num_reqs,
-                        opt.inter_request_ms,
-                    )
-                    .await?
-                }
-            }
+    let get_aws_client = |opt: &Opt| match opt {
+        Opt {
+            aws_access_key_id: Some(key_id),
+            aws_secret_access_key: Some(secret),
+            ..
+        } => {
+            debug!("Using provided AWS credentials");
+            sqs::sqs_client_from_creds(key_id.clone(), secret.clone())
         }
+        Opt { .. } => {
+            debug!("Using default AWS credentials");
+            Ok(sqs::default_sqs_client()) // us-east-1
+        }
+    };
+
+    Ok(match opt.mode {
+        Mode::BestEffort => match opt.queue {
+            QueueAddr::Aws(ref a) => {
+                let sqs_client = get_aws_client(&opt)?;
+                let cn = SqsChunnel::new(sqs_client, once(a.as_str()));
+                do_best_effort_exp(
+                    cn,
+                    SqsAddr {
+                        queue_id: a.to_owned(),
+                        group: None,
+                    },
+                    opt.num_reqs,
+                    opt.inter_request_ms,
+                )
+                .await?
+            }
+            QueueAddr::Azure(ref a) => {
+                let az_client = get_az_client(&opt)?;
+                let cn = AzStorageQueueChunnel::new(az_client, once(a.as_str()));
+                do_best_effort_exp(cn, a.to_string(), opt.num_reqs, opt.inter_request_ms).await?
+            }
+            QueueAddr::Gcp(ref a) => {
+                let gcp_client = get_gcp_client(&opt).await?;
+                let cn = PubSubChunnel::new(gcp_client, once(a.as_str())).await?;
+                do_best_effort_exp(
+                    cn,
+                    PubSubAddr {
+                        topic_id: a.to_string(),
+                        group: None,
+                    },
+                    opt.num_reqs,
+                    opt.inter_request_ms,
+                )
+                .await?
+            }
+        },
         Mode::Ordered {
             num_groups: Some(n), // n == 1: total ordering
         } => {
@@ -186,7 +197,7 @@ async fn do_exp(opt: &Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             match opt.queue {
                 QueueAddr::Azure(_) => unimplemented!("no offloaded azure ordering implementaion"),
                 QueueAddr::Aws(ref a) => {
-                    let sqs_client = sqs::default_sqs_client(); // us-east-1
+                    let sqs_client = get_aws_client(&opt)?;
                     let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
                     do_ordered_groups_exp(
                         ch,
@@ -475,19 +486,23 @@ fn dump_results(
     msgs: Vec<RecvdMsg>,
     recv_span: Duration,
     mode: Mode,
+    inter_request_ms: u64,
+    queue_addr: &QueueAddr,
 ) -> Result<(), Report> {
     let mut f = std::fs::File::create(path)?;
     writeln!(
         &mut f,
-        "mode num_msgs elapsed_us req_latency_us req_orderedness"
+        "mode provider inter_request_ms num_msgs elapsed_us req_latency_us req_orderedness"
     )?;
     let num_msgs = msgs.len();
     for (i, m) in msgs.into_iter().enumerate() {
         let orderedness = ((i as isize) - (m.req_num as isize)).abs() as f32 / num_msgs as f32;
         writeln!(
             &mut f,
-            "{} {} {} {} {}",
+            "{} {} {} {} {} {} {}",
             mode,
+            queue_addr.provider(),
+            inter_request_ms,
             num_msgs,
             recv_span.as_micros(),
             m.elapsed.as_micros(),

@@ -25,6 +25,16 @@ impl std::str::FromStr for QueueAddr {
     }
 }
 
+impl QueueAddr {
+    pub fn provider(&self) -> &str {
+        match self {
+            QueueAddr::Aws(_) => "aws",
+            QueueAddr::Azure(_) => "azure",
+            QueueAddr::Gcp(_) => "gcp",
+        }
+    }
+}
+
 pub trait SetGroup {
     fn set_group(&mut self, group: String);
 }
