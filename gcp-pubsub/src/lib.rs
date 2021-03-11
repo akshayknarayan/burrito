@@ -78,6 +78,24 @@ pub async fn default_gcloud_client() -> Result<Client, Report> {
     GcpCreds::default().from_env_vars().finish().await
 }
 
+pub async fn make_topic(client: &mut Client, name: String) -> Result<String, Report> {
+    Ok(client
+        .create_topic(&name, Default::default())
+        .await?
+        .id()
+        .to_owned())
+}
+
+pub async fn delete_topic(client: &mut Client, name: String) -> Result<(), Report> {
+    client
+        .topic(&name)
+        .await?
+        .ok_or_else(|| eyre!("Topic not found"))?
+        .delete()
+        .await
+        .map_err(Into::into)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PubSubAddr {
     pub topic_id: String,

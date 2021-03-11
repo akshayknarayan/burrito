@@ -79,6 +79,40 @@ pub fn sqs_client_from_creds(key_id: String, key_secret: String) -> Result<SqsCl
     AwsAccess::default().key(key_id, key_secret).make_client()
 }
 
+pub async fn make_fifo_queue(client: &SqsClient, name: String) -> Result<String, Report> {
+    ensure!(name.ends_with(".fifo"), "Fifo queue name must end in .fifo");
+
+    let rusoto_sqs::CreateQueueResult { queue_url } = client
+        .create_queue(rusoto_sqs::CreateQueueRequest {
+            queue_name: name,
+            attributes: Some(
+                std::iter::once(("FifoQueue".to_owned(), "true".to_owned())).collect(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .wrap_err("create_queue errored")?;
+    queue_url.ok_or_else(|| eyre!("No queue URL returned"))
+}
+
+pub async fn make_be_queue(client: &SqsClient, name: String) -> Result<String, Report> {
+    let rusoto_sqs::CreateQueueResult { queue_url } = client
+        .create_queue(rusoto_sqs::CreateQueueRequest {
+            queue_name: name,
+            ..Default::default()
+        })
+        .await
+        .wrap_err("create_queue errored")?;
+    queue_url.ok_or_else(|| eyre!("No queue URL returned"))
+}
+
+pub async fn delete_queue(client: &SqsClient, name: String) -> Result<(), Report> {
+    client
+        .delete_queue(rusoto_sqs::DeleteQueueRequest { queue_url: name })
+        .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SqsAddr {
     pub queue_id: String,

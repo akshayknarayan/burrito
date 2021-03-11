@@ -159,6 +159,7 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
     Ok(match opt.mode {
         Mode::BestEffort => match opt.queue {
             QueueAddr::Aws(ref mut a) => {
+                let mut delete_queue = false;
                 let sqs_client = get_aws_client(&o)?;
                 if a == "gen" {
                     use rand::Rng;
@@ -169,10 +170,11 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                         .collect();
                     debug!(?name, "making aws best-effort queue");
                     *a = sqs::make_be_queue(&sqs_client, name).await?;
+                    delete_queue = true;
                 }
 
                 let cn = SqsChunnel::new(sqs_client, once(a.as_str()));
-                do_best_effort_exp(
+                let r = do_best_effort_exp(
                     cn,
                     SqsAddr {
                         queue_id: a.to_owned(),
@@ -181,17 +183,35 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                     opt.num_reqs,
                     opt.inter_request_ms,
                 )
-                .await?
+                .await;
+                if delete_queue {
+                    let sqs_client = get_aws_client(&o)?;
+                    sqs::delete_queue(&sqs_client, a.clone()).await?;
+                }
+                r?
             }
             QueueAddr::Azure(ref a) => {
                 let az_client = get_az_client(&opt)?;
                 let cn = AzStorageQueueChunnel::new(az_client, once(a.as_str()));
                 do_best_effort_exp(cn, a.to_string(), opt.num_reqs, opt.inter_request_ms).await?
             }
-            QueueAddr::Gcp(ref a) => {
-                let gcp_client = get_gcp_client(&opt).await?;
+            QueueAddr::Gcp(ref mut a) => {
+                let mut delete_queue = false;
+                let mut gcp_client = get_gcp_client(&o).await?;
+                if a == "gen" {
+                    use rand::Rng;
+                    let rng = rand::thread_rng();
+                    let name = "bertha-"
+                        .chars()
+                        .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
+                        .collect();
+                    debug!(?name, "making gcp best-effort queue");
+                    *a = gcp_pubsub::make_topic(&mut gcp_client, name).await?;
+                    delete_queue = true;
+                }
+
                 let cn = PubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                do_best_effort_exp(
+                let r = do_best_effort_exp(
                     cn,
                     PubSubAddr {
                         topic_id: a.to_string(),
@@ -200,7 +220,12 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                     opt.num_reqs,
                     opt.inter_request_ms,
                 )
-                .await?
+                .await;
+                if delete_queue {
+                    let mut gcp_client = get_gcp_client(&o).await?;
+                    gcp_pubsub::delete_topic(&mut gcp_client, a.clone()).await?;
+                }
+                r?
             }
         },
         Mode::Ordered {
@@ -210,6 +235,7 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             match opt.queue {
                 QueueAddr::Azure(_) => unimplemented!("no offloaded azure ordering implementaion"),
                 QueueAddr::Aws(ref mut a) => {
+                    let mut delete_queue = false;
                     let sqs_client = get_aws_client(&o)?;
                     if a == "gen" {
                         use rand::Rng;
@@ -221,10 +247,11 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                             .collect();
                         debug!(?name, "making aws fifo queue");
                         *a = sqs::make_fifo_queue(&sqs_client, name).await?;
+                        delete_queue = true;
                     }
 
                     let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
-                    do_ordered_groups_exp(
+                    let r = do_ordered_groups_exp(
                         ch,
                         SqsAddr {
                             queue_id: a.to_owned(),
@@ -234,12 +261,29 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                         n,
                         opt.inter_request_ms,
                     )
-                    .await?
+                    .await;
+                    if delete_queue {
+                        let sqs_client = get_aws_client(&o)?;
+                        sqs::delete_queue(&sqs_client, a.clone()).await?;
+                    }
+                    r?
                 }
-                QueueAddr::Gcp(ref a) => {
-                    let gcp_client = get_gcp_client(&opt).await?;
+                QueueAddr::Gcp(ref mut a) => {
+                    let mut delete_queue = false;
+                    let mut gcp_client = get_gcp_client(&o).await?;
+                    if a == "gen" {
+                        use rand::Rng;
+                        let rng = rand::thread_rng();
+                        let name = "bertha-"
+                            .chars()
+                            .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
+                            .collect();
+                        debug!(?name, "making gcp ordered queue");
+                        *a = gcp_pubsub::make_topic(&mut gcp_client, name).await?;
+                        delete_queue = true;
+                    }
                     let ch = OrderedPubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                    do_ordered_groups_exp(
+                    let r = do_ordered_groups_exp(
                         ch,
                         PubSubAddr {
                             topic_id: a.to_string(),
@@ -249,7 +293,12 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                         n,
                         opt.inter_request_ms,
                     )
-                    .await?
+                    .await;
+                    if delete_queue {
+                        let mut gcp_client = get_gcp_client(&o).await?;
+                        gcp_pubsub::delete_topic(&mut gcp_client, a.clone()).await?;
+                    }
+                    r?
                 }
             }
         }
@@ -257,6 +306,7 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
         Mode::Ordered { num_groups: None } => match opt.queue {
             QueueAddr::Azure(_) => unimplemented!("no offloaded azure ordering implementaion"),
             QueueAddr::Aws(ref mut a) => {
+                let mut delete_queue = false;
                 let sqs_client = get_aws_client(&o)?;
                 if a == "gen" {
                     use rand::Rng;
@@ -268,10 +318,11 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                         .collect();
                     debug!(?name, "making aws fifo queue");
                     *a = sqs::make_fifo_queue(&sqs_client, name).await?;
+                    delete_queue = true;
                 }
 
                 let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
-                do_atmostonce_exp(
+                let r = do_atmostonce_exp(
                     ch,
                     SqsAddr {
                         queue_id: a.to_owned(),
@@ -280,12 +331,29 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                     opt.num_reqs,
                     opt.inter_request_ms,
                 )
-                .await?
+                .await;
+                if delete_queue {
+                    let sqs_client = get_aws_client(&o)?;
+                    sqs::delete_queue(&sqs_client, a.clone()).await?;
+                }
+                r?
             }
-            QueueAddr::Gcp(ref a) => {
-                let gcp_client = get_gcp_client(&opt).await?;
+            QueueAddr::Gcp(ref mut a) => {
+                let mut delete_queue = false;
+                let mut gcp_client = get_gcp_client(&o).await?;
+                if a == "gen" {
+                    use rand::Rng;
+                    let rng = rand::thread_rng();
+                    let name = "bertha-"
+                        .chars()
+                        .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
+                        .collect();
+                    debug!(?name, "making gcp ordered queue");
+                    *a = gcp_pubsub::make_topic(&mut gcp_client, name).await?;
+                    delete_queue = true;
+                }
                 let ch = OrderedPubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                do_atmostonce_exp(
+                let r = do_atmostonce_exp(
                     ch,
                     PubSubAddr {
                         topic_id: a.to_string(),
@@ -294,7 +362,12 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                     opt.num_reqs,
                     opt.inter_request_ms,
                 )
-                .await?
+                .await;
+                if delete_queue {
+                    let mut gcp_client = get_gcp_client(&o).await?;
+                    gcp_pubsub::delete_topic(&mut gcp_client, a.clone()).await?;
+                }
+                r?
             }
         },
     })
