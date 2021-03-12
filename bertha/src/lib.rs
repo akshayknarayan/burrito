@@ -9,6 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod and_then_concurrent;
+pub mod atmostonce;
 pub mod bincode;
 pub mod chan_transport;
 pub mod either;
