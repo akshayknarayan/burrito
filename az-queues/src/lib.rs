@@ -86,7 +86,7 @@ pub fn default_azure_storage_client() -> Result<Arc<StorageAccountClient>, Repor
     AzureAccountBuilder::default().from_env_vars().finish()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AzStorageQueueChunnel {
     az_client: Arc<StorageClient>,
     queues: Vec<String>,
@@ -161,7 +161,7 @@ impl ChunnelConnection for AzStorageQueueChunnel {
                         msg.len() == 1,
                         "Asked for only 1 message in GetMessagesRequest"
                     );
-                    break ((cl, msg.pop().unwrap()));
+                    break (cl, msg.pop().unwrap());
                 } else {
                     futs = leftover_futs;
                 }
@@ -219,7 +219,7 @@ mod test {
                     account_name,
                     account_key,
                 );
-                const TEST_QUEUE_URL: &'static str =
+                const TEST_QUEUE_URL: &str =
                     "https://berthaproject.queue.core.windows.net/test-queue";
                 let ch = AzStorageQueueChunnel::new(az_client, vec![TEST_QUEUE_URL]);
 

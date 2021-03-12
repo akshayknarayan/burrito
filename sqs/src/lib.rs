@@ -128,7 +128,7 @@ impl From<(String, String)> for SqsAddr {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OrderedSqsChunnel {
     inner: SqsChunnel,
     send_ctr: Arc<AtomicUsize>,
@@ -215,6 +215,14 @@ impl ChunnelConnection for OrderedSqsChunnel {
 pub struct SqsChunnel {
     sqs_client: SqsClient,
     recv_queue_urls: Vec<String>,
+}
+
+impl std::fmt::Debug for SqsChunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqsChunnel")
+            .field("recv_queue_urls", &self.recv_queue_urls)
+            .finish()
+    }
 }
 
 impl SqsChunnel {

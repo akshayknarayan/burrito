@@ -28,7 +28,7 @@ impl Default for GcpCreds {
 
 impl GcpCreds {
     /// Reads the environment variables `GOOGLE_APPLICATION_CREDENTIALS` and `GCP_PROJECT_NAME`.
-    pub fn from_env_vars(self) -> Self {
+    pub fn with_env_vars(self) -> Self {
         self.creds_path_env().project_name_env()
     }
 
@@ -75,7 +75,7 @@ impl GcpCreds {
 ///
 /// Requires the environment variables `GCP_PROJECT_NAME` and `GOOGLE_APPLICATION_CREDENTIALS` to be set.
 pub async fn default_gcloud_client() -> Result<Client, Report> {
-    GcpCreds::default().from_env_vars().finish().await
+    GcpCreds::default().with_env_vars().finish().await
 }
 
 pub async fn make_topic(client: &mut Client, name: String) -> Result<String, Report> {
@@ -111,7 +111,7 @@ impl From<(String, String)> for PubSubAddr {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OrderedPubSubChunnel {
     inner: PubSubChunnel,
 }
@@ -179,6 +179,12 @@ impl ChunnelConnection for OrderedPubSubChunnel {
 pub struct PubSubChunnel {
     ps_client: Client,
     subscriptions: HashMap<String, Subscription>,
+}
+
+impl std::fmt::Debug for PubSubChunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PubSubChunnel").finish()
+    }
 }
 
 impl PubSubChunnel {
@@ -340,7 +346,7 @@ mod test {
                 let project_name =
                     std::env::var("GCLOUD_PROJECT_NAME").wrap_err("GCLOUD_PROJECT_NAME env var")?;
                 // this test assumes "my-topic" already exists.
-                const TEST_TOPIC_URL: &'static str = "my-topic1";
+                const TEST_TOPIC_URL: &str = "my-topic1";
                 let gcloud_client = Client::new(project_name.clone())
                     .await
                     .wrap_err("make client")?;
@@ -354,12 +360,12 @@ mod test {
                     .await
                     .wrap_err("making chunnel")?;
 
-                const GROUP_A: &'static str = "A";
-                const A1: &'static str = "message A1";
-                const A2: &'static str = "message A2";
-                const GROUP_B: &'static str = "B";
-                const B1: &'static str = "message B1";
-                const B2: &'static str = "message B2";
+                const GROUP_A: &str = "A";
+                const A1: &str = "message A1";
+                const A2: &str = "message A2";
+                const GROUP_B: &str = "B";
+                const B1: &str = "message B1";
+                const B2: &str = "message B2";
 
                 let addr_a: PubSubAddr = (TEST_TOPIC_URL.to_string(), GROUP_A.to_string()).into();
                 let addr_b: PubSubAddr = (TEST_TOPIC_URL.to_string(), GROUP_B.to_string()).into();
@@ -436,7 +442,7 @@ mod test {
                     std::env::var("GCLOUD_PROJECT_NAME").wrap_err("GCLOUD_PROJECT_NAME env var")?;
                 let gcloud_client = Client::new(project_name).await.wrap_err("make client")?;
                 // this test assumes "my-topic" already exists.
-                const TEST_TOPIC_URL: &'static str = "my-topic";
+                const TEST_TOPIC_URL: &str = "my-topic";
                 let mut ch = PubSubChunnel::new(gcloud_client, vec![TEST_TOPIC_URL])
                     .await
                     .wrap_err("making chunnel")?;
