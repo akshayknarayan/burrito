@@ -8,12 +8,25 @@ use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::{debug, debug_span, trace};
+use tracing_futures::Instrument;
 
 /// At Most Once Delivery semantics with no other assumptions.
+///
+/// [`crate::tagger::OrderedChunnelProj`] will already provide at-most-once semantics, but this
+/// implementation relaxes the ordering requirement.
 #[derive(Debug, Clone)]
 pub struct AtMostOnceChunnel {
     /// Time horizon to remember old messages for
     pub sunset: std::time::Duration,
+}
+
+impl Default for AtMostOnceChunnel {
+    fn default() -> Self {
+        Self {
+            sunset: std::time::Duration::from_secs(600),
+        }
+    }
 }
 
 impl<InC, A, D> Chunnel<InC> for AtMostOnceChunnel
@@ -71,15 +84,18 @@ where
         let delivered_msgs = Arc::clone(&self.delivered_msgs);
         let inner = Arc::clone(&self.inner);
         let sunset = self.sunset;
-        Box::pin(async move {
-            loop {
-                let (addr, (seq, data)) = inner.recv().await?;
-                let mut ent = delivered_msgs.entry(addr.clone()).or_default();
-                if ent.is_new(seq, sunset) {
-                    return Ok((addr, data));
+        Box::pin(
+            async move {
+                loop {
+                    let (addr, (seq, data)) = inner.recv().await?;
+                    let mut ent = delivered_msgs.entry(addr.clone()).or_default();
+                    if ent.is_new(seq, sunset) {
+                        return Ok((addr, data));
+                    }
                 }
             }
-        })
+            .instrument(debug_span!("at-most-once:recv")),
+        )
     }
 }
 
@@ -105,6 +121,7 @@ impl RecvState {
                 // do the update.
                 let cutoff = std::time::Instant::now() - sunset;
                 let new_deliver_times = self.deliver_times.split_off(&cutoff);
+                debug!(pruned_msgs = ?&self.deliver_times.len(), "forget old msgs");
                 self.delivered = new_deliver_times.values().copied().collect();
                 self.deliver_times = new_deliver_times;
                 self.last_update = Some(std::time::Instant::now());
@@ -119,6 +136,7 @@ impl RecvState {
             self.delivered.insert(seq);
             true
         } else {
+            trace!(?seq, "discarding repeat msg");
             false
         };
 
@@ -129,16 +147,17 @@ impl RecvState {
 
 #[cfg(test)]
 mod test {
+    use super::AtMostOnceChunnel;
     use crate::test::Serve;
     use crate::{
-        bincode::SerializeChunnel, chan_transport::Chan, reliable::ReliabilityChunnel, Chunnel,
-        ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
+        bincode::SerializeChunnel, chan_transport::Chan, Chunnel, ChunnelConnection,
+        ChunnelConnector, ChunnelListener, CxList,
     };
     use color_eyre::Report;
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use tracing::{debug, info, info_span};
+    use tracing::{debug, info, info_span, instrument};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -173,7 +192,7 @@ mod test {
 
                 let (mut srv, mut cln) = t.split();
                 let mut l =
-                    CxList::from(ReliabilityChunnel::default()).wrap(SerializeChunnel::default());
+                    CxList::from(AtMostOnceChunnel::default()).wrap(SerializeChunnel::default());
 
                 let rcv_st = srv.listen(()).await.unwrap();
                 let mut rcv_st = l.serve(rcv_st).await.unwrap();
@@ -190,31 +209,44 @@ mod test {
         .unwrap();
     }
 
+    #[instrument(skip(snd_ch, rcv_ch, msgs))]
     async fn do_transmit(
         snd_ch: impl ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
         rcv_ch: impl ChunnelConnection<Data = (u32, Vec<u8>)> + Send + Sync + 'static,
         msgs: Vec<(u32, Vec<u8>)>,
     ) {
-        // recv side
+        let num_msgs = msgs.len();
         tokio::spawn(
             async move {
-                info!("starting receiver");
-                loop {
-                    let m = rcv_ch.recv().await.unwrap();
-                    debug!(m = ?m, "rcvd");
-                }
+                futures_util::future::join_all(msgs.into_iter().map(|m| {
+                    debug!(m = ?m, "sending");
+                    snd_ch.send(m)
+                }))
+                .await
+                .into_iter()
+                .collect::<Result<(), _>>()
+                .unwrap();
             }
-            .instrument(tracing::debug_span!("receiver")),
+            .instrument(info_span!("sender")),
         );
 
-        futures_util::future::join_all(msgs.into_iter().map(|m| {
-            debug!(m = ?m, "sending");
-            snd_ch.send(m)
-        }))
-        .await
-        .into_iter()
-        .collect::<Result<(), _>>()
-        .unwrap();
+        info!("starting receiver");
+        let mut cnt = 0;
+        loop {
+            let m = rcv_ch.recv().await.unwrap();
+            debug!(m = ?m, "rcvd");
+            cnt += 1;
+
+            if cnt == num_msgs {
+                break;
+            }
+        }
+
+        // check for no duplicates
+        match tokio::time::timeout(std::time::Duration::from_millis(100), rcv_ch.recv()).await {
+            Ok(Err(_)) | Err(_) => (),
+            _ => panic!("unexpected recv"),
+        }
 
         info!("done");
     }

@@ -628,4 +628,52 @@ mod test {
         )
         .unwrap();
     }
+
+    #[test]
+    fn delivery() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.try_init().unwrap_or(());
+        color_eyre::install().unwrap_or(());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        use std::sync::{Arc, Mutex};
+
+        rt.block_on(
+            async move {
+                let mut t = Chan::default();
+                // duplicate each packet once
+                let saved: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+                t.link_conditions(move |x: Option<Vec<u8>>| match x {
+                    Some(p) => {
+                        *saved.lock().unwrap() = Some(p.clone());
+                        Some(p)
+                    }
+                    None => saved.lock().unwrap().take(),
+                });
+
+                let (mut srv, mut cln) = t.split();
+
+                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
+
+                let rcv_st = srv.listen(()).await?;
+                let mut rcv_st = stack.serve(rcv_st).await?;
+                let rcv = rcv_st.next().await.unwrap().unwrap();
+
+                let cln = cln.connect(()).await?;
+                let snd = stack.connect_wrap(cln).await?;
+
+                do_transmit(snd, rcv).await;
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::info_span!("delivery")),
+        )
+        .unwrap();
+    }
 }
