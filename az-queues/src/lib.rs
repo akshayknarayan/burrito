@@ -3,7 +3,8 @@
 //!
 //! Chunnel data type = (String, String) -> (queue URL, msg_string)
 
-use azure_storage::clients::{AsStorageClient, StorageAccountClient, StorageClient};
+pub use azure_storage::clients::AsStorageClient;
+use azure_storage::clients::{StorageAccountClient, StorageClient};
 use azure_storage::queue::{
     responses::{GetMessagesResponse, PutMessageResponse},
     AsPopReceiptClient, AsQueueClient,
@@ -65,7 +66,7 @@ impl AzureAccountBuilder {
         }
     }
 
-    pub fn from_env_vars(self) -> Self {
+    pub fn with_env_vars(self) -> Self {
         self.name_env_var().key_env_var()
     }
 
@@ -83,7 +84,27 @@ impl AzureAccountBuilder {
 /// Requires environment variables `AZ_STORAGE_ACCOUNT_NAME` and `AZ_STORAGE_ACCOUNT_KEY` to be set.
 /// For fancy config, call [`StorageAccountClient::new`], etc, yourself.
 pub fn default_azure_storage_client() -> Result<Arc<StorageAccountClient>, Report> {
-    AzureAccountBuilder::default().from_env_vars().finish()
+    AzureAccountBuilder::default().with_env_vars().finish()
+}
+
+pub async fn make_queue(client: &Arc<StorageClient>, name: String) -> Result<(), Report> {
+    let client = client.as_queue_client(name);
+    client
+        .create()
+        .execute()
+        .await
+        .map_err(|e| eyre!("Error making azure queue: {:?}", e))?;
+    Ok(())
+}
+
+pub async fn delete_queue(client: &Arc<StorageClient>, name: String) -> Result<(), Report> {
+    let client = client.as_queue_client(name);
+    client
+        .delete()
+        .execute()
+        .await
+        .map_err(|e| eyre!("Error making azure queue: {:?}", e))?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
