@@ -137,7 +137,7 @@ where
 /// It returns data segments in the order they were sent.
 #[derive(Clone, Debug)]
 pub struct OrderedChunnelProj {
-    hole_thresh: Option<usize>,
+    pub hole_thresh: Option<usize>,
 }
 
 impl OrderedChunnelProj {
