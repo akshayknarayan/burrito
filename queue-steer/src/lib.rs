@@ -1,13 +1,21 @@
 //! Steer messages to the right queue.
 
 use az_queues::AzStorageQueueChunnel;
-use bertha::{Chunnel, ChunnelConnection, Negotiate};
+use bertha::{
+    atmostonce::{AtMostOnceChunnel, AtMostOnceCn},
+    tagger::{OrderedChunnelProj, OrderedProj},
+    Chunnel, ChunnelConnection, Negotiate,
+};
 use color_eyre::eyre::{bail, eyre, Report};
 use futures_util::future::{ready, Ready};
 use gcp_pubsub::{PubSubAddr, PubSubChunnel};
 use sqs::{SqsAddr, SqsChunnel};
 use std::future::Future;
+use std::hash::Hash;
 use std::pin::Pin;
+
+#[cfg(feature = "bin")]
+pub mod bin_help;
 
 #[derive(Debug, Clone)]
 pub enum QueueAddr {
@@ -94,6 +102,76 @@ impl bertha::negotiate::CapabilitySet for MessageQueueCaps {
     fn universe() -> Option<Vec<Self>> {
         // return None to force both sides to match
         None // TODO is this correct?
+    }
+}
+
+/// Newtype [`bertha::tagger::OrderedChunnelProj`] to impl `Negotiate` on `MessageQueueCaps`
+/// semantics.
+#[derive(Debug, Clone)]
+pub struct Ordered(OrderedChunnelProj);
+
+impl<A, D, InC> Chunnel<InC> for Ordered
+where
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = OrderedProj<A, InC, D>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(OrderedProj::new(cn, self.0.hole_thresh)))
+    }
+}
+
+impl Negotiate for Ordered {
+    type Capability = MessageQueueCaps;
+
+    fn guid() -> u64 {
+        0xd0dcf8a1cfb0319f
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![MessageQueueCaps {
+            ordering: MessageQueueOrdering::Ordered,
+            reliability: MessageQueueReliability::AtMostOnce,
+        }]
+    }
+}
+
+/// Newtype [`bertha::atmostonce::AtMostOnceChunnel`] to implement `Negotiate` on
+/// `MessageQueueCaps`.
+#[derive(Debug, Clone)]
+pub struct AtMostOnce(AtMostOnceChunnel);
+
+impl<A, D, InC> Chunnel<InC> for AtMostOnce
+where
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = AtMostOnceCn<InC, A>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(AtMostOnceCn::new(cn, self.0.sunset)))
+    }
+}
+
+impl Negotiate for AtMostOnce {
+    type Capability = MessageQueueCaps;
+
+    fn guid() -> u64 {
+        0xb6d905613efd7758
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![MessageQueueCaps {
+            ordering: MessageQueueOrdering::BestEffort,
+            reliability: MessageQueueReliability::AtMostOnce,
+        }]
     }
 }
 

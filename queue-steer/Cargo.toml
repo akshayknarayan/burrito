@@ -27,3 +27,7 @@ tracing-subscriber = { version = "0.2", optional = true }
 [[bin]]
 name = "bench"
 required-features = ["bin"]
+
+[[bin]]
+name = "bench2"
+required-features = ["bin"]
