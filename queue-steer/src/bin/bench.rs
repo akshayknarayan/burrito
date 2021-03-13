@@ -2,7 +2,7 @@
 //!
 //! This program is both the producer and the consumer (in different threads).
 //! The chunnel stacks it benchmarks should support the (addr, data) = (String, String)
-//! datatype. Any ordering semantics should be offered per-`ChunnelConnection`.
+//! datatype.
 
 use az_queues::AzStorageQueueChunnel;
 use bertha::{
@@ -10,12 +10,10 @@ use bertha::{
     util::ProjectLeft,
     Chunnel, ChunnelConnection, CxList,
 };
-use color_eyre::{
-    eyre::{bail, ensure},
-    Report,
-};
+use color_eyre::{eyre::ensure, Report};
 use futures_util::stream::{iter, StreamExt, TryStreamExt};
 use gcp_pubsub::{OrderedPubSubChunnel, PubSubAddr, PubSubChunnel};
+use queue_steer::bin_help::Mode;
 use queue_steer::QueueAddr;
 use sqs::{OrderedSqsChunnel, SqsAddr, SqsChunnel};
 use std::collections::HashMap;
@@ -23,7 +21,6 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::io::Write;
 use std::iter::once;
-use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
@@ -124,7 +121,7 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             .with_key(key)
             .finish(),
         Opt { .. } => az_queues::AzureAccountBuilder::default()
-            .from_env_vars()
+            .with_env_vars()
             .finish(),
     };
 
@@ -137,7 +134,7 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             .with_creds_path(file)
             .with_project_name(name)
             .finish(),
-        Opt { .. } => gcp_pubsub::GcpCreds::default().from_env_vars().finish(),
+        Opt { .. } => gcp_pubsub::GcpCreds::default().with_env_vars().finish(),
     };
 
     let get_aws_client = |opt: &Opt| match opt {
@@ -161,7 +158,7 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             QueueAddr::Aws(ref mut a) => {
                 let mut delete_queue = false;
                 let sqs_client = get_aws_client(&o)?;
-                if a == "gen" {
+                if a.queue_id == "gen" {
                     use rand::Rng;
                     let rng = rand::thread_rng();
                     let name = "bertha-"
@@ -169,24 +166,18 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                         .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
                         .collect();
                     debug!(?name, "making aws best-effort queue");
-                    *a = sqs::make_be_queue(&sqs_client, name).await?;
+                    *a = SqsAddr {
+                        queue_id: sqs::make_be_queue(&sqs_client, name).await?,
+                        group: None,
+                    };
                     delete_queue = true;
                 }
 
-                let cn = SqsChunnel::new(sqs_client, once(a.as_str()));
-                let r = do_best_effort_exp(
-                    cn,
-                    SqsAddr {
-                        queue_id: a.to_owned(),
-                        group: None,
-                    },
-                    opt.num_reqs,
-                    opt.inter_request_ms,
-                )
-                .await;
+                let cn = SqsChunnel::new(sqs_client, once(a.queue_id.as_str()));
+                let r = do_best_effort_exp(cn, a.clone(), opt.num_reqs, opt.inter_request_ms).await;
                 if delete_queue {
                     let sqs_client = get_aws_client(&o)?;
-                    sqs::delete_queue(&sqs_client, a.clone()).await?;
+                    sqs::delete_queue(&sqs_client, a.queue_id.clone()).await?;
                 }
                 r?
             }
@@ -198,7 +189,7 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             QueueAddr::Gcp(ref mut a) => {
                 let mut delete_queue = false;
                 let mut gcp_client = get_gcp_client(&o).await?;
-                if a == "gen" {
+                if a.topic_id == "gen" {
                     use rand::Rng;
                     let rng = rand::thread_rng();
                     let name = "bertha-"
@@ -206,24 +197,18 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                         .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
                         .collect();
                     debug!(?name, "making gcp best-effort queue");
-                    *a = gcp_pubsub::make_topic(&mut gcp_client, name).await?;
+                    *a = PubSubAddr {
+                        topic_id: gcp_pubsub::make_topic(&mut gcp_client, name).await?,
+                        group: None,
+                    };
                     delete_queue = true;
                 }
 
-                let cn = PubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                let r = do_best_effort_exp(
-                    cn,
-                    PubSubAddr {
-                        topic_id: a.to_string(),
-                        group: None,
-                    },
-                    opt.num_reqs,
-                    opt.inter_request_ms,
-                )
-                .await;
+                let cn = PubSubChunnel::new(gcp_client, once(a.topic_id.as_str())).await?;
+                let r = do_best_effort_exp(cn, a.clone(), opt.num_reqs, opt.inter_request_ms).await;
                 if delete_queue {
                     let mut gcp_client = get_gcp_client(&o).await?;
-                    gcp_pubsub::delete_topic(&mut gcp_client, a.clone()).await?;
+                    gcp_pubsub::delete_topic(&mut gcp_client, a.topic_id.clone()).await?;
                 }
                 r?
             }
@@ -237,7 +222,7 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                 QueueAddr::Aws(ref mut a) => {
                     let mut delete_queue = false;
                     let sqs_client = get_aws_client(&o)?;
-                    if a == "gen" {
+                    if a.queue_id == "gen" {
                         use rand::Rng;
                         let rng = rand::thread_rng();
                         let name = "bertha-"
@@ -246,32 +231,27 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                             .chain(".fifo".chars())
                             .collect();
                         debug!(?name, "making aws fifo queue");
-                        *a = sqs::make_fifo_queue(&sqs_client, name).await?;
+                        *a = SqsAddr {
+                            queue_id: sqs::make_fifo_queue(&sqs_client, name).await?,
+                            group: None,
+                        };
                         delete_queue = true;
                     }
 
-                    let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
-                    let r = do_ordered_groups_exp(
-                        ch,
-                        SqsAddr {
-                            queue_id: a.to_owned(),
-                            group: None,
-                        },
-                        opt.num_reqs,
-                        n,
-                        opt.inter_request_ms,
-                    )
-                    .await;
+                    let ch = OrderedSqsChunnel::new(sqs_client, once(a.queue_id.as_str()))?;
+                    let r =
+                        do_ordered_groups_exp(ch, a.clone(), opt.num_reqs, n, opt.inter_request_ms)
+                            .await;
                     if delete_queue {
                         let sqs_client = get_aws_client(&o)?;
-                        sqs::delete_queue(&sqs_client, a.clone()).await?;
+                        sqs::delete_queue(&sqs_client, a.queue_id.clone()).await?;
                     }
                     r?
                 }
                 QueueAddr::Gcp(ref mut a) => {
                     let mut delete_queue = false;
                     let mut gcp_client = get_gcp_client(&o).await?;
-                    if a == "gen" {
+                    if a.topic_id == "gen" {
                         use rand::Rng;
                         let rng = rand::thread_rng();
                         let name = "bertha-"
@@ -279,24 +259,20 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                             .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
                             .collect();
                         debug!(?name, "making gcp ordered queue");
-                        *a = gcp_pubsub::make_topic(&mut gcp_client, name).await?;
+                        *a = PubSubAddr {
+                            topic_id: gcp_pubsub::make_topic(&mut gcp_client, name).await?,
+                            group: None,
+                        };
                         delete_queue = true;
                     }
-                    let ch = OrderedPubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                    let r = do_ordered_groups_exp(
-                        ch,
-                        PubSubAddr {
-                            topic_id: a.to_string(),
-                            group: None,
-                        },
-                        opt.num_reqs,
-                        n,
-                        opt.inter_request_ms,
-                    )
-                    .await;
+                    let ch =
+                        OrderedPubSubChunnel::new(gcp_client, once(a.topic_id.as_str())).await?;
+                    let r =
+                        do_ordered_groups_exp(ch, a.clone(), opt.num_reqs, n, opt.inter_request_ms)
+                            .await;
                     if delete_queue {
                         let mut gcp_client = get_gcp_client(&o).await?;
-                        gcp_pubsub::delete_topic(&mut gcp_client, a.clone()).await?;
+                        gcp_pubsub::delete_topic(&mut gcp_client, a.topic_id.clone()).await?;
                     }
                     r?
                 }
@@ -308,7 +284,7 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
             QueueAddr::Aws(ref mut a) => {
                 let mut delete_queue = false;
                 let sqs_client = get_aws_client(&o)?;
-                if a == "gen" {
+                if a.queue_id == "gen" {
                     use rand::Rng;
                     let rng = rand::thread_rng();
                     let name = "bertha-"
@@ -317,31 +293,25 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                         .chain(".fifo".chars())
                         .collect();
                     debug!(?name, "making aws fifo queue");
-                    *a = sqs::make_fifo_queue(&sqs_client, name).await?;
+                    *a = SqsAddr {
+                        queue_id: sqs::make_fifo_queue(&sqs_client, name).await?,
+                        group: None,
+                    };
                     delete_queue = true;
                 }
 
-                let ch = OrderedSqsChunnel::new(sqs_client, once(a.as_str()))?;
-                let r = do_atmostonce_exp(
-                    ch,
-                    SqsAddr {
-                        queue_id: a.to_owned(),
-                        group: None,
-                    },
-                    opt.num_reqs,
-                    opt.inter_request_ms,
-                )
-                .await;
+                let ch = OrderedSqsChunnel::new(sqs_client, once(a.queue_id.as_str()))?;
+                let r = do_atmostonce_exp(ch, a.clone(), opt.num_reqs, opt.inter_request_ms).await;
                 if delete_queue {
                     let sqs_client = get_aws_client(&o)?;
-                    sqs::delete_queue(&sqs_client, a.clone()).await?;
+                    sqs::delete_queue(&sqs_client, a.queue_id.clone()).await?;
                 }
                 r?
             }
             QueueAddr::Gcp(ref mut a) => {
                 let mut delete_queue = false;
                 let mut gcp_client = get_gcp_client(&o).await?;
-                if a == "gen" {
+                if a.topic_id == "gen" {
                     use rand::Rng;
                     let rng = rand::thread_rng();
                     let name = "bertha-"
@@ -349,23 +319,17 @@ async fn do_exp(opt: &mut Opt) -> Result<(Vec<RecvdMsg>, Duration), Report> {
                         .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
                         .collect();
                     debug!(?name, "making gcp ordered queue");
-                    *a = gcp_pubsub::make_topic(&mut gcp_client, name).await?;
+                    *a = PubSubAddr {
+                        topic_id: gcp_pubsub::make_topic(&mut gcp_client, name).await?,
+                        group: None,
+                    };
                     delete_queue = true;
                 }
-                let ch = OrderedPubSubChunnel::new(gcp_client, once(a.as_str())).await?;
-                let r = do_atmostonce_exp(
-                    ch,
-                    PubSubAddr {
-                        topic_id: a.to_string(),
-                        group: None,
-                    },
-                    opt.num_reqs,
-                    opt.inter_request_ms,
-                )
-                .await;
+                let ch = OrderedPubSubChunnel::new(gcp_client, once(a.topic_id.as_str())).await?;
+                let r = do_atmostonce_exp(ch, a.clone(), opt.num_reqs, opt.inter_request_ms).await;
                 if delete_queue {
                     let mut gcp_client = get_gcp_client(&o).await?;
-                    gcp_pubsub::delete_topic(&mut gcp_client, a.clone()).await?;
+                    gcp_pubsub::delete_topic(&mut gcp_client, a.topic_id.clone()).await?;
                 }
                 r?
             }
@@ -615,54 +579,6 @@ fn orderedness(receive_order: &[usize]) -> usize {
         .enumerate()
         .map(|(i, req_num)| (i as isize - *req_num as isize).abs() as usize)
         .sum()
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Mode {
-    BestEffort,
-    /// if num_groups = Some(1), all keys are in the same group, so there is total ordering.  
-    ///
-    /// if num_groups = Some(n > 1), number of client threads = number of ordering groups (measure
-    /// effect on throughput).  
-    ///
-    /// if num_groups = None, each key is in its own ordering group (so there can be is
-    /// at-most-once delivery without ordering).
-    ///
-    /// Some(0) is invalid.
-    Ordered {
-        num_groups: Option<usize>,
-    },
-}
-
-impl std::fmt::Display for Mode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        match self {
-            Mode::BestEffort => f.write_str("BestEffort")?,
-            Mode::Ordered {
-                num_groups: Some(n),
-            } => write!(f, "Ordered:{}", n)?,
-            Mode::Ordered { num_groups: None } => f.write_str("AtMostOnce")?,
-        };
-
-        Ok(())
-    }
-}
-
-impl FromStr for Mode {
-    type Err = Report;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let sp: Vec<_> = s.split(':').collect();
-        match sp.as_slice() {
-            ["BestEffort"] | ["besteffort"] | ["be"] => Ok(Mode::BestEffort),
-            ["Ordered", g] | ["ordered", g] | ["ord", g] => {
-                let g: usize = g.parse()?;
-                Ok(Mode::Ordered {
-                    num_groups: if g == 0 { None } else { Some(g) },
-                })
-            }
-            _ => bail!("Unkown mode {:?}", s),
-        }
-    }
 }
 
 fn dump_results(
