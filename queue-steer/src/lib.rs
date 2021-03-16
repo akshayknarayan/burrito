@@ -17,10 +17,10 @@ use std::pin::Pin;
 #[cfg(feature = "bin")]
 pub mod bin_help;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum QueueAddr {
     Aws(SqsAddr),
-    Azure(String),
+    Azure(String, String),
     Gcp(PubSubAddr),
 }
 
@@ -36,7 +36,7 @@ impl std::str::FromStr for QueueAddr {
                 queue_id: g.to_string(),
                 group: None,
             }),
-            ["az", g] | ["Azure", g] => QueueAddr::Azure(g.to_string()),
+            ["az", g] | ["Azure", g] => QueueAddr::Azure(g.to_string(), String::new()),
             ["gcp", g] | ["GCP", g] => QueueAddr::Gcp(PubSubAddr {
                 topic_id: g.to_string(),
                 group: None,
@@ -50,7 +50,7 @@ impl QueueAddr {
     pub fn provider(&self) -> &str {
         match self {
             QueueAddr::Aws(_) => "aws",
-            QueueAddr::Azure(_) => "azure",
+            QueueAddr::Azure(_, _) => "azure",
             QueueAddr::Gcp(_) => "gcp",
         }
     }
@@ -58,6 +58,18 @@ impl QueueAddr {
 
 pub trait SetGroup {
     fn set_group(&mut self, group: String);
+}
+
+impl SetGroup for QueueAddr {
+    fn set_group(&mut self, group: String) {
+        match self {
+            QueueAddr::Aws(ref mut a) => a.set_group(group),
+            QueueAddr::Gcp(ref mut a) => a.set_group(group),
+            QueueAddr::Azure(_, ref mut s) => {
+                *s = group;
+            }
+        }
+    }
 }
 
 impl SetGroup for sqs::SqsAddr {
@@ -142,7 +154,7 @@ impl Negotiate for Ordered {
 
 /// Newtype [`bertha::atmostonce::AtMostOnceChunnel`] to implement `Negotiate` on
 /// `MessageQueueCaps`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AtMostOnce(AtMostOnceChunnel);
 
 impl<A, D, InC> Chunnel<InC> for AtMostOnce
@@ -273,7 +285,7 @@ impl ChunnelConnection for BaseQueue {
             }
             BaseQueue::Azure(this) => {
                 let addr = match addr {
-                    QueueAddr::Azure(a) => a,
+                    QueueAddr::Azure(a, _) => a,
                     x => {
                         return Box::pin(ready(Err(eyre!(
                             "Wrong address type for underlying queue: {:?}",
@@ -311,7 +323,7 @@ impl ChunnelConnection for BaseQueue {
                 let fut = this.recv();
                 Box::pin(async move {
                     let (addr, data) = fut.await?;
-                    Ok((QueueAddr::Azure(addr), data))
+                    Ok((QueueAddr::Azure(addr, String::new()), data))
                 })
             }
             BaseQueue::Gcp(this) => {
