@@ -4,7 +4,7 @@
 //! Chunnel data type = (String, String) -> (queue URL, msg_string)
 
 pub use azure_storage::clients::AsStorageClient;
-use azure_storage::clients::{StorageAccountClient, StorageClient};
+use azure_storage::clients::StorageAccountClient;
 use azure_storage::queue::{
     responses::{GetMessagesResponse, PutMessageResponse},
     AsPopReceiptClient, AsQueueClient,
@@ -15,6 +15,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
+
+/// The underlying client for Azure storage.
+pub use azure_storage::clients::StorageClient;
 
 /// Uses account name and key.
 ///

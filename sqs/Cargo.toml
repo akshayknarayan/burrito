@@ -16,6 +16,7 @@ rusoto_sqs = "0.46"
 rusoto_credential = "0.46"
 rand = "0.7"
 base64 = "0.13"
+serde = "1"
 
 [dev-dependencies]
 tracing-subscriber = "0.2"

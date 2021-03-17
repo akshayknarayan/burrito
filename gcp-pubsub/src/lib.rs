@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
+/// The underlying client to Google PubSub.
+pub use google_cloud::pubsub::Client as GcpClient;
+
 /// Builder for [`Client`].
 #[derive(Debug)]
 pub struct GcpCreds {
@@ -96,7 +99,7 @@ pub async fn delete_topic(client: &mut Client, name: String) -> Result<(), Repor
         .map_err(Into::into)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PubSubAddr {
     pub topic_id: String,
     pub group: Option<String>,

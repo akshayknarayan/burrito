@@ -15,6 +15,7 @@ google-cloud = { git = "https://github.com/akshayknarayan/google-cloud-rs", feat
 chrono = "0.4"
 rand = "0.7"
 serde_json = "1"
+serde = "1"
 
 [dev-dependencies]
 tracing-subscriber = "0.2"

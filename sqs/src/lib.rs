@@ -9,13 +9,16 @@ use bertha::ChunnelConnection;
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use rusoto_sqs::{
     DeleteMessageRequest, Message, ReceiveMessageRequest, ReceiveMessageResult, SendMessageRequest,
-    SendMessageResult, Sqs, SqsClient,
+    SendMessageResult, Sqs,
 };
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc};
 use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
+
+/// The underlying client type to access Sqs.
+pub use rusoto_sqs::SqsClient;
 
 #[derive(Clone)]
 pub struct AwsAccess {
@@ -113,7 +116,7 @@ pub async fn delete_queue(client: &SqsClient, name: String) -> Result<(), Report
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SqsAddr {
     pub queue_id: String,
     pub group: Option<String>,
