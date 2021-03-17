@@ -1,8 +1,4 @@
-use bertha::{
-    bincode::{Base64Chunnel, SerializeChunnelProject},
-    util::ProjectLeft,
-    Chunnel, ChunnelConnection, CxList,
-};
+use bertha::{util::ProjectLeft, ChunnelConnection};
 use color_eyre::eyre::{bail, ensure, Report};
 use futures_util::stream::{iter, StreamExt, TryStreamExt};
 use std::collections::HashMap;
@@ -236,7 +232,7 @@ async fn send_reqs(
 
 /// Each of `receive_chunnels` corresponds to one ordering group. We receive on all until a total
 /// of `num_reqs` messages.
-#[instrument(skip(receive_chunnels))]
+#[instrument(skip(start, receive_chunnels))]
 async fn receive_reqs<A>(
     start: std::time::Instant,
     num_reqs: usize,

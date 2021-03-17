@@ -7,27 +7,21 @@
 use az_queues::{AsStorageClient, AzStorageQueueChunnel};
 use bertha::{
     bincode::{Base64Chunnel, SerializeChunnelProject},
-    util::ProjectLeft,
-    Chunnel, ChunnelConnection, CxList,
+    Chunnel, CxList,
 };
-use color_eyre::{
-    eyre::{bail, ensure, eyre},
-    Report,
-};
-use futures_util::stream::{iter, StreamExt, TryStreamExt};
+use color_eyre::Report;
 use gcp_pubsub::{PubSubAddr, PubSubChunnel};
 use queue_steer::bin_help::{
-    do_atmostonce_exp, do_best_effort_exp, do_ordered_groups_exp, dump_results, Mode, RecvdMsg,
+    do_atmostonce_exp, do_best_effort_exp, do_ordered_groups_exp, dump_results, Mode,
 };
-use queue_steer::{AtMostOnce, BaseQueue, QueueAddr};
+use queue_steer::{AtMostOnce, BaseQueue, Ordered, QueueAddr};
 use sqs::{SqsAddr, SqsChunnel};
 use std::fmt::Debug;
 use std::iter::once;
 use std::sync::Arc;
 use structopt::StructOpt;
-use tracing::{debug, info, info_span, instrument, trace};
+use tracing::{debug, info};
 use tracing_error::ErrorLayer;
-use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
 
 #[derive(Clone, Debug, StructOpt)]
@@ -88,7 +82,7 @@ async fn main() -> Result<(), Report> {
         provider,
     } = Opt::from_args();
     info!(?mode, ?num_reqs, ?inter_request_ms, provider = ?provider.provider(), "starting");
-    let (ch, addr, was_generated) = provider.into_base_queue(queue).await?;
+    let (ch, addr, provider_cleanup) = provider.into_base_queue(queue).await?;
 
     let (msgs, elapsed) = match mode {
         Mode::BestEffort => {
@@ -103,21 +97,25 @@ async fn main() -> Result<(), Report> {
                 .wrap(SerializeChunnelProject::default())
                 .wrap(Base64Chunnel::default());
             let ch = stack.connect_wrap(ch).await?;
-            let _ch: Box<
-                dyn ChunnelConnection<Data = (QueueAddr, (u32, queue_steer::bin_help::Msg))>,
-            > = Box::new(ch);
-            unimplemented!()
+            //let _ch: Box<
+            //    dyn ChunnelConnection<Data = (QueueAddr, (u32, queue_steer::bin_help::Msg))>,
+            //> = Box::new(ch);
+            do_atmostonce_exp(ch, addr.clone(), num_reqs, inter_request_ms).await?
         }
         Mode::Ordered {
             num_groups: Some(n),
         } => {
             // ordered, with potentially many groups
-            unimplemented!()
+            let mut stack = CxList::from(Ordered::default())
+                .wrap(SerializeChunnelProject::default())
+                .wrap(Base64Chunnel::default());
+            let ch = stack.connect_wrap(ch).await?;
+            do_ordered_groups_exp(ch, addr.clone(), num_reqs, n, inter_request_ms).await?
         }
     };
 
-    if was_generated {
-        // TODO need to remove the queue
+    if let Some(cleanup) = provider_cleanup {
+        cleanup.cleanup().await?;
     }
 
     let mut latencies: Vec<_> = msgs.iter().map(|m| m.elapsed).collect();
@@ -144,6 +142,65 @@ async fn main() -> Result<(), Report> {
     Ok(())
 }
 
+pub struct ProviderCleanup {
+    queue: String,
+    inner: ProviderCleanupInner,
+}
+
+impl ProviderCleanup {
+    async fn cleanup(self) -> Result<(), Report> {
+        use ProviderCleanupInner::*;
+        let queue = self.queue;
+        debug!(?queue, provider = ?self.inner.provider(), "deleting queue");
+        match self.inner {
+            Aws(c) => sqs::delete_queue(&c, queue).await,
+            Azure(c) => az_queues::delete_queue(&c, queue).await,
+            Gcp(mut c) => gcp_pubsub::delete_topic(&mut c, queue).await,
+        }
+    }
+}
+
+impl From<(String, sqs::SqsClient)> for ProviderCleanup {
+    fn from((queue, inner): (String, sqs::SqsClient)) -> Self {
+        Self {
+            queue,
+            inner: ProviderCleanupInner::Aws(inner),
+        }
+    }
+}
+impl From<(String, Arc<az_queues::StorageClient>)> for ProviderCleanup {
+    fn from((queue, inner): (String, Arc<az_queues::StorageClient>)) -> Self {
+        Self {
+            queue,
+            inner: ProviderCleanupInner::Azure(inner),
+        }
+    }
+}
+impl From<(String, gcp_pubsub::GcpClient)> for ProviderCleanup {
+    fn from((queue, inner): (String, gcp_pubsub::GcpClient)) -> Self {
+        Self {
+            queue,
+            inner: ProviderCleanupInner::Gcp(inner),
+        }
+    }
+}
+
+enum ProviderCleanupInner {
+    Aws(sqs::SqsClient),
+    Azure(Arc<az_queues::StorageClient>),
+    Gcp(gcp_pubsub::GcpClient),
+}
+
+impl ProviderCleanupInner {
+    fn provider(&self) -> &str {
+        match self {
+            ProviderCleanupInner::Aws(_) => "aws",
+            ProviderCleanupInner::Azure(_) => "azure",
+            ProviderCleanupInner::Gcp(_) => "gcp",
+        }
+    }
+}
+
 impl Provider {
     pub fn provider(&self) -> &str {
         match self {
@@ -156,7 +213,7 @@ impl Provider {
     pub async fn into_base_queue(
         self,
         queue: Option<String>,
-    ) -> Result<(BaseQueue, QueueAddr, bool), Report> {
+    ) -> Result<(BaseQueue, QueueAddr, Option<ProviderCleanup>), Report> {
         let mut generated = false;
         let queue: String = queue.unwrap_or_else(|| {
             generated = true;
@@ -164,7 +221,11 @@ impl Provider {
             let rng = rand::thread_rng();
             "bertha-"
                 .chars()
-                .chain(rng.sample_iter(&rand::distributions::Alphanumeric).take(10))
+                .chain(
+                    rng.sample_iter(&rand::distributions::Alphanumeric)
+                        .take(10)
+                        .flat_map(char::to_lowercase),
+                )
                 .collect()
         });
 
@@ -176,10 +237,12 @@ impl Provider {
             } => {
                 let sqs_client =
                     sqs::sqs_client_from_creds(aws_access_key_id, aws_secret_access_key)?;
-                let queue = if generated {
-                    sqs::make_be_queue(&sqs_client, queue).await?
+                let (queue, generated) = if generated {
+                    // what if we want to optimize to a fifo queue?
+                    let queue = sqs::make_be_queue(&sqs_client, queue.clone()).await?;
+                    (queue.clone(), Some((queue, sqs_client.clone()).into()))
                 } else {
-                    queue
+                    (queue, None)
                 };
 
                 debug!(?queue, "AWS queue");
@@ -202,9 +265,12 @@ impl Provider {
                     .with_key(az_key)
                     .finish()?;
 
-                if generated {
+                let generated = if generated {
                     az_queues::make_queue(&az_client.as_storage_client(), queue.clone()).await?;
-                }
+                    Some((queue.clone(), az_client.as_storage_client()).into())
+                } else {
+                    None
+                };
 
                 debug!(?queue, "Azure queue");
                 let cn = AzStorageQueueChunnel::new(az_client, once(queue.as_str()));
@@ -220,10 +286,11 @@ impl Provider {
                     .finish()
                     .await?;
 
-                let queue = if generated {
-                    gcp_pubsub::make_topic(&mut gcp_client, queue).await?
+                let (queue, generated) = if generated {
+                    let queue = gcp_pubsub::make_topic(&mut gcp_client, queue.clone()).await?;
+                    (queue.clone(), Some((queue, gcp_client.clone()).into()))
                 } else {
-                    queue
+                    (queue, None)
                 };
 
                 debug!(?queue, "GCP queue");

@@ -17,7 +17,7 @@ use std::pin::Pin;
 #[cfg(feature = "bin")]
 pub mod bin_help;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum QueueAddr {
     Aws(SqsAddr),
     Azure(String, String),
@@ -119,13 +119,27 @@ impl bertha::negotiate::CapabilitySet for MessageQueueCaps {
 
 /// Newtype [`bertha::tagger::OrderedChunnelProj`] to impl `Negotiate` on `MessageQueueCaps`
 /// semantics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Ordered(OrderedChunnelProj);
+
+impl From<OrderedChunnelProj> for Ordered {
+    fn from(i: OrderedChunnelProj) -> Self {
+        Self(i)
+    }
+}
 
 impl<A, D, InC> Chunnel<InC> for Ordered
 where
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    A: serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + std::fmt::Debug
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static,
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
@@ -157,10 +171,24 @@ impl Negotiate for Ordered {
 #[derive(Debug, Clone, Default)]
 pub struct AtMostOnce(AtMostOnceChunnel);
 
+impl From<AtMostOnceChunnel> for AtMostOnce {
+    fn from(i: AtMostOnceChunnel) -> Self {
+        Self(i)
+    }
+}
+
 impl<A, D, InC> Chunnel<InC> for AtMostOnce
 where
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    A: serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + std::fmt::Debug
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static,
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
