@@ -9,7 +9,6 @@ use color_eyre::eyre;
 use dashmap::DashMap;
 use futures_util::future::{ready, Ready};
 use std::collections::BinaryHeap;
-use std::convert::TryInto;
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
@@ -167,8 +166,16 @@ impl Negotiate for OrderedChunnelProj {
 
 impl<A, D, InC> Chunnel<InC> for OrderedChunnelProj
 where
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    A: serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + std::fmt::Debug
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static,
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
@@ -209,7 +216,7 @@ impl Negotiate for OrderedChunnel {
 
 impl<D, InC> Chunnel<InC> for OrderedChunnel
 where
-    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (u32, (), D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     type Future =
@@ -259,9 +266,17 @@ impl<A: Eq + Hash, C, D> OrderedProj<A, C, D> {
 
 impl<A, C, D> ChunnelConnection for OrderedProj<A, C, D>
 where
-    C: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
     D: Send + Sync + 'static,
-    A: Eq + Hash + Clone + std::fmt::Debug + Send + Sync + 'static,
+    A: serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + std::fmt::Debug
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static,
 {
     type Data = (A, D);
 
@@ -283,7 +298,7 @@ where
                 };
 
                 trace!(seq = ?seq, "sending");
-                inner.send((addr, (seq, data))).await?;
+                inner.send((addr.clone(), (seq, addr, data))).await?;
                 trace!(seq = ?seq, "finished send");
                 Ok(())
             }
@@ -318,7 +333,7 @@ where
                         }
                     }
 
-                    let (a, (seq, d)) = inner.recv().await?;
+                    let (_a, (seq, a, d)) = inner.recv().await?;
                     trace!(seq = ?seq, from=?a, "received pkt, locking state");
                     let mut st = state.entry(a.clone()).or_default();
                     #[allow(clippy::comparison_chain)]
@@ -376,80 +391,10 @@ impl<D> Ord for DataPair<D> {
     }
 }
 
-/// Simpler serialization for (u32, Vec<u8>) cases.
-#[derive(Debug, Clone)]
-pub struct SeqUnreliableChunnel;
-
-impl<InC> Chunnel<InC> for SeqUnreliableChunnel
-where
-    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
-{
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = SeqUnreliable<InC>;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(SeqUnreliable::from(cn)))
-    }
-}
-
-/// `SeqUnreliable` accepts (u32, Vec<u8>) pairs as Data for transmission.
-#[derive(Default, Debug, Clone)]
-pub struct SeqUnreliable<C> {
-    inner: Arc<C>,
-}
-
-impl<Cx> From<Cx> for SeqUnreliable<Cx> {
-    fn from(cx: Cx) -> SeqUnreliable<Cx> {
-        SeqUnreliable {
-            inner: Arc::new(cx),
-        }
-    }
-}
-
-impl<C> ChunnelConnection for SeqUnreliable<C>
-where
-    C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
-{
-    type Data = (u32, Vec<u8>);
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(
-            async move {
-                let (seq, data) = data;
-                let mut buf = seq.to_be_bytes().to_vec();
-                buf.extend(&data);
-                inner.send(buf).await?;
-                Ok(())
-            }
-            .instrument(tracing::trace_span!("sequnreliable_send")),
-        )
-    }
-
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(
-            async move {
-                let mut seq = inner.recv().await?;
-                // pop off the seqno
-                let data = seq.split_off(4);
-                let seq = u32::from_be_bytes(seq[0..4].try_into().unwrap());
-                Ok((seq, data))
-            }
-            .instrument(tracing::trace_span!("sequnreliable_recv")),
-        )
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use super::{OrderedChunnel, SeqUnreliableChunnel, TaggerChunnel};
+    use super::{OrderedChunnel, TaggerChunnel};
+    use crate::bincode::SerializeChunnel;
     use crate::chan_transport::Chan;
     use crate::test::Serve;
     use crate::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList};
@@ -477,7 +422,7 @@ mod test {
         rt.block_on(
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
-                let mut stack = CxList::from(TaggerChunnel).wrap(SeqUnreliableChunnel);
+                let mut stack = CxList::from(TaggerChunnel).wrap(SerializeChunnel::default());
 
                 let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;
@@ -550,7 +495,8 @@ mod test {
         rt.block_on(
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
-                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
+                let mut stack =
+                    CxList::from(OrderedChunnel::default()).wrap(SerializeChunnel::default());
 
                 let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;
@@ -612,7 +558,8 @@ mod test {
 
                 let (mut srv, mut cln) = t.split();
 
-                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
+                let mut stack =
+                    CxList::from(OrderedChunnel::default()).wrap(SerializeChunnel::default());
 
                 let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;
@@ -660,7 +607,8 @@ mod test {
 
                 let (mut srv, mut cln) = t.split();
 
-                let mut stack = CxList::from(OrderedChunnel::default()).wrap(SeqUnreliableChunnel);
+                let mut stack =
+                    CxList::from(OrderedChunnel::default()).wrap(SerializeChunnel::default());
 
                 let rcv_st = srv.listen(()).await?;
                 let mut rcv_st = stack.serve(rcv_st).await?;

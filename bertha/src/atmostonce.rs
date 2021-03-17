@@ -31,8 +31,8 @@ impl Default for AtMostOnceChunnel {
 
 impl<InC, A, D> Chunnel<InC> for AtMostOnceChunnel
 where
-    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    A: Clone + Eq + Hash + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    A: serde::Serialize + serde::de::DeserializeOwned + Clone + Eq + Hash + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
     type Connection = AtMostOnceCn<InC, A>;
@@ -66,8 +66,8 @@ where
 
 impl<C, A, D> ChunnelConnection for AtMostOnceCn<C, A>
 where
-    A: Clone + Eq + Hash + Send + Sync + 'static,
-    C: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
+    A: serde::Serialize + serde::de::DeserializeOwned + Clone + Eq + Hash + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
 {
     type Data = (A, D);
 
@@ -77,7 +77,7 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let mut next_seq = self.next_seq.entry(addr.clone()).or_insert(0);
         *next_seq += 1;
-        self.inner.send((addr, (*next_seq, data)))
+        self.inner.send((addr.clone(), (*next_seq, addr, data)))
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
@@ -87,7 +87,7 @@ where
         Box::pin(
             async move {
                 loop {
-                    let (addr, (seq, data)) = inner.recv().await?;
+                    let (_addr, (seq, addr, data)) = inner.recv().await?;
                     let mut ent = delivered_msgs.entry(addr.clone()).or_default();
                     if ent.is_new(seq, sunset) {
                         return Ok((addr, data));
@@ -102,9 +102,6 @@ where
 #[derive(Debug, Default, Clone)]
 struct RecvState {
     last_update: Option<std::time::Instant>,
-    /// If we receive a seq < earliest_seq, we won't deliver it.
-    /// The `earliest_seq` is the one that we saw a `sunset` amount of time ago.
-    earliest_seq: u32,
     /// Times that we got the packets, so we can get all those past the `sunset`.
     deliver_times: BTreeMap<std::time::Instant, u32>,
     /// Corresponds to the values of `deliver_times`, but we want to look them up.
