@@ -94,7 +94,7 @@ async fn main() -> Result<(), Report> {
         elapsed,
         opt.mode,
         opt.inter_request_ms,
-        &opt.queue,
+        &opt.queue.provider(),
     )?;
     Ok(())
 }

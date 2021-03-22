@@ -295,7 +295,7 @@ pub fn dump_results(
     recv_span: Duration,
     mode: Mode,
     inter_request_ms: u64,
-    queue_addr: &crate::QueueAddr,
+    provider: &str,
 ) -> Result<(), Report> {
     use std::io::prelude::*;
     let mut f = std::fs::File::create(path)?;
@@ -310,7 +310,7 @@ pub fn dump_results(
             &mut f,
             "{} {} {} {} {} {} {}",
             mode,
-            queue_addr.provider(),
+            provider,
             inter_request_ms,
             num_msgs,
             recv_span.as_micros(),

@@ -4,15 +4,14 @@ use az_queues::AzStorageQueueChunnel;
 use bertha::{
     atmostonce::{AtMostOnceChunnel, AtMostOnceCn},
     tagger::{OrderedChunnelProj, OrderedProj},
+    util::NeverCn,
     Chunnel, ChunnelConnection, Negotiate,
 };
 use color_eyre::eyre::{bail, eyre, Report};
 use futures_util::future::{ready, Ready};
-use gcp_pubsub::{PubSubAddr, PubSubChunnel};
-use sqs::{SqsAddr, SqsChunnel};
-use std::future::Future;
+use gcp_pubsub::{OrderedPubSubChunnel, PubSubAddr, PubSubChunnel};
+use sqs::{OrderedSqsChunnel, SqsAddr, SqsChunnel};
 use std::hash::Hash;
-use std::pin::Pin;
 
 #[cfg(feature = "bin")]
 pub mod bin_help;
@@ -88,7 +87,6 @@ impl SetGroup for gcp_pubsub::PubSubAddr {
 pub enum MessageQueueOrdering {
     BestEffort,
     Ordered,
-    GroupOrdered { num_groups: usize },
     ArbitraryDependencies(String),
 }
 
@@ -215,17 +213,35 @@ impl Negotiate for AtMostOnce {
     }
 }
 
-/// Wraps basic chunnel connections.
-///
-/// Since this is a wrapper, it can impl `Chunnel` and `Negotiate`.
 #[derive(Debug, Clone)]
-pub struct BaseQueueChunnel;
+pub struct SqsChunnelWrap(SqsChunnel);
+impl From<SqsChunnel> for SqsChunnelWrap {
+    fn from(i: SqsChunnel) -> Self {
+        Self(i)
+    }
+}
 
-impl Negotiate for BaseQueueChunnel {
+impl From<SqsChunnelWrap> for SqsChunnel {
+    fn from(SqsChunnelWrap(s): SqsChunnelWrap) -> SqsChunnel {
+        s
+    }
+}
+
+impl Chunnel<NeverCn> for SqsChunnelWrap {
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = SqsChunnel;
+    type Error = Report;
+
+    fn connect_wrap(&mut self, _: NeverCn) -> Self::Future {
+        ready(Ok(self.0.clone()))
+    }
+}
+
+impl Negotiate for SqsChunnelWrap {
     type Capability = MessageQueueCaps;
 
     fn guid() -> u64 {
-        0xc59e844359deaaa3
+        0xfe8e872efd74c245
     }
 
     fn capabilities() -> Vec<Self::Capability> {
@@ -236,131 +252,48 @@ impl Negotiate for BaseQueueChunnel {
     }
 }
 
-impl Chunnel<SqsChunnel> for BaseQueueChunnel {
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = BaseQueue;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: SqsChunnel) -> Self::Future {
-        ready(Ok(cn.into()))
-    }
-}
-
-impl Chunnel<AzStorageQueueChunnel> for BaseQueueChunnel {
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = BaseQueue;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: AzStorageQueueChunnel) -> Self::Future {
-        ready(Ok(cn.into()))
-    }
-}
-
-impl Chunnel<PubSubChunnel> for BaseQueueChunnel {
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = BaseQueue;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: PubSubChunnel) -> Self::Future {
-        ready(Ok(cn.into()))
-    }
-}
-
 #[derive(Debug, Clone)]
-pub enum BaseQueue {
-    Aws(SqsChunnel),
-    Azure(AzStorageQueueChunnel),
-    Gcp(PubSubChunnel),
-}
-
-impl From<SqsChunnel> for BaseQueue {
-    fn from(s: SqsChunnel) -> Self {
-        BaseQueue::Aws(s)
+pub struct OrderedSqsChunnelWrap(OrderedSqsChunnel);
+impl From<OrderedSqsChunnel> for OrderedSqsChunnelWrap {
+    fn from(i: OrderedSqsChunnel) -> Self {
+        Self(i)
     }
 }
 
-impl From<AzStorageQueueChunnel> for BaseQueue {
-    fn from(s: AzStorageQueueChunnel) -> Self {
-        BaseQueue::Azure(s)
+impl From<OrderedSqsChunnelWrap> for OrderedSqsChunnel {
+    fn from(OrderedSqsChunnelWrap(s): OrderedSqsChunnelWrap) -> Self {
+        s
     }
 }
 
-impl From<PubSubChunnel> for BaseQueue {
-    fn from(s: PubSubChunnel) -> Self {
-        BaseQueue::Gcp(s)
+impl From<SqsChunnelWrap> for OrderedSqsChunnelWrap {
+    fn from(SqsChunnelWrap(i): SqsChunnelWrap) -> Self {
+        let i: OrderedSqsChunnel = i.into();
+        i.into()
     }
 }
 
-impl ChunnelConnection for BaseQueue {
-    type Data = (QueueAddr, String);
+impl Chunnel<NeverCn> for OrderedSqsChunnelWrap {
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = OrderedSqsChunnel;
+    type Error = Report;
 
-    fn send(
-        &self,
-        (addr, data): Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        match self {
-            BaseQueue::Aws(this) => {
-                let addr = match addr {
-                    QueueAddr::Aws(a) => a,
-                    x => {
-                        return Box::pin(ready(Err(eyre!(
-                            "Wrong address type for underlying queue: {:?}",
-                            x
-                        ))))
-                    }
-                };
-                this.send((addr, data))
-            }
-            BaseQueue::Azure(this) => {
-                let addr = match addr {
-                    QueueAddr::Azure(a, _) => a,
-                    x => {
-                        return Box::pin(ready(Err(eyre!(
-                            "Wrong address type for underlying queue: {:?}",
-                            x
-                        ))))
-                    }
-                };
-                this.send((addr, data))
-            }
-            BaseQueue::Gcp(this) => {
-                let addr = match addr {
-                    QueueAddr::Gcp(a) => a,
-                    x => {
-                        return Box::pin(ready(Err(eyre!(
-                            "Wrong address type for underlying queue: {:?}",
-                            x
-                        ))))
-                    }
-                };
-                this.send((addr, data))
-            }
-        }
+    fn connect_wrap(&mut self, _: NeverCn) -> Self::Future {
+        ready(Ok(self.0.clone()))
+    }
+}
+
+impl Negotiate for OrderedSqsChunnelWrap {
+    type Capability = MessageQueueCaps;
+
+    fn guid() -> u64 {
+        0xc0fd9c1303caab54
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        match self {
-            BaseQueue::Aws(this) => {
-                let fut = this.recv();
-                Box::pin(async move {
-                    let (addr, data) = fut.await?;
-                    Ok((QueueAddr::Aws(addr), data))
-                })
-            }
-            BaseQueue::Azure(this) => {
-                let fut = this.recv();
-                Box::pin(async move {
-                    let (addr, data) = fut.await?;
-                    Ok((QueueAddr::Azure(addr, String::new()), data))
-                })
-            }
-            BaseQueue::Gcp(this) => {
-                let fut = this.recv();
-                Box::pin(async move {
-                    let (addr, data) = fut.await?;
-                    Ok((QueueAddr::Gcp(addr), data))
-                })
-            }
-        }
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![MessageQueueCaps {
+            ordering: MessageQueueOrdering::Ordered,
+            reliability: MessageQueueReliability::AtMostOnce,
+        }]
     }
 }
