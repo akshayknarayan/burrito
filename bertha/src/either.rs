@@ -1,7 +1,7 @@
 //! The `Either` type implements traits where both variants implement the trait with the same
 //! output type.
 
-use super::{Chunnel, ChunnelConnection};
+use super::{Chunnel, ChunnelConnection, CxListReverse};
 use color_eyre::eyre::{eyre, Report};
 use futures_util::{
     future::{FutureExt, TryFutureExt},
@@ -172,6 +172,21 @@ where
         match self {
             Left(i) => i.next(),
             Right(i) => i.next(),
+        }
+    }
+}
+
+impl<A, B> CxListReverse for Either<A, B>
+where
+    A: CxListReverse,
+    B: CxListReverse,
+{
+    type Reversed = Either<A::Reversed, B::Reversed>;
+
+    fn rev(self) -> Self::Reversed {
+        match self {
+            Either::Left(a) => Either::Left(a.rev()),
+            Either::Right(b) => Either::Right(b.rev()),
         }
     }
 }

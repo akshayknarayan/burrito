@@ -33,7 +33,7 @@ pub trait Chunnel<I> {
     fn connect_wrap(&mut self, inner: I) -> Self::Future;
 }
 
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Copy, PartialEq, Eq)]
 pub struct CxNil;
 
 impl<C> Chunnel<C> for CxNil
@@ -134,12 +134,12 @@ pub trait CxListReverse {
     fn rev(self) -> Self::Reversed;
 }
 
-impl<N: Negotiate> CxListReverse for N {
-    type Reversed = Self;
-    fn rev(self) -> Self::Reversed {
-        self
-    }
-}
+//impl<N: Negotiate> CxListReverse for N {
+//    type Reversed = Self;
+//    fn rev(self) -> Self::Reversed {
+//        self
+//    }
+//}
 
 impl<H, T> CxListReverse for CxList<H, T>
 where

@@ -1324,6 +1324,38 @@ where
     }
 }
 
+/// Mechanism to register semantics on an address.
+pub trait Rendezvous<'a> {
+    type Future: Future<Output = Result<Option<Vec<u8>>, Self::Error>> + 'a;
+    type Error: Send + Sync;
+
+    fn init_or_fetch(&'a mut self, addr: String, nonce: Vec<u8>) -> Self::Future;
+}
+
+/// Rendezvous-based negotiation.
+pub async fn negotiate_rendezvous<'a, S, R>(
+    stack: S,
+    rendezvous_point: &'a mut R,
+    addr: String,
+) -> Result<<S as Pick>::Picked, Report>
+where
+    S: Pick + GetOffers + Debug + Clone + Send + Sync + 'static,
+    <S as Pick>::Picked: NegotiatePicked + Clone + Debug + Send,
+    R: Rendezvous<'a>,
+    <R as Rendezvous<'a>>::Error: Into<Report>,
+{
+    // for rendezvous-based negotiation, the other side is not present. So, we assume they think
+    // the same way as us.
+    let offers = stack.offers().collect();
+    let (picked, offers) = monomorphize(stack, offers, &addr).await?;
+    let nonce = bincode::serialize(&offers)?;
+    rendezvous_point
+        .init_or_fetch(addr, nonce)
+        .await
+        .map_err(Into::into)?;
+    Ok(picked)
+}
+
 #[allow(non_upper_case_globals)]
 #[cfg(test)]
 mod test {
