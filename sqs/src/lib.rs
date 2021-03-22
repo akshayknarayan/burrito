@@ -137,6 +137,15 @@ pub struct OrderedSqsChunnel {
     send_ctr: Arc<AtomicUsize>,
 }
 
+impl From<SqsChunnel> for OrderedSqsChunnel {
+    fn from(inner: SqsChunnel) -> Self {
+        Self {
+            inner,
+            send_ctr: Default::default(),
+        }
+    }
+}
+
 impl OrderedSqsChunnel {
     pub fn new<'a>(
         sqs_client: SqsClient,
@@ -237,6 +246,10 @@ impl SqsChunnel {
             sqs_client,
             recv_queue_urls: recv_queue_urls.into_iter().map(str::to_owned).collect(),
         }
+    }
+
+    pub fn listen(&mut self, addr: &str) {
+        self.recv_queue_urls.push(addr.to_owned());
     }
 }
 

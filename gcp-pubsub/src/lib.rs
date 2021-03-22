@@ -119,6 +119,12 @@ pub struct OrderedPubSubChunnel {
     inner: PubSubChunnel,
 }
 
+impl From<PubSubChunnel> for OrderedPubSubChunnel {
+    fn from(inner: PubSubChunnel) -> Self {
+        Self { inner }
+    }
+}
+
 impl OrderedPubSubChunnel {
     pub async fn new<'a>(
         ps_client: Client,
