@@ -15,6 +15,7 @@ members = [
     "sqs",
     "queue-steer",
     "round-order",
+    "redis-basechunnel",
 ]
 
 [profile.release]
