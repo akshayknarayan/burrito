@@ -14,7 +14,9 @@ use gcp_pubsub::{PubSubAddr, PubSubChunnel};
 use queue_steer::bin_help::{
     do_atmostonce_exp, do_best_effort_exp, do_ordered_groups_exp, dump_results, Mode, RecvdMsg,
 };
-use queue_steer::{AtMostOnce, Ordered, OrderedSqsChunnelWrap, QueueAddr, SqsChunnelWrap};
+use queue_steer::{
+    AtMostOnce, KafkaChunnelWrap, Ordered, OrderedSqsChunnelWrap, QueueAddr, SqsChunnelWrap,
+};
 use sqs::{SqsAddr, SqsChunnel};
 use std::fmt::Debug;
 use std::iter::once;
@@ -61,6 +63,10 @@ pub enum Provider {
         gcp_key_file: std::path::PathBuf,
         #[structopt(long)]
         gcp_project_name: String,
+    },
+    Kafka {
+        #[structopt(long)]
+        addr: String,
     },
 }
 
@@ -118,6 +124,7 @@ impl Provider {
             Provider::Aws { .. } => "aws",
             Provider::Azure { .. } => "azure",
             Provider::Gcp { .. } => "gcp",
+            Provider::Kafka { .. } => "kafka",
         }
     }
 
@@ -231,6 +238,18 @@ impl Provider {
                 //    gen.cleanup().await?;
                 //}
                 //Ok((msgs, elapsed))
+            }
+            Kafka { addr } => {
+                kafka::make_topic(&addr, &queue).await?;
+                info!(?queue, "Kafka queue");
+                let cn: KafkaChunnelWrap = kafka::KafkaChunnel::new(&addr)?.into();
+                let c_addr = kafka::KafkaAddr {
+                    topic_id: queue.clone(),
+                    group: None,
+                };
+                let (msgs, elapsed) = do_exp!(mode, cn, c_addr, num_reqs, inter_request_ms);
+                kafka::delete_topic(&addr, &queue).await?;
+                Ok((msgs, elapsed))
             }
             Gcp {
                 gcp_key_file,

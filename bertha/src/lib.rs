@@ -153,6 +153,13 @@ where
     }
 }
 
+impl CxListReverse for CxNil {
+    type Reversed = Self;
+    fn rev(self) -> Self::Reversed {
+        self
+    }
+}
+
 pub trait ChunnelListener {
     type Future: Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static;
     type Addr;

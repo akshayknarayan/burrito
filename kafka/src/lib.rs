@@ -64,6 +64,12 @@ pub struct KafkaChunnel {
     consumer: Arc<StreamConsumer>,
 }
 
+impl std::fmt::Debug for KafkaChunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.debug_tuple("KafkaChunnel").finish()
+    }
+}
+
 impl KafkaChunnel {
     pub fn new(addr: &str) -> Result<Self, Report> {
         let mut cfg = ClientConfig::new();
