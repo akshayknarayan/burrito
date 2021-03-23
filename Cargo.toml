@@ -13,6 +13,7 @@ members = [
     "az-queues",
     "gcp-pubsub",
     "sqs",
+    "kafka",
     "queue-steer",
     "round-order",
     "redis-basechunnel",
