@@ -333,101 +333,84 @@ fn sample_opt(s: SqsChunnel) {
         CxList::from(AtMostOnce::default()) // or OrderedChunnelProj
             .wrap(SerializeChunnelProject::<(u32, queue_steer::bin_help::Msg)>::default())
             .wrap(Base64Chunnel::default())
-            .wrap(SqsChunnelWrap::from(s.clone()));
-
-    use bertha::CxListReverse;
+            .wrap(SqsChunnelWrap::from(s));
 
     // if AtMostOnce |> .* |> SqsChunnelWrap
     // replace with .* |> OrderedSqsChunnelWrap
-    let opt = stack.rev().transform(Default::default());
-    let opt = opt.rev();
+    let mut opt = stack.transform();
 
-    let t = opt.connect_wrap(NeverCn::default());
+    let _t = opt.connect_wrap(bertha::util::NeverCn::default());
 
     // end state if things match up.
-    let end = CxList::from(SerializeChunnelProject::<queue_steer::bin_help::Msg>::default())
-        .wrap(Base64Chunnel::default())
-        .wrap(OrderedSqsChunnelWrap::from(OrderedSqsChunnel::from(
-            s.clone(),
-        )));
+    //let end = CxList::from(SerializeChunnelProject::<queue_steer::bin_help::Msg>::default())
+    //    .wrap(Base64Chunnel::default())
+    //    .wrap(OrderedSqsChunnelWrap::from(OrderedSqsChunnel::from(
+    //        s.clone(),
+    //    )));
 }
 
-use bertha::{either::Either, CxNil};
-trait OrdOpt<Ctx> {
-    type Output;
-    fn transform(self, ctx: Ctx) -> Self::Output;
+use bertha::CxNil;
+
+trait OrdOpt {
+    type Opt;
+    fn transform(self) -> Self::Opt;
 }
 
-struct OrdStackCtx<T1, T2> {
-    matched: bool,
-    if_matched: T1,
-    non_match: T2,
-}
+impl<T> OrdOpt for CxList<SqsChunnelWrap, CxList<T, CxList<AtMostOnce, CxNil>>> {
+    type Opt = CxList<OrderedSqsChunnelWrap, CxList<T, CxNil>>;
 
-impl Default for OrdStackCtx<CxNil, CxNil> {
-    fn default() -> Self {
-        OrdStackCtx {
-            matched: false,
-            if_matched: Default::default(),
-            non_match: Default::default(),
+    fn transform(self) -> Self::Opt {
+        let CxList {
+            head: sqs,
+            tail:
+                CxList {
+                    head: head_t,
+                    tail:
+                        CxList {
+                            head: _head_amo,
+                            tail: CxNil,
+                        },
+                },
+        } = self;
+        CxList {
+            head: sqs.into(),
+            tail: CxList {
+                head: head_t,
+                tail: CxNil,
+            },
         }
     }
 }
 
-// base case
-impl<T1, T2> OrdOpt<OrdStackCtx<T1, T2>> for CxList<SqsChunnelWrap, CxNil>
-where
-    T1: bertha::AppendBack<OrderedSqsChunnelWrap>,
-    T2: bertha::AppendBack<SqsChunnelWrap>,
-{
-    type Output = Either<T1::Appended, T2::Appended>;
+impl<T1, T2> OrdOpt for CxList<SqsChunnelWrap, CxList<T1, CxList<T2, CxList<AtMostOnce, CxNil>>>> {
+    type Opt = CxList<OrderedSqsChunnelWrap, CxList<T1, CxList<T2, CxNil>>>;
 
-    fn transform(self, c: OrdStackCtx<T1, T2>) -> Self::Output {
-        if c.matched {
-            Either::Left(c.if_matched.append(self.head.into()))
-        } else {
-            Either::Right(c.non_match.append(self.head))
-        }
-    }
-}
-
-use bertha::Negotiate;
-// generic case
-impl<T1, T2, Head, Tail> OrdOpt<OrdStackCtx<T1, T2>> for CxList<Head, Tail>
-where
-    Head: Negotiate + Clone,
-    Tail: OrdOpt<OrdStackCtx<T1::Appended, T2::Appended>> + OrdOpt<OrdStackCtx<T1, T2::Appended>>,
-    T1: bertha::AppendBack<Head>,
-    T2: bertha::AppendBack<Head>,
-{
-    type Output = Either<
-        <Tail as OrdOpt<OrdStackCtx<T1::Appended, T2::Appended>>>::Output,
-        <Tail as OrdOpt<OrdStackCtx<T1, T2::Appended>>>::Output,
-    >;
-
-    fn transform(
-        self,
-        OrdStackCtx {
-            matched,
-            if_matched,
-            non_match,
-        }: OrdStackCtx<T1, T2>,
-    ) -> Self::Output {
-        if Head::guid() == AtMostOnce::guid() {
-            if matched {
-                panic!("matched twice");
-            }
-            Either::Right(self.tail.transform(OrdStackCtx {
-                matched: true,
-                if_matched,
-                non_match: non_match.append(self.head.clone()),
-            }))
-        } else {
-            Either::Left(self.tail.transform(OrdStackCtx {
-                matched,
-                if_matched: if_matched.append(self.head.clone()),
-                non_match: non_match.append(self.head.clone()),
-            }))
+    fn transform(self) -> Self::Opt {
+        let CxList {
+            head: sqs,
+            tail:
+                CxList {
+                    head: head_t1,
+                    tail:
+                        CxList {
+                            head: head_t2,
+                            tail:
+                                CxList {
+                                    head: _head_amo,
+                                    tail: CxNil,
+                                },
+                        },
+                },
+        } = self;
+        CxList {
+            head: sqs.into(),
+            tail: CxList {
+                head: head_t1,
+                tail: CxList {
+                    head: head_t2,
+                    tail: CxNil,
+                },
+            },
         }
     }
 }
