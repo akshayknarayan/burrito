@@ -190,7 +190,7 @@ mod test {
     fn kafka_send_recv() {
         // relies on Kafka running
         let kafka_addr =
-            std::env::var("KAKFA_SERVER").unwrap_or_else(|_| "localhost:9092".to_owned());
+            std::env::var("KAFKA_SERVER").unwrap_or_else(|_| "localhost:9092".to_owned());
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -207,11 +207,11 @@ mod test {
         rt.block_on(
             async move {
                 let topic_name = gen_resource_id();
-                info!(?topic_name, "making topic");
+                info!(?topic_name, ?kafka_addr, "making topic");
                 make_topic(&kafka_addr, &topic_name).await?;
 
                 let ch = KafkaChunnel::new(&kafka_addr)?;
-                ch.listen(&["test"])?;
+                ch.listen(&[&topic_name])?;
                 ch.send((
                     KafkaAddr {
                         topic_id: topic_name.clone(),
