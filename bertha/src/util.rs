@@ -363,8 +363,7 @@ where
     }
 }
 
-/// For testing-assertion purposes, a chunnel that errors if send() is called or inner.recv()
-/// returns data.
+/// A chunnel that errors if it is invoked. Used as a base to build chunnel stacks from.
 #[derive(Debug, Clone, Default)]
 pub struct Never;
 

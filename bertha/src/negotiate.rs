@@ -1,7 +1,8 @@
 //! Chunnel wrapper types to negotiate between multiple implementations.
 
 use crate::{
-    either::MakeEither, Chunnel, ChunnelConnection, CxList, CxNil, DataEither, Either, FlipEither,
+    either::MakeEither, util::NeverCn, Chunnel, ChunnelConnection, CxList, CxNil, DataEither,
+    Either, FlipEither,
 };
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{
@@ -886,11 +887,20 @@ where
             }
             ClientOffer(client_offers) => {
                 let s = stack.clone();
-                let (new_stack, client_resp) = match monomorphize(s, client_offers, &a).await {
-                    Ok((new_stack, picked_offers)) => (
-                        Some(new_stack),
-                        NegotiateMsg::ServerReply(Ok(picked_offers)),
-                    ),
+                let (new_stack, client_resp) = match monomorphize(s, client_offers, &a) {
+                    Ok((mut new_stack, nonce, picked_offers)) => {
+                        let nonce_buf = bincode::serialize(&nonce)
+                            .wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
+
+                        new_stack
+                            .call_negotiate_picked(&nonce_buf)
+                            .instrument(debug_span!("call_negotiate_picked"))
+                            .await;
+                        (
+                            Some(new_stack),
+                            NegotiateMsg::ServerReply(Ok(picked_offers)),
+                        )
+                    }
                     Err(e) => {
                         debug!(err = %format!("{:#}", &e), "negotiation handshake failed");
                         (None, NegotiateMsg::ServerReply(Err(e.to_string())))
@@ -954,15 +964,22 @@ where
     }
 }
 
-async fn monomorphize<Srv, A>(
+fn monomorphize<Srv, A>(
     stack: Srv,
     client_offers: Vec<HashMap<u64, Offer>>,
     from_addr: &A,
-) -> Result<(<Srv as Pick>::Picked, Vec<HashMap<u64, Offer>>), Report>
+) -> Result<
+    (
+        <Srv as Pick>::Picked,
+        NegotiateMsg,
+        Vec<HashMap<u64, Offer>>,
+    ),
+    Report,
+>
 where
     Srv: Pick + GetOffers + Clone + Debug + Send + 'static,
     // main-line branch: Pick on incoming negotiation handshake.
-    <Srv as Pick>::Picked: NegotiatePicked + Clone + Debug + Send + 'static,
+    <Srv as Pick>::Picked: Clone + Debug + Send + 'static,
     A: Serialize + DeserializeOwned + Debug + Send + Sync + 'static,
 {
     // enumerate possible offer groups from `stack`.
@@ -974,7 +991,7 @@ where
     // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve,
     //    impl Serve>> into a CxList<impl Serve>
     let PickResult {
-        stack: mut new_stack,
+        stack: new_stack,
         filtered_pairs,
         ..
     } = check_touched(stack, valid_pairs).wrap_err(eyre!("error monomorphizing stack"))?;
@@ -1008,15 +1025,8 @@ where
         addr: bincode::serialize(from_addr)?,
         picked: server_choice,
     };
-    let nonce_buf =
-        bincode::serialize(&nonce).wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
 
-    new_stack
-        .call_negotiate_picked(&nonce_buf)
-        .instrument(debug_span!("call_negotiate_picked"))
-        .await;
-
-    Ok((new_stack, client_choices))
+    Ok((new_stack, nonce, client_choices))
 }
 
 #[derive(Debug, Clone)]
@@ -1324,36 +1334,392 @@ where
     }
 }
 
+pub enum UpgradeEitherApply<A: Apply, B: Apply> {
+    Left(A::Applied, B),
+    Right(B::Applied, A),
+}
+
+impl<A: Apply, B: Apply> UpgradeEitherApply<A, B> {
+    fn with_either_and_saved(
+        applied: Either<A::Applied, B::Applied>,
+        a_saved: A,
+        b_saved: B,
+    ) -> Self {
+        match applied {
+            Either::Left(a) => UpgradeEitherApply::Left(a, b_saved),
+            Either::Right(b) => UpgradeEitherApply::Right(b, a_saved),
+        }
+    }
+}
+
+impl<InC, A, B, Acn, Bcn> Chunnel<InC> for UpgradeEitherApply<A, B>
+where
+    InC: Send + 'static,
+    A: Apply + Clone + Send + 'static,
+    B: Apply + Clone + Send + 'static,
+    <A as Apply>::Applied: Chunnel<InC, Connection = Acn> + Clone + Send + 'static,
+    <B as Apply>::Applied: Chunnel<InC, Connection = Bcn> + Clone + Send + 'static,
+    <<A as Apply>::Applied as Chunnel<InC>>::Future: Send + 'static,
+    <<B as Apply>::Applied as Chunnel<InC>>::Future: Send + 'static,
+    <<A as Apply>::Applied as Chunnel<InC>>::Error: Into<Report>,
+    <<B as Apply>::Applied as Chunnel<InC>>::Error: Into<Report>,
+    Acn: ChunnelConnection + 'static,
+    Bcn: ChunnelConnection + 'static,
+    UpgradeEitherConn<A, B, Acn, Bcn>: ChunnelConnection,
+{
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = UpgradeEitherConn<A, B, Acn, Bcn>;
+    type Error = Report;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        match self {
+            UpgradeEitherApply::Left(ach, b) => {
+                let b = b.clone();
+                let mut ach = ach.clone();
+                Box::pin(async move {
+                    let acn = ach.connect_wrap(cn).await.map_err(Into::into)?;
+                    Ok(UpgradeEitherConn::Left(acn, b))
+                })
+            }
+            UpgradeEitherApply::Right(bch, a) => {
+                let a = a.clone();
+                let mut bch = bch.clone();
+                Box::pin(async move {
+                    let bcn = bch.connect_wrap(cn).await.map_err(Into::into)?;
+                    Ok(UpgradeEitherConn::Right(bcn, a))
+                })
+            }
+        }
+    }
+}
+
+pub enum UpgradeEitherConn<A, B, Acn, Bcn> {
+    Left(Acn, B),
+    Right(Bcn, A),
+    UpgradeLeft(Acn),
+    UpgradeRight(Bcn),
+}
+
+impl<A, B, Acn, Bcn, D> ChunnelConnection for UpgradeEitherConn<A, B, Acn, Bcn>
+where
+    Acn: ChunnelConnection<Data = D>,
+    Bcn: ChunnelConnection<Data = D>,
+{
+    type Data = D;
+
+    fn send(&self, data: D) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        use UpgradeEitherConn::*;
+        match self {
+            Left(a, _) | UpgradeLeft(a) => a.send(data),
+            Right(b, _) | UpgradeRight(b) => b.send(data),
+        }
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        use UpgradeEitherConn::*;
+        match self {
+            Left(a, _) | UpgradeLeft(a) => a.recv(),
+            Right(b, _) | UpgradeRight(b) => b.recv(),
+        }
+    }
+}
+
+impl<A, B, Acn, Bcn> UpgradeEitherConn<A, B, Acn, Bcn>
+where
+    A: Apply + Clone,
+    B: Apply + Clone,
+    <A as Apply>::Applied: Chunnel<NeverCn, Connection = Acn> + Clone + Send + 'static,
+    <B as Apply>::Applied: Chunnel<NeverCn, Connection = Bcn> + Clone + Send + 'static,
+    <<A as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
+    <<B as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
+{
+    // TODO go back and save enough state to switch back if needed.
+    async fn try_upgrade(&mut self, new_offers: HashMap<u64, Offer>) -> Result<(), Report> {
+        match self {
+            UpgradeEitherConn::Left(_, b) => {
+                let ApplyResult { mut applied, .. } = b.clone().apply(new_offers)?;
+                let cn = applied
+                    .connect_wrap(NeverCn::default())
+                    .await
+                    .map_err(Into::into)?;
+                *self = UpgradeEitherConn::UpgradeRight(cn);
+                Ok(())
+            }
+            UpgradeEitherConn::Right(_, a) => {
+                let ApplyResult { mut applied, .. } = a.clone().apply(new_offers)?;
+                let cn = applied
+                    .connect_wrap(NeverCn::default())
+                    .await
+                    .map_err(Into::into)?;
+                *self = UpgradeEitherConn::UpgradeLeft(cn);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+pub struct UpgradeEitherConnWrap<A, B, Acn, Bcn> {
+    negotiation: Arc<TokioMutex<oneshot::Receiver<HashMap<u64, Offer>>>>,
+    inner: Arc<TokioMutex<UpgradeEitherConn<A, B, Acn, Bcn>>>,
+}
+
+impl<D, A, B, Acn, Bcn> ChunnelConnection for UpgradeEitherConnWrap<A, B, Acn, Bcn>
+where
+    UpgradeEitherConn<A, B, Acn, Bcn>: ChunnelConnection<Data = D>,
+    A: Apply + Clone + Send + Sync + 'static,
+    B: Apply + Clone + Send + Sync + 'static,
+    <A as Apply>::Applied: Chunnel<NeverCn, Connection = Acn> + Clone + Send + 'static,
+    <B as Apply>::Applied: Chunnel<NeverCn, Connection = Bcn> + Clone + Send + 'static,
+    <<A as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
+    <<B as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
+    Acn: Send + Sync + 'static,
+    Bcn: Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Data = D;
+    fn send(&self, data: D) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        let inner = Arc::clone(&self.inner);
+        let neg = Arc::clone(&self.negotiation);
+        Box::pin(async move {
+            if let Ok(upgrade) = neg.lock().await.try_recv() {
+                inner.lock().await.try_upgrade(upgrade).await?;
+            }
+
+            inner.lock().await.send(data).await
+        })
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        use futures_util::future;
+        let inner = Arc::clone(&self.inner);
+        let neg = Arc::clone(&self.negotiation);
+        let upgrade_fut = async move {
+            use std::ops::DerefMut;
+            let mut rg = neg.lock().await;
+            let r = rg.deref_mut();
+            match r.await {
+                Ok(up) => up,
+                Err(_) => future::pending().await,
+            }
+        };
+        let inner2 = Arc::clone(&self.inner);
+        let recv_fut = async move { inner.lock().await.recv().await };
+
+        Box::pin(async move {
+            tokio::pin!(recv_fut);
+            tokio::pin!(upgrade_fut);
+            match future::select(recv_fut, upgrade_fut).await {
+                future::Either::Left((recvd, _)) => recvd,
+                future::Either::Right((upgrade, recvr)) => {
+                    std::mem::drop(recvr); // cancel the future and drop, so its lock on inner is dropped.
+                    let mut inner = inner2.lock().await;
+                    inner.try_upgrade(upgrade).await?;
+                    inner.recv().await
+                }
+            }
+        })
+    }
+}
+
+impl<D, A, B, Acn, Bcn> UpgradeEitherConnWrap<A, B, Acn, Bcn>
+where
+    UpgradeEitherConn<A, B, Acn, Bcn>: ChunnelConnection<Data = D>,
+    A: Apply + Clone,
+    B: Apply + Clone,
+    <A as Apply>::Applied: Chunnel<NeverCn, Connection = Acn> + Clone + Send + 'static,
+    <B as Apply>::Applied: Chunnel<NeverCn, Connection = Bcn> + Clone + Send + 'static,
+    <<A as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
+    <<B as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
+{
+    async fn with_negotiator<R, E, F>(
+        inner: UpgradeEitherConn<A, B, Acn, Bcn>,
+        mut negotiator: R,
+        addr: String,
+        curr_entry: RendezvousEntry,
+    ) -> Self
+    where
+        R: for<'r> Rendezvous<'r, Error = E, Future = F> + Send + 'static,
+        F: Future<Output = Result<Option<RendezvousEntry>, E>> + Send,
+        E: Into<Report>,
+    {
+        let (s, r) = oneshot::channel();
+        tokio::spawn(
+            async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+                    // negotiator.ask(curr_entry)
+                    match negotiator
+                        .compare_exchange(addr.clone(), curr_entry.clone())
+                        .await
+                    {
+                        Ok(Some(new)) => {
+                            // s.send(new)
+                            debug!("new semantics, exiting");
+                            s.send(new.nonce).unwrap();
+                            break;
+                        }
+                        Ok(None) => {
+                            trace!("no change");
+                            continue;
+                        }
+                        Err(e) => {
+                            let r = e.into();
+                            warn!(err = ?r, "failed");
+                            break;
+                        }
+                    }
+                }
+            }
+            .instrument(debug_span!("poll_rendezvous_negotiate")),
+        );
+
+        Self {
+            negotiation: Arc::new(TokioMutex::new(r)),
+            inner: Arc::new(TokioMutex::new(inner)),
+        }
+    }
+}
+
+pub struct UpgradeSelect<T1, T2> {
+    pub left: T1,
+    pub right: T2,
+    prefer: Either<(), ()>,
+}
+
+impl<T1, T2> From<UpgradeSelect<T1, T2>> for Select<T1, T2> {
+    fn from(us: UpgradeSelect<T1, T2>) -> Select<T1, T2> {
+        Select::from((us.left, us.right)).prefer(us.prefer)
+    }
+}
+
+impl<T1, T2> Apply for UpgradeSelect<T1, T2>
+where
+    T1: Apply + Clone,
+    T2: Apply + Clone,
+{
+    type Applied = UpgradeEitherApply<T1, T2>;
+
+    fn apply(
+        self,
+        picked_offers: HashMap<u64, Offer>,
+    ) -> Result<ApplyResult<Self::Applied>, Report> {
+        let left_saved = self.left.clone();
+        let right_saved = self.right.clone();
+
+        let sel: Select<T1, T2> = self.into();
+        let ApplyResult {
+            applied,
+            picked,
+            touched,
+            score,
+        } = sel.apply(picked_offers)?;
+
+        let applied = UpgradeEitherApply::with_either_and_saved(applied, left_saved, right_saved);
+        Ok(ApplyResult {
+            applied,
+            picked,
+            touched,
+            score,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RendezvousEntry {
+    nonce: HashMap<u64, Offer>,
+    multi_consumer: bool,
+    multi_producer: bool,
+}
+
 /// Mechanism to register semantics on an address.
+///
+/// Basically a KV store.
 pub trait Rendezvous<'a> {
-    type Future: Future<Output = Result<Option<Vec<u8>>, Self::Error>> + 'a;
+    /// None -> offer matches, or superceded existing.
+    /// Some(foo) -> offer was superceded by foo.
+    type Future: Future<Output = Result<Option<RendezvousEntry>, Self::Error>> + 'a;
     type Error: Send + Sync;
 
-    fn init_or_fetch(&'a mut self, addr: String, nonce: Vec<u8>) -> Self::Future;
+    /// anything supercedes a null entry.
+    /// `multi_producer = true` supercedes `multi_producer = false`.
+    /// `multi_consumer = true` supercedes `multi_consumer = false`.
+    fn compare_exchange(&'a mut self, addr: String, offer: RendezvousEntry) -> Self::Future;
 }
 
 /// Rendezvous-based negotiation.
-pub async fn negotiate_rendezvous<'a, S, R>(
-    stack: S,
-    rendezvous_point: &'a mut R,
+pub async fn negotiate_rendezvous<Ssingle, Smulti, SsingleCn, SmultiCn, R, E, F>(
+    stack: UpgradeSelect<Ssingle, Smulti>,
+    mut rendezvous_point: R,
     addr: String,
-) -> Result<<S as Pick>::Picked, Report>
+) -> Result<Either<UpgradeEitherConnWrap<Ssingle, Smulti, SsingleCn, SmultiCn>, SmultiCn>, Report>
 where
-    S: Pick + GetOffers + Debug + Clone + Send + Sync + 'static,
-    <S as Pick>::Picked: NegotiatePicked + Clone + Debug + Send,
-    R: Rendezvous<'a>,
-    <R as Rendezvous<'a>>::Error: Into<Report>,
+    Ssingle: Pick + Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
+    <Ssingle as Pick>::Picked: Clone + Debug + Send,
+    <Ssingle as Apply>::Applied: Chunnel<NeverCn, Connection = SsingleCn> + Clone + Debug + Send,
+    <<Ssingle as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
+    Smulti: Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
+    <Smulti as Apply>::Applied: Chunnel<NeverCn, Connection = SmultiCn> + Clone + Debug + Send,
+    <<Smulti as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
+    UpgradeEitherApply<Ssingle, Smulti>:
+        Chunnel<NeverCn, Connection = UpgradeEitherConn<Ssingle, Smulti, SsingleCn, SmultiCn>>,
+    <UpgradeEitherApply<Ssingle, Smulti> as Chunnel<NeverCn>>::Error: Into<Report>,
+    UpgradeEitherConn<Ssingle, Smulti, SsingleCn, SmultiCn>: ChunnelConnection,
+    R: for<'a> Rendezvous<'a, Error = E, Future = F> + Send + 'static,
+    E: Into<Report>,
+    F: Future<Output = Result<Option<RendezvousEntry>, E>> + Send,
 {
-    // for rendezvous-based negotiation, the other side is not present. So, we assume they think
-    // the same way as us.
-    let offers = stack.offers().collect();
-    let (picked, offers) = monomorphize(stack, offers, &addr).await?;
-    let nonce = bincode::serialize(&offers)?;
-    rendezvous_point
-        .init_or_fetch(addr, nonce)
-        .await
-        .map_err(Into::into)?;
-    Ok(picked)
+    // first try assuming we are first. So, "negotiate" against ourselves for a nonce.
+    // we impl Pick just to pass to monomorphize, for our actual stack we will use the nonce, since
+    // our Either type explicitly handles apply.
+    let stack_left = stack.left.clone();
+    let offers = stack_left.offers().collect();
+    let offer = if let (_stack, NegotiateMsg::ServerNonce { picked, .. }, _client_offers) =
+        monomorphize(stack_left, offers, &addr)?
+    {
+        RendezvousEntry {
+            nonce: picked,
+            multi_consumer: false,
+            multi_producer: false,
+        }
+    } else {
+        unreachable!()
+    };
+
+    let picked = offer.clone();
+    let res = {
+        let rp = &mut rendezvous_point;
+        rp.compare_exchange(addr.clone(), offer)
+            .await
+            .map_err(Into::into)
+    }?;
+
+    match res {
+        None => {
+            // if we were first, kick off a `rendezvous_point` polling future and return an upgradable
+            // UpgradeEitherConn with a handle to the poller.
+            let ApplyResult { mut applied, .. } = stack.apply(picked.nonce.clone())?;
+            let cn = applied
+                .connect_wrap(NeverCn::default())
+                .await
+                .map_err(Into::into)?;
+            let cn =
+                UpgradeEitherConnWrap::with_negotiator(cn, rendezvous_point, addr.clone(), picked)
+                    .await;
+            Ok(Either::Left(cn))
+        }
+        Some(RendezvousEntry { nonce, .. }) => {
+            // if we were second, there won't be an upgrade. just apply the nonce on Smulti.
+            let ApplyResult { mut applied, .. } = stack.right.apply(nonce)?;
+            Ok(Either::Right(
+                applied
+                    .connect_wrap(NeverCn::default())
+                    .await
+                    .map_err(Into::into)?,
+            ))
+        }
+    }
 }
 
 #[allow(non_upper_case_globals)]
