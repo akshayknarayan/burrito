@@ -1,7 +1,7 @@
 //! Measure message throughput, latency, and ordered-ness for an experiment [`Mode`].
 //!
 //! This program is both the producer and the consumer (in different threads).
-//! The chunnel stacks it benchmarks should support the (addr, data) = (QueueAddr, String)
+//! The chunnel stacks it benchmarks should support the (addr, data) = (impl SetGroup, String)
 //! datatype.
 
 use az_queues::{AsStorageClient, AzStorageQueueChunnel};
@@ -15,7 +15,8 @@ use queue_steer::bin_help::{
     do_atmostonce_exp, do_best_effort_exp, do_ordered_groups_exp, dump_results, Mode, RecvdMsg,
 };
 use queue_steer::{
-    AtMostOnce, KafkaChunnelWrap, Ordered, OrderedSqsChunnelWrap, QueueAddr, SqsChunnelWrap,
+    AtMostOnce, AzQueueChunnelWrap, GcpPubSubWrap, KafkaChunnelWrap, Ordered,
+    OrderedSqsChunnelWrap, SqsChunnelWrap,
 };
 use sqs::{SqsAddr, SqsChunnel};
 use std::fmt::Debug;
@@ -195,7 +196,7 @@ impl Provider {
                 let sqs_client =
                     sqs::sqs_client_from_creds(aws_access_key_id, aws_secret_access_key)?;
                 let (queue, generated): (_, Option<ProviderCleanup>) = if generated {
-                    // what if we want to optimize to a fifo queue?
+                    // TODO what if we want to optimize to a fifo queue?
                     let queue = sqs::make_be_queue(&sqs_client, queue.clone()).await?;
                     (queue.clone(), Some((queue, sqs_client.clone()).into()))
                 } else {
@@ -230,19 +231,24 @@ impl Provider {
                     None
                 };
 
+                use queue_steer::{FakeSetGroup, FakeSetGroupAddr};
                 debug!(?queue, "Azure queue");
-                unimplemented!()
-                //let cn = AzStorageQueueChunnel::new(az_client, once(queue.as_str()));
-                //let (msgs, elapsed) = do_exp!(mode, cn, queue, num_reqs, inter_request_ms)?;
-                //if let Some(gen) = generated {
-                //    gen.cleanup().await?;
-                //}
-                //Ok((msgs, elapsed))
+                let cn: AzQueueChunnelWrap =
+                    AzStorageQueueChunnel::new(az_client, once(queue.as_str())).into();
+                let cn = CxList::from(FakeSetGroup::default()).wrap(cn);
+                let addr: FakeSetGroupAddr = queue.into();
+                let (msgs, elapsed) = do_exp!(mode, cn, addr, num_reqs, inter_request_ms);
+                if let Some(gen) = generated {
+                    gen.cleanup().await?;
+                }
+                Ok((msgs, elapsed))
             }
             Kafka { addr } => {
                 kafka::make_topic(&addr, &queue).await?;
-                info!(?queue, "Kafka queue");
-                let cn: KafkaChunnelWrap = kafka::KafkaChunnel::new(&addr)?.into();
+                info!(?queue, ?addr, "Kafka queue");
+                let ch = kafka::KafkaChunnel::new(&addr)?;
+                ch.listen(&[&queue])?;
+                let cn: KafkaChunnelWrap = ch.into();
                 let c_addr = kafka::KafkaAddr {
                     topic_id: queue.clone(),
                     group: None,
@@ -270,16 +276,17 @@ impl Provider {
 
                 debug!(?queue, "GCP queue");
                 let addr = PubSubAddr {
-                    topic_id: queue,
+                    topic_id: queue.clone(),
                     group: None,
                 };
-                unimplemented!()
-                //let cn = PubSubChunnel::new(gcp_client, once(queue.as_str())).await?;
-                //let (msgs, elapsed) = do_exp!(mode, cn, addr, num_reqs, inter_request_ms)?;
-                //if let Some(gen) = generated {
-                //    gen.cleanup().await?;
-                //}
-                //Ok((msgs, elapsed))
+                let cn: GcpPubSubWrap = PubSubChunnel::new(gcp_client, once(queue.as_str()))
+                    .await?
+                    .into();
+                let (msgs, elapsed) = do_exp!(mode, cn, addr, num_reqs, inter_request_ms);
+                if let Some(gen) = generated {
+                    gen.cleanup().await?;
+                }
+                Ok((msgs, elapsed))
             }
         }
     }
@@ -345,8 +352,6 @@ impl ProviderCleanupInner {
 }
 
 fn sample_opt(s: SqsChunnel) {
-    use sqs::OrderedSqsChunnel;
-
     // input
     let stack =
         CxList::from(AtMostOnce::default()) // or OrderedChunnelProj
