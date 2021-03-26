@@ -1550,10 +1550,7 @@ where
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
                     // negotiator.ask(curr_entry)
-                    match negotiator
-                        .compare_exchange(addr.clone(), curr_entry.clone())
-                        .await
-                    {
+                    match negotiator.negotiate(addr.clone(), curr_entry.clone()).await {
                         Ok(Some(new)) => {
                             // s.send(new)
                             debug!("new semantics, exiting");
@@ -1628,9 +1625,8 @@ where
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RendezvousEntry {
-    nonce: HashMap<u64, Offer>,
-    multi_consumer: bool,
-    multi_producer: bool,
+    pub nonce: HashMap<u64, Offer>,
+    pub multi: bool,
 }
 
 /// Mechanism to register semantics on an address.
@@ -1643,9 +1639,8 @@ pub trait Rendezvous<'a> {
     type Error: Send + Sync;
 
     /// anything supercedes a null entry.
-    /// `multi_producer = true` supercedes `multi_producer = false`.
-    /// `multi_consumer = true` supercedes `multi_consumer = false`.
-    fn compare_exchange(&'a mut self, addr: String, offer: RendezvousEntry) -> Self::Future;
+    /// `multi = true` supercedes `multi = false`.
+    fn negotiate(&'a mut self, addr: String, offer: RendezvousEntry) -> Self::Future;
 }
 
 /// Rendezvous-based negotiation.
@@ -1680,8 +1675,7 @@ where
     {
         RendezvousEntry {
             nonce: picked,
-            multi_consumer: false,
-            multi_producer: false,
+            multi: false,
         }
     } else {
         unreachable!()
@@ -1690,9 +1684,7 @@ where
     let picked = offer.clone();
     let res = {
         let rp = &mut rendezvous_point;
-        rp.compare_exchange(addr.clone(), offer)
-            .await
-            .map_err(Into::into)
+        rp.negotiate(addr.clone(), offer).await.map_err(Into::into)
     }?;
 
     match res {

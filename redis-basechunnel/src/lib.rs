@@ -1,7 +1,7 @@
 // Pin<Box<...>> is necessary and not worth breaking up
 #![allow(clippy::type_complexity)]
 
-use bertha::negotiate::Rendezvous;
+use bertha::negotiate::{Rendezvous, RendezvousEntry};
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use std::sync::Arc;
 use std::{future::Future, pin::Pin};
@@ -28,28 +28,66 @@ impl RedisBase {
 
 impl<'a> Rendezvous<'a> for RedisBase {
     type Error = Report;
-    type Future = Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, Self::Error>> + 'a>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Option<RendezvousEntry>, Self::Error>> + 'a>>;
 
-    /// Establish semantics via nonce in redis. If semantics already established, return Some(nonce) for
-    /// comparison. Else `None` to indicate no one else was there first.
-    fn init_or_fetch(&'a mut self, queue_name: String, neg_nonce: Vec<u8>) -> Self::Future {
+    fn negotiate(&'a mut self, addr: String, offer: RendezvousEntry) -> Self::Future {
         Box::pin(async move {
+            let neg_nonce = bincode::serialize(&offer).wrap_err("serialize entry")?;
+            let mut redis_conn = self.redis_conn.lock().await;
             let mut r = redis::pipe();
             let (set_res, nonce_val): (isize, Vec<u8>) = r
                 .atomic()
-                .set_nx(&queue_name, &neg_nonce[..])
-                .get(queue_name)
-                .query_async(&mut *self.redis_conn.lock().await)
+                .set_nx(&addr, &neg_nonce[..])
+                .get(addr.clone())
+                .query_async(&mut *redis_conn)
                 .await?;
             if set_res == 1 {
                 // was set
+                // anything supercedes a null entry.
                 ensure!(nonce_val == neg_nonce, "Nonce values mismatched");
                 Ok(None)
             } else if set_res == 0 {
                 // was not set
-                Ok(Some(nonce_val))
+                let nonce_val: RendezvousEntry =
+                    bincode::deserialize(&nonce_val).wrap_err("deserialize entry")?;
+
+                // `multi = true` supercedes `multi = false`.
+                match (nonce_val, offer) {
+                    (
+                        nv @ RendezvousEntry { multi: true, .. },
+                        RendezvousEntry { multi: false, .. },
+                    ) => {
+                        // we are superceded by nonce_val.
+                        Ok(Some(nv))
+                    }
+                    (RendezvousEntry { multi: false, .. }, RendezvousEntry { multi: true, .. }) => {
+                        // we supercede. overwrite.
+                        let mut r = redis::pipe();
+                        r.atomic()
+                            .set(&addr, &neg_nonce[..])
+                            .query_async(&mut *redis_conn)
+                            .await?;
+                        Ok(None)
+                    }
+                    (
+                        nv @ RendezvousEntry { .. },
+                        RendezvousEntry {
+                            nonce: our_nonce, ..
+                        },
+                    ) => {
+                        if nv.nonce == our_nonce {
+                            // either we set the same thing, or no one else has set since our last time.
+                            Ok(None)
+                        } else {
+                            // nonces didn't match, but multi-mode did. weird. maybe we're trying
+                            // to access using a wrong stack. we defer to what's already
+                            // registered.
+                            Ok(Some(nv))
+                        }
+                    }
+                }
             } else {
-                unreachable!();
+                unreachable!()
             }
         })
     }
