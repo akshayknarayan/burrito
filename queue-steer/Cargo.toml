@@ -5,7 +5,7 @@ authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
 [features]
-bin = ["structopt", "tracing-subscriber", "tracing-error"]
+bin = ["structopt", "tracing-subscriber", "tracing-error", "redis-basechunnel"]
 
 [dependencies]
 sqs = { path = "../sqs" }
@@ -21,6 +21,7 @@ tracing-futures = "0.2"
 rand = "0.7"
 serde = "1"
 redis = { version = "0.20", default-features = false, features = ["aio", "tokio-comp"] }
+redis-basechunnel = { path = "../redis-basechunnel" , optional = true }
 tokio = { version = "1", features = ["macros", "sync"] }
 tracing-error = { version = "0.1", optional = true }
 structopt = { version = "0.3", optional = true }
@@ -28,4 +29,8 @@ tracing-subscriber = { version = "0.2", optional = true }
 
 [[bin]]
 name = "bench2"
+required-features = ["bin"]
+
+[[bin]]
+name = "transition"
 required-features = ["bin"]

@@ -1533,15 +1533,14 @@ where
     <<A as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
     <<B as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
 {
-    async fn with_negotiator<R, E, F>(
+    async fn with_negotiator<R, E>(
         inner: UpgradeEitherConn<A, B, Acn, Bcn>,
         mut negotiator: R,
         addr: String,
         curr_entry: RendezvousEntry,
     ) -> Self
     where
-        R: for<'r> Rendezvous<'r, Error = E, Future = F> + Send + 'static,
-        F: Future<Output = Result<Option<RendezvousEntry>, E>> + Send,
+        R: for<'r> Rendezvous<'r, Error = E> + Send + 'static,
         E: Into<Report>,
     {
         let (s, r) = oneshot::channel();
@@ -1579,15 +1578,24 @@ where
     }
 }
 
+/// `left` is always single-(producer/consumer), and `right` multi-mode.
 pub struct UpgradeSelect<T1, T2> {
     pub left: T1,
     pub right: T2,
-    prefer: Either<(), ()>,
 }
 
 impl<T1, T2> From<UpgradeSelect<T1, T2>> for Select<T1, T2> {
-    fn from(us: UpgradeSelect<T1, T2>) -> Select<T1, T2> {
-        Select::from((us.left, us.right)).prefer(us.prefer)
+    fn from(us: UpgradeSelect<T1, T2>) -> Self {
+        Select::from((us.left, us.right))
+    }
+}
+
+impl<T1, T2> From<Select<T1, T2>> for UpgradeSelect<T1, T2> {
+    fn from(s: Select<T1, T2>) -> Self {
+        UpgradeSelect {
+            left: s.left,
+            right: s.right,
+        }
     }
 }
 
@@ -1635,7 +1643,7 @@ pub struct RendezvousEntry {
 pub trait Rendezvous<'a> {
     /// None -> offer matches, or superceded existing.
     /// Some(foo) -> offer was superceded by foo.
-    type Future: Future<Output = Result<Option<RendezvousEntry>, Self::Error>> + 'a;
+    type Future: Future<Output = Result<Option<RendezvousEntry>, Self::Error>> + Send + 'a;
     type Error: Send + Sync;
 
     /// anything supercedes a null entry.
@@ -1644,7 +1652,7 @@ pub trait Rendezvous<'a> {
 }
 
 /// Rendezvous-based negotiation.
-pub async fn negotiate_rendezvous<Ssingle, Smulti, SsingleCn, SmultiCn, R, E, F>(
+pub async fn negotiate_rendezvous<Ssingle, Smulti, SsingleCn, SmultiCn, R, E>(
     stack: UpgradeSelect<Ssingle, Smulti>,
     mut rendezvous_point: R,
     addr: String,
@@ -1661,9 +1669,8 @@ where
         Chunnel<NeverCn, Connection = UpgradeEitherConn<Ssingle, Smulti, SsingleCn, SmultiCn>>,
     <UpgradeEitherApply<Ssingle, Smulti> as Chunnel<NeverCn>>::Error: Into<Report>,
     UpgradeEitherConn<Ssingle, Smulti, SsingleCn, SmultiCn>: ChunnelConnection,
-    R: for<'a> Rendezvous<'a, Error = E, Future = F> + Send + 'static,
+    R: for<'a> Rendezvous<'a, Error = E> + Send + 'static,
     E: Into<Report>,
-    F: Future<Output = Result<Option<RendezvousEntry>, E>> + Send,
 {
     // first try assuming we are first. So, "negotiate" against ourselves for a nonce.
     // we impl Pick just to pass to monomorphize, for our actual stack we will use the nonce, since

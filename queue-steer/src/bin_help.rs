@@ -182,8 +182,8 @@ where
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Msg {
-    send_time: Duration,
-    req_num: usize,
+    pub send_time: Duration,
+    pub req_num: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,7 +193,7 @@ pub struct RecvdMsg {
 }
 
 impl RecvdMsg {
-    fn from_start(start: std::time::Instant, msg: Msg) -> Self {
+    pub fn from_start(start: std::time::Instant, msg: Msg) -> Self {
         Self {
             elapsed: start.elapsed() - msg.send_time,
             req_num: msg.req_num,

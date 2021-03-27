@@ -131,7 +131,7 @@ where
 #[derive(Debug, Clone, Default)]
 pub struct Base64Chunnel;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Base64Capability;
 
 impl crate::negotiate::CapabilitySet for Base64Capability {

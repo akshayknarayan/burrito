@@ -28,7 +28,8 @@ impl RedisBase {
 
 impl<'a> Rendezvous<'a> for RedisBase {
     type Error = Report;
-    type Future = Pin<Box<dyn Future<Output = Result<Option<RendezvousEntry>, Self::Error>> + 'a>>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Option<RendezvousEntry>, Self::Error>> + Send + 'a>>;
 
     fn negotiate(&'a mut self, addr: String, offer: RendezvousEntry) -> Self::Future {
         Box::pin(async move {

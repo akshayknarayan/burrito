@@ -138,7 +138,20 @@ pub struct OrderedSqsChunnel {
 }
 
 impl From<SqsChunnel> for OrderedSqsChunnel {
-    fn from(inner: SqsChunnel) -> Self {
+    fn from(mut inner: SqsChunnel) -> Self {
+        let fifo_urls = inner
+            .recv_queue_urls
+            .into_iter()
+            .map(|s| {
+                if !s.ends_with(".fifo") {
+                    format!("{}.fifo", s)
+                } else {
+                    s
+                }
+            })
+            .collect();
+        inner.recv_queue_urls = fifo_urls;
+
         Self {
             inner,
             send_ctr: Default::default(),
@@ -177,17 +190,26 @@ impl ChunnelConnection for OrderedSqsChunnel {
 
     fn send(
         &self,
-        (SqsAddr { queue_id, group }, body): Self::Data,
+        (
+            SqsAddr {
+                mut queue_id,
+                group,
+            },
+            body,
+        ): Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let sqs = self.inner.sqs_client.clone();
         let ctr = self
             .send_ctr
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
-            ensure!(
-                queue_id.ends_with(".fifo"),
-                "Can only send to a FIFO queue with an OrderedSqsChunnel"
-            );
+            //ensure!(
+            //    queue_id.ends_with(".fifo"),
+            //    "Can only send to a FIFO queue with an OrderedSqsChunnel"
+            //);
+            if !queue_id.ends_with(".fifo") {
+                queue_id = format!("{}.fifo", queue_id);
+            }
 
             // message_deduplication_id is optional if cloud-side "content-based deduplication" is
             // enabled, but required if it is not.
