@@ -1461,7 +1461,7 @@ where
 }
 
 pub struct UpgradeEitherConnWrap<A, B, Acn, Bcn> {
-    negotiation: Arc<TokioMutex<oneshot::Receiver<HashMap<u64, Offer>>>>,
+    negotiation: Arc<TokioMutex<Option<oneshot::Receiver<HashMap<u64, Offer>>>>>,
     inner: Arc<TokioMutex<UpgradeEitherConn<A, B, Acn, Bcn>>>,
 }
 
@@ -1483,10 +1483,15 @@ where
         let inner = Arc::clone(&self.inner);
         let neg = Arc::clone(&self.negotiation);
         Box::pin(async move {
-            if let Ok(upgrade) = neg.lock().await.try_recv() {
-                inner.lock().await.try_upgrade(upgrade).await?;
+            let mut neg_g = neg.lock().await;
+            if let Some(ref mut oneshot_receiver) = *neg_g {
+                if let Ok(upgrade) = oneshot_receiver.try_recv() {
+                    inner.lock().await.try_upgrade(upgrade).await?;
+                    *neg_g = None;
+                }
             }
 
+            std::mem::drop(neg_g);
             inner.lock().await.send(data).await
         })
     }
@@ -1499,9 +1504,13 @@ where
             use std::ops::DerefMut;
             let mut rg = neg.lock().await;
             let r = rg.deref_mut();
-            match r.await {
-                Ok(up) => up,
-                Err(_) => future::pending().await,
+            if let Some(ref mut r) = *r {
+                match r.await {
+                    Ok(up) => up,
+                    Err(_) => future::pending().await,
+                }
+            } else {
+                future::pending().await
             }
         };
         let inner2 = Arc::clone(&self.inner);
@@ -1538,26 +1547,56 @@ where
         mut negotiator: R,
         addr: String,
         curr_entry: RendezvousEntry,
+        upgrade_entry: RendezvousEntry,
     ) -> Self
     where
         R: for<'r> Rendezvous<'r, Error = E> + Send + 'static,
-        E: Into<Report>,
+        E: Into<Report> + Send,
     {
         let (s, r) = oneshot::channel();
         tokio::spawn(
             async move {
+                debug!("starting");
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     // negotiator.ask(curr_entry)
-                    match negotiator.negotiate(addr.clone(), curr_entry.clone()).await {
-                        Ok(Some(new)) => {
+                    match negotiator
+                        .negotiate(addr.clone(), curr_entry.clone(), false)
+                        .await
+                    {
+                        Ok(NegotiateRendezvousResult::Superceded(new)) => {
                             // s.send(new)
                             debug!("new semantics, exiting");
                             s.send(new.nonce).unwrap();
                             break;
                         }
-                        Ok(None) => {
-                            trace!("no change");
+                        Ok(NegotiateRendezvousResult::NeedUpgrade) => {
+                            debug!("using new semantics");
+                            match negotiator
+                                .negotiate(addr.clone(), upgrade_entry.clone(), false)
+                                .await
+                            {
+                                Ok(NegotiateRendezvousResult::Matched) => {
+                                    debug!("new semantics, exiting");
+                                    s.send(upgrade_entry.nonce).unwrap();
+                                    break;
+                                }
+                                Ok(NegotiateRendezvousResult::Superceded(new)) => {
+                                    // s.send(new)
+                                    debug!("new semantics, exiting");
+                                    s.send(new.nonce).unwrap();
+                                    break;
+                                }
+                                Ok(NegotiateRendezvousResult::NeedUpgrade) => unreachable!(),
+                                Err(e) => {
+                                    let r = e.into();
+                                    warn!(err = ?r, "failed");
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(NegotiateRendezvousResult::Matched) => {
+                            debug!("no change");
                             continue;
                         }
                         Err(e) => {
@@ -1572,7 +1611,7 @@ where
         );
 
         Self {
-            negotiation: Arc::new(TokioMutex::new(r)),
+            negotiation: Arc::new(TokioMutex::new(Some(r))),
             inner: Arc::new(TokioMutex::new(inner)),
         }
     }
@@ -1637,21 +1676,32 @@ pub struct RendezvousEntry {
     pub multi: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum NegotiateRendezvousResult {
+    /// the offer provided either matched the rendezvous or superceded it.
+    Matched,
+    /// the offer did not match, and we need to provide an upgraded version.
+    NeedUpgrade,
+    /// the offer is superceded, and we should use the returned entry.
+    Superceded(RendezvousEntry),
+}
+
 /// Mechanism to register semantics on an address.
 ///
 /// Basically a KV store.
 pub trait Rendezvous<'a> {
     /// None -> offer matches, or superceded existing.
     /// Some(foo) -> offer was superceded by foo.
-    type Future: Future<Output = Result<Option<RendezvousEntry>, Self::Error>> + Send + 'a;
+    type Future: Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a;
     type Error: Send + Sync;
 
     /// anything supercedes a null entry.
-    /// `multi = true` supercedes `multi = false`.
-    fn negotiate(&'a mut self, addr: String, offer: RendezvousEntry) -> Self::Future;
+    /// `multi = false` + `multi = false` => `multi = true`
+    fn negotiate(&'a mut self, addr: String, offer: RendezvousEntry, new: bool) -> Self::Future;
 }
 
 /// Rendezvous-based negotiation.
+#[instrument(skip(stack, rendezvous_point))]
 pub async fn negotiate_rendezvous<Ssingle, Smulti, SsingleCn, SmultiCn, R, E>(
     stack: UpgradeSelect<Ssingle, Smulti>,
     mut rendezvous_point: R,
@@ -1662,7 +1712,8 @@ where
     <Ssingle as Pick>::Picked: Clone + Debug + Send,
     <Ssingle as Apply>::Applied: Chunnel<NeverCn, Connection = SsingleCn> + Clone + Debug + Send,
     <<Ssingle as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
-    Smulti: Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
+    Smulti: Pick + Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
+    <Smulti as Pick>::Picked: Clone + Debug + Send,
     <Smulti as Apply>::Applied: Chunnel<NeverCn, Connection = SmultiCn> + Clone + Debug + Send,
     <<Smulti as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
     UpgradeEitherApply<Ssingle, Smulti>:
@@ -1670,7 +1721,7 @@ where
     <UpgradeEitherApply<Ssingle, Smulti> as Chunnel<NeverCn>>::Error: Into<Report>,
     UpgradeEitherConn<Ssingle, Smulti, SsingleCn, SmultiCn>: ChunnelConnection,
     R: for<'a> Rendezvous<'a, Error = E> + Send + 'static,
-    E: Into<Report>,
+    E: Into<Report> + Send,
 {
     // first try assuming we are first. So, "negotiate" against ourselves for a nonce.
     // we impl Pick just to pass to monomorphize, for our actual stack we will use the nonce, since
@@ -1688,29 +1739,94 @@ where
         unreachable!()
     };
 
+    debug!(?offer, "monomorphized sole occupancy stack");
     let picked = offer.clone();
-    let res = {
+    let mut res = {
         let rp = &mut rendezvous_point;
-        rp.negotiate(addr.clone(), offer).await.map_err(Into::into)
+        rp.negotiate(addr.clone(), offer, true)
+            .await
+            .map_err(Into::into)
     }?;
 
+    use NegotiateRendezvousResult::*;
+    // handle NeedUpgrade case.
+    if let NeedUpgrade = &res {
+        let stack_right = stack.right.clone();
+        let offers = stack_right.offers().collect();
+        let offer = if let (_stack, NegotiateMsg::ServerNonce { picked, .. }, _client_offers) =
+            monomorphize(stack_right, offers, &addr)?
+        {
+            RendezvousEntry {
+                nonce: picked,
+                multi: true,
+            }
+        } else {
+            unreachable!()
+        };
+
+        debug!(?offer, "monomorphized multi-occupancy stack");
+        let picked = offer.clone();
+        match {
+            let rp = &mut rendezvous_point;
+            rp.negotiate(addr.clone(), offer, false)
+                .await
+                .map_err(Into::into)
+        }? {
+            Matched => {
+                // use superceded-case logic below.
+                res = Superceded(picked);
+            }
+            NeedUpgrade => {
+                return Err(eyre!(
+                    "unexpected negotiation response NeedUpgrade, expected Matched on multi-offer"
+                ))
+            }
+            r @ Superceded(_) => {
+                debug!(?r, "Negotiate overwritten during NeedsUpgrade cycle");
+                res = r
+            }
+        }
+    }
+
     match res {
-        None => {
+        Matched => {
             // if we were first, kick off a `rendezvous_point` polling future and return an upgradable
             // UpgradeEitherConn with a handle to the poller.
+            let stack_right = stack.right.clone();
+            let offers = stack_right.offers().collect();
+            let upgrade_entry =
+                if let (_stack, NegotiateMsg::ServerNonce { picked, .. }, _client_offers) =
+                    monomorphize(stack_right, offers, &addr)?
+                {
+                    RendezvousEntry {
+                        nonce: picked,
+                        multi: true,
+                    }
+                } else {
+                    unreachable!()
+                };
+
             let ApplyResult { mut applied, .. } = stack.apply(picked.nonce.clone())?;
             let cn = applied
                 .connect_wrap(NeverCn::default())
                 .await
                 .map_err(Into::into)?;
-            let cn =
-                UpgradeEitherConnWrap::with_negotiator(cn, rendezvous_point, addr.clone(), picked)
-                    .await;
+
+            let cn = UpgradeEitherConnWrap::with_negotiator(
+                cn,
+                rendezvous_point,
+                addr.clone(),
+                picked,
+                upgrade_entry,
+            )
+            .await;
+            debug!("returning upgradable connection");
             Ok(Either::Left(cn))
         }
-        Some(RendezvousEntry { nonce, .. }) => {
+        Superceded(RendezvousEntry { nonce, .. }) => {
             // if we were second, there won't be an upgrade. just apply the nonce on Smulti.
             let ApplyResult { mut applied, .. } = stack.right.apply(nonce)?;
+            debug!("returning upgraded connection");
             Ok(Either::Right(
                 applied
                     .connect_wrap(NeverCn::default())
@@ -1718,6 +1834,7 @@ where
                     .map_err(Into::into)?,
             ))
         }
+        _ => unreachable!(),
     }
 }
 

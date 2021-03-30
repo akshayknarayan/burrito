@@ -96,6 +96,7 @@ async fn main() -> Result<(), Report> {
     Ok(())
 }
 
+#[instrument(skip(sqs_client, redis))]
 async fn run_exp(
     num_reqs: usize,
     inter_request: Duration,
@@ -103,7 +104,9 @@ async fn run_exp(
     redis: String,
 ) -> Result<Vec<RecvdMsg>, Report> {
     let redis_base = RedisBase::new(&redis).await?;
-    let (be_queue, fifo_queue): (String, String) = (gen_id(false), gen_id(true));
+    let be_queue: String = gen_id(false);
+    let mut fifo_queue = be_queue.clone();
+    fifo_queue.push_str(".fifo");
     let be_queue = sqs::make_be_queue(&sqs_client, be_queue.clone()).await?;
     let fifo_queue = sqs::make_fifo_queue(&sqs_client, fifo_queue.clone()).await?;
 
@@ -143,6 +146,7 @@ async fn run_exp(
     // use 5 groups.
     let groups: Vec<_> = (0..4).map(|g| g.to_string()).collect();
 
+    #[instrument(skip(cn, groups, start))]
     async fn do_reqs(
         addr: SqsAddr,
         cn: &impl ChunnelConnection<Data = (SqsAddr, Msg)>,
@@ -153,7 +157,9 @@ async fn run_exp(
     ) -> Result<(), Report> {
         for req_num in 0..num_reqs {
             let mut a = addr.clone();
-            a.set_group(groups[req_num % groups.len()].clone());
+            let grp_num = req_num % groups.len();
+            a.set_group(groups[grp_num].clone());
+            debug!(?grp_num, ?req_num, "sending");
             cn.send((
                 a,
                 Msg {
@@ -161,13 +167,15 @@ async fn run_exp(
                     req_num,
                 },
             ))
-            .await?;
+            .await
+            .wrap_err("send error")?;
             tokio::time::sleep(inter_request).await;
         }
 
         Ok(())
     }
 
+    let mut recvs = vec![];
     // send num_reqs messages with 1 consumer, then add a second consumer for another num_reqs messages.
     info!("phase 1: 1 producer, 1 consumer");
     tokio::select! {
@@ -179,6 +187,16 @@ async fn run_exp(
         }
     };
 
+    info!("phase 1 done sending");
+    for i in 0..num_reqs {
+        let m = r
+            .recv()
+            .await
+            .ok_or_else(|| eyre!("{:?} < {} msgs received", i, num_reqs))?;
+        recvs.push(m);
+    }
+
+    info!("phase 2: 1 producer, 2 consumers");
     let (recv_err_s, mut recv_err_r2) = oneshot::channel::<Report>();
     tokio::spawn(receiver(
         sqs_client.clone(),
@@ -189,10 +207,15 @@ async fn run_exp(
         recv_err_s,
     ));
 
-    info!("phase 2: 1 producer, 2 consumers");
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+    let addr = SqsAddr {
+        queue_id: fifo_queue.clone(),
+        group: None,
+    };
     tokio::select! {
         res = do_reqs(addr.clone(), &cn, &groups, start, inter_request, num_reqs) => {
-            res?;
+            res.wrap_err("phase 2 sends failed")?;
         }
         recv_err = &mut recv_err_r1 => {
             recv_err.wrap_err("receiver 1 failed")?;
@@ -202,13 +225,12 @@ async fn run_exp(
         }
     };
 
-    info!("done sending");
-    let mut recvs = vec![];
-    for i in 0..200usize {
+    info!("phase 2 done sending");
+    for i in 0..num_reqs {
         let m = r
             .recv()
             .await
-            .ok_or_else(|| eyre!("{:?} < 200 msgs received", i))?;
+            .ok_or_else(|| eyre!("{:?} < {} msgs received", i, num_reqs))?;
         recvs.push(m);
     }
 
@@ -217,7 +239,7 @@ async fn run_exp(
     Ok(recvs)
 }
 
-#[instrument(skip(sqs_client, recvds, err, redis_addr))]
+#[instrument(skip(sqs_client, recvds, err, redis_addr, addr, start))]
 async fn receiver(
     sqs_client: SqsClient,
     redis_addr: String,

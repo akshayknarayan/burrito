@@ -4,7 +4,6 @@
 //! Chunnel data type = (String, String) -> (queue URL, msg_string)
 
 // TODO: publish to SNS topics, auto-create SQS queues as subscriptions
-
 use bertha::ChunnelConnection;
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use rusoto_sqs::{
@@ -14,7 +13,7 @@ use rusoto_sqs::{
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc};
-use tracing::{debug, debug_span, trace};
+use tracing::{debug, debug_span, instrument, trace};
 use tracing_futures::Instrument;
 
 /// The underlying client type to access Sqs.
@@ -82,6 +81,7 @@ pub fn sqs_client_from_creds(key_id: String, key_secret: String) -> Result<SqsCl
     AwsAccess::default().key(key_id, key_secret).make_client()
 }
 
+#[instrument(skip(client))]
 pub async fn make_fifo_queue(client: &SqsClient, name: String) -> Result<String, Report> {
     ensure!(name.ends_with(".fifo"), "Fifo queue name must end in .fifo");
 
@@ -98,6 +98,7 @@ pub async fn make_fifo_queue(client: &SqsClient, name: String) -> Result<String,
     queue_url.ok_or_else(|| eyre!("No queue URL returned"))
 }
 
+#[instrument(skip(client))]
 pub async fn make_be_queue(client: &SqsClient, name: String) -> Result<String, Report> {
     let rusoto_sqs::CreateQueueResult { queue_url } = client
         .create_queue(rusoto_sqs::CreateQueueRequest {
@@ -109,6 +110,7 @@ pub async fn make_be_queue(client: &SqsClient, name: String) -> Result<String, R
     queue_url.ok_or_else(|| eyre!("No queue URL returned"))
 }
 
+#[instrument(skip(client))]
 pub async fn delete_queue(client: &SqsClient, name: String) -> Result<(), Report> {
     client
         .delete_queue(rusoto_sqs::DeleteQueueRequest { queue_url: name })
@@ -142,9 +144,10 @@ impl From<SqsChunnel> for OrderedSqsChunnel {
         let fifo_urls = inner
             .recv_queue_urls
             .into_iter()
-            .map(|s| {
+            .map(|mut s| {
                 if !s.ends_with(".fifo") {
-                    format!("{}.fifo", s)
+                    s.push_str(".fifo");
+                    s
                 } else {
                     s
                 }
@@ -208,7 +211,7 @@ impl ChunnelConnection for OrderedSqsChunnel {
             //    "Can only send to a FIFO queue with an OrderedSqsChunnel"
             //);
             if !queue_id.ends_with(".fifo") {
-                queue_id = format!("{}.fifo", queue_id);
+                queue_id.push_str(".fifo");
             }
 
             // message_deduplication_id is optional if cloud-side "content-based deduplication" is
