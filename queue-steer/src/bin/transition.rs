@@ -13,9 +13,9 @@ use std::iter::once;
 use std::time::Duration;
 use structopt::StructOpt;
 use tokio::sync::{mpsc, oneshot};
-use tracing::instrument;
-use tracing::{debug, info};
+use tracing::{debug, info, info_span, instrument};
 use tracing_error::ErrorLayer;
+use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
 
 #[derive(Clone, Debug, StructOpt)]
@@ -116,14 +116,17 @@ async fn run_exp(
     let (s, mut r) = mpsc::unbounded_channel();
     let (recv_err_s, mut recv_err_r1) = oneshot::channel::<Report>();
     // start consumer 1.
-    tokio::spawn(receiver(
-        sqs_client.clone(),
-        redis.clone(),
-        be_queue.clone(),
-        start,
-        s.clone(),
-        recv_err_s,
-    ));
+    tokio::spawn(
+        receiver(
+            sqs_client.clone(),
+            redis.clone(),
+            be_queue.clone(),
+            start,
+            s.clone(),
+            recv_err_s,
+        )
+        .instrument(info_span!("consumer1")),
+    );
 
     // producer
     let cn: SqsChunnelWrap = SqsChunnel::new(sqs_client.clone(), once(be_queue.as_str())).into();
@@ -198,21 +201,18 @@ async fn run_exp(
 
     info!("phase 2: 1 producer, 2 consumers");
     let (recv_err_s, mut recv_err_r2) = oneshot::channel::<Report>();
-    tokio::spawn(receiver(
-        sqs_client.clone(),
-        redis.clone(),
-        be_queue.clone(),
-        start,
-        s.clone(),
-        recv_err_s,
-    ));
+    tokio::spawn(
+        receiver(
+            sqs_client.clone(),
+            redis.clone(),
+            be_queue.clone(),
+            start,
+            s.clone(),
+            recv_err_s,
+        )
+        .instrument(info_span!("consumer2")),
+    );
 
-    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-
-    let addr = SqsAddr {
-        queue_id: fifo_queue.clone(),
-        group: None,
-    };
     tokio::select! {
         res = do_reqs(addr.clone(), &cn, &groups, start, inter_request, num_reqs) => {
             res.wrap_err("phase 2 sends failed")?;
@@ -270,7 +270,9 @@ async fn receiver(
         let cn = negotiate_rendezvous(st, redis_base, addr.clone()).await?;
         loop {
             let (_, r) = cn.recv().await?;
-            recvds.send(RecvdMsg::from_start(start, r))?;
+            let m = RecvdMsg::from_start(start, r);
+            info!(?m, "got msg");
+            recvds.send(m)?;
         }
     }
 
