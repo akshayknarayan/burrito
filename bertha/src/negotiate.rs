@@ -1486,6 +1486,7 @@ where
             let mut neg_g = neg.lock().await;
             if let Some(ref mut oneshot_receiver) = *neg_g {
                 if let Ok(upgrade) = oneshot_receiver.try_recv() {
+                    debug!("applying upgraded semantics (send)");
                     inner.lock().await.try_upgrade(upgrade).await?;
                     *neg_g = None;
                 }
@@ -1524,6 +1525,7 @@ where
                 future::Either::Right((upgrade, recvr)) => {
                     std::mem::drop(recvr); // cancel the future and drop, so its lock on inner is dropped.
                     let mut inner = inner2.lock().await;
+                    debug!("applying upgraded semantics (recv)");
                     inner.try_upgrade(upgrade).await?;
                     inner.recv().await
                 }
@@ -1542,7 +1544,7 @@ where
     <<A as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
     <<B as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
 {
-    async fn with_negotiator<R, E>(
+    async fn with_negotiator<R>(
         inner: UpgradeEitherConn<A, B, Acn, Bcn>,
         mut negotiator: R,
         addr: String,
@@ -1550,68 +1552,67 @@ where
         upgrade_entry: RendezvousEntry,
     ) -> Self
     where
-        R: for<'r> Rendezvous<'r, Error = E> + Send + 'static,
-        E: Into<Report> + Send,
+        R: Rendezvous + Send + 'static,
+        <R as Rendezvous>::Error: Into<Report> + Send,
     {
         let (s, r) = oneshot::channel();
+        let negotiation = Arc::new(TokioMutex::new(Some(r)));
+        let neg_l = Arc::clone(&negotiation);
         tokio::spawn(
             async move {
                 debug!("starting");
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    // negotiator.ask(curr_entry)
-                    match negotiator
-                        .negotiate(addr.clone(), curr_entry.clone(), false)
-                        .await
-                    {
-                        Ok(NegotiateRendezvousResult::Superceded(new)) => {
-                            // s.send(new)
-                            debug!("new semantics, exiting");
-                            s.send(new.nonce).unwrap();
-                            break;
-                        }
-                        Ok(NegotiateRendezvousResult::NeedUpgrade) => {
-                            debug!("using new semantics");
-                            match negotiator
-                                .negotiate(addr.clone(), upgrade_entry.clone(), false)
-                                .await
-                            {
-                                Ok(NegotiateRendezvousResult::Matched) => {
-                                    debug!("new semantics, exiting");
-                                    s.send(upgrade_entry.nonce).unwrap();
-                                    break;
-                                }
-                                Ok(NegotiateRendezvousResult::Superceded(new)) => {
-                                    // s.send(new)
-                                    debug!("new semantics, exiting");
-                                    s.send(new.nonce).unwrap();
-                                    break;
-                                }
-                                Ok(NegotiateRendezvousResult::NeedUpgrade) => unreachable!(),
-                                Err(e) => {
-                                    let r = e.into();
-                                    warn!(err = ?r, "failed");
-                                    break;
-                                }
+                let nonce = match negotiator.notify(addr.clone(), curr_entry).await {
+                    Ok(NegotiateRendezvousResult::Superceded(new)) => {
+                        debug!("new semantics, exiting");
+                        new.nonce
+                    }
+                    Ok(NegotiateRendezvousResult::NeedUpgrade) => {
+                        debug!("using new semantics");
+                        match negotiator
+                            .negotiate(addr.clone(), upgrade_entry.clone(), false)
+                            .await
+                        {
+                            Ok(NegotiateRendezvousResult::Matched) => {
+                                debug!("new semantics, exiting");
+                                upgrade_entry.nonce
+                            }
+                            Ok(NegotiateRendezvousResult::Superceded(new)) => {
+                                debug!("new semantics, exiting");
+                                new.nonce
+                            }
+                            Ok(NegotiateRendezvousResult::NeedUpgrade) => unreachable!(),
+                            Err(e) => {
+                                let r = e.into();
+                                warn!(err = ?r, "failed");
+                                return;
                             }
                         }
-                        Ok(NegotiateRendezvousResult::Matched) => {
-                            debug!("no change");
-                            continue;
-                        }
-                        Err(e) => {
-                            let r = e.into();
-                            warn!(err = ?r, "failed");
-                            break;
-                        }
                     }
+                    Ok(NegotiateRendezvousResult::Matched) => unreachable!(),
+                    Err(e) => {
+                        let r = e.into();
+                        warn!(err = ?r, "failed");
+                        return;
+                    }
+                };
+
+                debug!("committing upgrade");
+                // we lock this not to use it, but to prevent a send while the commit is happening.
+                let _neg_g = neg_l.lock().await;
+                if let Err(e) = negotiator.commit_upgrade(addr.clone()).await {
+                    let r = e.into();
+                    warn!(err = ?r, "failed");
+                    return;
                 }
+
+                debug!("upgrade committed, channel send");
+                s.send(nonce).unwrap();
             }
             .instrument(debug_span!("poll_rendezvous_negotiate")),
         );
 
         Self {
-            negotiation: Arc::new(TokioMutex::new(Some(r))),
+            negotiation,
             inner: Arc::new(TokioMutex::new(inner)),
         }
     }
@@ -1689,20 +1690,61 @@ pub enum NegotiateRendezvousResult {
 /// Mechanism to register semantics on an address.
 ///
 /// Basically a KV store.
-pub trait Rendezvous<'a> {
-    /// None -> offer matches, or superceded existing.
-    /// Some(foo) -> offer was superceded by foo.
-    type Future: Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a;
+pub trait Rendezvous {
     type Error: Send + Sync;
 
     /// anything supercedes a null entry.
     /// `multi = false` + `multi = false` => `multi = true`
-    fn negotiate(&'a mut self, addr: String, offer: RendezvousEntry, new: bool) -> Self::Future;
+    fn negotiate<'a>(
+        &'a mut self,
+        addr: String,
+        offer: RendezvousEntry,
+        new: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a>>;
+
+    fn commit_upgrade<'a>(
+        &'a mut self,
+        addr: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
+
+    /// Should return when semantics on addr need to be upgraded or have been superceded.
+    ///
+    /// Default is a poll-based implementation. A more efficient (or correct!) implementation might use
+    /// notifications instead.
+    fn notify<'a>(
+        &'a mut self,
+        addr: String,
+        curr_entry: RendezvousEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a>>
+    where
+        Self: Send,
+    {
+        Box::pin(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let res = {
+                    self.negotiate(addr.clone(), curr_entry.clone(), false)
+                        .await
+                };
+                match res {
+                    Ok(NegotiateRendezvousResult::Matched) => {
+                        debug!("no change");
+                        continue;
+                    }
+                    r @ Ok(NegotiateRendezvousResult::Superceded(_))
+                    | r @ Ok(NegotiateRendezvousResult::NeedUpgrade)
+                    | r @ Err(_) => {
+                        return r;
+                    }
+                }
+            }
+        })
+    }
 }
 
 /// Rendezvous-based negotiation.
 #[instrument(skip(stack, rendezvous_point))]
-pub async fn negotiate_rendezvous<Ssingle, Smulti, SsingleCn, SmultiCn, R, E>(
+pub async fn negotiate_rendezvous<Ssingle, Smulti, SsingleCn, SmultiCn, R>(
     stack: UpgradeSelect<Ssingle, Smulti>,
     mut rendezvous_point: R,
     addr: String,
@@ -1720,8 +1762,8 @@ where
         Chunnel<NeverCn, Connection = UpgradeEitherConn<Ssingle, Smulti, SsingleCn, SmultiCn>>,
     <UpgradeEitherApply<Ssingle, Smulti> as Chunnel<NeverCn>>::Error: Into<Report>,
     UpgradeEitherConn<Ssingle, Smulti, SsingleCn, SmultiCn>: ChunnelConnection,
-    R: for<'a> Rendezvous<'a, Error = E> + Send + 'static,
-    E: Into<Report> + Send,
+    R: Rendezvous + Send + 'static,
+    <R as Rendezvous>::Error: Into<Report> + Send,
 {
     // first try assuming we are first. So, "negotiate" against ourselves for a nonce.
     // we impl Pick just to pass to monomorphize, for our actual stack we will use the nonce, since
@@ -1826,6 +1868,12 @@ where
         Superceded(RendezvousEntry { nonce, .. }) => {
             // if we were second, there won't be an upgrade. just apply the nonce on Smulti.
             let ApplyResult { mut applied, .. } = stack.right.apply(nonce)?;
+            debug!("committing semantics upgrade");
+            rendezvous_point
+                .commit_upgrade(addr.clone())
+                .await
+                .map_err(Into::into)
+                .wrap_err("commit_upgrade on new conn")?;
             debug!("returning upgraded connection");
             Ok(Either::Right(
                 applied
