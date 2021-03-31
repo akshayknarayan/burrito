@@ -232,7 +232,7 @@ impl ChunnelConnection for OrderedSqsChunnel {
                 })
                 .await
                 .wrap_err(eyre!("sqs.send_message on {:?}", queue_id))?;
-            debug!(
+            trace!(
                 ?message_id,
                 ?sequence_number,
                 ?queue_id,
@@ -299,7 +299,7 @@ impl ChunnelConnection for SqsChunnel {
                 })
                 .await
                 .wrap_err(eyre!("sqs.send_message on {:?}", queue_id))?;
-            debug!(?message_id, ?sequence_number, ?queue_id, "sent sqs message");
+            trace!(?message_id, ?sequence_number, ?queue_id, "sent sqs message");
             Ok(())
         })
     }
@@ -342,7 +342,7 @@ impl ChunnelConnection for SqsChunnel {
                                         })
                                         .await
                                         .wrap_err(eyre!("sqs.receive_message on {:?}", qu))?;
-                                    debug!(?resp, "sqs receive_message future completed");
+                                    trace!(?resp, "sqs receive_message future completed");
                                     Ok::<_, Report>((resp, qu))
                                 })
                             })
@@ -399,7 +399,7 @@ impl ChunnelConnection for SqsChunnel {
                     group: attributes
                         .and_then(|attrs| attrs.get("MessageGroupId").map(Clone::clone)),
                 };
-                debug!(?from_addr, "receive_message succeeded");
+                trace!(?from_addr, "receive_message succeeded");
                 Ok((from_addr, body.unwrap()))
             }
             .instrument(debug_span!("sqs_recv")),
