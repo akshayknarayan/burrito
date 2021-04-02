@@ -13,7 +13,7 @@ use rusoto_sqs::{
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc};
-use tracing::{debug, debug_span, instrument, trace};
+use tracing::{debug_span, instrument, trace};
 use tracing_futures::Instrument;
 
 /// The underlying client type to access Sqs.
@@ -237,7 +237,7 @@ impl ChunnelConnection for OrderedSqsChunnel {
                 ?sequence_number,
                 ?queue_id,
                 ?group,
-                "sent sqs message"
+                "sent ordered sqs message"
             );
             Ok(())
         })
@@ -299,7 +299,12 @@ impl ChunnelConnection for SqsChunnel {
                 })
                 .await
                 .wrap_err(eyre!("sqs.send_message on {:?}", queue_id))?;
-            trace!(?message_id, ?sequence_number, ?queue_id, "sent sqs message");
+            trace!(
+                ?message_id,
+                ?sequence_number,
+                ?queue_id,
+                "sent unordered sqs message"
+            );
             Ok(())
         })
     }

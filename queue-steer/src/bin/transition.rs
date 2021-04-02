@@ -148,6 +148,8 @@ async fn run_exp(
 
     // use 5 groups.
     let groups: Vec<_> = (0..4).map(|g| g.to_string()).collect();
+    // one group (total
+    //let groups = vec!["1".to_string()];
 
     #[instrument(skip(cn, groups, start))]
     async fn do_reqs(
@@ -157,8 +159,9 @@ async fn run_exp(
         start: std::time::Instant,
         inter_request: Duration,
         num_reqs: usize,
+        req_num_offset: usize,
     ) -> Result<(), Report> {
-        for req_num in 0..num_reqs {
+        for req_num in req_num_offset..req_num_offset + num_reqs {
             let mut a = addr.clone();
             let grp_num = req_num % groups.len();
             a.set_group(groups[grp_num].clone());
@@ -182,7 +185,7 @@ async fn run_exp(
     // send num_reqs messages with 1 consumer, then add a second consumer for another num_reqs messages.
     info!("phase 1: 1 producer, 1 consumer");
     tokio::select! {
-        res = do_reqs(addr.clone(), &cn, &groups, start, inter_request, num_reqs) => {
+        res = do_reqs(addr.clone(), &cn, &groups, start, inter_request, num_reqs, 0) => {
             res?;
         }
         recv_err = &mut recv_err_r1 => {
@@ -214,7 +217,7 @@ async fn run_exp(
     );
 
     tokio::select! {
-        res = do_reqs(addr.clone(), &cn, &groups, start, inter_request, num_reqs) => {
+        res = do_reqs(addr.clone(), &cn, &groups, start, inter_request, num_reqs, num_reqs) => {
             res.wrap_err("phase 2 sends failed")?;
         }
         recv_err = &mut recv_err_r1 => {

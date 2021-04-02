@@ -188,6 +188,7 @@ pub struct Msg {
 
 #[derive(Debug, Clone, Copy)]
 pub struct RecvdMsg {
+    pub send_time: Duration,
     pub elapsed: Duration,
     pub req_num: usize,
 }
@@ -195,6 +196,7 @@ pub struct RecvdMsg {
 impl RecvdMsg {
     pub fn from_start(start: std::time::Instant, msg: Msg) -> Self {
         Self {
+            send_time: msg.send_time,
             elapsed: start.elapsed() - msg.send_time,
             req_num: msg.req_num,
         }
@@ -301,19 +303,20 @@ pub fn dump_results(
     let mut f = std::fs::File::create(path)?;
     writeln!(
         &mut f,
-        "mode provider inter_request_ms num_msgs elapsed_us req_latency_us req_orderedness"
+        "mode provider inter_request_ms num_msgs elapsed_us msg_send_time req_latency_us req_orderedness"
     )?;
     let num_msgs = msgs.len();
     for (i, m) in msgs.into_iter().enumerate() {
         let orderedness = ((i as isize) - (m.req_num as isize)).abs() as f32 / num_msgs as f32;
         writeln!(
             &mut f,
-            "{} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {}",
             mode,
             provider,
             inter_request_ms,
             num_msgs,
             recv_span.as_micros(),
+            m.send_time.as_micros(),
             m.elapsed.as_micros(),
             orderedness,
         )?;

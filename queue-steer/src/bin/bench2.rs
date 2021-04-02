@@ -196,7 +196,6 @@ impl Provider {
                 let sqs_client =
                     sqs::sqs_client_from_creds(aws_access_key_id, aws_secret_access_key)?;
                 let (queue, generated): (_, Option<ProviderCleanup>) = if generated {
-                    // TODO what if we want to optimize to a fifo queue?
                     let queue = sqs::make_be_queue(&sqs_client, queue.clone()).await?;
                     (queue.clone(), Some((queue, sqs_client.clone()).into()))
                 } else {
