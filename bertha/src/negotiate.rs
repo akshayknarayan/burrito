@@ -1502,27 +1502,32 @@ where
         let inner = Arc::clone(&self.inner);
         let neg = Arc::clone(&self.negotiation);
         let upgrade_fut = async move {
-            use std::ops::DerefMut;
             let mut rg = neg.lock().await;
-            let r = rg.deref_mut();
-            if let Some(ref mut r) = *r {
+            let up = if let Some(ref mut r) = *rg {
                 match r.await {
                     Ok(up) => up,
                     Err(_) => future::pending().await,
                 }
             } else {
                 future::pending().await
-            }
+            };
+
+            rg.take();
+            up
         };
         let inner2 = Arc::clone(&self.inner);
         let recv_fut = async move { inner.lock().await.recv().await };
 
         Box::pin(async move {
-            tokio::pin!(recv_fut);
-            tokio::pin!(upgrade_fut);
+            // We need to `Box::pin` this so that the `drop` call below actually drops the future,
+            // instead of dropping a `Pin` of the future. We need to actually drop the future so
+            // that it drops the `MutexGuard` it holds, so the lock doesn't deadlock.
+            let recv_fut = Box::pin(recv_fut);
+            let upgrade_fut = Box::pin(upgrade_fut);
             match future::select(recv_fut, upgrade_fut).await {
                 future::Either::Left((recvd, _)) => recvd,
                 future::Either::Right((upgrade, recvr)) => {
+                    debug!("received on upgrade channel");
                     std::mem::drop(recvr); // cancel the future and drop, so its lock on inner is dropped.
                     let mut inner = inner2.lock().await;
                     debug!("applying upgraded semantics (recv)");
@@ -1563,21 +1568,21 @@ where
                 debug!("starting");
                 let nonce = match negotiator.notify(addr.clone(), curr_entry).await {
                     Ok(NegotiateRendezvousResult::Superceded(new)) => {
-                        debug!("new semantics, exiting");
+                        debug!("superceded by new semantics");
                         new.nonce
                     }
                     Ok(NegotiateRendezvousResult::NeedUpgrade) => {
-                        debug!("using new semantics");
+                        debug!("need new semantics, upgrading");
                         match negotiator
                             .negotiate(addr.clone(), upgrade_entry.clone(), false)
                             .await
                         {
                             Ok(NegotiateRendezvousResult::Matched) => {
-                                debug!("new semantics, exiting");
+                                debug!("new semantics accepted");
                                 upgrade_entry.nonce
                             }
                             Ok(NegotiateRendezvousResult::Superceded(new)) => {
-                                debug!("new semantics, exiting");
+                                debug!("new semantics superceded");
                                 new.nonce
                             }
                             Ok(NegotiateRendezvousResult::NeedUpgrade) => unreachable!(),
@@ -1608,7 +1613,7 @@ where
                 debug!("upgrade committed, channel send");
                 s.send(nonce).unwrap();
             }
-            .instrument(debug_span!("poll_rendezvous_negotiate")),
+            .instrument(debug_span!("notify_rendezvous_negotiate")),
         );
 
         Self {
@@ -1874,7 +1879,6 @@ where
                 .await
                 .map_err(Into::into)
                 .wrap_err("commit_upgrade on new conn")?;
-            debug!("returning upgraded connection");
             Ok(Either::Right(
                 applied
                     .connect_wrap(NeverCn::default())
