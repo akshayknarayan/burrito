@@ -343,6 +343,9 @@ impl ChunnelConnection for SqsChunnel {
                                             queue_url: qu.clone(),
                                             visibility_timeout: Some(5),
                                             wait_time_seconds: Some(5),
+                                            attribute_names: Some(
+                                                vec!["MessageGroupId".to_owned()],
+                                            ),
                                             ..Default::default()
                                         })
                                         .await
@@ -397,6 +400,8 @@ impl ChunnelConnection for SqsChunnel {
                 .await
                 .wrap_err(eyre!("sqs.delete_message on {:?}", queue_id))?;
 
+                // remember that to get any attributes back you have to ask for them in the
+                // request.
                 trace!(?attributes, "receive_message attributes");
                 //let dedup_id = attrs.get("MessageDeduplicationId");
                 let from_addr = SqsAddr {
