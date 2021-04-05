@@ -9,6 +9,7 @@ use google_cloud::pubsub::{Client, PublishMessage, Subscription, SubscriptionCon
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use tracing::{debug, trace};
 
 /// The underlying client to Google PubSub.
 pub use google_cloud::pubsub::Client as GcpClient;
@@ -119,12 +120,6 @@ pub struct OrderedPubSubChunnel {
     inner: PubSubChunnel,
 }
 
-impl From<PubSubChunnel> for OrderedPubSubChunnel {
-    fn from(inner: PubSubChunnel) -> Self {
-        Self { inner }
-    }
-}
-
 impl OrderedPubSubChunnel {
     pub async fn new<'a>(
         ps_client: Client,
@@ -138,6 +133,12 @@ impl OrderedPubSubChunnel {
                 subscriptions,
             },
         })
+    }
+
+    pub async fn convert(mut inner: PubSubChunnel) -> Result<Self, Report> {
+        let topics: Vec<_> = inner.subscriptions.keys().cloned().collect();
+        inner.cleanup().await?;
+        Self::new(inner.ps_client, topics.iter().map(String::as_str)).await
     }
 
     pub async fn cleanup(&mut self) -> Result<(), Report> {
@@ -161,7 +162,7 @@ impl ChunnelConnection for OrderedPubSubChunnel {
         let mut client = self.inner.ps_client.clone();
         Box::pin(async move {
             let ordering_key =
-                ordering_key.ok_or(eyre!("Ordered send must include ordering group"))?;
+                ordering_key.ok_or_else(|| eyre!("Ordered send must include ordering group"))?;
             let topic = client
                 .topic(&topic_id)
                 .await
@@ -171,6 +172,7 @@ impl ChunnelConnection for OrderedPubSubChunnel {
             }
 
             let mut topic = topic.unwrap(); // checked above
+            trace!(?topic_id, ?ordering_key, "sending");
             let publish_msg = PublishMessage::from(body.as_bytes()).with_ordering_key(ordering_key);
             topic
                 .publish::<_, &'_ [u8]>(publish_msg)
@@ -266,6 +268,7 @@ impl ChunnelConnection for PubSubChunnel {
             // ordering_key is empty string if none was set
             let group = msg.take_ordering_key();
             let group = if group.is_empty() { None } else { Some(group) };
+            trace!(?topic_id, ?group, "recvd msg");
             Ok((PubSubAddr { topic_id, group }, body))
         })
     }
