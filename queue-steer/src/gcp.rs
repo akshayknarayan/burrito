@@ -57,10 +57,9 @@ impl From<OrderedGcpPubSubWrap> for OrderedPubSubChunnel {
     }
 }
 
-impl From<GcpPubSubWrap> for OrderedGcpPubSubWrap {
-    fn from(GcpPubSubWrap(i): GcpPubSubWrap) -> Self {
-        let i: OrderedPubSubChunnel = i.into();
-        i.into()
+impl OrderedGcpPubSubWrap {
+    pub async fn convert(inner: GcpPubSubWrap) -> Result<Self, Report> {
+        Ok(Self(OrderedPubSubChunnel::convert(inner.0).await?))
     }
 }
 

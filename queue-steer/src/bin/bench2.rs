@@ -9,13 +9,13 @@ use bertha::{
     bincode::{Base64Chunnel, SerializeChunnelProject},
     Chunnel, CxList,
 };
-use color_eyre::Report;
+use color_eyre::{eyre::eyre, Report};
 use gcp_pubsub::{PubSubAddr, PubSubChunnel};
 use queue_steer::bin_help::{
     do_atmostonce_exp, do_best_effort_exp, do_ordered_groups_exp, dump_results, Mode, RecvdMsg,
 };
 use queue_steer::{
-    AtMostOnce, AzQueueChunnelWrap, GcpPubSubWrap, KafkaChunnelWrap, Ordered,
+    AtMostOnce, AzQueueChunnelWrap, GcpPubSubWrap, KafkaChunnelWrap, Ordered, OrderedGcpPubSubWrap,
     OrderedSqsChunnelWrap, SqsChunnelWrap,
 };
 use sqs::{SqsAddr, SqsChunnel};
@@ -32,12 +32,16 @@ use tracing_subscriber::prelude::*;
 struct Opt {
     #[structopt(short, long)]
     mode: Mode,
-    #[structopt(short, long)]
+    #[structopt(short = "n", long)]
     num_reqs: usize,
     #[structopt(short, long)]
     queue: Option<String>,
     #[structopt(short, long)]
     inter_request_ms: u64,
+    #[structopt(short = "r", long)]
+    num_receivers: usize,
+    #[structopt(long)]
+    service_mode: bool, // client-side or service-side impl.
     #[structopt(short, long)]
     out_file: std::path::PathBuf,
 
@@ -84,7 +88,9 @@ async fn main() -> Result<(), Report> {
     let Opt {
         mode,
         num_reqs,
+        num_receivers,
         inter_request_ms,
+        service_mode,
         out_file,
         queue,
         provider,
@@ -92,28 +98,39 @@ async fn main() -> Result<(), Report> {
     let prov = provider.provider().to_owned();
     info!(?mode, ?num_reqs, ?inter_request_ms, provider = ?provider, "starting");
     let (msgs, elapsed) = provider
-        .run_exp(queue, mode, num_reqs, inter_request_ms)
+        .run_exp(
+            queue,
+            mode,
+            service_mode,
+            num_reqs,
+            inter_request_ms,
+            num_receivers,
+        )
         .await?;
 
-    let mut latencies: Vec<_> = msgs.iter().map(|m| m.elapsed).collect();
-    latencies.sort_unstable();
-    let len = latencies.len() as f64;
-    let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
-    let quantiles: Vec<_> = quantile_idxs
-        .iter()
-        .map(|q| (len * q) as usize)
-        .map(|i| latencies[i])
-        .collect();
+    if !msgs.is_empty() {
+        let mut latencies: Vec<_> = msgs.iter().map(|m| m.elapsed).collect();
+        latencies.sort_unstable();
+        let len = latencies.len() as f64;
+        let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
+        let quantiles: Vec<_> = quantile_idxs
+            .iter()
+            .map(|q| (len * q) as usize)
+            .map(|i| latencies[i])
+            .collect();
 
-    info!(
-        ?elapsed,
-        ?num_reqs,
-        p25 = ?quantiles[0],
-        p50 = ?quantiles[1],
-        p75 = ?quantiles[2],
-        p95 = ?quantiles[3],
-        "done",
-    );
+        info!(
+            ?elapsed,
+            ?num_reqs,
+            p25 = ?quantiles[0],
+            p50 = ?quantiles[1],
+            p75 = ?quantiles[2],
+            p95 = ?quantiles[3],
+            "done",
+        );
+    } else {
+        info!("skipped",);
+    }
 
     dump_results(out_file, msgs, elapsed, mode, inter_request_ms, &prov)?;
     Ok(())
@@ -133,9 +150,15 @@ impl Provider {
         self,
         queue: Option<String>,
         mode: Mode,
+        service_mode: bool,
         num_reqs: usize,
         inter_request_ms: u64,
+        num_receivers: usize,
     ) -> Result<(Vec<RecvdMsg>, Duration), Report> {
+        if !service_mode && num_receivers != 1 {
+            return Err(eyre!("Cannot have > 1 receiver with client mode"));
+        }
+
         let mut generated = false;
         let queue: String = queue.unwrap_or_else(|| {
             generated = true;
@@ -151,8 +174,51 @@ impl Provider {
                 .collect()
         });
 
+        macro_rules! do_exp_service {
+            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr) => {{
+                use bertha::util::NeverCn;
+                match mode {
+                    Mode::BestEffort => {
+                        info!("skipping service-side besteffort");
+                        (vec![], Duration::from_millis(0))
+                    }
+                    Mode::Ordered { num_groups: None } => {
+                        let mut stack = CxList::from(SerializeChunnelProject::default())
+                            .wrap(Base64Chunnel::default())
+                            .wrap($cn);
+                        let ch = stack.connect_wrap(NeverCn::default()).await?;
+                        do_atmostonce_exp(
+                            ch,
+                            $addr.clone(),
+                            $num_reqs,
+                            $inter_request_ms,
+                            $num_receivers,
+                        )
+                        .await?
+                    }
+                    Mode::Ordered {
+                        num_groups: Some(n),
+                    } => {
+                        let mut stack = CxList::from(SerializeChunnelProject::default())
+                            .wrap(Base64Chunnel::default())
+                            .wrap($cn);
+                        let ch = stack.connect_wrap(NeverCn::default()).await?;
+                        do_ordered_groups_exp(
+                            ch,
+                            $addr.clone(),
+                            $num_reqs,
+                            n,
+                            $inter_request_ms,
+                            $num_receivers,
+                        )
+                        .await?
+                    }
+                }
+            }};
+        }
+
         macro_rules! do_exp {
-            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr) => {{
+            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr) => {{
                 use bertha::util::NeverCn;
                 match mode {
                     Mode::BestEffort => {
@@ -160,7 +226,14 @@ impl Provider {
                             .wrap(Base64Chunnel::default())
                             .wrap($cn);
                         let ch = stack.connect_wrap(NeverCn::default()).await?;
-                        do_best_effort_exp(ch, $addr.clone(), $num_reqs, $inter_request_ms).await?
+                        do_best_effort_exp(
+                            ch,
+                            $addr.clone(),
+                            $num_reqs,
+                            $inter_request_ms,
+                            $num_receivers,
+                        )
+                        .await?
                     }
                     Mode::Ordered { num_groups: None } => {
                         // at most once.
@@ -169,7 +242,14 @@ impl Provider {
                             .wrap(Base64Chunnel::default())
                             .wrap($cn);
                         let ch = stack.connect_wrap(NeverCn::default()).await?;
-                        do_atmostonce_exp(ch, $addr.clone(), $num_reqs, $inter_request_ms).await?
+                        do_atmostonce_exp(
+                            ch,
+                            $addr.clone(),
+                            $num_reqs,
+                            $inter_request_ms,
+                            $num_receivers,
+                        )
+                        .await?
                     }
                     Mode::Ordered {
                         num_groups: Some(n),
@@ -180,8 +260,15 @@ impl Provider {
                             .wrap(Base64Chunnel::default())
                             .wrap($cn);
                         let ch = stack.connect_wrap(NeverCn::default()).await?;
-                        do_ordered_groups_exp(ch, $addr.clone(), $num_reqs, n, $inter_request_ms)
-                            .await?
+                        do_ordered_groups_exp(
+                            ch,
+                            $addr.clone(),
+                            $num_reqs,
+                            n,
+                            $inter_request_ms,
+                            $num_receivers,
+                        )
+                        .await?
                     }
                 }
             }};
@@ -196,19 +283,32 @@ impl Provider {
                 let sqs_client =
                     sqs::sqs_client_from_creds(aws_access_key_id, aws_secret_access_key)?;
                 let (queue, generated): (_, Option<ProviderCleanup>) = if generated {
-                    let queue = sqs::make_be_queue(&sqs_client, queue.clone()).await?;
-                    (queue.clone(), Some((queue, sqs_client.clone()).into()))
+                    if service_mode {
+                        let mut q = queue.clone();
+                        q.push_str(".fifo");
+                        let queue = sqs::make_fifo_queue(&sqs_client, q.clone()).await?;
+                        (queue.clone(), Some((queue, sqs_client.clone()).into()))
+                    } else {
+                        let queue = sqs::make_be_queue(&sqs_client, queue.clone()).await?;
+                        (queue.clone(), Some((queue, sqs_client.clone()).into()))
+                    }
                 } else {
                     (queue, None)
                 };
 
                 debug!(?queue, "AWS queue");
-                let cn: SqsChunnelWrap = SqsChunnel::new(sqs_client, once(queue.as_str())).into();
                 let addr = SqsAddr {
-                    queue_id: queue,
+                    queue_id: queue.clone(),
                     group: None,
                 };
-                let (msgs, elapsed) = do_exp!(mode, cn, addr, num_reqs, inter_request_ms);
+                let cn: SqsChunnelWrap = SqsChunnel::new(sqs_client, once(queue.as_str())).into();
+                let (msgs, elapsed) = if service_mode {
+                    let cn: OrderedSqsChunnelWrap = cn.into();
+                    do_exp_service!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
+                } else {
+                    do_exp!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
+                };
+
                 if let Some(gen) = generated {
                     gen.cleanup().await?;
                 }
@@ -218,6 +318,11 @@ impl Provider {
                 az_account_name,
                 az_key,
             } => {
+                if service_mode {
+                    debug!("skipping service-mode Azure");
+                    return Ok((vec![], Duration::from_millis(0)));
+                }
+
                 let az_client = az_queues::AzureAccountBuilder::default()
                     .with_name(az_account_name)
                     .with_key(az_key)
@@ -236,7 +341,8 @@ impl Provider {
                     AzStorageQueueChunnel::new(az_client, once(queue.as_str())).into();
                 let cn = CxList::from(FakeSetGroup::default()).wrap(cn);
                 let addr: FakeSetGroupAddr = queue.into();
-                let (msgs, elapsed) = do_exp!(mode, cn, addr, num_reqs, inter_request_ms);
+                let (msgs, elapsed) =
+                    do_exp!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers);
                 if let Some(gen) = generated {
                     gen.cleanup().await?;
                 }
@@ -252,7 +358,13 @@ impl Provider {
                     topic_id: queue.clone(),
                     group: None,
                 };
-                let (msgs, elapsed) = do_exp!(mode, cn, c_addr, num_reqs, inter_request_ms);
+
+                let (msgs, elapsed) = if service_mode {
+                    do_exp_service!(mode, cn, c_addr, num_reqs, inter_request_ms, num_receivers)
+                } else {
+                    do_exp!(mode, cn, c_addr, num_reqs, inter_request_ms, num_receivers)
+                };
+
                 kafka::delete_topic(&addr, &queue).await?;
                 Ok((msgs, elapsed))
             }
@@ -278,10 +390,18 @@ impl Provider {
                     topic_id: queue.clone(),
                     group: None,
                 };
+
+                // todo figure out how to call .cleanup
                 let cn: GcpPubSubWrap = PubSubChunnel::new(gcp_client, once(queue.as_str()))
                     .await?
                     .into();
-                let (msgs, elapsed) = do_exp!(mode, cn, addr, num_reqs, inter_request_ms);
+                let (msgs, elapsed) = if service_mode {
+                    let cn = OrderedGcpPubSubWrap::convert(cn).await?;
+                    do_exp_service!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
+                } else {
+                    do_exp!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
+                };
+
                 if let Some(gen) = generated {
                     gen.cleanup().await?;
                 }
