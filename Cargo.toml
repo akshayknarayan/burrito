@@ -17,6 +17,7 @@ members = [
     "queue-steer",
     "round-order",
     "redis-basechunnel",
+    "tls-tunnel",
 ]
 
 [profile.release]

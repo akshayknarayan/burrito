@@ -1,0 +1,20 @@
+[package]
+name = "tls-tunnel"
+version = "0.1.0"
+authors = ["Akshay Narayan <akshayn@mit.edu>"]
+edition = "2018"
+
+[dependencies]
+bertha = { path = "../bertha" }
+futures-util = "0.3"
+color-eyre = "=0.5.7"
+tracing = "0.1"
+tracing-futures = "0.2"
+rand = "0.7"
+tokio = { version = "1", features = ["net"] }
+serde = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tracing-subscriber = "0.2"
+tracing-error = "0.1"
