@@ -1,13 +1,13 @@
 //! Spawn processes for ghostunnel client and server, to create a TLS tunnel.
 
-use color_eyre::eyre::Report;
+use color_eyre::eyre::{Report, WrapErr};
 use std::path::Path;
 use std::process::{Child, Command};
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Debug)]
 pub struct GhostTunnel {
-    process_handle: Child,
+    pub(crate) process_handle: Child,
 }
 
 impl Drop for GhostTunnel {
@@ -33,8 +33,9 @@ impl GhostTunnel {
         let certs_location = certs_location.as_ref();
         let keystore_arg = certs_location.join("server-combined.pem");
         let cacert_arg = certs_location.join("cacert.pem");
-        let local_addr_arg = format!("unix:{:?}", local_addr.as_ref());
+        let local_addr_arg = unix_addr_arg(local_addr);
         let external_addr_arg = external_addr.to_string();
+        debug!(mode = "tunnel-exit", external_addr = ?&external_addr_arg, local_addr = ?&local_addr_arg, "starting ghostunnel");
         let child = Command::new(ghostunnel_path.as_ref())
             .arg("--keystore")
             .arg(keystore_arg)
@@ -46,7 +47,8 @@ impl GhostTunnel {
             .arg("--target")
             .arg(local_addr_arg)
             .arg("--allow-all")
-            .spawn()?;
+            .spawn()
+            .wrap_err("spawn ghostunnel server process")?;
         Ok(Self {
             process_handle: child,
         })
@@ -66,8 +68,9 @@ impl GhostTunnel {
         let certs_location = certs_location.as_ref();
         let keystore_arg = certs_location.join("client-keystore.p12");
         let cacert_arg = certs_location.join("cacert.pem");
-        let local_addr_arg = format!("unix:{:?}", local_addr.as_ref());
+        let local_addr_arg = unix_addr_arg(local_addr);
         let external_addr_arg = external_addr.to_string();
+        debug!(mode = "tunnel-entry", external_addr = ?&external_addr_arg, local_addr = ?&local_addr_arg, "starting ghostunnel");
         let child = Command::new(ghostunnel_path.as_ref())
             .arg("--keystore")
             .arg(keystore_arg)
@@ -75,13 +78,19 @@ impl GhostTunnel {
             .arg(cacert_arg)
             .arg("client")
             .arg("--target")
-            .arg(local_addr_arg)
-            .arg("--listen")
             .arg(external_addr_arg)
-            .arg("--allow-all")
-            .spawn()?;
+            .arg("--listen")
+            .arg(local_addr_arg)
+            .spawn()
+            .wrap_err("spawn ghostunnel client process")?;
         Ok(Self {
             process_handle: child,
         })
     }
+}
+
+fn unix_addr_arg(a: impl AsRef<Path>) -> String {
+    let p = a.as_ref();
+    let s = p.to_str().expect("utf8 path");
+    "unix:".chars().chain(s.chars()).collect()
 }
