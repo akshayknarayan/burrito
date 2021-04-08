@@ -114,10 +114,32 @@ impl<NeverCn> Chunnel<NeverCn> for TLSChunnel {
 
             let send = if let Some((cli_unix, gt)) = send {
                 let gt = gt.wrap_err("client-side tunnel process")?;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 debug!(tunnel_entry = ?&cli_unix, "connecting to remote");
-                let e = eyre!("connect unix socket to {:?}", cli_unix);
-                let uc = UnixStream::connect(cli_unix.clone()).await.wrap_err(e)?;
+                // retry loop until the ghostunnel process starts listening
+                let start = std::time::Instant::now();
+                let mut tries = 0usize;
+                let uc = loop {
+                    match UnixStream::connect(&cli_unix).await {
+                        Ok(uc) => break uc,
+                        Err(e) => {
+                            if start.elapsed() > std::time::Duration::from_millis(1000) {
+                                let ctx = eyre!(
+                                    "can't connect unix socket to {:?} after {:?} tries ({:?})",
+                                    cli_unix,
+                                    tries,
+                                    start.elapsed(),
+                                );
+                                return Err(Report::from(e).wrap_err(ctx));
+                            } else {
+                                tries += 1;
+                                trace!(addr = ?&cli_unix, ?tries, err = %format!("{:#}", e), "failed connection");
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        }
+                    }
+                };
+
+                debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to remote");
                 Some((uc, gt))
             } else {
                 None
@@ -445,7 +467,6 @@ mod t {
                     .instrument(info_span!("server")),
                 );
 
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 info!("starting sender");
                 let mut cli = TLSChunnel::new(PathBuf::from("/tmp"), ghostunnel_binary, certs_dir)
                     .connect(ADDR.parse().unwrap());
