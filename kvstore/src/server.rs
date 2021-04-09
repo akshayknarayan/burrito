@@ -237,7 +237,7 @@ async fn single_shard(
         .await
     {
         warn!(err = ?e, "Shard errorred");
-        panic!(e);
+        panic!("{}", e);
     }
 }
 

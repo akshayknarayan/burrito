@@ -67,7 +67,7 @@ impl From<OrderedChunnelProj> for Ordered {
 
 impl<A, D, InC> Chunnel<InC> for Ordered
 where
-    InC: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
     A: serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
@@ -116,7 +116,7 @@ impl From<AtMostOnceChunnel> for AtMostOnce {
 
 impl<A, D, InC> Chunnel<InC> for AtMostOnce
 where
-    InC: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
     A: serde::Serialize
         + serde::de::DeserializeOwned
         + Clone

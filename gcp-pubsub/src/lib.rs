@@ -9,7 +9,7 @@ use google_cloud::pubsub::{Client, PublishMessage, Subscription, SubscriptionCon
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use tracing::{debug, trace};
+use tracing::trace;
 
 /// The underlying client to Google PubSub.
 pub use google_cloud::pubsub::Client as GcpClient;

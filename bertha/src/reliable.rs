@@ -775,8 +775,8 @@ mod test {
     }
 
     #[test]
-    fn drop_2_tagged() {
-        use crate::{tagger::TaggerChunnel, CxList};
+    fn drop_2_order() {
+        use crate::{tagger::OrderedChunnel, CxList};
 
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
@@ -807,7 +807,7 @@ mod test {
                 });
 
                 let (mut srv, mut cln) = t.split();
-                let mut stack = CxList::from(TaggerChunnel)
+                let mut stack = CxList::from(OrderedChunnel::default())
                     .wrap(ReliabilityChunnel::default())
                     .wrap(SerializeChunnel::default());
 

@@ -166,7 +166,7 @@ impl Negotiate for OrderedChunnelProj {
 
 impl<A, D, InC> Chunnel<InC> for OrderedChunnelProj
 where
-    InC: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
     A: serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
@@ -216,7 +216,7 @@ impl Negotiate for OrderedChunnel {
 
 impl<D, InC> Chunnel<InC> for OrderedChunnel
 where
-    InC: ChunnelConnection<Data = (u32, (), D)> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (u32, D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     type Future =
@@ -266,7 +266,7 @@ impl<A: Eq + Hash, C, D> OrderedProj<A, C, D> {
 
 impl<A, C, D> ChunnelConnection for OrderedProj<A, C, D>
 where
-    C: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
     D: Send + Sync + 'static,
     A: serde::Serialize
         + serde::de::DeserializeOwned
@@ -298,7 +298,7 @@ where
                 };
 
                 trace!(seq = ?seq, "sending");
-                inner.send((addr.clone(), (seq, addr, data))).await?;
+                inner.send((addr, (seq, data))).await?;
                 trace!(seq = ?seq, "finished send");
                 Ok(())
             }
@@ -333,7 +333,7 @@ where
                         }
                     }
 
-                    let (_a, (seq, a, d)) = inner.recv().await?;
+                    let (a, (seq, d)) = inner.recv().await?;
                     trace!(seq = ?seq, from=?a, "received pkt, locking state");
                     let mut st = state.entry(a.clone()).or_default();
                     #[allow(clippy::comparison_chain)]

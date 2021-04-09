@@ -1,5 +1,5 @@
 use bertha::{util::ProjectLeft, ChunnelConnection};
-use color_eyre::eyre::{bail, ensure, eyre, Report};
+use color_eyre::eyre::{bail, eyre, Report};
 use futures_util::stream::{iter, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::fmt::Debug;

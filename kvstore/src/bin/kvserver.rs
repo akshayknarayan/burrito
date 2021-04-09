@@ -1,4 +1,4 @@
-use color_eyre::eyre::{eyre, Report};
+use color_eyre::eyre::Report;
 use kvstore::serve;
 use structopt::StructOpt;
 use tracing::{info, info_span};
@@ -77,7 +77,7 @@ async fn main() -> Result<(), Report> {
 #[cfg(not(feature = "use-shenango"))]
 async fn run_server(opt: Opt) -> Result<(), Report> {
     if opt.shenango_cfg.is_some() {
-        tracing::warn!(cfg_file = ?opt.shenangp_cfg, "Shenango is disabled, ignoring config");
+        tracing::warn!(cfg_file = ?opt.shenango_cfg, "Shenango is disabled, ignoring config");
     }
 
     serve(

@@ -31,7 +31,7 @@ impl Default for AtMostOnceChunnel {
 
 impl<InC, A, D> Chunnel<InC> for AtMostOnceChunnel
 where
-    InC: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
     A: serde::Serialize + serde::de::DeserializeOwned + Clone + Eq + Hash + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
@@ -67,7 +67,7 @@ where
 impl<C, A, D> ChunnelConnection for AtMostOnceCn<C, A>
 where
     A: serde::Serialize + serde::de::DeserializeOwned + Clone + Eq + Hash + Send + Sync + 'static,
-    C: ChunnelConnection<Data = (A, (u32, A, D))> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
 {
     type Data = (A, D);
 
@@ -77,7 +77,7 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let mut next_seq = self.next_seq.entry(addr.clone()).or_insert(0);
         *next_seq += 1;
-        self.inner.send((addr.clone(), (*next_seq, addr, data)))
+        self.inner.send((addr, (*next_seq, data)))
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
@@ -87,7 +87,7 @@ where
         Box::pin(
             async move {
                 loop {
-                    let (_addr, (seq, addr, data)) = inner.recv().await?;
+                    let (addr, (seq, data)) = inner.recv().await?;
                     let mut ent = delivered_msgs.entry(addr.clone()).or_default();
                     if ent.is_new(seq, sunset) {
                         return Ok((addr, data));
