@@ -19,6 +19,7 @@ use bertha::{
 use color_eyre::eyre::Report;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -85,10 +86,26 @@ impl<Lch, Lr, Ag> LocalNameChunnel<Lch, Lr, Ag> {
     }
 }
 
-impl<Gc, Lr, LrCn, LrErr, Lrd, Lch, Lcn, LchErr, D> Chunnel<Gc>
-    for LocalNameChunnel<Lch, Lr, SocketAddr>
+pub trait GetSockAddr {
+    fn as_sk_addr(&self) -> SocketAddr;
+}
+
+impl GetSockAddr for SocketAddr {
+    fn as_sk_addr(&self) -> SocketAddr {
+        *self
+    }
+}
+
+impl<A> GetSockAddr for (SocketAddr, A) {
+    fn as_sk_addr(&self) -> SocketAddr {
+        self.0
+    }
+}
+
+impl<A, Gc, Lr, LrCn, LrErr, Lrd, Lch, Lcn, LchErr, D> Chunnel<Gc> for LocalNameChunnel<Lch, Lr, A>
 where
-    Gc: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
+    Gc: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
+    A: GetSockAddr + Clone + Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
     // Raw local connections. Lrd, local raw data, is probably Vec<u8> (e.g. for Lctr = UDS), but
     // don't assume this.
@@ -105,7 +122,7 @@ where
     Lcn: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
     LchErr: Into<Report> + Send + Sync + 'static,
 {
-    type Connection = LocalNameCn<Gc, Lcn>;
+    type Connection = LocalNameCn<Gc, Lcn, A>;
     type Error = Report;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -114,11 +131,12 @@ where
         let mut local_raw = self.local_raw.clone();
         let mut local_chunnel = self.local_chunnel.clone();
         let cl = self.cl.as_ref().map(Arc::clone);
-        let gaddr = self.listen_addr;
+        let gaddr = self.listen_addr.clone();
 
         Box::pin(async move {
             let local_raw_cn = match (gaddr, &cl) {
-                (Some(gaddr), Some(cl)) => match cl.lock().await.register(gaddr).await {
+                (Some(gaddr), Some(cl)) => match cl.lock().await.register(gaddr.as_sk_addr()).await
+                {
                     Ok(laddr) => {
                         debug!(?laddr, "LocalNameClient registered");
                         local_raw
@@ -158,15 +176,15 @@ enum LocalAddrCacheEntry<A> {
     },
 }
 
-pub struct LocalNameCn<Gc, Lc> {
+pub struct LocalNameCn<Gc, Lc, A> {
     cl: Option<Arc<Mutex<client::LocalNameClient>>>,
     global_cn: Arc<Gc>,
     local_cn: Arc<Lc>,
     addr_cache: Arc<StdMutex<HashMap<SocketAddr, LocalAddrCacheEntry<PathBuf>>>>,
-    rev_addr_map: Arc<StdMutex<HashMap<PathBuf, SocketAddr>>>,
+    rev_addr_map: Arc<StdMutex<HashMap<PathBuf, A>>>,
 }
 
-impl<Gc, Lc> LocalNameCn<Gc, Lc> {
+impl<Gc, Lc, A> LocalNameCn<Gc, Lc, A> {
     fn new(cl: Option<Arc<Mutex<client::LocalNameClient>>>, global_cn: Gc, local_cn: Lc) -> Self {
         Self {
             cl,
@@ -178,13 +196,14 @@ impl<Gc, Lc> LocalNameCn<Gc, Lc> {
     }
 }
 
-impl<Gc, Lc, D> ChunnelConnection for LocalNameCn<Gc, Lc>
+impl<A, Gc, Lc, D> ChunnelConnection for LocalNameCn<Gc, Lc, A>
 where
-    Gc: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
+    Gc: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
+    A: GetSockAddr + Clone + Debug + Send + 'static,
     Lc: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    type Data = (Either<SocketAddr, PathBuf>, D);
+    type Data = (Either<A, PathBuf>, D);
 
     fn send(
         &self,
@@ -200,11 +219,12 @@ where
                 Either::Right(pb) => return local_cn.send((pb, data)).await,
                 Either::Left(sk) => sk,
             };
+            let skaddr = addr.as_sk_addr();
 
             // 1. check local cache
             let entry = {
                 let c = addr_cache.lock().unwrap();
-                c.get(&addr).map(Clone::clone)
+                c.get(&skaddr).map(Clone::clone)
             };
 
             // 2. if match, send on correct connection.
@@ -229,14 +249,14 @@ where
             trace!(?addr, "do lookup");
             if let Some(cl) = cl {
                 let mut cl_g = cl.lock().await;
-                let res = cl_g.query(addr).await;
+                let res = cl_g.query(skaddr).await;
                 std::mem::drop(cl_g);
                 match res {
                     Ok(Some(laddr)) => {
                         {
                             let mut c = addr_cache.lock().unwrap();
                             c.insert(
-                                addr,
+                                skaddr,
                                 LocalAddrCacheEntry::Hit {
                                     laddr: laddr.clone(),
                                     expiry: std::time::Instant::now()
@@ -256,7 +276,7 @@ where
                         {
                             let mut c = addr_cache.lock().unwrap();
                             c.insert(
-                                addr,
+                                skaddr,
                                 LocalAddrCacheEntry::AntiHit {
                                     expiry: Some(
                                         std::time::Instant::now()
@@ -277,7 +297,7 @@ where
             } else {
                 {
                     let mut c = addr_cache.lock().unwrap();
-                    c.insert(addr, LocalAddrCacheEntry::AntiHit { expiry: None });
+                    c.insert(skaddr, LocalAddrCacheEntry::AntiHit { expiry: None });
                 }
 
                 return global_cn.send((addr, data)).await;
@@ -298,7 +318,7 @@ where
                     trace!(?laddr, "recvd");
                     let c = rev_addr_map.lock().unwrap();
                     match c.get(&laddr) {
-                        Some(addr) => Ok((Either::Left(*addr), data)),
+                        Some(addr) => Ok((Either::Left(addr.clone()), data)),
                         None => Ok((Either::Right(laddr), data)),
                     }
                 }
@@ -316,6 +336,7 @@ mod test {
         util::Nothing, ChunnelConnection, ChunnelConnector, ChunnelListener,
     };
     use futures_util::stream::TryStreamExt;
+    use std::net::SocketAddr;
     use tracing::info;
     use tracing_error::ErrorLayer;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -335,7 +356,7 @@ mod test {
             .unwrap();
 
         let addr = "127.0.0.1:19052".parse().unwrap();
-        let lch = LocalNameChunnel {
+        let lch = LocalNameChunnel::<_, _, SocketAddr> {
             cl: None,
             listen_addr: None,
             local_raw: UnixSkChunnel::default(),
@@ -350,7 +371,8 @@ mod test {
                     .unwrap();
                 st.try_for_each_concurrent(None, |cn| async move {
                     loop {
-                        let m = cn.recv().await.unwrap();
+                        let m: (Either<SocketAddr, std::path::PathBuf>, Vec<u8>) =
+                            cn.recv().await.unwrap();
                         info!(?m, "got msg");
                         cn.send(m).await.unwrap();
                     }
@@ -360,7 +382,6 @@ mod test {
             });
 
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
             let cn = negotiate_client(lch, UdpSkChunnel.connect(()).await.unwrap(), addr)
                 .await
                 .unwrap();

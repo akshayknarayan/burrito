@@ -9,6 +9,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use structopt::StructOpt;
+use tls_tunnel::{TLSChunnel, TlsConnAddr};
 use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -22,6 +23,10 @@ struct Opt {
     addr: Option<SocketAddr>,
     #[structopt(long)]
     unix_addr: Option<PathBuf>,
+    #[structopt(long, default_value = "/tmp")]
+    encr_unix_root: PathBuf,
+    #[structopt(long)]
+    encr_ghostunnel_root: Option<PathBuf>,
     #[structopt(short, long)]
     work: rpcbench::Work,
     #[structopt(short, long)]
@@ -32,6 +37,37 @@ struct Opt {
     reqs_per_iter: usize,
     #[structopt(short, long)]
     out_file: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct EncryptOpt {
+    unix_root: PathBuf,
+    ghostunnel_root: PathBuf,
+}
+
+impl EncryptOpt {
+    fn from(o: &Opt) -> Option<Self> {
+        if let Some(ref gt) = o.encr_ghostunnel_root {
+            Some(EncryptOpt {
+                ghostunnel_root: gt.clone(),
+                unix_root: o.encr_unix_root.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn unix_root(&self) -> PathBuf {
+        self.unix_root.clone()
+    }
+
+    fn bin_path(&self) -> PathBuf {
+        self.ghostunnel_root.join("ghostunnel")
+    }
+
+    fn cert_dir_path(&self) -> PathBuf {
+        self.ghostunnel_root.join("test-keys/")
+    }
 }
 
 #[tokio::main]
@@ -75,24 +111,30 @@ async fn main() -> Result<(), Report> {
 
     color_eyre::install().unwrap();
 
+    let enc = EncryptOpt::from(&opt);
+
     let pp = rpcbench::PingParams {
         work: opt.work,
         padding: vec![0u8; opt.size_of_req.unwrap_or_default()],
     };
 
     let per_iter = opt.reqs_per_iter;
-    let durs = match opt {
-        Opt {
-            burrito_root: Some(root),
-            addr: Some(addr),
-            iters,
-            reqs_per_iter,
-            ..
-        } => {
+    let out_file = opt.out_file.clone();
+    let durs = match (opt, enc) {
+        (
+            Opt {
+                burrito_root: Some(root),
+                addr: Some(addr),
+                iters,
+                reqs_per_iter,
+                ..
+            },
+            None,
+        ) => {
             let fncl = |addr| {
                 let r = root.clone();
                 async move {
-                    let lch = LocalNameChunnel::new(
+                    let lch = LocalNameChunnel::<_, _, SocketAddr>::new(
                         r.clone(),
                         None,
                         UnixSkChunnel::with_root(r),
@@ -106,20 +148,61 @@ async fn main() -> Result<(), Report> {
                     Ok(ProjectLeft::new(Either::Left(addr), cn))
                 }
             };
-            info!(?root, ?addr, "Burrito mode");
+            info!(?root, ?addr, encryption = "no", "Burrito mode");
             rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
         }
-
-        Opt {
-            burrito_root: None,
-            addr: Some(addr),
-            iters,
-            reqs_per_iter,
-            ..
-        } => {
+        (
+            Opt {
+                burrito_root: Some(root),
+                addr: Some(addr),
+                iters,
+                reqs_per_iter,
+                ..
+            },
+            Some(enc),
+        ) => {
+            let fncl = |(addr, x)| {
+                let enc = enc.clone();
+                let r = root.clone();
+                async move {
+                    let lch = LocalNameChunnel::new(
+                        r.clone(),
+                        None,
+                        UnixSkChunnel::with_root(r),
+                        SerializeChunnelProject::default(),
+                    )
+                    .await?;
+                    let tls = TLSChunnel::<(SocketAddr, TlsConnAddr)>::new(
+                        enc.unix_root(),
+                        enc.bin_path(),
+                        enc.cert_dir_path(),
+                    )
+                    .connect(addr);
+                    let stack = CxList::from(KvReliabilityChunnel::default())
+                        .wrap(SerializeChunnelProject::default())
+                        .wrap(lch)
+                        .wrap(tls);
+                    let cn = negotiate_client(stack, UdpSkChunnel.connect(()).await?, addr).await?;
+                    Ok(ProjectLeft::new(Either::Left((addr, x)), cn))
+                }
+            };
+            info!(?root, ?addr, encryption = "yes", "Burrito mode");
+            rpcbench::client_ping((addr, TlsConnAddr::Request), fncl, pp, iters, reqs_per_iter)
+                .await?
+        }
+        (
+            Opt {
+                burrito_root: None,
+                addr: Some(addr),
+                iters,
+                reqs_per_iter,
+                ..
+            },
+            None,
+        ) => {
             // raw udp mode
-            info!(?addr, "UDP mode");
-            let http = |addr| async move {
+            info!(?addr, encrypt = "no", "UDP mode");
+            let fncl = |addr| async move {
                 let cn = negotiate_client(
                     CxList::from(KvReliabilityChunnel::default())
                         .wrap(SerializeChunnelProject::default()),
@@ -129,15 +212,52 @@ async fn main() -> Result<(), Report> {
                 .await?;
                 Ok(ProjectLeft::new(addr, cn))
             };
-            rpcbench::client_ping(addr, http, pp, iters, reqs_per_iter).await?
+            rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
         }
-        Opt {
-            unix_addr: Some(addr),
-            burrito_root,
-            iters,
-            reqs_per_iter,
-            ..
-        } => {
+        (
+            Opt {
+                burrito_root: None,
+                addr: Some(addr),
+                iters,
+                reqs_per_iter,
+                ..
+            },
+            Some(enc),
+        ) => {
+            // raw udp mode
+            info!(?addr, encrypt = "yes", "UDP mode");
+            let fncl = |addr| {
+                let enc = enc.clone();
+                async move {
+                    let tls = TLSChunnel::<TlsConnAddr>::new(
+                        enc.unix_root(),
+                        enc.bin_path(),
+                        enc.cert_dir_path(),
+                    )
+                    .connect(addr);
+                    let cn = negotiate_client(
+                        CxList::from(KvReliabilityChunnel::default())
+                            .wrap(SerializeChunnelProject::default())
+                            .wrap(tls),
+                        UdpSkChunnel.connect(()).await?,
+                        addr,
+                    )
+                    .await?;
+                    Ok(ProjectLeft::new(TlsConnAddr::Request, cn))
+                }
+            };
+            rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
+        }
+        (
+            Opt {
+                unix_addr: Some(addr),
+                burrito_root,
+                iters,
+                reqs_per_iter,
+                ..
+            },
+            _,
+        ) => {
             // raw unix mode
             info!(?addr, "uds mode");
             let ctr = |addr: PathBuf| {
@@ -166,7 +286,7 @@ async fn main() -> Result<(), Report> {
     };
 
     tracing::info!("done");
-    if let Some(ref path) = opt.out_file {
+    if let Some(ref path) = out_file {
         tracing::debug!("writing latencies file");
         let mut f = std::fs::File::create(path)?;
         writeln!(&mut f, "Elapsed_us,Total_us,Server_us")?;

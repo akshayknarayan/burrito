@@ -223,7 +223,6 @@ where
     let mut durs = vec![];
     for i in 0..iters {
         trace!(iter = i, "start_loop");
-
         let then = std::time::Instant::now();
         let st = connector(addr.clone())
             .await
@@ -241,7 +240,6 @@ where
     }
 
     dump_durs(&durs);
-
     Ok(durs)
 }
 

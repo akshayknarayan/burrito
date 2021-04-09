@@ -8,6 +8,7 @@ edition = "2018"
 bertha = { path = "../bertha" }
 burrito-localname-ctl = { path = "../burrito-localname-ctl", features = ["ctl"] }
 kvstore = { path = "../kvstore" }
+tls-tunnel = { path = "../tls-tunnel" }
 serde = "1"
 bincode = "1"
 color-eyre = "0.5"

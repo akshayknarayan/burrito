@@ -6,7 +6,7 @@
 // Pin<Box<...>> is necessary and not worth breaking up
 #![allow(clippy::type_complexity)]
 
-use bertha::{util::NeverCn, Chunnel, ChunnelConnection, Negotiate};
+use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -21,16 +21,43 @@ use tracing_futures::Instrument;
 
 mod ghostunnel;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct Encryption;
+
+impl bertha::negotiate::CapabilitySet for Encryption {
+    fn guid() -> u64 {
+        0xb4bf3b3e0fa957df
+    }
+
+    fn universe() -> Option<Vec<Self>> {
+        // return None to force both sides to match
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct TLSChunnel {
+pub struct TLSChunnel<A = TlsConnAddr> {
     unix_root: PathBuf,
     listen: Option<SocketAddr>,
     remote: Option<SocketAddr>,
     binary_path: PathBuf,
     certs_location: PathBuf,
+    _phantom: std::marker::PhantomData<A>,
 }
 
-impl TLSChunnel {
+impl<A> Negotiate for TLSChunnel<A> {
+    type Capability = Encryption;
+
+    fn guid() -> u64 {
+        0x967d89ae5d240be3
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![Encryption]
+    }
+}
+
+impl<A> TLSChunnel<A> {
     pub fn new(unix_root: PathBuf, binary_path: PathBuf, certs_location: PathBuf) -> Self {
         TLSChunnel {
             unix_root,
@@ -38,6 +65,7 @@ impl TLSChunnel {
             certs_location,
             listen: None,
             remote: None,
+            _phantom: Default::default(),
         }
     }
 
@@ -56,14 +84,19 @@ impl TLSChunnel {
     }
 }
 
-impl<NeverCn> Chunnel<NeverCn> for TLSChunnel {
+impl<A, T> Chunnel<T> for TLSChunnel<A>
+where
+    A: GetTlsConnAddr + 'static,
+{
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Connection = TlsConn;
+    type Connection = TlsConn<A>;
     type Error = Report;
 
-    fn connect_wrap(&mut self, _: NeverCn) -> Self::Future {
+    // ingore the inner connection
+    fn connect_wrap(&mut self, _: T) -> Self::Future {
         let root = self.unix_root.clone();
+        let remote_skaddr = self.remote.clone();
         // generate unix local addresses corresponding to the listen-addr and remote-addr for
         // ghostunnel
         use rand::Rng;
@@ -149,7 +182,7 @@ impl<NeverCn> Chunnel<NeverCn> for TLSChunnel {
                 return Err(eyre!("Need at least one of send and listen sides"));
             }
 
-            Ok(TlsConn::new(listen, send))
+            Ok(TlsConn::new(remote_skaddr, listen, send))
         })
     }
 }
@@ -158,45 +191,76 @@ impl<NeverCn> Chunnel<NeverCn> for TLSChunnel {
 ///
 /// Keep the server and client tunnel process handles around until drop time, when we want to kill the child
 /// processes.
-pub struct TlsConn {
+pub struct TlsConn<A> {
     listen: Option<Arc<UnixListener>>,
     listen_conns: Arc<Mutex<Vec<UnixStream>>>,
+    remote_addr: Option<SocketAddr>,
     send: Option<Arc<Mutex<UnixStream>>>,
     _tls_tunnel_server_handle: Option<ghostunnel::GhostTunnel>,
     _tls_tunnel_client_handle: Option<ghostunnel::GhostTunnel>,
+    _phantom: std::marker::PhantomData<A>,
 }
 
-impl TlsConn {
+impl<A> TlsConn<A> {
     fn new(
+        remote_addr: Option<SocketAddr>,
         listen: Option<(UnixListener, ghostunnel::GhostTunnel)>,
         send: Option<(UnixStream, ghostunnel::GhostTunnel)>,
     ) -> Self {
         match (listen, send) {
             (Some((listen, server_handle)), Some((send, client_handle))) => TlsConn {
+                remote_addr,
                 listen: Some(Arc::new(listen)),
                 send: Some(Arc::new(Mutex::new(send))),
                 listen_conns: Arc::new(Mutex::new(Vec::new())),
                 _tls_tunnel_server_handle: Some(server_handle),
                 _tls_tunnel_client_handle: Some(client_handle),
+                _phantom: Default::default(),
             },
             (Some((listen, server_handle)), None) => TlsConn {
+                remote_addr,
                 listen: Some(Arc::new(listen)),
                 send: None,
                 listen_conns: Arc::new(Mutex::new(Vec::new())),
                 _tls_tunnel_server_handle: Some(server_handle),
                 _tls_tunnel_client_handle: None,
+                _phantom: Default::default(),
             },
             (None, Some((send, client_handle))) => TlsConn {
+                remote_addr,
                 listen: None,
                 send: Some(Arc::new(Mutex::new(send))),
                 listen_conns: Arc::new(Mutex::new(Vec::new())),
                 _tls_tunnel_server_handle: None,
                 _tls_tunnel_client_handle: Some(client_handle),
+                _phantom: Default::default(),
             },
             (None, None) => {
                 unreachable!("Must specify at least either client side or server side")
             }
         }
+    }
+}
+
+pub trait GetTlsConnAddr: From<(SocketAddr, TlsConnAddr)> {
+    fn as_tlsconn_addr(&self) -> TlsConnAddr;
+}
+
+impl From<(SocketAddr, TlsConnAddr)> for TlsConnAddr {
+    fn from((_, a): (SocketAddr, TlsConnAddr)) -> TlsConnAddr {
+        a
+    }
+}
+
+impl GetTlsConnAddr for TlsConnAddr {
+    fn as_tlsconn_addr(&self) -> TlsConnAddr {
+        *self
+    }
+}
+
+impl GetTlsConnAddr for (SocketAddr, TlsConnAddr) {
+    fn as_tlsconn_addr(&self) -> TlsConnAddr {
+        self.1
     }
 }
 
@@ -208,14 +272,17 @@ impl TlsConn {
 /// On the recv() side, `Request` is returned by responses on the outgoing socket, and
 /// `Response(n)` should be passed back to send() to respond on the same socket a request came in
 /// on.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TlsConnAddr {
     Request,
     Response(usize),
 }
 
-impl ChunnelConnection for TlsConn {
-    type Data = (TlsConnAddr, Vec<u8>);
+impl<A> ChunnelConnection for TlsConn<A>
+where
+    A: GetTlsConnAddr,
+{
+    type Data = (A, Vec<u8>);
 
     fn send(
         &self,
@@ -225,6 +292,7 @@ impl ChunnelConnection for TlsConn {
 
         let len = d.len() as u64;
         let send_sk = self.send.as_ref().map(Arc::clone);
+        let addr = addr.as_tlsconn_addr();
         let conns = match addr {
             TlsConnAddr::Request => None,
             TlsConnAddr::Response(_) => Some(Arc::clone(&self.listen_conns)),
@@ -287,6 +355,7 @@ impl ChunnelConnection for TlsConn {
             Ok(buf)
         }
 
+        let remote_skaddr = self.remote_addr;
         let sk = self.listen.as_ref().map(|c| Arc::clone(c));
         let conns = Arc::clone(&self.listen_conns);
         let send_side = self.send.as_ref().map(|c| Arc::clone(c));
@@ -342,17 +411,21 @@ impl ChunnelConnection for TlsConn {
                                             let addr = match fut_num {
                                                 x if x == num_conns - 1 && send_side.is_some() => {
                                                     // received on the send socket.
-                                                    TlsConnAddr::Request
+                                                    (remote_skaddr.unwrap(), TlsConnAddr::Request)
                                                 }
                                                 x => {
                                                     // received on one of the active connection sockets.
-                                                    TlsConnAddr::Response(x)
+                                                    let fake_addr = SocketAddr::from((
+                                                        std::net::Ipv4Addr::UNSPECIFIED,
+                                                        50000 + x as u16,
+                                                    ));
+                                                    (fake_addr, TlsConnAddr::Response(x))
                                                 }
                                             };
-                                            return Ok((addr, v));
+                                            return Ok((addr.into(), v));
                                         }
                                         Err(err) => {
-                                            debug!(?err, "Stream read failed");
+                                            debug!(err = %format!("{:#}", err), "Stream read failed");
                                             to_remove = Some(fut_num);
                                         }
                                     }
@@ -383,7 +456,10 @@ impl ChunnelConnection for TlsConn {
                                 .await;
                             match recv_msg(sk).await {
                                 Ok(v) => {
-                                    return Ok((TlsConnAddr::Request, v));
+                                    return Ok((
+                                        (remote_skaddr.unwrap(), TlsConnAddr::Request).into(),
+                                        v,
+                                    ));
                                 }
                                 Err(err) => {
                                     return Err(err.wrap_err(eyre!("Send-side socket errored")));
@@ -409,7 +485,7 @@ mod t {
     use bertha::{util::NeverCn, Chunnel, ChunnelConnection};
     use color_eyre::eyre::{Report, WrapErr};
     use std::path::PathBuf;
-    use tracing::{info, info_span, trace};
+    use tracing::{info, info_span};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -453,8 +529,12 @@ mod t {
                     async move {
                         info!("starting");
                         // start server-side
-                        let mut srv = TLSChunnel::new(PathBuf::from("/tmp"), gt_bin, certd)
-                            .listen(ADDR.parse().unwrap());
+                        let mut srv = TLSChunnel::<super::TlsConnAddr>::new(
+                            PathBuf::from("/tmp"),
+                            gt_bin,
+                            certd,
+                        )
+                        .listen(ADDR.parse().unwrap());
                         let cn = srv.connect_wrap(NeverCn::<()>::default()).await.unwrap();
                         info!("listening");
                         loop {
