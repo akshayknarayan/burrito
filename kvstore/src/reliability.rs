@@ -3,7 +3,7 @@ use bertha::{
     util::{MsgId, Nothing},
     Chunnel, ChunnelConnection, Negotiate,
 };
-use color_eyre::eyre;
+use color_eyre::eyre::{self, WrapErr};
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
@@ -152,7 +152,7 @@ where
             loop {
                 tokio::select!(
                     resp = inner.recv() => {
-                        let resp = resp?;
+                        let resp = resp.wrap_err("kvreliability recv acks")?;
 
                         // careful about blocking here, could deadlock
                         let recv_msg_id = resp.1.id();

@@ -264,7 +264,8 @@ where
     S: ChunnelConnector<Addr = A, Error = E> + Clone + Send + Sync + 'static,
     S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     Ss: Apply + GetOffers + Clone + Send + Sync + 'static,
-    <Ss as Apply>::Applied: Chunnel<S::Connection> + Clone + Debug + Send + 'static,
+    <Ss as Apply>::Applied:
+        Chunnel<S::Connection> + bertha::NegotiatePicked + Clone + Debug + Send + 'static,
     <<Ss as Apply>::Applied as Chunnel<S::Connection>>::Connection:
         ChunnelConnection<Data = D> + Send + Sync + 'static,
     <<Ss as Apply>::Applied as Chunnel<S::Connection>>::Error: Into<Error> + Send + Sync + 'static,

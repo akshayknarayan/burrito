@@ -69,7 +69,7 @@ impl KvClient<NeverCn> {
         .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
         .prefer_right();
         let ser = SerializeChunnelProject::default();
-        let stack = CxList::from(Select::from((cl, Nothing::<()>::default())))
+        let stack = CxList::from(Select::from((cl, Nothing::<_>::default())))
             .wrap(sel)
             .wrap(ser);
 

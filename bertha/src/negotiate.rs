@@ -1237,14 +1237,14 @@ pub fn negotiate_client<C, A, S>(
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     S: Apply + GetOffers + Clone + Send + 'static,
-    <S as Apply>::Applied: Chunnel<C> + Clone + Debug + Send + 'static,
+    <S as Apply>::Applied: Chunnel<C> + NegotiatePicked + Clone + Debug + Send + 'static,
     <<S as Apply>::Applied as Chunnel<C>>::Error: Into<Report> + Send + Sync + 'static,
-    A: Clone + Debug + Send + Sync + 'static,
+    A: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static,
 {
     async move {
         debug!(?addr, "client negotiation starting");
         let offers = NegotiateMsg::ClientOffer(stack.offers().collect());
-        let resp = try_negotiate_offer_loop(&cn, addr, offers).await?;
+        let resp = try_negotiate_offer_loop(&cn, addr.clone(), offers).await?;
         match resp {
             NegotiateMsg::ServerReply(Ok(picked)) => {
                 // 4. monomorphize `stack`, picking received choices
@@ -1253,6 +1253,7 @@ where
                 let mut new_stack = None;
                 let mut apply_err = eyre!("Apply error");
                 for p in picked {
+                    let p2 = p.clone();
                     match check_apply(stack.clone(), p)
                         .wrap_err(eyre!("Could not apply received impls to stack"))
                     {
@@ -1264,7 +1265,7 @@ where
                             // TODO what if two options are tied? This will arbitrarily pick the first.
                             if p_sc > sc || new_stack.is_none() {
                                 sc = p_sc;
-                                new_stack = Some(ns);
+                                new_stack = Some((ns, p2));
                             }
                         }
                         Err(e) => {
@@ -1275,10 +1276,15 @@ where
                     }
                 }
 
-                let mut new_stack = new_stack.ok_or_else(|| {
+                let (mut new_stack, nonce) = new_stack.ok_or_else(|| {
                     apply_err.wrap_err(eyre!("All received options failed to apply"))
                 })?;
                 debug!(applied = ?&new_stack, "applied to stack");
+                let nonce = bincode::serialize(&NegotiateMsg::ServerNonce {
+                    addr: bincode::serialize(&addr)?,
+                    picked: nonce,
+                })?;
+                new_stack.call_negotiate_picked(&nonce).await;
 
                 // 5. return new_stack.connect_wrap(vec_u8_conn)
                 new_stack.connect_wrap(cn).await.map_err(Into::into)
