@@ -2,17 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-/// Callers must pass exactly one String in name, and exactly one of:
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
-    pub name: SocketAddr,
+    pub addrs: Vec<SocketAddr>,
 }
 
 /// register_addr: The name that was passed.
 /// local_addr: The assigned path to listen on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterReplyOk {
-    pub register_addr: SocketAddr,
+    pub register_addr: Vec<SocketAddr>,
     pub local_addr: PathBuf,
 }
 

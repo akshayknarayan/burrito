@@ -34,11 +34,29 @@ impl LocalNameClient {
     }
 
     pub async fn register(&mut self, name: SocketAddr) -> Result<PathBuf, Error> {
-        tracing::trace!(?name, "registering");
+        if name.ip().is_unspecified() {
+            let addrs = pnet::datalink::interfaces()
+                .into_iter()
+                .filter(|i| i.is_up() && !i.is_loopback() && !i.ips.is_empty())
+                .flat_map(|i| {
+                    i.ips.into_iter().map(|a| {
+                        let mut addr = name;
+                        addr.set_ip(a.ip());
+                        addr
+                    })
+                });
+            self.do_register_addrs(addrs.collect()).await
+        } else {
+            self.do_register_addrs(vec![name]).await
+        }
+    }
+
+    async fn do_register_addrs(&mut self, addrs: Vec<SocketAddr>) -> Result<PathBuf, Error> {
+        tracing::trace!(?addrs, "registering");
         futures_util::future::poll_fn(|cx| self.cl.poll_ready(cx)).await?;
         match self
             .cl
-            .call(proto::Request::Register(proto::RegisterRequest { name }))
+            .call(proto::Request::Register(proto::RegisterRequest { addrs }))
             .await
         {
             Ok(proto::Reply::Register(r)) => {

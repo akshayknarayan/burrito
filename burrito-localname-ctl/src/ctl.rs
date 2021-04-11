@@ -117,8 +117,8 @@ impl tower::Service<proto::Request> for BurritoNet {
         let this = self.clone();
         Box::pin(async move {
             Ok(match req {
-                proto::Request::Register(proto::RegisterRequest { name }) => {
-                    proto::Reply::Register(this.do_register(name).await.into())
+                proto::Request::Register(proto::RegisterRequest { addrs }) => {
+                    proto::Reply::Register(this.do_register(addrs).await.into())
                 }
                 proto::Request::Query(sk) => match this.query(&sk).await {
                     Ok(rep) => proto::Reply::Query(
@@ -136,8 +136,11 @@ impl tower::Service<proto::Request> for BurritoNet {
 }
 
 impl BurritoNet {
-    async fn do_register(&self, register: SocketAddr) -> Result<proto::RegisterReplyOk, String> {
-        self.assign_insert(register)
+    async fn do_register(
+        &self,
+        register: Vec<SocketAddr>,
+    ) -> Result<proto::RegisterReplyOk, String> {
+        self.assign_insert(register.clone())
             .await
             .map(|rep| proto::RegisterReplyOk {
                 register_addr: register,
@@ -145,13 +148,15 @@ impl BurritoNet {
             })
     }
 
-    async fn assign_insert(&self, service_addr: SocketAddr) -> Result<PathBuf, String> {
+    async fn assign_insert(&self, service_addrs: Vec<SocketAddr>) -> Result<PathBuf, String> {
         let a = get_addr();
         let p = PathBuf::from(&a);
-        self.name_table_insert(service_addr, p.clone()).await?;
+        for service_addr in &service_addrs {
+            self.name_table_insert(*service_addr, p.clone()).await?;
+        }
 
         info!(
-            service = ?&service_addr,
+            service = ?&service_addrs,
             addr = ?&p,
             "New service listening"
         );
