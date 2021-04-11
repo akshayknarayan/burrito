@@ -8,9 +8,11 @@
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{eyre, Report, WrapErr};
+use futures_util::future::{ready, Ready};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::{future::Future, pin::Pin};
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -35,17 +37,35 @@ impl bertha::negotiate::CapabilitySet for Encryption {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TLSChunnel<A = TlsConnAddr> {
     unix_root: PathBuf,
     listen: Option<SocketAddr>,
     remote: Option<SocketAddr>,
     binary_path: PathBuf,
     certs_location: PathBuf,
+    listen_cn: Option<Result<(UnixListener, ghostunnel::GhostTunnel), Report>>,
+    send_cn: Arc<StdMutex<Option<Result<(UnixStream, ghostunnel::GhostTunnel), Report>>>>,
     _phantom: std::marker::PhantomData<A>,
 }
 
-impl<A> Negotiate for TLSChunnel<A> {
+impl<A> Clone for TLSChunnel<A> {
+    fn clone(&self) -> Self {
+        Self {
+            unix_root: self.unix_root.clone(),
+            binary_path: self.binary_path.clone(),
+            certs_location: self.certs_location.clone(),
+            listen_cn: None,
+            send_cn: Arc::new(StdMutex::new(None)),
+            ..*self
+        }
+    }
+}
+
+impl<A> Negotiate for TLSChunnel<A>
+where
+    A: Send,
+{
     type Capability = Encryption;
 
     fn guid() -> u64 {
@@ -54,6 +74,88 @@ impl<A> Negotiate for TLSChunnel<A> {
 
     fn capabilities() -> Vec<Self::Capability> {
         vec![Encryption]
+    }
+
+    fn picked<'s>(&mut self, _nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        let root = self.unix_root.clone();
+        // generate unix local addresses corresponding to the listen-addr and remote-addr for
+        // ghostunnel
+        use rand::Rng;
+        let rng = rand::thread_rng();
+        let stem: String = rng
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(10)
+            .collect();
+
+        self.listen_cn = self.listen.map(|srv| {
+            debug!("enabling listen");
+            let mut srv_unix_name = stem.clone();
+            srv_unix_name.push_str("-srv");
+            let mut srv_unix = root.clone();
+            srv_unix.push(srv_unix_name);
+            let gt = ghostunnel::GhostTunnel::start_server(
+                srv,
+                &srv_unix,
+                &self.binary_path,
+                &self.certs_location,
+            )
+            .wrap_err("listen-side tunnel process")?;
+            let ul = UnixListener::bind(srv_unix).wrap_err("bind unix listener")?;
+            Ok((ul, gt))
+        });
+
+        let send = self.remote.map(|rem| {
+            let send_cn = Arc::clone(&self.send_cn);
+
+            let mut cli_unix_name = stem.clone();
+            cli_unix_name.push_str("-cli");
+            let mut cli_unix = root.clone();
+            cli_unix.push(cli_unix_name);
+            let gt = ghostunnel::GhostTunnel::start_client(
+                rem,
+                &cli_unix,
+                &self.binary_path,
+                &self.certs_location,
+            ).wrap_err("client-side tunnel process");
+            (send_cn, async move {
+                debug!(tunnel_entry = ?&cli_unix, "connecting to remote");
+                // retry loop until the ghostunnel process starts listening
+                let start = std::time::Instant::now();
+                let mut tries = 0usize;
+                let uc = loop {
+                    match UnixStream::connect(&cli_unix).await {
+                        Ok(uc) => break uc,
+                        Err(e) => {
+                            if start.elapsed() > std::time::Duration::from_millis(1000) {
+                                let ctx = eyre!(
+                                    "can't connect unix socket to {:?} after {:?} tries ({:?})",
+                                    cli_unix,
+                                    tries,
+                                    start.elapsed(),
+                                );
+                                return Err(Report::from(e).wrap_err(ctx));
+                            } else {
+                                tries += 1;
+                                trace!(addr = ?&cli_unix, ?tries, err = %format!("{:#}", e), "failed connection");
+                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            }
+                        }
+                    }
+                };
+
+                debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to remote");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                Ok((uc, gt?))
+            })
+        });
+
+        Box::pin(async move {
+            if let Some((send_cn, send_fut)) = send {
+                let v = Some(send_fut.await);
+                let mut send_cn_g = send_cn.lock().unwrap();
+                *send_cn_g = v;
+            }
+        })
     }
 }
 
@@ -65,6 +167,8 @@ impl<A> TLSChunnel<A> {
             certs_location,
             listen: None,
             remote: None,
+            listen_cn: None,
+            send_cn: Arc::new(StdMutex::new(None)),
             _phantom: Default::default(),
         }
     }
@@ -86,104 +190,28 @@ impl<A> TLSChunnel<A> {
 
 impl<A, T> Chunnel<T> for TLSChunnel<A>
 where
-    A: GetTlsConnAddr + 'static,
+    A: GetTlsConnAddr + Send + 'static,
 {
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
     type Connection = TlsConn<A>;
     type Error = Report;
 
     // ingore the inner connection
     fn connect_wrap(&mut self, _: T) -> Self::Future {
-        let root = self.unix_root.clone();
         let remote_skaddr = self.remote.clone();
-        // generate unix local addresses corresponding to the listen-addr and remote-addr for
-        // ghostunnel
-        use rand::Rng;
-        let rng = rand::thread_rng();
-        let stem: String = rng
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .take(10)
-            .collect();
-        let listen = self.listen.map(|srv| {
-            let mut srv_unix_name = stem.clone();
-            srv_unix_name.push_str("-srv");
-            let mut srv_unix = root.clone();
-            srv_unix.push(srv_unix_name);
-            let gt = ghostunnel::GhostTunnel::start_server(
-                srv,
-                &srv_unix,
-                &self.binary_path,
-                &self.certs_location,
-            );
-            let ul = UnixListener::bind(srv_unix);
-            (ul, gt)
-        });
-
-        let send = self.remote.map(|rem| {
-            let mut cli_unix_name = stem.clone();
-            cli_unix_name.push_str("-cli");
-            let mut cli_unix = root.clone();
-            cli_unix.push(cli_unix_name);
-            let gt = ghostunnel::GhostTunnel::start_client(
-                rem,
-                &cli_unix,
-                &self.binary_path,
-                &self.certs_location,
-            );
-            (cli_unix, gt)
-        });
-
-        Box::pin(async move {
-            let listen = if let Some((ul, gt)) = listen {
-                debug!("enabling listen");
-                Some((
-                    ul.wrap_err("bind unix listener")?,
-                    gt.wrap_err("listen-side tunnel process")?,
-                ))
-            } else {
-                None
-            };
-
-            let send = if let Some((cli_unix, gt)) = send {
-                let gt = gt.wrap_err("client-side tunnel process")?;
-                debug!(tunnel_entry = ?&cli_unix, "connecting to remote");
-                // retry loop until the ghostunnel process starts listening
-                let start = std::time::Instant::now();
-                let mut tries = 0usize;
-                let uc = loop {
-                    match UnixStream::connect(&cli_unix).await {
-                        Ok(uc) => break uc,
-                        Err(e) => {
-                            if start.elapsed() > std::time::Duration::from_millis(1000) {
-                                let ctx = eyre!(
-                                    "can't connect unix socket to {:?} after {:?} tries ({:?})",
-                                    cli_unix,
-                                    tries,
-                                    start.elapsed(),
-                                );
-                                return Err(Report::from(e).wrap_err(ctx));
-                            } else {
-                                tries += 1;
-                                trace!(addr = ?&cli_unix, ?tries, err = %format!("{:#}", e), "failed connection");
-                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                            }
-                        }
-                    }
-                };
-
-                debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to remote");
-                Some((uc, gt))
-            } else {
-                None
-            };
-
-            if send.is_none() && listen.is_none() {
+        let mut f = || {
+            let mut scn_g = self.send_cn.lock().unwrap();
+            if scn_g.is_none() && self.listen_cn.is_none() {
                 return Err(eyre!("Need at least one of send and listen sides"));
             }
 
-            Ok(TlsConn::new(remote_skaddr, listen, send))
-        })
+            Ok(TlsConn::new(
+                remote_skaddr,
+                self.listen_cn.take().transpose()?,
+                scn_g.take().transpose()?,
+            ))
+        };
+        ready(f())
     }
 }
 
@@ -329,10 +357,10 @@ where
 
                 sk.write_u64(len)
                     .await
-                    .wrap_err("error sending to tls tunnel entry")?;
+                    .wrap_err("error sending (hdr) to tls tunnel entry")?;
                 sk.write_all(&d)
                     .await
-                    .wrap_err("error sending to tls tunnel entry")?;
+                    .wrap_err("error sending (body) to tls tunnel entry")?;
                 Ok(())
             }
             .instrument(trace_span!("tlsconn-send")),
@@ -346,12 +374,12 @@ where
             let len = sk
                 .read_u64()
                 .await
-                .wrap_err("error recieving from tls tunnel exit")?;
+                .wrap_err("error receiving (hdr) from tls tunnel exit")?;
             let mut buf = Vec::with_capacity(len as usize);
             buf.resize(len as usize, 0);
             sk.read_exact(&mut buf)
                 .await
-                .wrap_err("error recieving from tls tunnel exit")?;
+                .wrap_err("error receiving (body) from tls tunnel exit")?;
             Ok(buf)
         }
 

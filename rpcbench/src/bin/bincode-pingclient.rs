@@ -3,7 +3,7 @@ use bertha::{
     uds::UnixSkChunnel, util::ProjectLeft, ChunnelConnector, CxList,
 };
 use burrito_localname_ctl::LocalNameChunnel;
-use color_eyre::eyre::{bail, Report};
+use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 use kvstore::reliability::KvReliabilityChunnel;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -288,7 +288,7 @@ async fn main() -> Result<(), Report> {
     tracing::info!("done");
     if let Some(ref path) = out_file {
         tracing::debug!("writing latencies file");
-        let mut f = std::fs::File::create(path)?;
+        let mut f = std::fs::File::create(path).wrap_err(eyre!("Create file: {:?}", path))?;
         writeln!(&mut f, "Elapsed_us,Total_us,Server_us")?;
         for (time, t, s) in durs.iter() {
             writeln!(&mut f, "{},{},{}", time.as_micros(), t, s)?;

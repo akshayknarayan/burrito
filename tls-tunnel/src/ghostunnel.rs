@@ -32,21 +32,18 @@ impl GhostTunnel {
     ) -> Result<Self, Report> {
         let certs_location = certs_location.as_ref();
         let keystore_arg = certs_location.join("server-combined.pem");
-        let cacert_arg = certs_location.join("cacert.pem");
         let local_addr_arg = unix_addr_arg(local_addr);
         let external_addr_arg = external_addr.to_string();
         debug!(mode = "tunnel-exit", external_addr = ?&external_addr_arg, local_addr = ?&local_addr_arg, "starting ghostunnel");
         let child = Command::new(ghostunnel_path.as_ref())
             .arg("--keystore")
             .arg(keystore_arg)
-            .arg("--cacert")
-            .arg(cacert_arg)
             .arg("server")
             .arg("--listen")
             .arg(external_addr_arg)
             .arg("--target")
             .arg(local_addr_arg)
-            .arg("--allow-all")
+            .arg("--disable-authentication")
             .spawn()
             .wrap_err("spawn ghostunnel server process")?;
         Ok(Self {
@@ -63,24 +60,18 @@ impl GhostTunnel {
         external_addr: std::net::SocketAddr,
         local_addr: impl AsRef<Path>,
         ghostunnel_path: impl AsRef<Path>,
-        certs_location: impl AsRef<Path>,
+        _certs_location: impl AsRef<Path>,
     ) -> Result<Self, Report> {
-        let certs_location = certs_location.as_ref();
-        let keystore_arg = certs_location.join("client-keystore.p12");
-        let cacert_arg = certs_location.join("cacert.pem");
         let local_addr_arg = unix_addr_arg(local_addr);
         let external_addr_arg = external_addr.to_string();
         debug!(mode = "tunnel-entry", external_addr = ?&external_addr_arg, local_addr = ?&local_addr_arg, "starting ghostunnel");
         let child = Command::new(ghostunnel_path.as_ref())
-            .arg("--keystore")
-            .arg(keystore_arg)
-            .arg("--cacert")
-            .arg(cacert_arg)
             .arg("client")
             .arg("--target")
             .arg(external_addr_arg)
             .arg("--listen")
             .arg(local_addr_arg)
+            .arg("--disable-authentication")
             .spawn()
             .wrap_err("spawn ghostunnel client process")?;
         Ok(Self {
