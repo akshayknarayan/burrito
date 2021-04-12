@@ -178,7 +178,7 @@ impl Server {
                 debug!("New connection");
                 loop {
                     let (a, i, p) = match tokio::time::timeout(
-                        std::time::Duration::from_millis(50),
+                        std::time::Duration::from_millis(200),
                         cn.recv(),
                     )
                     .await
@@ -223,6 +223,7 @@ where
     let mut durs = vec![];
     for i in 0..iters {
         trace!(iter = i, "start_loop");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let then = std::time::Instant::now();
         let st = connector(addr.clone())
             .await
