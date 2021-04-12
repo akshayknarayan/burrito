@@ -98,7 +98,9 @@ impl ChunnelConnection for UnixSk {
         Box::pin(async move {
             let (addr, data) = data;
             trace!(to = ?&addr, "send");
-            sk.send_to(&data, &addr).await?;
+            sk.send_to(&data, &addr)
+                .await
+                .wrap_err(eyre!("unixsk send to address: {:?}", &addr))?;
             Ok(())
         })
     }

@@ -16,7 +16,7 @@ pub mod ctl;
 use bertha::{
     either::Either, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Negotiate,
 };
-use color_eyre::eyre::Report;
+use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -237,11 +237,17 @@ where
                 }) if expiry < std::time::Instant::now() => (),
                 Some(LocalAddrCacheEntry::Hit { laddr, .. }) => {
                     trace!(?laddr, "local send");
-                    return local_cn.send((laddr.clone(), data)).await;
+                    return local_cn
+                        .send((laddr.clone(), data))
+                        .await
+                        .wrap_err("localname-ctl local send");
                 }
                 Some(LocalAddrCacheEntry::AntiHit { .. }) => {
                     trace!(?addr, "global send");
-                    return global_cn.send((addr, data)).await;
+                    return global_cn
+                        .send((addr, data))
+                        .await
+                        .wrap_err("localname-ctl global send");
                 }
             };
 
@@ -270,7 +276,10 @@ where
                         }
 
                         trace!(?laddr, "local send");
-                        return local_cn.send((laddr.clone(), data)).await;
+                        return local_cn
+                            .send((laddr.clone(), data))
+                            .await
+                            .wrap_err("localname-ctl local send");
                     }
                     Ok(None) => {
                         {
@@ -287,11 +296,17 @@ where
                         }
 
                         trace!(?addr, "global send");
-                        return global_cn.send((addr, data)).await;
+                        return global_cn
+                            .send((addr, data))
+                            .await
+                            .wrap_err("localname-ctl global send");
                     }
                     Err(e) => {
                         debug!(err = %format!("{:#}", e), ?addr, "LocalNameClient query failed");
-                        return global_cn.send((addr, data)).await;
+                        return global_cn
+                            .send((addr, data))
+                            .await
+                            .wrap_err("localname-ctl global send");
                     }
                 }
             } else {
@@ -300,7 +315,10 @@ where
                     c.insert(skaddr, LocalAddrCacheEntry::AntiHit { expiry: None });
                 }
 
-                return global_cn.send((addr, data)).await;
+                return global_cn
+                    .send((addr, data))
+                    .await
+                    .wrap_err("localname-ctl global send");
             }
         })
     }
@@ -322,7 +340,7 @@ where
                         None => Ok((Either::Right(laddr), data)),
                     }
                 }
-                FEither::Right((Err(e), _)) => Err(e.wrap_err("local_cn recv erred")),
+                FEither::Right((Err(e), _)) => Err(e.wrap_err("localname-ctl local_cn recv erred")),
             }
         })
     }
