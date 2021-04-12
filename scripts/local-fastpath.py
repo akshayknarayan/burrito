@@ -86,12 +86,15 @@ parser.add_argument('--burrito-root', type=str)
 parser.add_argument('--mode', type=str, action='append', choices=['encr', 'rel', 'fp', 'all'])
 
 args = parser.parse_args()
-if args.mode == 'all':
+if 'all' in args.mode:
     args.mode = ['encr', 'rel', 'fp']
 
 for srv in args.server:
     is_remote = '127.0.0.1' in srv
     for m in args.mode:
+        if m not in ['encr', 'rel', 'fp']:
+            agenda.failure(f"unknown mode {m}")
+            break
         if m != 'rel' and args.ghostunnel is None:
             agenda.failure("need ghostunnel arg for non-rel exp")
             break
@@ -102,6 +105,5 @@ for srv in args.server:
             args.server_port,
             args.ghostunnel if m != 'rel' else None,
             args.burrito_root if m == 'fp' else None)
-        #time.sleep(10)
-        input()
+        time.sleep(30)
         exp(srv, m, args)
