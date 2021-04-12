@@ -44,7 +44,7 @@ pub struct TLSChunnel<A = TlsConnAddr> {
     remote: Option<SocketAddr>,
     binary_path: PathBuf,
     certs_location: PathBuf,
-    listen_cn: Option<Result<(UnixListener, ghostunnel::GhostTunnel), Report>>,
+    listen_cn: Arc<StdMutex<Option<Result<(UnixListener, ghostunnel::GhostTunnel), Report>>>>,
     send_cn: Arc<StdMutex<Option<Result<(UnixStream, ghostunnel::GhostTunnel), Report>>>>,
     _phantom: std::marker::PhantomData<A>,
 }
@@ -55,7 +55,7 @@ impl<A> Clone for TLSChunnel<A> {
             unix_root: self.unix_root.clone(),
             binary_path: self.binary_path.clone(),
             certs_location: self.certs_location.clone(),
-            listen_cn: None,
+            listen_cn: Arc::new(StdMutex::new(None)),
             send_cn: Arc::new(StdMutex::new(None)),
             ..*self
         }
@@ -87,7 +87,7 @@ where
             .take(10)
             .collect();
 
-        self.listen_cn = self.listen.map(|srv| {
+        let listen = self.listen.map(|srv| {
             debug!("enabling listen");
             let mut srv_unix_name = stem.clone();
             srv_unix_name.push_str("-srv");
@@ -99,9 +99,44 @@ where
                 &self.binary_path,
                 &self.certs_location,
             )
-            .wrap_err("listen-side tunnel process")?;
-            let ul = UnixListener::bind(srv_unix).wrap_err("bind unix listener")?;
-            Ok((ul, gt))
+            .wrap_err("listen-side tunnel process");
+            let ul = UnixListener::bind(srv_unix).wrap_err("bind unix listener");
+            ( Arc::clone(&self.listen_cn), 
+            async move {
+                let gt = gt?;
+                let ul = ul?;
+                let try_conn_addr = if srv.ip().is_unspecified() {
+                    let mut addr = srv;
+                    addr.set_ip("127.0.0.1".parse().unwrap());
+                    addr
+                } else {
+                    srv
+                };
+
+                let start = std::time::Instant::now();
+                let mut tries = 0usize;
+                trace!("waiting for external addr to come up");
+                loop {
+                    if let Err(e) = tokio::net::TcpStream::connect(try_conn_addr).await {
+                        if start.elapsed() > std::time::Duration::from_millis(1000) {
+                            let ctx = eyre!(
+                                "can't connect to {:?} after {:?} tries ({:?})",
+                                try_conn_addr,
+                                tries,
+                                start.elapsed(),
+                            );
+                            return Err(Report::from(e).wrap_err(ctx));
+                        } else {
+                            tries += 1;
+                            trace!(addr = ?&try_conn_addr, ?tries, err = %format!("{:#}", e), "failed connection");
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    } else { break; }
+                }
+
+                debug!(addr = ?try_conn_addr, elapsed = ?start.elapsed(), "remote is up");
+                Ok((ul, gt))
+            })
         });
 
         let send = self.remote.map(|rem| {
@@ -144,12 +179,17 @@ where
                 };
 
                 debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to remote");
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 Ok((uc, gt?))
             })
         });
 
         Box::pin(async move {
+            if let Some((listen_cn, l_fut)) = listen {
+                let v = Some(l_fut.await);
+                let mut l_cn_g = listen_cn.lock().unwrap();
+                *l_cn_g = v;
+            }
+
             if let Some((send_cn, send_fut)) = send {
                 let v = Some(send_fut.await);
                 let mut send_cn_g = send_cn.lock().unwrap();
@@ -167,7 +207,7 @@ impl<A> TLSChunnel<A> {
             certs_location,
             listen: None,
             remote: None,
-            listen_cn: None,
+            listen_cn: Arc::new(StdMutex::new(None)),
             send_cn: Arc::new(StdMutex::new(None)),
             _phantom: Default::default(),
         }
@@ -199,15 +239,16 @@ where
     // ingore the inner connection
     fn connect_wrap(&mut self, _: T) -> Self::Future {
         let remote_skaddr = self.remote.clone();
-        let mut f = || {
+        let f = || {
             let mut scn_g = self.send_cn.lock().unwrap();
-            if scn_g.is_none() && self.listen_cn.is_none() {
+            let mut lcn_g = self.listen_cn.lock().unwrap();
+            if scn_g.is_none() && lcn_g.is_none() {
                 return Err(eyre!("Need at least one of send and listen sides"));
             }
 
             Ok(TlsConn::new(
                 remote_skaddr,
-                self.listen_cn.take().transpose()?,
+                lcn_g.take().transpose()?,
                 scn_g.take().transpose()?,
             ))
         };

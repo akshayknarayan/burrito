@@ -14,6 +14,8 @@ impl Drop for GhostTunnel {
     fn drop(&mut self) {
         if let Err(err) = self.process_handle.kill() {
             warn!(?err, "Failed to kill ghostunnel process");
+        } else {
+            debug!("killed ghostunnel process");
         }
     }
 }
