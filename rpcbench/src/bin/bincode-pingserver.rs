@@ -6,8 +6,8 @@ use bertha::{
     ChunnelListener, CxList,
 };
 use burrito_localname_ctl::LocalNameChunnel;
-use color_eyre::eyre::{bail, Report};
-use kvstore::reliability::KvReliabilityServerChunnel;
+use color_eyre::eyre::{bail, eyre, Report, WrapErr};
+//use kvstore::reliability::KvReliabilityServerChunnel;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -73,8 +73,7 @@ impl EncryptOpt {
 async fn unix(srv: rpcbench::Server, addr: PathBuf) -> Result<(), Report> {
     info!(?addr, "Serving unix-only mode");
     let st = negotiate_server(
-        CxList::from(KvReliabilityServerChunnel::default())
-            .wrap(SerializeChunnelProject::default()),
+        CxList::from(SerializeChunnelProject::default()),
         UnixReqChunnel.listen(addr).await?,
     )
     .await?;
@@ -90,17 +89,14 @@ async fn udp(srv: rpcbench::Server, port: u16, enc: Option<EncryptOpt>) -> Resul
             TLSChunnel::<TlsConnAddr>::new(enc.unix_root(), enc.bin_path(), enc.cert_dir_path())
                 .listen(addr);
         let st = negotiate_server(
-            CxList::from(KvReliabilityServerChunnel::default())
-                .wrap(SerializeChunnelProject::default())
-                .wrap(tls),
+            CxList::from(SerializeChunnelProject::default()).wrap(tls),
             UdpReqChunnel::default().listen(addr).await?,
         )
         .await?;
         srv.serve(st).await
     } else {
         let st = negotiate_server(
-            CxList::from(KvReliabilityServerChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
+            CxList::from(SerializeChunnelProject::default()),
             UdpReqChunnel::default().listen(addr).await?,
         )
         .await?;
@@ -123,7 +119,7 @@ async fn burrito(
             root.clone(),
             Some((addr, TlsConnAddr::Request)),
             UnixSkChunnel::with_root(root.clone()),
-            SerializeChunnelProject::default(),
+            bertha::CxNil,
         )
         .await?;
         let tls = TLSChunnel::<(SocketAddr, TlsConnAddr)>::new(
@@ -132,8 +128,7 @@ async fn burrito(
             enc.cert_dir_path(),
         )
         .listen(addr);
-        let stack = CxList::from(KvReliabilityServerChunnel::default())
-            .wrap(SerializeChunnelProject::default())
+        let stack = CxList::from(SerializeChunnelProject::default())
             .wrap(lch)
             .wrap(tls);
 
@@ -145,12 +140,10 @@ async fn burrito(
             root.clone(),
             Some(addr),
             UnixSkChunnel::with_root(root.clone()),
-            SerializeChunnelProject::default(),
+            bertha::CxNil,
         )
         .await?;
-        let stack = CxList::from(KvReliabilityServerChunnel::default())
-            .wrap(SerializeChunnelProject::default())
-            .wrap(lch);
+        let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
 
         info!(?port, ?root, "Serving localname mode without encryption");
         let st = negotiate_server(stack, UdpReqChunnel.listen(addr).await?).await?;
