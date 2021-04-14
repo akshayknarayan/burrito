@@ -37,13 +37,15 @@ impl GhostTunnel {
                     match rd.read_line(&mut buf) {
                         Ok(x) if x == 0 => break false,
                         Ok(_) => {
-                            debug!(?buf, "read line");
                             if buf.contains(SEARCH_FOR) {
+                                debug!(?buf, "read line");
                                 break true;
                             }
                         }
                         Err(_) => break false,
                     }
+
+                    buf.clear();
                 }
             } else {
                 false
@@ -78,7 +80,7 @@ impl GhostTunnel {
             .arg("--target")
             .arg(local_addr_arg)
             .arg("--disable-authentication")
-            .stderr(std::process::Stdio::piped())
+            //.stderr(std::process::Stdio::piped())
             .spawn()
             .wrap_err("spawn ghostunnel server process")?;
         Ok(Self {
@@ -108,7 +110,7 @@ impl GhostTunnel {
             .arg("--listen")
             .arg(local_addr_arg)
             .arg("--disable-authentication")
-            .stderr(std::process::Stdio::piped())
+            //.stderr(std::process::Stdio::piped())
             .spawn()
             .wrap_err("spawn ghostunnel client process")?;
         Ok(Self {

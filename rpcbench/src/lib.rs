@@ -306,6 +306,7 @@ pub fn dump_durs(durs: &[(Duration, i64, i64)]) {
         .map(|i| just_durs[i])
         .collect();
     info!(?quantiles, "done");
+    println!("quantiles: {:?}", quantiles);
 }
 
 #[cfg(test)]

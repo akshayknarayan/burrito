@@ -7,7 +7,7 @@
 #![allow(clippy::type_complexity)]
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
-use color_eyre::eyre::{eyre, ensure, Report, WrapErr};
+use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -101,7 +101,7 @@ where
             )
             .wrap_err("listen-side tunnel process");
             let ul = UnixListener::bind(srv_unix).wrap_err("bind unix listener");
-            ( Arc::clone(&self.listen_cn), 
+            ( Arc::clone(&self.listen_cn),
             async move {
                 let mut gt = gt?;
                 let ul = ul?;
@@ -116,7 +116,7 @@ where
                 let start = std::time::Instant::now();
                 let mut tries = 0usize;
                 trace!("waiting for external addr to come up");
-                ensure!(gt.wait_up(), "ghostunnel did not start listening");
+                //ensure!(gt.wait_up(), "ghostunnel did not start listening");
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     if let Err(e) = tokio::net::TcpStream::connect(try_conn_addr).await {
@@ -142,7 +142,6 @@ where
 
         let send = self.remote.map(|rem| {
             let send_cn = Arc::clone(&self.send_cn);
-
             let mut cli_unix_name = stem.clone();
             cli_unix_name.push_str("-cli");
             let mut cli_unix = root.clone();
@@ -156,7 +155,7 @@ where
             (send_cn, async move {
                 let mut gt = gt?;
                 debug!(tunnel_entry = ?&cli_unix, "connecting to remote");
-                ensure!(gt.wait_up(), "ghostunnel did not start listening");
+                //ensure!(gt.wait_up(), "ghostunnel did not start listening");
                 // retry loop until the ghostunnel process starts listening
                 let start = std::time::Instant::now();
                 let mut tries = 0usize;
@@ -179,6 +178,25 @@ where
                             }
                         }
                     }
+                };
+
+                let start = std::time::Instant::now();
+                let mut tries = 0usize;
+                loop {
+                    if let Err(e) = tokio::net::TcpStream::connect(rem).await {
+                        if start.elapsed() > std::time::Duration::from_millis(1000) {
+                            let ctx = eyre!(
+                                "can't connect to {:?} after {:?} tries ({:?})",
+                                rem,
+                                tries,
+                                start.elapsed(),
+                            );
+                            return Err(Report::from(e).wrap_err(ctx));
+                        } else {
+                            tries += 1;
+                            trace!(addr = ?&rem, ?tries, err = %format!("{:#}", e), "failed connection");
+                        }
+                    } else { break}
                 };
 
                 debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to remote");
@@ -502,13 +520,11 @@ where
                                         }
                                     }
                                 }
-                                Either::Right((res, _)) => match res {
-                                    Ok((new_sk, addr)) => {
-                                        debug!(?addr, "new stream");
-                                        to_add = Some(new_sk);
-                                    }
-                                    Err(e) => return Err(e).wrap_err("Error accepting connection"),
-                                },
+                                Either::Right((res, _)) => {
+                                    let (new_sk, addr) = res.wrap_err("Error accepting connection")?;
+                                    debug!(?addr, "new stream");
+                                    to_add = Some(new_sk);
+                                }
                             };
                         }
                         (None, 0) => {
@@ -526,17 +542,11 @@ where
                                 .expect("There must be a send-side connection")
                                 .lock()
                                 .await;
-                            match recv_msg(sk).await {
-                                Ok(v) => {
-                                    return Ok((
-                                        (remote_skaddr.unwrap(), TlsConnAddr::Request).into(),
-                                        v,
-                                    ));
-                                }
-                                Err(err) => {
-                                    return Err(err.wrap_err(eyre!("Send-side socket errored")));
-                                }
-                            }
+                            let v = recv_msg(sk).await.wrap_err(eyre!("Send-side socket errored"))?;
+                            return Ok((
+                                (remote_skaddr.unwrap(), TlsConnAddr::Request).into(),
+                                v,
+                            ));
                         }
                         (None, _) => {
                             // There is no listener to accept new connections, and somehow multiple

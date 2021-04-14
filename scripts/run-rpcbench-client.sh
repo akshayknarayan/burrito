@@ -17,7 +17,7 @@ fi
 if [[ $2 =~ ":" ]]; then 
     if [[ $6 != "none" ]]; then
         if [[ $7 != "none"  ]]; then
-            sudo docker exec -e RUST_LOG=debug,burrito_localname_ctl=trace,rpcbench=trace,bertha=trace rpcbench-cli /client \
+            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
                 --addr $2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $7
         else
             sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
@@ -25,7 +25,7 @@ if [[ $2 =~ ":" ]]; then
         fi
     else
         if [[ $7 != "none"  ]]; then
-            sudo docker exec -e RUST_LOG=debug,burrito_localname_ctl=trace,rpcbench=trace,bertha=trace rpcbench-cli /client \
+            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
                 --addr $2 -w=imm $3 $4 -o="/$5.data" $7
         else
             sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
@@ -41,7 +41,7 @@ else
     container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-srv)
     if [[ $6 != "none" ]]; then
         if [[ $7 != "none"  ]]; then
-            sudo docker exec -e RUST_LOG=debug,burrito_localname_ctl=trace,rpcbench=trace,bertha=trace rpcbench-cli /client \
+            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
                 --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $7
         else
             sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
@@ -49,7 +49,7 @@ else
         fi
     else
         if [[ $7 != "none"  ]]; then
-            sudo docker exec -e RUST_LOG=debug,burrito_localname_ctl=trace,rpcbench=trace,bertha=trace rpcbench-cli /client \
+            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
                 --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" $7
         else
             sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
