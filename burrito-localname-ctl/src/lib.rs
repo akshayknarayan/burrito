@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
-use tracing::{debug, trace};
+use tracing::{debug, instrument, trace};
 
 /// LocalNameChunnel fast-paths data bound to local destinations.
 ///
@@ -236,14 +236,14 @@ where
                     ..
                 }) if expiry < std::time::Instant::now() => (),
                 Some(LocalAddrCacheEntry::Hit { laddr, .. }) => {
-                    trace!(?laddr, "local send");
+                    trace!(?laddr, kind = "local", "determined send hit");
                     return local_cn
                         .send((laddr.clone(), data))
                         .await
                         .wrap_err("localname-ctl local send");
                 }
                 Some(LocalAddrCacheEntry::AntiHit { .. }) => {
-                    trace!(?addr, "global send");
+                    trace!(?addr, kind = "global", "determined send hit");
                     return global_cn
                         .send((addr, data))
                         .await
@@ -251,75 +251,21 @@ where
                 }
             };
 
-            // 3. otherwise, do a lookup and then send accordingly.
-            trace!(?addr, "do lookup");
+            // 3. otherwise, spawn off lookup. We want to avoid blocking, so just send on the
+            //    global for now.
+
             if let Some(cl) = cl {
-                let mut cl_g = cl.lock().await;
-                let res = cl_g.query(skaddr).await;
-                std::mem::drop(cl_g);
-                match res {
-                    Ok(Some(laddr)) => {
-                        {
-                            let mut c = addr_cache.lock().unwrap();
-                            c.insert(
-                                skaddr,
-                                LocalAddrCacheEntry::Hit {
-                                    laddr: laddr.clone(),
-                                    expiry: std::time::Instant::now()
-                                        + std::time::Duration::from_millis(100),
-                                },
-                            );
-                        }
-
-                        {
-                            rev_addr_map.lock().unwrap().insert(laddr.clone(), addr);
-                        }
-
-                        trace!(?laddr, "local send");
-                        return local_cn
-                            .send((laddr.clone(), data))
-                            .await
-                            .wrap_err("localname-ctl local send");
-                    }
-                    Ok(None) => {
-                        {
-                            let mut c = addr_cache.lock().unwrap();
-                            c.insert(
-                                skaddr,
-                                LocalAddrCacheEntry::AntiHit {
-                                    expiry: Some(
-                                        std::time::Instant::now()
-                                            + std::time::Duration::from_millis(100),
-                                    ),
-                                },
-                            );
-                        }
-
-                        trace!(?addr, "global send");
-                        return global_cn
-                            .send((addr, data))
-                            .await
-                            .wrap_err("localname-ctl global send");
-                    }
-                    Err(e) => {
-                        debug!(err = %format!("{:#}", e), ?addr, "LocalNameClient query failed");
-                        return global_cn
-                            .send((addr, data))
-                            .await
-                            .wrap_err("localname-ctl global send");
-                    }
-                }
+                tokio::spawn(query_ctl(addr.clone(), cl, addr_cache, rev_addr_map));
             } else {
-                {
-                    let mut c = addr_cache.lock().unwrap();
-                    c.insert(skaddr, LocalAddrCacheEntry::AntiHit { expiry: None });
-                }
-
-                return global_cn
-                    .send((addr, data))
-                    .await
-                    .wrap_err("localname-ctl global send");
+                let mut c = addr_cache.lock().unwrap();
+                c.insert(skaddr, LocalAddrCacheEntry::AntiHit { expiry: None });
             }
+
+            trace!(?addr, kind = "global", "determined send miss");
+            return global_cn
+                .send((addr, data))
+                .await
+                .wrap_err("localname-ctl global send");
         })
     }
 
@@ -333,7 +279,6 @@ where
                 FEither::Left((Ok((gaddr, data)), _)) => Ok((Either::Left(gaddr), data)),
                 FEither::Left((Err(e), _)) => Err(e),
                 FEither::Right((Ok((laddr, data)), _)) => {
-                    trace!(?laddr, "recvd");
                     let c = rev_addr_map.lock().unwrap();
                     match c.get(&laddr) {
                         Some(addr) => Ok((Either::Left(addr.clone()), data)),
@@ -343,6 +288,55 @@ where
                 FEither::Right((Err(e), _)) => Err(e.wrap_err("localname-ctl local_cn recv erred")),
             }
         })
+    }
+}
+
+#[instrument(level = "trace", skip(cl, addr_cache, rev_addr_map))]
+async fn query_ctl<A>(
+    addr: A,
+    cl: Arc<Mutex<client::LocalNameClient>>,
+    addr_cache: Arc<StdMutex<HashMap<SocketAddr, LocalAddrCacheEntry<PathBuf>>>>,
+    rev_addr_map: Arc<StdMutex<HashMap<PathBuf, A>>>,
+) where
+    A: GetSockAddr + Clone + Debug + Send + 'static,
+{
+    let skaddr = addr.as_sk_addr();
+    let mut cl_g = cl.lock().await;
+    let res = cl_g.query(skaddr).await;
+    std::mem::drop(cl_g);
+    trace!(?res, "queried localname-ctl");
+
+    fn insert_antihit(
+        skaddr: SocketAddr,
+        addr_cache: Arc<StdMutex<HashMap<SocketAddr, LocalAddrCacheEntry<PathBuf>>>>,
+    ) {
+        let mut c = addr_cache.lock().unwrap();
+        c.insert(
+            skaddr,
+            LocalAddrCacheEntry::AntiHit {
+                expiry: Some(std::time::Instant::now() + std::time::Duration::from_millis(100)),
+            },
+        );
+    }
+
+    match res {
+        Ok(Some(laddr)) => {
+            let mut c = addr_cache.lock().unwrap();
+            c.insert(
+                skaddr,
+                LocalAddrCacheEntry::Hit {
+                    laddr: laddr.clone(),
+                    expiry: std::time::Instant::now() + std::time::Duration::from_millis(100),
+                },
+            );
+
+            rev_addr_map.lock().unwrap().insert(laddr.clone(), addr);
+        }
+        Ok(None) => insert_antihit(skaddr, addr_cache),
+        Err(e) => {
+            debug!(err = %format!("{:#}", e), ?addr, "LocalNameClient query failed");
+            insert_antihit(skaddr, addr_cache);
+        }
     }
 }
 
