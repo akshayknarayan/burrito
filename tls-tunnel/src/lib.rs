@@ -7,7 +7,7 @@
 #![allow(clippy::type_complexity)]
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{eyre, ensure, Report, WrapErr};
 use futures_util::future::{ready, Ready};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -103,7 +103,7 @@ where
             let ul = UnixListener::bind(srv_unix).wrap_err("bind unix listener");
             ( Arc::clone(&self.listen_cn), 
             async move {
-                let gt = gt?;
+                let mut gt = gt?;
                 let ul = ul?;
                 let try_conn_addr = if srv.ip().is_unspecified() {
                     let mut addr = srv;
@@ -116,7 +116,9 @@ where
                 let start = std::time::Instant::now();
                 let mut tries = 0usize;
                 trace!("waiting for external addr to come up");
+                ensure!(gt.wait_up(), "ghostunnel did not start listening");
                 loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     if let Err(e) = tokio::net::TcpStream::connect(try_conn_addr).await {
                         if start.elapsed() > std::time::Duration::from_millis(1000) {
                             let ctx = eyre!(
@@ -129,7 +131,6 @@ where
                         } else {
                             tries += 1;
                             trace!(addr = ?&try_conn_addr, ?tries, err = %format!("{:#}", e), "failed connection");
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                         }
                     } else { break; }
                 }
@@ -153,7 +154,9 @@ where
                 &self.certs_location,
             ).wrap_err("client-side tunnel process");
             (send_cn, async move {
+                let mut gt = gt?;
                 debug!(tunnel_entry = ?&cli_unix, "connecting to remote");
+                ensure!(gt.wait_up(), "ghostunnel did not start listening");
                 // retry loop until the ghostunnel process starts listening
                 let start = std::time::Instant::now();
                 let mut tries = 0usize;
@@ -179,7 +182,7 @@ where
                 };
 
                 debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to remote");
-                Ok((uc, gt?))
+                Ok((uc, gt))
             })
         });
 

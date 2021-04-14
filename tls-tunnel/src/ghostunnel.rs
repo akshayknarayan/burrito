@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 #[derive(Debug)]
 pub struct GhostTunnel {
     pub(crate) process_handle: Child,
+    is_up: bool,
 }
 
 impl Drop for GhostTunnel {
@@ -21,6 +22,37 @@ impl Drop for GhostTunnel {
 }
 
 impl GhostTunnel {
+    pub(crate) fn wait_up(&mut self) -> bool {
+        if self.is_up {
+            true
+        } else {
+            // TODO switch to tokio::process so we don't have to issue blocking read
+            // calls here.
+            self.is_up = if let Some(ref mut stderr) = self.process_handle.stderr {
+                const SEARCH_FOR: &str = "listening for connections";
+                let mut buf = String::with_capacity(80);
+                use std::io::BufRead;
+                let mut rd = std::io::BufReader::new(stderr);
+                loop {
+                    match rd.read_line(&mut buf) {
+                        Ok(x) if x == 0 => break false,
+                        Ok(_) => {
+                            debug!(?buf, "read line");
+                            if buf.contains(SEARCH_FOR) {
+                                break true;
+                            }
+                        }
+                        Err(_) => break false,
+                    }
+                }
+            } else {
+                false
+            };
+
+            self.is_up
+        }
+    }
+
     /// The end of the tunnel that serves https and forwards to a local path.
     ///
     /// Serves TLS on `external_addr`, and forwards requests to `local_addr`.
@@ -46,10 +78,12 @@ impl GhostTunnel {
             .arg("--target")
             .arg(local_addr_arg)
             .arg("--disable-authentication")
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .wrap_err("spawn ghostunnel server process")?;
         Ok(Self {
             process_handle: child,
+            is_up: false,
         })
     }
 
@@ -74,10 +108,12 @@ impl GhostTunnel {
             .arg("--listen")
             .arg(local_addr_arg)
             .arg("--disable-authentication")
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .wrap_err("spawn ghostunnel client process")?;
         Ok(Self {
             process_handle: child,
+            is_up: false,
         })
     }
 }
