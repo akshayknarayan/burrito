@@ -12,7 +12,8 @@ use std::future::Future;
 use std::str::FromStr;
 use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::Duration;
-use tracing::{debug, debug_span, info, instrument, trace};
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::{debug, debug_span, info, instrument, trace, trace_span};
 use tracing_futures::Instrument;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -107,17 +108,23 @@ impl bertha::util::MsgId for Msg {
 #[derive(Clone, Debug)]
 pub struct Server {
     req_cnt: Arc<AtomicUsize>,
+    collect_traces: Option<UnboundedSender<()>>,
 }
 
 impl Default for Server {
     fn default() -> Self {
         Self {
             req_cnt: Arc::new(0.into()),
+            collect_traces: None,
         }
     }
 }
 
 impl Server {
+    pub fn set_trace_collection_trigger(&mut self, collect_traces: Option<UnboundedSender<()>>) {
+        self.collect_traces = collect_traces;
+    }
+
     pub fn get_counter(&self) -> Arc<AtomicUsize> {
         self.req_cnt.clone()
     }
@@ -162,7 +169,7 @@ impl Server {
     }
 
     #[allow(clippy::unit_arg)] // https://github.com/tokio-rs/tracing/issues/1093
-    #[instrument(skip(l), err)]
+    #[instrument(skip(self, l), err)]
     pub async fn serve<A: std::fmt::Debug>(
         self,
         l: impl futures_util::stream::Stream<
@@ -177,10 +184,12 @@ impl Server {
             async move {
                 debug!("New connection");
                 loop {
+                    trace!("listening");
                     let (a, i, p) = match tokio::time::timeout(
-                        std::time::Duration::from_millis(200),
+                        std::time::Duration::from_millis(1000),
                         cn.recv(),
                     )
+                    .instrument(trace_span!("listen_req"))
                     .await
                     {
                         Ok(Ok((a, Msg::Ping(i, p)))) => (a, i, p),
@@ -191,11 +200,18 @@ impl Server {
                         Ok(Ok(d)) => bail!("Expected PingParams, got {:?}", d),
                         Err(_to) => {
                             debug!("Connection timing out");
+                            if let Some(ref ch) = srv.collect_traces {
+                                ch.send(()).expect("Receiver won't drop");
+                            }
                             return Ok(());
                         }
                     };
+                    trace!("got req");
                     let ans: Pong = srv.do_ping(p).await.unwrap();
-                    cn.send((a, Msg::pong_with_id(i, ans))).await?;
+                    trace!("sending resp");
+                    cn.send((a, Msg::pong_with_id(i, ans)))
+                        .instrument(trace_span!("send_resp"))
+                        .await?;
                 }
             }
             .instrument(debug_span!("connection", ?ctr))
@@ -205,7 +221,7 @@ impl Server {
     }
 }
 
-#[instrument(skip(addr, connector), err)]
+#[instrument(skip(addr, connector, msg), err)]
 pub async fn client_ping<A, C, F, S>(
     addr: A,
     connector: C,
@@ -226,12 +242,13 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let then = std::time::Instant::now();
         let st = connector(addr.clone())
+            .instrument(tracing::trace_span!("connector", iter = i))
             .await
             .wrap_err("could not connect")?;
         trace!(iter = i, "connected");
         for j in 0..reqs_per_iter {
             trace!(iter = i, which = j, "ping_start");
-            let (tot, srv) = do_one_ping(&st, msg.clone()).await?;
+            let (tot, srv) = do_one_ping(&st, msg.clone(), i, j).await?;
             trace!(iter = i, which = j, "ping_end");
             durs.push((start.elapsed(), tot, srv));
         }
@@ -247,10 +264,21 @@ where
 async fn do_one_ping(
     cn: &impl ChunnelConnection<Data = Msg>,
     msg: PingParams,
+    iter: usize,
+    which: usize,
 ) -> Result<(i64, i64), Report> {
     let then = std::time::Instant::now();
-    cn.send(msg.into()).await.wrap_err("ping send")?;
-    let response = match cn.recv().await.wrap_err("pong recv")? {
+    cn.send(msg.into())
+        .instrument(tracing::trace_span!("req", ?iter))
+        .await
+        .wrap_err("ping send")?;
+    trace!(?iter, ?which, "send done");
+    let response = match cn
+        .recv()
+        .instrument(tracing::trace_span!("resp", ?iter))
+        .await
+        .wrap_err("pong recv")?
+    {
         Msg::Pong(_, p) => p,
         _ => bail!("Didn't receive Pong"),
     };

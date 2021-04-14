@@ -33,6 +33,9 @@ struct Opt {
 
     #[structopt(long)]
     encr_ghostunnel_root: Option<PathBuf>,
+
+    #[structopt(short, long)]
+    out_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,15 +160,69 @@ async fn burrito(
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
-    let opt = Opt::from_args();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(ErrorLayer::default());
-    let _guard = subscriber.set_default();
+    let mut opt = Opt::from_args();
+    let subscriber = tracing_subscriber::registry();
+    let trigger_trace_rewrite = if let Some(path) = opt.out_file.take() {
+        let timing_layer = tracing_timing::Builder::default()
+            .no_span_recursion()
+            .layer(|| tracing_timing::Histogram::new_with_max(1_000_000, 2).unwrap());
+        let timing_downcaster = timing_layer.downcaster();
+        let subscriber = subscriber
+            .with(timing_layer)
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let d = tracing::Dispatch::new(subscriber);
+        d.clone().init();
+        // sends on s trigger rewrites on r.
+        let (s, mut r) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(_) = r.recv().await {
+                let mut f = std::fs::File::create(&path)
+                    .wrap_err(eyre!("Trace file {:?}", path))
+                    .unwrap();
+                let timing = timing_downcaster
+                    .downcast(&d)
+                    .expect("downcast timing layer");
+                timing.force_synchronize();
+                // these values are in nanoseconds
+                timing.with_histograms(|hs| {
+                    for (span_group, hs) in hs {
+                        for (event_group, h) in hs {
+                            use std::io::Write;
+                            writeln!(
+                                &mut f,
+                                "{}:{} (ns:min,p25,p50,p75,p95,max;cnt): {} {} {} {} {} {} {}",
+                                span_group,
+                                event_group,
+                                h.min(),
+                                h.value_at_quantile(0.25),
+                                h.value_at_quantile(0.5),
+                                h.value_at_quantile(0.75),
+                                h.value_at_quantile(0.95),
+                                h.max(),
+                                h.len(),
+                            )
+                            .expect("write to trace file");
+                        }
+                    }
+                });
+            }
+        });
+        Some(s)
+    } else {
+        let subscriber = subscriber
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let d = tracing::Dispatch::new(subscriber);
+        d.init();
+        None
+    };
     color_eyre::install().unwrap();
 
-    let srv = rpcbench::Server::default();
+    let mut srv = rpcbench::Server::default();
+    srv.set_trace_collection_trigger(trigger_trace_rewrite);
     if let Some(path) = opt.unix_addr {
         return unix(srv, path).await;
     }
