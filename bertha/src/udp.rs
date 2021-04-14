@@ -14,6 +14,7 @@
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{future::FutureExt, stream::Stream};
+use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -82,7 +83,7 @@ impl<A> UdpSk<A> {
 
 impl<A> ChunnelConnection for UdpSk<A>
 where
-    A: Into<SocketAddr> + From<SocketAddr> + Send + 'static,
+    A: Into<SocketAddr> + From<SocketAddr> + Debug + Send + 'static,
 {
     type Data = (A, Vec<u8>);
 
@@ -93,6 +94,7 @@ where
         let sk = Arc::clone(&self.sk);
         Box::pin(async move {
             let (addr, data) = data;
+            trace!(to = ?&addr, "send");
             let addr = addr.into();
             sk.send_to(&data, &addr).await?;
             Ok(())
@@ -105,6 +107,7 @@ where
 
         Box::pin(async move {
             let (len, from) = sk.recv_from(&mut buf).await?;
+            trace!(from = ?&from, "recv");
             let data = buf[0..len].to_vec();
             Ok((from.into(), data))
         })
