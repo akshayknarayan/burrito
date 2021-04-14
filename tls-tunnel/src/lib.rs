@@ -116,7 +116,7 @@ where
                 let start = std::time::Instant::now();
                 let mut tries = 0usize;
                 trace!("waiting for external addr to come up");
-                //ensure!(gt.wait_up(), "ghostunnel did not start listening");
+                ensure!(gt.wait_up(), "ghostunnel did not start listening");
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     if let Err(e) = tokio::net::TcpStream::connect(try_conn_addr).await {
@@ -155,7 +155,7 @@ where
             (send_cn, async move {
                 let mut gt = gt?;
                 debug!(tunnel_entry = ?&cli_unix, "connecting to remote");
-                //ensure!(gt.wait_up(), "ghostunnel did not start listening");
+                ensure!(gt.wait_up(), "ghostunnel did not start listening");
                 // retry loop until the ghostunnel process starts listening
                 let start = std::time::Instant::now();
                 let mut tries = 0usize;

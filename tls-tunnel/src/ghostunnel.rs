@@ -80,7 +80,7 @@ impl GhostTunnel {
             .arg("--target")
             .arg(local_addr_arg)
             .arg("--disable-authentication")
-            //.stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .wrap_err("spawn ghostunnel server process")?;
         Ok(Self {
@@ -110,7 +110,7 @@ impl GhostTunnel {
             .arg("--listen")
             .arg(local_addr_arg)
             .arg("--disable-authentication")
-            //.stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .wrap_err("spawn ghostunnel client process")?;
         Ok(Self {
