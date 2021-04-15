@@ -272,9 +272,6 @@ fn paced_ops_stream(
 ) -> impl futures_util::stream::Stream<Item = (usize, Op)> + Send {
     let len = ops.len();
     use futures_util::stream::StreamExt;
-    //let mut ops = tokio::time::interval(Duration::from_micros(interarrival_micros as u64))
-    //use async_timer as hrtimer;
-    //let tkr = hrtimer::interval(Duration::from_micros(interarrival_micros as u64));
     let tkr = poisson_ticker::SpinTicker::new_with_log_id(
         Duration::from_micros(interarrival_micros as u64),
         client_id,

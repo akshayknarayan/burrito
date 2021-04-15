@@ -1,4 +1,4 @@
-use color_eyre::eyre::Report;
+use color_eyre::eyre::{eyre, Report};
 use kvstore::serve;
 use structopt::StructOpt;
 use tracing::{info, info_span};
