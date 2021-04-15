@@ -15,7 +15,7 @@ use burrito_shard_ctl::ClientShardChunnelClient;
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use tracing::{debug, debug_span, trace};
+use tracing::{debug, debug_span, instrument, trace};
 use tracing_futures::Instrument;
 
 /// Connect to a Kv service.
@@ -28,12 +28,11 @@ impl<C: ChunnelConnection> Clone for KvClient<C> {
 }
 
 impl KvClient<NeverCn> {
+    #[instrument(skip(raw_cn), err)]
     pub async fn new_basicclient(
         raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
-        debug!("make client");
-
         // the is ugly but needed to match the DataEither data type the server wants.
         let sel = Select::from((
             CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
@@ -51,16 +50,36 @@ impl KvClient<NeverCn> {
         Ok(Self::new_from_cn(cn))
     }
 
+    #[instrument(skip(raw_cn), err)]
+    pub async fn new_nonshardclient(
+        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+        canonical_addr: SocketAddr,
+    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
+        use crate::reliability::KvReliabilityChunnel;
+        let sel = Select::from((
+            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
+            KvReliabilityChunnel::default(),
+        ))
+        .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
+        .prefer_right();
+        let stack = CxList::from(sel).wrap(SerializeChunnelProject::default());
+
+        debug!("negotiation");
+        let cn = bertha::negotiate::negotiate_client(stack, raw_cn, canonical_addr)
+            .instrument(debug_span!("client_negotiate"))
+            .await?;
+        let cn = ProjectLeft::new(canonical_addr, cn);
+        Ok(Self::new_from_cn(cn))
+    }
+
+    #[instrument(skip(raw_cn), err)]
     pub async fn new_shardclient(
         raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         redis_addr: SocketAddr,
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
-        let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
-        debug!("make client");
-
         use crate::reliability::KvReliabilityChunnel;
-
+        let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
         let cl = ClientShardChunnelClient::new(canonical_addr, &redis_addr).await?;
         let sel = Select::from((
             CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
@@ -92,7 +111,7 @@ impl<C> KvClient<C>
 where
     C: ChunnelConnection<Data = Msg> + Send + Sync + 'static,
 {
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "trace", skip(self))]
     async fn do_req(&self, req: Msg) -> Result<Option<String>, Report> {
         let cn = &self.0;
         let id = req.id;

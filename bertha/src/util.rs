@@ -249,7 +249,7 @@ where
                             map.insert(from.clone(), sch);
                         }
 
-                        if last_print.elapsed() > std::time::Duration::from_millis(1000) {
+                        if last_print.elapsed() > std::time::Duration::from_secs(10) {
                             let p_inc = pending_inc_ctr.load(atomic::Ordering::SeqCst);
                             let p_dec = pending_dec_ctr.load(atomic::Ordering::SeqCst);
                             tracing::info!(

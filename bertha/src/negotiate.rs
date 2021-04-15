@@ -539,7 +539,7 @@ fn check_touched<T: Pick>(
 where
     T::Picked: Debug,
 {
-    let pr = t.pick(pairs)?;
+    let pr = t.pick(pairs).wrap_err(eyre!("pick failed"))?;
     trace!(?pr, "try pick");
     let touched = &pr.touched_cap_guids;
     let pairs: Vec<_> = pr

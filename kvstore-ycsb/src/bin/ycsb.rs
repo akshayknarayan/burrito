@@ -1,5 +1,5 @@
 use bertha::{ChunnelConnection, ChunnelConnector};
-use color_eyre::eyre::{Report, WrapErr};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use kvstore::KvClient;
 use kvstore_ycsb::{ops, Op};
 use std::collections::HashMap;
@@ -36,6 +36,12 @@ struct Opt {
     #[structopt(short, long)]
     logging: bool,
 
+    #[structopt(long)]
+    loads_only: bool,
+
+    #[structopt(long)]
+    skip_loads: bool,
+
     #[structopt(short, long)]
     out_file: Option<PathBuf>,
 }
@@ -51,7 +57,6 @@ fn get_raw_connector(
         > + Clone,
     Report,
 > {
-    use color_eyre::eyre::eyre;
     let path = path
         .ok_or_else(|| eyre!("If shenango feature is enabled, shenango_cfg must be specified"))?;
     Ok(shenango_chunnel::ShenangoUdpSkChunnel::new(&path))
@@ -86,6 +91,10 @@ fn main() -> Result<(), Report> {
         color_eyre::install()?;
     }
 
+    if opt.loads_only && opt.skip_loads {
+        return Err(eyre!("Must do either loads or skip them"));
+    }
+
     info!("reading workload");
     let loads = ops(opt.accesses.with_extension("load")).wrap_err("Reading loads")?;
     let accesses = ops(opt.accesses.clone()).wrap_err("Reading accesses")?;
@@ -98,18 +107,29 @@ fn main() -> Result<(), Report> {
 
     rt.block_on(async move {
         let ctr = get_raw_connector(opt.shenango_config)?;
-        let mut basic_client =
-            KvClient::new_basicclient(ctr.clone().connect(()).await.map_err(Into::into)?, opt.addr)
-                .instrument(info_span!("make kvclient", client_id = "loads_client"))
-                .await?;
-        do_loads(&mut basic_client, loads)
-            .instrument(info_span!("loads"))
+        if !opt.skip_loads {
+            let mut basic_client = KvClient::new_basicclient(
+                ctr.clone().connect(()).await.map_err(Into::into)?,
+                opt.addr,
+            )
+            .instrument(info_span!("make kvclient", client_id = "loads_client"))
             .await?;
+            do_loads(&mut basic_client, loads)
+                .instrument(info_span!("loads"))
+                .await?;
+            if opt.loads_only {
+                info!("doing only loads, done");
+                return Ok(());
+            }
+        } else {
+            info!("skipping loads");
+        }
+
         let (num_clients, (durs, remaining_inflight, time)) = if opt.use_basicclient {
             let mut access_by_client = HashMap::default();
             info!(mode = "basicclient", "make clients");
             for (cid, ops) in group_by_client(accesses).into_iter() {
-                let client = KvClient::new_basicclient(
+                let client = KvClient::new_nonshardclient(
                     ctr.clone().connect(()).await.map_err(Into::into)?,
                     opt.addr,
                 )
