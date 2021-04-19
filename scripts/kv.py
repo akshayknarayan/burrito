@@ -224,6 +224,12 @@ runtime_spininng_kthreads 3
     else:
         subprocess.run(f"rm -f host.config && cp {fname} host.config", shell=True)
 
+def get_timeout(wrkfile, interarrival_us):
+    with open(wrkfile, 'r') as f:
+        num_reqs = sum(1 for _ in f)
+        total_time_s = num_reqs * interarrival_us / 1e6
+        return max(int(total_time_s * 2), 180)
+
 def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     conn.run("sudo pkill -9 kvserver-ebpf")
     conn.run("sudo pkill -9 kvserver-noebpf")
@@ -247,39 +253,34 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     time.sleep(2)
     conn.check_proc(f"kvserver-{with_ebpf}", f"{outf}.err")
 
-def run_client(conn, server, redis_addr, interarrival, outf, wrkload='uniform'):
+def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkload='uniform'):
     conn.run("sudo pkill -9 iokerneld")
     wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadb1-4.access"
     if wrkload == 'uniform':
         wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"
 
+    timeout = get_timeout(wrkfile, interarrival)
     write_shenango_config(conn)
+    use_basicclient = '--use-basicclient' if shardtype != 'client' else ''
 
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/ycsb --addr {server}:4242 --redis-addr={redis_addr} -i {interarrival} --accesses {wrkfile} --out-file={outf}0.data1 -s host.config --logging",
+    agenda.subtask(f"client starting, timeout {timeout}")
+    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/ycsb \
+            --addr {server}:4242 \
+            --redis-addr={redis_addr} \
+            -i {interarrival} \
+            --accesses {wrkfile} \
+            --out-file={outf}0.data1 \
+            -s host.config \
+            {use_basicclient} \
+            --logging --skip-loads",
         wd="~/burrito",
         stdout=f"{outf}0.out",
         stderr=f"{outf}0.err",
-        timeout=180,
+        timeout=timeout,
         )
     check(ok, "client", conn.addr)
-    #ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/ycsb --addr {server}:4242 --redis-addr={redis_addr} -i {interarrival} --accesses {wrkfile} --out-file={outf}1.data1",
-    #    wd="~/burrito",
-    #    stdout=f"{outf}1.out",
-    #    stderr=f"{outf}1.err",
-    #    timeout=120,
-    #    )
-    #check(ok, "client", conn.addr)
-
-    # wait for the other one
-    #while True:
-    #    ok = conn.run(f"ls {outf}0.data1", wd="~/burrito")
-    #    if ok.exited == 0:
-    #        break
-    #    else:
-    #        time.sleep(1)
-
     conn.run("sudo pkill -9 iokerneld")
     agenda.subtask("client done")
 
@@ -297,6 +298,36 @@ def start_redis(machine, use_sudo=False):
     agenda.subtask(f"Started redis on {machine.host}")
     return f"{machine.alt}:6379"
 
+def run_loads(conn, server, redis_addr, outf, wrkload='uniform'):
+    conn.run("sudo pkill -9 iokerneld")
+    wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadb1-4.access"
+    if wrkload == 'uniform':
+        wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"
+
+    write_shenango_config(conn)
+
+    conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+    time.sleep(2)
+    agenda.subtask(f"loads client starting")
+    try:
+        ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/ycsb \
+                --addr {server}:4242 \
+                --redis-addr={redis_addr} \
+                -i 1000 \
+                --accesses {wrkfile} \
+                -s host.config \
+                --use-basicclient \
+                --logging --loads-only",
+            wd="~/burrito",
+            stdout=f"{outf}-loads.out",
+            stderr=f"{outf}-loads.err",
+            timeout=60,
+            )
+    finally:
+        conn.run("sudo pkill -9 iokerneld")
+    check(ok, "client", conn.addr)
+    agenda.subtask("loads client done")
+
 def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrkload='uniform'):
     server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-{iter_num}-kvserver"
     outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-{iter_num}-client"
@@ -308,15 +339,14 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
         m.run(f"rm -rf {outdir}", wd="~/burrito")
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
-    if os.path.exists(f"{outf}0-{machines[1].addr}.data") and os.path.exists(f"{outf}1-{machines[1].addr}.data"):
+    if os.path.exists(f"{outf}0-{machines[1].addr}.data"):
         agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
         return True
     else:
         agenda.task(f"running: {outf}1-{machines[1].addr}.data")
 
-    # load = 100 (client threads / proc) * 3 (procs/machine) * {len(machines) - 1} (machines) / {interarrival} (per client thread)
-    # interarrival = 100 * 3 * {len(machines) - 1} / load
-    # n = 1 client/machine now
+    # load = (4 (client threads / proc) * 1 (procs/machine) * {len(machines) - 1} (machines))
+    #        / {interarrival} (per client thread)
     interarrival_secs = 4 * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
 
@@ -327,20 +357,25 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
     redis_addr = start_redis(machines[0])
     time.sleep(5)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, workload = {wrkload}, iter = {iter_num}, load = {ops_per_sec}, ops/s -> interarrival_us = {interarrival_us}")
+    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, workload = {wrkload}, iter = {iter_num}, load = {ops_per_sec}, ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
     redis_port = redis_addr.split(":")[-1]
     start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, shards=num_shards, ebpf=(shardtype == 'xdpserver'))
     time.sleep(5)
+    # prime the server with loads
+    # conn, server, redis_addr, outf, wrkload='uniform'
+    agenda.task("doing loads")
+    run_loads(machines[1], server_addr, redis_addr, outf)
     # others are clients
-    agenda.subtask("starting clients")
+    agenda.task("starting clients")
     clients = [threading.Thread(target=run_client, args=(
             m,
             server_addr,
             redis_addr,
             interarrival_us,
+            shardtype,
             outf
         ),
         kwargs={'wrkload':wrkload}
@@ -348,7 +383,7 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
 
     [t.start() for t in clients]
     [t.join() for t in clients]
-    agenda.subtask("client returned")
+    agenda.task("all clients returned")
 
     # kill the server
     machines[0].run("sudo pkill -9 kvserver-ebpf")
@@ -358,44 +393,49 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
     for m in machines:
         m.run("rm ~/burrito/*.config")
 
-    try:
-        if not machines[0].local:
-            get_local(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
-            get_local(f"~/burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+    agenda.task("get server files")
+    if not machines[0].local:
+        get_local(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
+        get_local(f"~/burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
 
-        def get_files(num):
-            fn = c.get
-            if c.local:
-                agenda.subtask(f"Use get_local: {c.host}")
-                fn = get_local
+    def get_files(num):
+        fn = c.get
+        if c.local:
+            agenda.subtask(f"Use get_local: {c.host}")
+            fn = get_local
 
-            agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
-            fn(
-                f"burrito/{outf}{num}.err",
-                local=f"{outf}{num}-{c.addr}.err",
-                preserve_mode=False,
-            )
-            agenda.subtask(f"getting {outf}{num}-{c.addr}.out")
-            fn(
-                f"burrito/{outf}{num}.out",
-                local=f"{outf}{num}-{c.addr}.out",
-                preserve_mode=False,
-            )
-            agenda.subtask(f"getting {outf}{num}-{c.addr}.data1")
-            fn(
-                f"burrito/{outf}{num}.data1",
-                local=f"{outf}{num}-{c.addr}.data1",
-                preserve_mode=False,
-            )
+        agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
+        fn(
+            f"burrito/{outf}{num}.err",
+            local=f"{outf}{num}-{c.addr}.err",
+            preserve_mode=False,
+        )
+        agenda.subtask(f"getting {outf}{num}-{c.addr}.out")
+        fn(
+            f"burrito/{outf}{num}.out",
+            local=f"{outf}{num}-{c.addr}.out",
+            preserve_mode=False,
+        )
+        agenda.subtask(f"getting {outf}{num}-{c.addr}.data1")
+        fn(
+            f"burrito/{outf}{num}.data1",
+            local=f"{outf}{num}-{c.addr}.data1",
+            preserve_mode=False,
+        )
 
-        for c in machines[1:]:
+    agenda.task("get client files")
+    ok = True
+    for c in machines[1:]:
+        try:
             get_files(0)
             #get_files(1)
             #get_files(2)
             #get_files(3)
-    except Exception as e:
-        agenda.subfailure(f"At least one file missing: {e}")
-        return False
+        except Exception as e:
+            agenda.subfailure(f"At least one file missing for {c}: {e}")
+            ok = False
+    if not ok:
+        return ok
 
     def awk_files(num):
         subprocess.run(f"awk '{{if (!hdr) {{hdr=$1; print \"ShardType NumShards Wrkload Ops \"$0;}} else {{print \"{shardtype} {num_shards} {wrkload} {ops_per_sec} \"$0}} }}' {outf}{num}-{c.addr}.data1 > {outf}{num}-{c.addr}.data", shell=True, check=True)
