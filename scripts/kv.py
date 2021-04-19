@@ -305,28 +305,36 @@ def run_loads(conn, server, redis_addr, outf, wrkload='uniform'):
         wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"
 
     write_shenango_config(conn)
-
-    conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
-    time.sleep(2)
-    agenda.subtask(f"loads client starting")
-    try:
-        ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/ycsb \
-                --addr {server}:4242 \
-                --redis-addr={redis_addr} \
-                -i 1000 \
-                --accesses {wrkfile} \
-                -s host.config \
-                --use-basicclient \
-                --logging --loads-only",
-            wd="~/burrito",
-            stdout=f"{outf}-loads.out",
-            stderr=f"{outf}-loads.err",
-            timeout=60,
-            )
-    finally:
-        conn.run("sudo pkill -9 iokerneld")
-    check(ok, "client", conn.addr)
-    agenda.subtask("loads client done")
+    while True:
+        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+        time.sleep(2)
+        loads_start = time.time()
+        agenda.subtask(f"loads client starting")
+        ok = None
+        try:
+            ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/ycsb \
+                    --addr {server}:4242 \
+                    --redis-addr={redis_addr} \
+                    -i 1000 \
+                    --accesses {wrkfile} \
+                    -s host.config \
+                    --use-basicclient \
+                    --logging --loads-only",
+                wd="~/burrito",
+                stdout=f"{outf}-loads.out",
+                stderr=f"{outf}-loads.err",
+                timeout=200,
+                )
+        except:
+            agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
+        finally:
+            conn.run("sudo pkill -9 iokerneld")
+        if ok is None or ok.exited != 0:
+            agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
+            continue
+        else:
+            agenda.subtask(f"loads client done: {time.time() - loads_start} s")
+            break
 
 def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrkload='uniform'):
     server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-{iter_num}-kvserver"
