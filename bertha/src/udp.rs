@@ -38,7 +38,8 @@ impl ChunnelListener for UdpSkChunnel {
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
-            let sk = tokio::net::UdpSocket::bind(a).map(|sk| Ok(UdpSk::new(sk?)));
+            let sk = tokio::net::UdpSocket::bind(a)
+                .map(move |sk| Ok(UdpSk::new(sk.wrap_err(eyre!("Bind to {}", a))?)));
             Ok(Box::pin(futures_util::stream::once(sk)) as _)
         })
     }
