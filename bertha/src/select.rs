@@ -8,25 +8,68 @@ use std::pin::Pin;
 use tracing::{debug, debug_span};
 use tracing_futures::Instrument;
 
+pub struct SameAddr;
+pub struct DiffAddrs;
+
 /// Select across two listeners.
 ///
 /// Listens on an external chunnel, for direct connections from clients, as well as an internal
 /// chunnel from the canonical_addr proxy.  The first caller to call `serve` will get the internal
 /// chunnel, and subsequent callers will error.
-pub struct SelectListener<A, B> {
+pub struct SelectListener<A, B, C = SameAddr> {
     a: A,
     b: B,
+    c: std::marker::PhantomData<C>,
 }
 
-impl<A, B> SelectListener<A, B> {
+impl<A, B> SelectListener<A, B, SameAddr> {
     /// internal: A way to listen for messages forwarded from the fallback canonical address listener.
     /// external: Listen for messages over the network.
     pub fn new(a: A, b: B) -> Self {
-        Self { a, b }
+        Self {
+            a,
+            b,
+            c: Default::default(),
+        }
+    }
+
+    pub fn separate_addresses(self) -> SelectListener<A, B, DiffAddrs> {
+        SelectListener {
+            a: self.a,
+            b: self.b,
+            c: Default::default(),
+        }
     }
 }
 
-impl<A, Ac, Ae, B, Bc, Be, Addr, D> ChunnelListener for SelectListener<A, B>
+macro_rules! do_listen {
+    ($a: expr, $b: expr) => {
+        Box::pin(
+            async move {
+                let (a_stream, b_stream) = futures_util::join!($a, $b);
+                let a_stream = a_stream
+                    .map_err(Into::into)?
+                    .map(|conn| Ok(Either::Left(conn.map_err(Into::into)?)));
+                let b_stream = b_stream
+                    .map_err(Into::into)?
+                    .map(|conn| Ok(Either::Right(conn.map_err(Into::into)?)));
+
+                debug!("serving");
+                Ok(Box::pin(futures_util::stream::select(a_stream, b_stream))
+                    as Pin<
+                        Box<
+                            dyn Stream<Item = Result<Self::Connection, Self::Error>>
+                                + Send
+                                + 'static,
+                        >,
+                    >)
+            }
+            .instrument(debug_span!("SelectListener::listen")),
+        )
+    };
+}
+
+impl<A, Ac, Ae, B, Bc, Be, Addr, D> ChunnelListener for SelectListener<A, B, SameAddr>
 where
     A: ChunnelListener<Addr = Addr, Connection = Ac, Error = Ae>,
     Ac: ChunnelConnection<Data = D> + Send + Sync + 'static,
@@ -47,28 +90,31 @@ where
     fn listen(&mut self, addr: Addr) -> Self::Future {
         let a_listen_fut = self.a.listen(addr.clone());
         let b_listen_fut = self.b.listen(addr);
-        Box::pin(
-            async move {
-                let (a_stream, b_stream) = futures_util::join!(a_listen_fut, b_listen_fut);
-                let a_stream = a_stream
-                    .map_err(Into::into)?
-                    .map(|conn| Ok(Either::Left(conn.map_err(Into::into)?)));
-                let b_stream = b_stream
-                    .map_err(Into::into)?
-                    .map(|conn| Ok(Either::Right(conn.map_err(Into::into)?)));
+        do_listen!(a_listen_fut, b_listen_fut)
+    }
+}
 
-                debug!("serving");
-                Ok(Box::pin(futures_util::stream::select(a_stream, b_stream))
-                    as Pin<
-                        Box<
-                            dyn Stream<Item = Result<Self::Connection, Self::Error>>
-                                + Send
-                                + 'static,
-                        >,
-                    >)
-            }
-            .instrument(debug_span!("SelectListener::listen")),
-        )
+impl<A, Ac, Ae, Aa, B, Bc, Be, Ba, D> ChunnelListener for SelectListener<A, B, DiffAddrs>
+where
+    A: ChunnelListener<Addr = Aa, Connection = Ac, Error = Ae>,
+    Ac: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    Ae: Into<Error> + Send + Sync + 'static,
+    B: ChunnelListener<Addr = Ba, Connection = Bc, Error = Be> + Send + 'static,
+    Bc: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    Be: Into<Error> + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    type Addr = (Aa, Ba);
+    type Connection = Either<Ac, Bc>;
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+
+    fn listen(&mut self, (a_addr, b_addr): Self::Addr) -> Self::Future {
+        let a_listen_fut = self.a.listen(a_addr);
+        let b_listen_fut = self.b.listen(b_addr);
+        do_listen!(a_listen_fut, b_listen_fut)
     }
 }
 
