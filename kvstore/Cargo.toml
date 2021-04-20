@@ -36,3 +36,7 @@ bincode = "1"
 [[bin]]
 name = "kvserver"
 required-features = ["bin"]
+
+[[bin]]
+name = "burrito-lb"
+required-features = ["bin", "use-shenango"]
