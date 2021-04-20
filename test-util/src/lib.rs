@@ -31,7 +31,7 @@ impl Redis {
                 "-d",
                 "-p",
                 &format!("{}:6379", port),
-                "redis:5",
+                "redis:6",
             ])
             .spawn()?;
 
