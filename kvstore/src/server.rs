@@ -6,7 +6,8 @@ use crate::reliability::KvReliabilityServerChunnel;
 use bertha::{
     bincode::SerializeChunnelProject, chan_transport::RendezvousChannel, either::DataEither,
     negotiate::Offer, reliable::ReliabilityProjChunnel, select::SelectListener,
-    tagger::OrderedChunnelProj, ChunnelConnection, ChunnelListener, CxList, GetOffers, Select,
+    tagger::OrderedChunnelProj, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
+    GetOffers, Select,
 };
 use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{eyre, Report, WrapErr};
@@ -19,6 +20,8 @@ use tracing_futures::Instrument;
 
 /// Start and serve a load balancer, which just forwards connections to existing shards.
 pub async fn serve_lb(
+    addr: SocketAddr,
+    shards: Vec<SocketAddr>,
     mut raw_listener: impl ChunnelListener<
             Addr = SocketAddr,
             Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
@@ -26,9 +29,15 @@ pub async fn serve_lb(
         > + Clone
         + Send
         + 'static,
-    addr: SocketAddr,
-    shards: Vec<SocketAddr>,
     shards_internal: Vec<SocketAddr>,
+    shard_connector: impl ChunnelConnector<
+            Addr = (),
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+            Error = impl Into<Report> + Send + Sync + 'static,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
     redis_addr: SocketAddr,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
 ) -> Result<(), Report> {
@@ -52,10 +61,11 @@ pub async fn serve_lb(
     .wrap(SerializeChunnelProject::default());
     let mut offer: Vec<_> = shard_stack.offers().collect();
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
+
     let cnsrv = burrito_shard_ctl::ShardCanonicalServer::new(
         si.clone(),
         Some(shards_internal),
-        udp_to_shard::UdpToShard,
+        udp_to_shard::UdpToShard(shard_connector),
         shard_stack,
         offer.pop().unwrap(),
         &redis_addr,
@@ -121,24 +131,25 @@ pub async fn single_shard(
         > + Send
         + 'static,
     internal_addr: Option<SocketAddr>,
-    internal_srv: Option<
-        impl ChunnelListener<
-                Addr = SocketAddr,
-                Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>
-                                 + Send
-                                 + Sync
-                                 + 'static,
-                Error = impl Into<Report> + Send + Sync + 'static,
-            > + Send
-            + 'static,
-    >,
-    s: tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>,
+    internal_srv: impl ChunnelListener<
+            Addr = SocketAddr,
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+            Error = impl Into<Report> + Send + Sync + 'static,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    need_address_embedding: bool,
+    s: impl Into<Option<tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>>>,
 ) {
+    let s = s.into();
     let internal_addr = internal_addr.unwrap_or(addr);
     info!(?addr, ?internal_addr, "listening");
 
-    async fn srv<C, Sc, Se>(st: Sc, s: tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>)
-    where
+    async fn srv<C, Sc, Se>(
+        st: Sc,
+        s: Option<tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>>,
+    ) where
         Sc: Stream<Item = Result<C, Se>> + Send + 'static,
         C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         Se: Into<Report> + Send + Sync + 'static,
@@ -156,7 +167,10 @@ pub async fn single_shard(
         let st = bertha::negotiate::negotiate_server(external, st)
             .await
             .unwrap();
-        s.send(offers).unwrap();
+
+        if let Some(s) = s {
+            s.send(offers).unwrap();
+        }
 
         // initialize the kv store.
         let store = Store::default();
@@ -200,8 +214,8 @@ pub async fn single_shard(
         }
     }
 
-    if let Some(is) = internal_srv {
-        let st = SelectListener::new(raw_listener, is)
+    if need_address_embedding {
+        let st = SelectListener::new(raw_listener, udp_to_shard::UdpToShard(internal_srv))
             .separate_addresses()
             .listen((addr, internal_addr))
             .await
@@ -209,7 +223,7 @@ pub async fn single_shard(
             .unwrap();
         srv(st, s).await
     } else {
-        let st = SelectListener::new(raw_listener, udp_to_shard::UdpToShard)
+        let st = SelectListener::new(raw_listener, internal_srv)
             .separate_addresses()
             .listen((addr, internal_addr))
             .await
@@ -254,7 +268,7 @@ pub async fn serve(
         let (s, r) = tokio::sync::oneshot::channel();
         let int_srv = internal_srv.clone();
         tokio::spawn(
-            single_shard(a, raw_listener.clone(), None, Some(int_srv), s)
+            single_shard(a, raw_listener.clone(), None, int_srv, false, s)
                 .instrument(debug_span!("shardsrv", addr = ?&a)),
         );
         rdy.push(r);
@@ -380,11 +394,7 @@ fn make_shardinfo(srv_ip: IpAddr, srv_port: u16, num_shards: u16) -> ShardInfo<S
 }
 
 mod udp_to_shard {
-    use bertha::{
-        udp::{UdpReqChunnel, UdpSkChunnel},
-        util::ProjectLeft,
-        ChunnelConnection, ChunnelConnector, ChunnelListener,
-    };
+    use bertha::{util::ProjectLeft, ChunnelConnection, ChunnelConnector, ChunnelListener};
     use color_eyre::eyre::{eyre, Report};
     use futures_util::stream::{Stream, StreamExt};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -400,30 +410,42 @@ mod udp_to_shard {
     /// So, we `ProjectLeft` a shard address onto the connection, and put the client address into
     /// the data type.
     #[derive(Debug, Clone, Default)]
-    pub(crate) struct UdpToShard;
+    pub struct UdpToShard<I>(pub I);
 
-    impl ChunnelConnector for UdpToShard {
+    impl<I, E> ChunnelConnector for UdpToShard<I>
+    where
+        I: ChunnelConnector<Addr = (), Error = E> + Clone + Send + Sync + 'static,
+        E: Into<Report> + Send + Sync + 'static,
+        UdpToShardCn<ProjectLeft<SocketAddr, <I as ChunnelConnector>::Connection>>:
+            ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+    {
         type Addr = SocketAddr;
         type Connection =
-            UdpToShardCn<ProjectLeft<SocketAddr, <UdpSkChunnel as ChunnelConnector>::Connection>>;
+            UdpToShardCn<ProjectLeft<SocketAddr, <I as ChunnelConnector>::Connection>>;
         type Future =
             Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
         type Error = Report;
 
         fn connect(&mut self, a: Self::Addr) -> Self::Future {
+            let mut ctr = self.0.clone();
             Box::pin(async move {
                 Ok(UdpToShardCn(ProjectLeft::new(
                     a,
-                    UdpSkChunnel::default().connect(()).await?,
+                    ctr.connect(()).await.map_err(Into::into)?,
                 )))
             })
         }
     }
 
-    impl ChunnelListener for UdpToShard {
+    impl<I, E> ChunnelListener for UdpToShard<I>
+    where
+        I: ChunnelListener<Addr = SocketAddr, Error = E> + Clone + Send + Sync + 'static,
+        E: Into<Report> + Send + Sync + 'static,
+        UdpToShardCn<ProjectLeft<SocketAddr, <I as ChunnelListener>::Connection>>:
+            ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+    {
         type Addr = SocketAddr;
-        type Connection =
-            UdpToShardCn<ProjectLeft<SocketAddr, <UdpReqChunnel as ChunnelListener>::Connection>>;
+        type Connection = UdpToShardCn<ProjectLeft<SocketAddr, <I as ChunnelListener>::Connection>>;
         type Future =
             Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
         type Stream =
@@ -431,20 +453,24 @@ mod udp_to_shard {
         type Error = Report;
 
         fn listen(&mut self, a: Self::Addr) -> Self::Future {
+            let mut lis = self.0.clone();
             Box::pin(async move {
-                let l = UdpReqChunnel::default().listen(a).await?;
+                let l = lis.listen(a).await.map_err(Into::into)?;
                 // ProjectLeft a is a dummy, the UdpConn will ignore it and replace with the
                 // req-connection source addr.
-                Ok(Box::pin(l.map(move |cn| Ok(UdpToShardCn(ProjectLeft::new(a, cn?))))) as _)
+                Ok(Box::pin(
+                    l.map(move |cn| Ok(UdpToShardCn(ProjectLeft::new(a, cn.map_err(Into::into)?)))),
+                ) as _)
             })
         }
     }
 
-    pub(crate) struct UdpToShardCn<C>(C);
+    #[derive(Debug, Clone)]
+    pub struct UdpToShardCn<C>(C);
 
     impl<C> ChunnelConnection for UdpToShardCn<C>
     where
-        C: ChunnelConnection<Data = Vec<u8>>,
+        C: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
     {
         type Data = (SocketAddr, Vec<u8>);
 

@@ -46,9 +46,8 @@ async fn main() -> Result<(), Report> {
     };
 
     info!(addr = ?&opt.addr, shards = ?&opt.shards, "starting load balancer");
-    let listener = shenango_chunnel::ShenangoUdpReqChunnel(
-        shenango_chunnel::ShenangoUdpSkChunnel::new(&opt.shenango_cfg),
-    );
+    let sk = shenango_chunnel::ShenangoUdpSkChunnel::new(&opt.shenango_cfg);
+    let listener = shenango_chunnel::ShenangoUdpReqChunnel(sk.clone());
 
     let shards_internal = opt
         .shards
@@ -57,10 +56,11 @@ async fn main() -> Result<(), Report> {
         .map(shard_internal_addr_from_external)
         .collect();
     serve_lb(
-        listener,
         opt.addr,
         opt.shards,
+        listener,
         shards_internal,
+        sk,
         opt.redis_addr,
         None,
     )

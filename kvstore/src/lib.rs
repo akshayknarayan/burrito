@@ -159,7 +159,8 @@ mod tests {
                             *sa,
                             UdpReqChunnel::default(),
                             Some(internal_addr),
-                            None::<UdpSkChunnel>,
+                            UdpReqChunnel::default(),
+                            true,
                             s,
                         )
                         .instrument(info_span!("shard", addr = ?sa)),
@@ -176,10 +177,11 @@ mod tests {
                 let (s, r) = tokio::sync::oneshot::channel();
                 tokio::spawn(
                     serve_lb(
-                        UdpReqChunnel::default(),
                         srv_addr,
                         shard_addrs,
+                        UdpReqChunnel::default(),
                         shard_internal_addrs,
+                        UdpSkChunnel::default(),
                         redis_sk_addr,
                         s,
                     )
