@@ -106,6 +106,7 @@ enumerate_enum!(pub ShardFns, 0xe898734df758d0c0, Sharding);
 #[derive(Clone)]
 pub struct ShardCanonicalServer<A, S, Ss> {
     addr: ShardInfo<A>,
+    internal_addr: Vec<A>,
     shards_inner: S,
     shards_inner_stack: Ss,
     shards_extern_nonce: HashMap<u64, Offer>,
@@ -120,11 +121,15 @@ impl<A: std::fmt::Debug, S, Ss> std::fmt::Debug for ShardCanonicalServer<A, S, S
     }
 }
 
-impl<A, S, Ss> ShardCanonicalServer<A, S, Ss> {
+impl<A, S, Ss> ShardCanonicalServer<A, S, Ss>
+where
+    A: Clone + std::fmt::Debug,
+{
     /// Inner is a chunnel for the external connection.
     /// Shards is a chunnel for an internal connection to the shards.
     pub async fn new(
         addr: ShardInfo<A>,
+        internal_addr: Option<Vec<A>>,
         shards_inner: S,
         shards_inner_stack: Ss,
         shards_extern_nonce: HashMap<u64, Offer>,
@@ -139,8 +144,18 @@ impl<A, S, Ss> ShardCanonicalServer<A, S, Ss> {
                 .wrap_err("Connecting to redis")?,
         ));
 
+        let internal_addr = internal_addr.unwrap_or(addr.shard_addrs.clone());
+        if internal_addr.len() != addr.shard_addrs.len() {
+            return Err(eyre!(
+                "Shard addresses mismatched between internal and external: {:?} != {:?}",
+                internal_addr,
+                addr
+            ));
+        }
+
         Ok(ShardCanonicalServer {
             addr,
+            internal_addr,
             shards_inner,
             shards_inner_stack,
             shards_extern_nonce,
@@ -151,7 +166,16 @@ impl<A, S, Ss> ShardCanonicalServer<A, S, Ss> {
 
 impl<A, S, Ss> Negotiate for ShardCanonicalServer<A, S, Ss>
 where
-    A: Clone + std::fmt::Debug + PartialEq + Send + Sync + 'static,
+    A: IpPort
+        + Serialize
+        + DeserializeOwned
+        + Clone
+        + PartialEq
+        + std::fmt::Debug
+        + std::fmt::Display
+        + Send
+        + Sync
+        + 'static,
     S: ChunnelConnector<Addr = A> + Clone + Send + Sync + 'static,
     <S as ChunnelConnector>::Error: Into<eyre::Report>,
     S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
@@ -167,7 +191,7 @@ where
     }
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
-        let addrs = self.addr.shard_addrs.clone();
+        let addrs = self.internal_addr.clone();
         let ctr = self.shards_inner.clone();
         let offer = self.shards_extern_nonce.clone();
         let msg: bertha::negotiate::NegotiateMsg = match bincode::deserialize(nonce) {
@@ -199,7 +223,18 @@ where
             Ok(m) => m,
         };
 
+        let redis_conn = Arc::clone(&self.redis_listen_connection);
+        let addr = self.addr.clone();
         Box::pin(async move {
+            // redis insert
+            if let Err(e) = redis_util::redis_insert(redis_conn, &addr)
+                .await
+                .wrap_err("Could not register shard info")
+            {
+                warn!(err = ?e, "failed inserting shard info in redis");
+                return;
+            }
+
             futures_util::future::join_all(addrs.into_iter().map(|shard| {
                 let buf = buf.clone();
                 let mut ctr = ctr.clone();
@@ -281,24 +316,18 @@ where
 
     fn connect_wrap(&mut self, conn: I) -> Self::Future {
         let addr = self.addr.clone();
+        let internal_addr = self.internal_addr.clone();
         let a1 = addr.clone();
         let shards_inner = self.shards_inner.clone();
         let shards_inner_stack = self.shards_inner_stack.clone();
-        let redis_conn = Arc::clone(&self.redis_listen_connection);
         Box::pin(
             async move {
-                // redis insert
-                redis_util::redis_insert(redis_conn, &addr)
-                    .await
-                    .wrap_err("Could not register shard info")?;
-                trace!("redis_insert");
-
                 let num_shards = addr.shard_addrs.len();
-                let addrs = addr.shard_addrs.clone();
 
                 // connect to shards
                 let conns: Vec<Arc<_>> =
-                    futures_util::future::join_all(addrs.into_iter().map(|a| async {
+                    futures_util::future::join_all(internal_addr.into_iter().map(|a| async {
+                        debug!(?a, "connecting to shard");
                         let a = a;
                         let cn = shards_inner
                             .clone()
@@ -414,7 +443,7 @@ where
                 // 3. Get response from the shard, and send back to client.
                 let resp = conn
                     .recv()
-                    .instrument(tracing::trace_span!("canonical-server-chan-recv"))
+                    .instrument(tracing::trace_span!("canonical-server-internal-recv"))
                     .await
                     .wrap_err("Receive from shard")?;
                 trace!(shard_idx, "got shard response");

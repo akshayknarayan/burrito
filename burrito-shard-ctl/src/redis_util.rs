@@ -34,6 +34,7 @@ where
 
     trace!("adding");
     r.query_async(&mut *conn.lock().await).await?;
+    trace!("done");
     Ok(())
 }
 
