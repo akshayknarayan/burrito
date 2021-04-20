@@ -40,3 +40,7 @@ required-features = ["bin"]
 [[bin]]
 name = "burrito-lb"
 required-features = ["bin", "use-shenango"]
+
+[[bin]]
+name = "single-shard"
+required-features = ["bin", "use-shenango"]
