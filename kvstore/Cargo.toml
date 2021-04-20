@@ -6,7 +6,7 @@ edition = "2018"
 
 [features]
 default = []
-bin = ["tracing-subscriber", "tracing-timing", "structopt", "ctrlc", "tokio/rt-multi-thread", "tracing/release_max_level_trace"]
+bin = ["tracing-subscriber", "tracing-timing", "structopt", "ctrlc", "tokio/rt-multi-thread"]
 use-shenango = ["shenango-chunnel"]
 ebpf = ["burrito-shard-ctl/ebpf"]
 

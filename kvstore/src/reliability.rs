@@ -43,7 +43,7 @@ impl Negotiate for KvReliabilityChunnel {
 impl Default for KvReliabilityChunnel {
     fn default() -> Self {
         KvReliabilityChunnel {
-            timeout: Duration::from_millis(100),
+            timeout: Duration::from_millis(500),
         }
     }
 }
