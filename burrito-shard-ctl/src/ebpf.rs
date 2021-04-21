@@ -30,11 +30,15 @@ impl<A: std::fmt::Debug, S, Ss> std::fmt::Debug for ShardCanonicalServerEbpf<A, 
     }
 }
 
-impl<A, S, Ss> ShardCanonicalServerEbpf<A, S, Ss> {
+impl<A, S, Ss> ShardCanonicalServerEbpf<A, S, Ss>
+where
+    A: Clone + std::fmt::Debug,
+{
     /// Inner is a chunnel for the external connection.
     /// Shards is a chunnel for an internal connection to the shards.
     pub async fn new(
         addr: ShardInfo<A>,
+        internal_addr: Option<Vec<A>>,
         shards_inner: S,
         shards_inner_stack: Ss,
         shards_extern_nonce: HashMap<u64, Offer>,
@@ -42,6 +46,7 @@ impl<A, S, Ss> ShardCanonicalServerEbpf<A, S, Ss> {
     ) -> Result<Self, Report> {
         let inner = ShardCanonicalServer::new(
             addr,
+            internal_addr,
             shards_inner,
             shards_inner_stack,
             shards_extern_nonce,
