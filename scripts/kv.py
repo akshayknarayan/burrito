@@ -187,15 +187,7 @@ def check_machine(ip):
     conn.alt = alt
     return (conn, commit)
 
-def setup_client(conn, outdir):
-    ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
-    check(ok, "mk outdir", conn.addr)
-    agenda.subtask(f"building burrito on {conn.addr}")
-    ok = conn.run("make sharding", wd = "~/burrito")
-    check(ok, "build", conn.addr)
-    return conn
-
-def setup_server(conn, outdir):
+def setup_machine(conn, outdir):
     ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
     check(ok, "mk outdir", conn.addr)
     agenda.subtask(f"building burrito on {conn.addr}")
@@ -234,9 +226,6 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     conn.run("sudo pkill -9 kvserver-ebpf")
     conn.run("sudo pkill -9 kvserver-noebpf")
     conn.run("sudo pkill -9 iokerneld")
-
-    #ok = conn.run(f"./target/release/xdp_clear -i {conn.addr}", wd="~/burrito", sudo=True)
-    #check(ok, "Clear xdp programs", conn.addr)
 
     write_shenango_config(conn)
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
@@ -403,8 +392,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
 
     agenda.task("get server files")
     if not machines[0].local:
-        get_local(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
-        get_local(f"~/burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+        machines[0].get(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
+        machines[0].get(f"~/burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
 
     def get_files(num):
         fn = c.get
@@ -492,18 +481,18 @@ def probe_ops(outdir, machines, num_shards, shardtype, low_ops, high_ops=None, w
             return probe_ops(outdir, machines, num_shards, shardtype, low_ops/2, high_ops=low_ops, wrkload=wrkload)
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--outdir', type=str, required=True)
-parser.add_argument('--load', type=int, action='append', required=True)
-parser.add_argument('--server', type=str, required=True)
-parser.add_argument('--client', type=str, action='append', required=True)
-parser.add_argument('--shards', type=int, action='append')
-parser.add_argument('--shardtype', type=str, action='append')
-parser.add_argument('--wrk', type=str, action='append')
-parser.add_argument('--mode', type=str)
-
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--outdir', type=str, required=True)
+    parser.add_argument('--load', type=int, action='append', required=True)
+    parser.add_argument('--server', type=str, required=True)
+    parser.add_argument('--client', type=str, action='append', required=True)
+    parser.add_argument('--shards', type=int, action='append')
+    parser.add_argument('--shardtype', type=str, action='append')
+    parser.add_argument('--wrk', type=str, action='append')
+    parser.add_argument('--mode', type=str)
     args = parser.parse_args()
+
     outdir = args.outdir
     ips = [args.server] + args.client
 
@@ -556,8 +545,7 @@ if __name__ == '__main__':
     # build
     agenda.task("building burrito...")
     thread_ok = True
-    setups = [threading.Thread(target=setup_server, args=(machines[0],outdir))] +\
-        [threading.Thread(target=setup_client, args=(m,outdir)) for m in machines[1:]]
+    setups = [threading.Thread(target=setup_machine, args=(m,outdir)) for m in machines]
     [t.start() for t in setups]
     [t.join() for t in setups]
     if not thread_ok:

@@ -12,7 +12,7 @@ struct Opt {
     #[structopt(short, long, default_value = "0.0.0.0:4242")]
     addr: SocketAddr,
 
-    #[structopt(short, long)]
+    #[structopt(long)]
     shards: Vec<SocketAddr>,
 
     #[structopt(short, long)]
