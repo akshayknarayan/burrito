@@ -17,7 +17,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, debug_span, trace, warn};
+use tracing::{debug, debug_span, trace, trace_span, warn};
 use tracing_futures::Instrument;
 
 pub const CONTROLLER_ADDRESS: &str = "shard-ctl";
@@ -443,7 +443,7 @@ where
                 // 3. Get response from the shard, and send back to client.
                 let resp = conn
                     .recv()
-                    .instrument(tracing::trace_span!("canonical-server-internal-recv"))
+                    .instrument(trace_span!("canonical-server-internal-recv"))
                     .await
                     .wrap_err("Receive from shard")?;
                 trace!(shard_idx, "got shard response");
@@ -451,7 +451,7 @@ where
 
                 Ok(None)
             }
-            .instrument(tracing::trace_span!("server-shard-recv")),
+            .instrument(trace_span!("server-shard-recv")),
         )
     }
 
