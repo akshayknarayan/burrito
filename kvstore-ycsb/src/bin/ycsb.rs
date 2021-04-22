@@ -193,7 +193,12 @@ async fn do_requests<S>(
 where
     S: bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static,
 {
-    use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
+    use futures_util::{
+        future::{select, Either},
+        stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt},
+    };
+
+    info!(?interarrival_micros, "starting requests");
 
     async fn time_req(
         cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static>,
@@ -204,41 +209,52 @@ where
         Ok::<_, Report>(now.elapsed())
     }
 
-    #[instrument(level = "info", skip(cl, ops, done))]
+    #[instrument(level = "info", skip(cl, ops, done), err)]
     async fn req_loop(
         cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static>,
-        mut ops: impl futures_util::stream::Stream<Item = (usize, Op)> + Unpin + Send + 'static,
+        mut ops: impl Stream<Item = (usize, Op)> + Unpin + Send + 'static,
         done: tokio::sync::watch::Receiver<bool>,
         client_id: usize,
     ) -> Result<(Vec<Duration>, usize), Report> {
         let mut durs = vec![];
-        let mut inflight = FuturesOrdered::new();
+        let mut inflight = FuturesUnordered::new();
+        let mut arrv = std::time::Instant::now();
 
         debug!("starting");
         loop {
-            tokio::select!(
-                Some((remaining_cnt, o)) = ops.next() => {
-                    if remaining_cnt > 0 {
+            // first check for a finished request.
+            let ops_val = match select(ops.next(), inflight.next()).await {
+                Either::Right((Some(Ok(d)), _)) => {
+                    trace!(inflight = inflight.len(), "request done");
+                    durs.push(d);
+                    None
+                }
+                Either::Right((Some(Err(e)), _)) => return Err(e),
+                Either::Right((None, f)) => Some(f.await),
+                Either::Left((x, _)) => Some(x),
+            };
+
+            // if after the above, something happened in incoming request stream -- either the
+            // stream directly yielded, or inflight gave us None and we then waited for a request -- then handle that.
+            if let Some(ov) = ops_val {
+                match ov {
+                    Some((remaining_cnt, o)) if remaining_cnt > 0 => {
                         inflight.push(time_req(cl.clone(), o));
-                        trace!(remaining_cnt, inflight = inflight.len(), "new request");
-                    } else {
+                        let interarrv = arrv.elapsed();
+                        arrv = std::time::Instant::now();
+                        trace!(
+                            remaining_cnt,
+                            inflight = inflight.len(),
+                            ?interarrv,
+                            "new request"
+                        );
+                    }
+                    _ => {
                         info!(completed = durs.len(), "finished requests");
                         break;
                     }
                 }
-                Some(r) = inflight.next() => {
-                    match r {
-                        Ok(d) => {
-                            trace!(inflight = inflight.len(), "request done");
-                            durs.push(d);
-                        }
-                        Err(e) => {
-                            debug!(err = ?e, "request failed");
-                            return Err(e);
-                        }
-                    }
-                }
-            );
+            }
 
             // This can't be inside the select because then the else clause would never be
             // triggered.
