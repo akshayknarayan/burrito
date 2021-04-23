@@ -60,7 +60,8 @@ def do_exp(outdir, lb, shards, clients, shardtype, ops_per_sec):
     shard_prefix = f"{outdir}/{shardtype}shard-{ops_per_sec}-shard"
     outf = f"{outdir}/{shardtype}shard-{ops_per_sec}-client"
 
-    if os.path.exists(f"{outf}-{clients[0].addr}.data"):
+    agenda.task(f"checking {outf}0-{clients[0].addr}.data")
+    if os.path.exists(f"{outf}0-{clients[0].addr}.data"):
         agenda.task(f"skipping: server = {lb.addr}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
         return True
     else:
