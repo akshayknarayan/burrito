@@ -362,20 +362,36 @@ async fn serve_canonical(
         ready.send(()).unwrap_or_default();
     }
 
-    st.try_for_each_concurrent(None, |r| {
-        async move {
+    let mut ctr = 0usize;
+    tokio::pin!(st);
+    while let Some(r) = st
+        .try_next()
+        .instrument(info_span!("negotiate_server"))
+        .await?
+    {
+        tokio::spawn(async move {
+            let ctr = ctr;
             loop {
-                let _: Option<(_, Msg)> = r
-                    .recv()
-                    .instrument(debug_span!("shard-canonical-server-connection"))
-                    .await?; // ShardCanonicalServerConnection is recv-only
+                match r
+                    .recv() // ShardCanonicalServerConnection is recv-only
+                    .instrument(debug_span!("shard-canonical-server-connection", ?ctr))
+                    .await
+                    .wrap_err("kvstore/server: Error while processing requests")
+                {
+                    Ok(x) => {
+                        let _: Option<(_, Msg)> = x;
+                    }
+                    Err(e) => {
+                        warn!(err = ?e, ?ctr, "exiting");
+                        break;
+                    }
+                }
             }
-        }
-    })
-    .instrument(info_span!("negotiate_server"))
-    .await
-    .wrap_err("kvstore/server: Error while processing requests")?;
-    unreachable!()
+        });
+        ctr += 1;
+    }
+
+    unreachable!() // negotiate_server never returns None
 }
 
 fn make_shardinfo(srv_ip: IpAddr, srv_port: u16, num_shards: u16) -> ShardInfo<SocketAddr> {
