@@ -10,7 +10,7 @@ use bertha::{
     GetOffers, Select,
 };
 use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -175,43 +175,66 @@ pub async fn single_shard(
         // initialize the kv store.
         let store = Store::default();
         let idx = Arc::new(AtomicUsize::new(0));
-        if let Err(e) = st
-        .try_for_each_concurrent(None, |cn| {
+
+        tokio::pin!(st);
+        loop {
+            let cn = match st
+                .try_next()
+                .instrument(debug_span!("negotiate_server"))
+                .await
+            {
+                Ok(Some(cn)) => cn,
+                Err(err) => {
+                    warn!(?err, "Could not accept connection");
+                    break;
+                }
+                Ok(None) => unreachable!(),
+            };
+
             let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let store = store.clone();
             // TODO deduplicate possible spurious retxs by req id
             let mut pending_sends = FuturesUnordered::new();
-            async move {
+
+            tokio::spawn(async move {
                 debug!("new");
                 loop {
                     trace!("call recv");
-                    tokio::select!(
-                        inc = cn.recv() => {
-                            let (a, msg): (_, Msg) =
-                                inc.wrap_err(eyre!("receive message error"))?;
+                    use futures_util::future::Either;
+                    let recv_val = match futures_util::future::select(pending_sends.next(), cn.recv()).await {
+                        Either::Left((Some(Ok(_)), _)) => None,
+                        Either::Left((Some(Err(e)), _)) => {
+                            warn!(err = ?e, ?idx, "exiting on send error");
+                            break;
+                        }
+                        Either::Left((None, f)) => Some(f.await),
+                        Either::Right((inc, _)) => Some(inc),
+                    };
+
+                    match recv_val {
+                        Some(Ok((a, msg @ Msg {..}))) => {
                             trace!(msg = ?&msg, from=?&a, pending_sends = pending_sends.len(), "got msg");
                             let rsp = store.call(msg);
                             let id = rsp.id;
                             let send_fut = cn.send((a, rsp));
                             pending_sends.push(async move {
-                                send_fut.await.wrap_err(eyre!("send response err"))?;
+                                send_fut.await?;
                                 trace!(msg_id = id, "sent response");
                                 Ok::<_, Report>(())
                             });
                         }
-                        Some(send_res) = pending_sends.next() => {
-                            send_res?;
+                        Some(Err(e)) => {
+                            warn!(err = ?e, ?idx, "exiting on recv error");
+                            break;
                         }
-                    );
+                        None => (),
+                    }
                 }
             }
-            .instrument(debug_span!("shard_connection", idx = ?idx))
-        })
-        .instrument(debug_span!("negotiate_server"))
-        .await {
-            warn!(err = ?e, "Shard errorred");
-            panic!("{}", e);
+            .instrument(debug_span!("shard_connection", idx = ?idx)));
         }
+
+        unreachable!();
     }
 
     if need_address_embedding {
