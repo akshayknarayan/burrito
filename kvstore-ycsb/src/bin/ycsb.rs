@@ -33,6 +33,9 @@ struct Opt {
     #[structopt(long)]
     use_basicclient: bool,
 
+    #[structopt(long)]
+    use_clientsharding: bool,
+
     #[structopt(short, long)]
     logging: bool,
 
@@ -125,24 +128,44 @@ fn main() -> Result<(), Report> {
             info!("skipping loads");
         }
 
-        let (num_clients, (durs, remaining_inflight, time)) = if opt.use_basicclient {
-            let mut access_by_client = HashMap::default();
-            info!(mode = "basicclient", "make clients");
-            for (cid, ops) in group_by_client(accesses).into_iter() {
-                let client = KvClient::new_nonshardclient(
-                    ctr.clone().connect(()).await.map_err(Into::into)?,
-                    opt.addr,
+        let (num_clients, (durs, remaining_inflight, time)) = if !opt.use_clientsharding {
+            if !opt.use_basicclient {
+                let mut access_by_client = HashMap::default();
+                info!(mode = "basicclient", "make clients");
+                for (cid, ops) in group_by_client(accesses).into_iter() {
+                    let client = KvClient::new_nonshardclient(
+                        ctr.clone().connect(()).await.map_err(Into::into)?,
+                        opt.addr,
+                    )
+                    .instrument(info_span!("make kvclient", client_id = ?cid))
+                    .await
+                    .wrap_err("make KvClient")?;
+                    access_by_client.insert(cid, (client, ops));
+                }
+                let num_clients = access_by_client.len();
+                (
+                    num_clients,
+                    do_requests(access_by_client, opt.interarrival_client_micros as _).await?,
                 )
-                .instrument(info_span!("make kvclient", client_id = ?cid))
-                .await
-                .wrap_err("make KvClient")?;
-                access_by_client.insert(cid, (client, ops));
+            } else {
+                let mut access_by_client = HashMap::default();
+                info!(mode = "basicclient", "make clients");
+                for (cid, ops) in group_by_client(accesses).into_iter() {
+                    let client = KvClient::new_basicclient(
+                        ctr.clone().connect(()).await.map_err(Into::into)?,
+                        opt.addr,
+                    )
+                    .instrument(info_span!("make kvclient", client_id = ?cid))
+                    .await
+                    .wrap_err("make KvClient")?;
+                    access_by_client.insert(cid, (client, ops));
+                }
+                let num_clients = access_by_client.len();
+                (
+                    num_clients,
+                    do_requests(access_by_client, opt.interarrival_client_micros as _).await?,
+                )
             }
-            let num_clients = access_by_client.len();
-            (
-                num_clients,
-                do_requests(access_by_client, opt.interarrival_client_micros as _).await?,
-            )
         } else {
             let mut access_by_client = HashMap::default();
             info!(mode = "shardclient", "make clients");

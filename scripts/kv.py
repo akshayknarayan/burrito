@@ -242,15 +242,19 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     time.sleep(2)
     conn.check_proc(f"kvserver-{with_ebpf}", f"{outf}.err")
 
-def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkload='uniform'):
+def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile):
     conn.run("sudo pkill -9 iokerneld")
-    wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadb1-4.access"
-    if wrkload == 'uniform':
-        wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"
 
     timeout = get_timeout(wrkfile, interarrival)
     write_shenango_config(conn)
-    use_basicclient = '--use-basicclient' if shardtype != 'client' else ''
+    if shardtype == 'client':
+        shard_arg = '--use-clientsharding'
+    elif shardtype == 'server':
+        shard_arg = ''
+    elif shardtype == 'basicclient':
+        shard_arg == '--use-basicclient'
+    else:
+        raise f"unknown shardtype {shardtype}"
 
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
@@ -262,7 +266,7 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkload=
             --accesses {wrkfile} \
             --out-file={outf}0.data1 \
             -s host.config \
-            {use_basicclient} \
+            {shard_arg} \
             --logging --skip-loads",
         wd="~/burrito",
         stdout=f"{outf}0.out",
@@ -287,11 +291,8 @@ def start_redis(machine, use_sudo=False):
     agenda.subtask(f"Started redis on {machine.host}")
     return f"{machine.alt}:6379"
 
-def run_loads(conn, server, redis_addr, outf, wrkload='uniform'):
+def run_loads(conn, server, redis_addr, outf, wrkfile):
     conn.run("sudo pkill -9 iokerneld")
-    wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadb1-4.access"
-    if wrkload == 'uniform':
-        wrkfile = "./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"
 
     write_shenango_config(conn)
     while True:
@@ -307,7 +308,6 @@ def run_loads(conn, server, redis_addr, outf, wrkload='uniform'):
                     -i 1000 \
                     --accesses {wrkfile} \
                     -s host.config \
-                    --use-basicclient \
                     --logging --loads-only",
                 wd="~/burrito",
                 stdout=f"{outf}-loads.out",
@@ -325,9 +325,10 @@ def run_loads(conn, server, redis_addr, outf, wrkload='uniform'):
             agenda.subtask(f"loads client done: {time.time() - loads_start} s")
             break
 
-def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrkload='uniform'):
-    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-{iter_num}-kvserver"
-    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkload}-{iter_num}-client"
+def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrkload):
+    wrkname = wrkload.split(".")[0]
+    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkname}-{iter_num}-kvserver"
+    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkname}-{iter_num}-client"
 
     for m in machines:
         if m.local:
@@ -340,11 +341,12 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
         agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
         return True
     else:
-        agenda.task(f"running: {outf}1-{machines[1].addr}.data")
+        agenda.task(f"running: {outf}0-{machines[1].addr}.data")
 
-    # load = (4 (client threads / proc) * 1 (procs/machine) * {len(machines) - 1} (machines))
+    # load = (n (client threads / proc) * 1 (procs/machine) * {len(machines) - 1} (machines))
     #        / {interarrival} (per client thread)
-    interarrival_secs = 4 * len(machines[1:]) / ops_per_sec
+    num_client_threads = int(wrkname.split('-')[-1])
+    interarrival_secs = num_client_threads * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
 
     #if interarrival_us < 5000:
@@ -354,17 +356,16 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
     redis_addr = start_redis(machines[0])
     time.sleep(5)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, workload = {wrkload}, iter = {iter_num}, load = {ops_per_sec}, ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
+    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, workload = {wrkname}, iter = {iter_num}, load = {ops_per_sec}, ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
     redis_port = redis_addr.split(":")[-1]
-    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, shards=num_shards, ebpf=(shardtype == 'xdpserver'))
+    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, shards=num_shards, ebpf=False)
     time.sleep(5)
     # prime the server with loads
-    # conn, server, redis_addr, outf, wrkload='uniform'
     agenda.task("doing loads")
-    run_loads(machines[1], server_addr, redis_addr, outf)
+    run_loads(machines[1], server_addr, redis_addr, outf, wrkload)
     # others are clients
     agenda.task("starting clients")
     clients = [threading.Thread(target=run_client, args=(
@@ -373,9 +374,9 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
             redis_addr,
             interarrival_us,
             shardtype,
-            outf
+            outf,
+            wrkload
         ),
-        kwargs={'wrkload':wrkload}
     ) for m in machines[1:]]
 
     [t.start() for t in clients]
@@ -425,9 +426,6 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
     for c in machines[1:]:
         try:
             get_files(0)
-            #get_files(1)
-            #get_files(2)
-            #get_files(3)
         except Exception as e:
             agenda.subfailure(f"At least one file missing for {c}: {e}")
             ok = False
@@ -441,44 +439,12 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
         agenda.subtask(f"adding experiment info for {c.addr}")
         try:
             awk_files(0)
-            #awk_files(1)
-            #awk_files(2)
-            #awk_files(3)
         except:
             agenda.subfailure(f"At least one file missing")
             return False
 
     agenda.task("done")
     return True
-
-def probe_ops(outdir, machines, num_shards, shardtype, low_ops, high_ops=None, wrkload='uniform'):
-    def try_n_times(n, ops):
-        for i in range(3):
-            thread_ok = True
-            ok = do_exp(outdir, machines, num_shards, shardtype, ops, i, wrkload=wrkload)
-            if not thread_ok:
-                raise Exception("experiment crashed")
-            if not ok:
-                return False
-        return True
-
-    if high_ops is not None and high_ops - low_ops < 20000:
-        agenda.task(f"resolved: num_shards = {num_shards}, shardtype = {shardtype}, workload = {wrkload} => {low_ops} ops/s")
-        return low_ops
-    elif high_ops is not None:
-        ops = (low_ops + high_ops) / 2
-        ok = try_n_times(3, ops)
-        if ok:
-            return probe_ops(outdir, machines, num_shards, shardtype, ops, high_ops=high_ops, wrkload=wrkload)
-        else:
-            return probe_ops(outdir, machines, num_shards, shardtype, low_ops, high_ops=ops, wrkload=wrkload)
-    else:
-        # probe by doubling upwards until it fails
-        ok = try_n_times(3, low_ops)
-        if ok:
-            return probe_ops(outdir, machines, num_shards, shardtype, low_ops*2, high_ops=None, wrkload=wrkload)
-        else:
-            return probe_ops(outdir, machines, num_shards, shardtype, low_ops/2, high_ops=low_ops, wrkload=wrkload)
 
 
 if __name__ == '__main__':
@@ -487,10 +453,9 @@ if __name__ == '__main__':
     parser.add_argument('--load', type=int, action='append', required=True)
     parser.add_argument('--server', type=str, required=True)
     parser.add_argument('--client', type=str, action='append', required=True)
-    parser.add_argument('--shards', type=int, action='append')
-    parser.add_argument('--shardtype', type=str, action='append')
-    parser.add_argument('--wrk', type=str, action='append')
-    parser.add_argument('--mode', type=str)
+    parser.add_argument('--shards', type=int, action='append', required=True)
+    parser.add_argument('--shardtype', type=str, action='append', required=True)
+    parser.add_argument('--wrk', type=str, action='append', required=True)
     args = parser.parse_args()
 
     outdir = args.outdir
@@ -500,28 +465,18 @@ if __name__ == '__main__':
         agenda.failure("Need more machines")
         sys.exit(1)
 
-    if args.mode is None:
-        args.mode = 'run'
-
-    if args.mode == 'run':
-        ops_per_sec = args.load
-    else:
-        ops_per_sec = args.load[0]
-
+    ops_per_sec = args.load
     if args.shards is None:
-        args.shards = [1]
+        agenda.failure("Need shards arg")
+        sys.exit(1)
 
-    if args.wrk is None:
-        args.wrk = ['zipf']
     for t in args.wrk:
-        if t not in ['zipf', 'uniform']:
-            agenda.failure(f"Unknown workload {t}")
+        if not t.endswith(".access") or '-' not in t:
+            agenda.failure(f"Workload file should be <name>-<concurrency>.access, got {t}")
             sys.exit(1)
 
-    if args.shardtype is None:
-        args.shardtype = ['server']
     for t in args.shardtype:
-        if t not in ['client', 'server', 'xdpserver']:
+        if t not in ['client', 'server', 'basicclient']: # basicclient is a subset of server
             agenda.failure(f"Unknown shardtype {t}")
             sys.exit(1)
 
@@ -556,25 +511,20 @@ if __name__ == '__main__':
     for w in args.wrk:
         for s in args.shards:
             for t in args.shardtype:
-                if args.mode == 'run':
-                    for o in ops_per_sec:
-                        if int(s) < 4 and int(o) > 100000:
-                            agenda.task(f"skipping: num_shards = {s}, shardtype = {t}, load = {o} ops/s")
-                            continue
+                for o in ops_per_sec:
+                    if int(s) < 4 and int(o) > 100000:
+                        agenda.task(f"skipping: num_shards = {s}, shardtype = {t}, load = {o} ops/s")
+                        continue
 
-                        do_exp(outdir, machines, s, t, o, 0, wrkload=w)
-                        #do_exp(outdir, machines, s, t, o, 1, wrkload=w)
-                        #do_exp(outdir, machines, s, t, o, 2, wrkload=w)
-                        #do_exp(outdir, machines, s, t, o, 3, wrkload=w)
-                else: # probe
-                    probe_ops(outdir, machines, s, t, ops_per_sec, wrkload=w)
+                    do_exp(outdir, machines, s, t, o, 0, wrkload=w)
 
     agenda.task("done")
+
+    # could do the aggregation here, but we do it in jupyter anyway
     #subprocess.run(f"rm -f {outdir}/*.data1", shell=True)
     #subprocess.run(f"rm -f {outdir}/*.data2", shell=True)
-    subprocess.run(f"cat ./{outdir}/*client*.data | awk '{{if (!hdr) {{hdr=$0; print $0;}} else if (hdr != $0) {{print $0}};}}' > {outdir}/exp.data", shell=True)
-    subprocess.run(f"awk '{{print $1,$2,$3,$4}}' {outdir}/exp.data | uniq > {outdir}/exp-scaling.data1", shell=True)
-    subprocess.run(f"python3 scripts/exp_max.py < {outdir}/exp-scaling.data1 > {outdir}/exp-scaling.data", shell=True)
-    agenda.task("plotting")
-    subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)
-    #subprocess.run(f"./scripts/kv-udp.R {outdir}/exp-scaling.data {outdir}/exp-scaling.pdf", shell=True)
+    #subprocess.run(f"cat ./{outdir}/*client*.data | awk '{{if (!hdr) {{hdr=$0; print $0;}} else if (hdr != $0) {{print $0}};}}' > {outdir}/exp.data", shell=True)
+    #subprocess.run(f"awk '{{print $1,$2,$3,$4}}' {outdir}/exp.data | uniq > {outdir}/exp-scaling.data1", shell=True)
+    #subprocess.run(f"python3 scripts/exp_max.py < {outdir}/exp-scaling.data1 > {outdir}/exp-scaling.data", shell=True)
+    #agenda.task("plotting")
+    #subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)
