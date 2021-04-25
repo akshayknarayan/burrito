@@ -7,7 +7,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::trace;
 
@@ -155,7 +155,6 @@ impl UnixConn {
         resp_addr: PathBuf,
         send: UnixSk,
         recv: Arc<Mutex<mpsc::UnboundedReceiver<(PathBuf, Vec<u8>)>>>,
-        _pending_ctr: Arc<AtomicUsize>,
     ) -> Self {
         UnixConn {
             resp_addr,

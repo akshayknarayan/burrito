@@ -18,7 +18,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, trace};
 
@@ -140,7 +140,6 @@ impl ChunnelListener for UdpReqChunnel {
 #[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
-    pending_ctr: Arc<AtomicUsize>,
     recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
     send: UdpSk<SocketAddr>,
 }
@@ -150,11 +149,9 @@ impl UdpConn {
         resp_addr: SocketAddr,
         send: UdpSk<SocketAddr>,
         recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
-        pending_ctr: Arc<AtomicUsize>,
     ) -> Self {
         UdpConn {
             resp_addr,
-            pending_ctr,
             recv,
             send,
         }
@@ -179,10 +176,8 @@ impl ChunnelConnection for UdpConn {
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let r = Arc::clone(&self.recv);
-        let ctr = Arc::clone(&self.pending_ctr);
         Box::pin(async move {
             let d = r.lock().await.recv().await;
-            ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             trace!(from = ?&d.as_ref().map(|x| x.0), "recv pkt");
             d.ok_or_else(|| eyre!("Nothing more to receive"))
         }) as _

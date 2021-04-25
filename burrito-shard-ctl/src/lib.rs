@@ -429,11 +429,12 @@ where
 
                 // 0. receive the packet.
                 let data = inner.recv().await?;
+                trace!("got packet");
 
                 // 1. evaluate the hash fn to determine where to forward to.
                 let shard_idx = (shard_fn)(&data);
                 let conn = shard_conns[shard_idx].clone();
-                trace!(shard_idx, "got packet");
+                trace!(shard_idx, "checked shard");
 
                 // 2. Forward to the shard.
                 // TODO this assumes no reordering.
