@@ -12,13 +12,9 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::{
-    atomic::{self, AtomicUsize},
-    Arc, Mutex as StdMutex,
-};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::trace;
-use tracing_futures::Instrument;
 
 pub trait MsgId {
     fn id(&self) -> usize;
@@ -190,85 +186,56 @@ where
         make_conn: MkConn,
     ) -> Pin<Box<dyn Stream<Item = Result<Conn, Report>> + Send + 'static>>
     where
-        MkConn: Fn(A, C, Arc<Mutex<mpsc::UnboundedReceiver<(A, Vec<u8>)>>>, Arc<AtomicUsize>) -> Conn
-            + Send
-            + 'static,
+        MkConn:
+            Fn(A, C, Arc<Mutex<mpsc::UnboundedReceiver<(A, Vec<u8>)>>>) -> Conn + Send + 'static,
         Conn: ChunnelConnection,
     {
         let sk = self.0;
-        let pending_inc_ctr: Arc<AtomicUsize> = Default::default();
-        let pending_dec_ctr: Arc<AtomicUsize> = Default::default();
         Box::pin(futures_util::stream::try_unfold(
             (
                 sk,
                 AHashMap::<_, mpsc::UnboundedSender<(A, Vec<u8>)>>::new(),
-                pending_inc_ctr,
-                pending_dec_ctr,
                 make_conn,
             ),
-            move |(sk, mut map, pending_inc_ctr, pending_dec_ctr, make_conn)| {
+            move |(sk, mut map, make_conn)| {
                 async move {
-                    let mut last_print = std::time::Instant::now();
                     loop {
-                        // careful: potential deadlocks since .recv on returned connection blocks
-                        // on .listen
+                        // careful: potential deadlocks since calling `.recv()` on returned
+                        // connection blocks on `.listen()`. Make sure to use `and_then_concurrent`.
                         let (from, data) = sk.recv().await?;
-                        let ctr = pending_inc_ctr.fetch_add(1, atomic::Ordering::SeqCst);
 
                         let mut done = None;
                         let c = map.entry(from.clone()).or_insert_with(|| {
-                            trace!(from = ?&from, "new connection");
                             let (sch, rch) = mpsc::unbounded_channel();
-                            let cn = make_conn(
+                            done = Some(make_conn(
                                 from.clone(),
                                 sk.clone(),
                                 Arc::new(Mutex::new(rch)),
-                                Arc::clone(&pending_dec_ctr),
-                            );
-
-                            done = Some(cn);
+                            ));
                             sch
                         });
-
-                        trace!(from = ?&from, pending = &ctr, "received pkt");
 
                         // the send fails only if the receiver stopped listening.
                         // so this becomes a new connection
                         if let Err(mpsc::error::SendError(data)) = c.send((from.clone(), data)) {
-                            trace!(from = ?&from, "new connection");
                             let (sch, rch) = mpsc::unbounded_channel();
-                            let cn = make_conn(
+                            done = Some(make_conn(
                                 from.clone(),
                                 sk.clone(),
                                 Arc::new(Mutex::new(rch)),
-                                Arc::clone(&pending_dec_ctr),
-                            );
-
-                            done = Some(cn);
+                            ));
+                            // Send again because the previous one failed, so the message would
+                            // otherwise be dropped. This won't block because it's an unbounded
+                            // channel.
                             sch.send(data).unwrap();
                             map.insert(from.clone(), sch);
                         }
 
-                        if last_print.elapsed() > std::time::Duration::from_secs(10) {
-                            let p_inc = pending_inc_ctr.load(atomic::Ordering::SeqCst);
-                            let p_dec = pending_dec_ctr.load(atomic::Ordering::SeqCst);
-                            tracing::info!(
-                                from = ?from,
-                                ?p_inc, ?p_dec,
-                                "pending"
-                            );
-                            last_print = std::time::Instant::now();
-                        }
-
                         if let Some(d) = done {
-                            return Ok(Some((
-                                d,
-                                (sk, map, pending_inc_ctr, pending_dec_ctr, make_conn),
-                            )));
+                            return Ok(Some((d, (sk, map, make_conn))));
                         }
                     }
                 }
-                .instrument(tracing::info_span!("steer"))
             },
         )) as _
     }

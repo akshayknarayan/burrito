@@ -8,7 +8,7 @@ use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{atomic::AtomicUsize, Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, trace, warn};
 
@@ -17,15 +17,20 @@ static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>
     Arc::new(StdMutex::new(None));
 }
 
+struct Msg {
+    addr: SocketAddrV4,
+    buf: Vec<u8>,
+}
+
 enum NewConn {
     Listen {
         addr: SocketAddrV4,
-        incoming: mpsc::UnboundedSender<(SocketAddrV4, Vec<u8>)>,
-        outgoing: channel::Receiver<(SocketAddrV4, Vec<u8>)>,
+        incoming: mpsc::UnboundedSender<Msg>,
+        outgoing: channel::Receiver<Msg>,
     },
     Dial {
-        incoming: mpsc::UnboundedSender<(SocketAddrV4, Vec<u8>)>,
-        outgoing: channel::Receiver<(SocketAddrV4, Vec<u8>)>,
+        incoming: mpsc::UnboundedSender<Msg>,
+        outgoing: channel::Receiver<Msg>,
     },
 }
 
@@ -71,8 +76,10 @@ impl NewConn {
                     .read_from(&mut buf)
                     .wrap_err("shenango read_from")
                     .unwrap();
-                trace!(sk=?laddr, "recv");
-                if let Err(_) = incoming.send((from_addr, buf[..read_len].to_vec())) {
+                if let Err(_) = incoming.send(Msg {
+                    addr: from_addr,
+                    buf: buf[..read_len].to_vec(),
+                }) {
                     warn!(sk=?laddr, "Incoming channel dropped, recv thread exiting");
                     break;
                 }
@@ -82,8 +89,7 @@ impl NewConn {
         // send
         shenango::thread::spawn(move || loop {
             match outgoing.try_recv() {
-                Ok((a, data)) => {
-                    trace!(sk=?laddr, "send");
+                Ok(Msg { addr: a, buf: data }) => {
                     sk.write_to(&data, a).wrap_err("shenango write_to").unwrap();
                 }
                 Err(crossbeam::channel::TryRecvError::Empty) => {
@@ -206,19 +212,26 @@ impl ChunnelConnector for ShenangoUdpSkChunnel {
     }
 }
 
-#[derive(Debug, Clone)]
+struct Recv {
+    r: mpsc::UnboundedReceiver<Msg>,
+}
+
+#[derive(Clone)]
 pub struct ShenangoUdpSk {
-    outgoing: channel::Sender<(SocketAddrV4, Vec<u8>)>,
-    incoming: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddrV4, Vec<u8>)>>>,
+    outgoing: channel::Sender<Msg>,
+    incoming: Arc<Mutex<Recv>>,
+}
+
+impl std::fmt::Debug for ShenangoUdpSk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShenangoUdpSk").finish()
+    }
 }
 
 impl ShenangoUdpSk {
-    fn new(
-        inc: mpsc::UnboundedReceiver<(SocketAddrV4, Vec<u8>)>,
-        out: channel::Sender<(SocketAddrV4, Vec<u8>)>,
-    ) -> Self {
+    fn new(inc: mpsc::UnboundedReceiver<Msg>, out: channel::Sender<Msg>) -> Self {
         Self {
-            incoming: Arc::new(Mutex::new(inc)),
+            incoming: Arc::new(Mutex::new(Recv { r: inc })),
             outgoing: out,
         }
     }
@@ -234,7 +247,9 @@ impl ChunnelConnection for ShenangoUdpSk {
         use SocketAddr::*;
         match data {
             (V4(addr), d) => {
-                self.outgoing.send((addr, d)).expect("shenango won't drop");
+                self.outgoing
+                    .send(Msg { addr, buf: d })
+                    .expect("shenango won't drop");
                 Box::pin(futures_util::future::ready(Ok(())))
             }
             (V6(a), _) => Box::pin(futures_util::future::ready(Err(eyre!(
@@ -247,12 +262,8 @@ impl ChunnelConnection for ShenangoUdpSk {
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let inc = Arc::clone(&self.incoming);
         Box::pin(async move {
-            let (a, d) = inc
-                .lock()
-                .await
-                .recv()
-                .await
-                .expect("shenango side will never drop");
+            let Recv { ref mut r } = *inc.lock().await;
+            let Msg { addr: a, buf: d } = r.recv().await.expect("shenango side will never drop");
             Ok((SocketAddr::V4(a), d))
         })
     }
@@ -284,7 +295,6 @@ impl ChunnelListener for ShenangoUdpReqChunnel {
 #[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
-    pending_ctr: Arc<AtomicUsize>,
     recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
     send: ShenangoUdpSk,
 }
@@ -294,11 +304,9 @@ impl UdpConn {
         resp_addr: SocketAddr,
         send: ShenangoUdpSk,
         recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
-        pending_ctr: Arc<AtomicUsize>,
     ) -> Self {
         UdpConn {
             resp_addr,
-            pending_ctr,
             recv,
             send,
         }
@@ -323,10 +331,8 @@ impl ChunnelConnection for UdpConn {
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let r = Arc::clone(&self.recv);
-        let ctr = Arc::clone(&self.pending_ctr);
         Box::pin(async move {
             let d = r.lock().await.recv().await;
-            ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             trace!(from = ?&d.as_ref().map(|x| x.0), "recv pkt");
             d.ok_or_else(|| eyre!("Nothing more to receive"))
         }) as _
