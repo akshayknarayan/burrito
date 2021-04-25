@@ -231,7 +231,7 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     with_ebpf = "ebpf" if ebpf else "noebpf"
-    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config",
+    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --trace-time={outf}.trace",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -252,7 +252,7 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile)
     elif shardtype == 'server':
         shard_arg = ''
     elif shardtype == 'basicclient':
-        shard_arg == '--use-basicclient'
+        shard_arg = '--use-basicclient'
     else:
         raise f"unknown shardtype {shardtype}"
 
@@ -326,7 +326,7 @@ def run_loads(conn, server, redis_addr, outf, wrkfile):
             break
 
 def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrkload):
-    wrkname = wrkload.split(".")[0]
+    wrkname = wrkload.split("/")[-1].split(".")[0]
     server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkname}-{iter_num}-kvserver"
     outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkname}-{iter_num}-client"
 
@@ -516,7 +516,7 @@ if __name__ == '__main__':
                         agenda.task(f"skipping: num_shards = {s}, shardtype = {t}, load = {o} ops/s")
                         continue
 
-                    do_exp(outdir, machines, s, t, o, 0, wrkload=w)
+                    do_exp(outdir, machines, s, t, o, 0, w)
 
     agenda.task("done")
 

@@ -28,7 +28,7 @@ struct Opt {
     log: bool,
 
     #[structopt(short, long)]
-    trace_time: bool,
+    trace_time: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
     color_eyre::install()?;
     let subscriber = tracing_subscriber::registry();
-    let timing_downcaster = if opt.trace_time {
+    let timing_downcaster = if let Some(ref trace_file) = &opt.trace_time {
         let timing_layer = tracing_timing::Builder::default()
             .no_span_recursion()
             .layer(|| tracing_timing::Histogram::new_with_max(1_000_000, 2).unwrap());
@@ -48,7 +48,7 @@ async fn main() -> Result<(), Report> {
             .with(ErrorLayer::default());
         let d = tracing::Dispatch::new(subscriber);
         d.clone().init();
-        Some((timing_downcaster, d))
+        Some((trace_file.clone(), timing_downcaster, d))
     } else {
         let subscriber = subscriber
             .with(tracing_subscriber::fmt::layer())
@@ -59,14 +59,19 @@ async fn main() -> Result<(), Report> {
         None
     };
 
-    if let Some((timing_downcaster, d)) = timing_downcaster {
-        ctrlc::set_handler(move || {
+    if let Some((trace_file, timing_downcaster, d)) = timing_downcaster {
+        tokio::spawn(async move {
             let timing = timing_downcaster
                 .downcast(&d)
                 .expect("downcast timing layer");
-            dump_tracing(timing);
-        })
-        .expect("set ctrlc handler");
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let mut f = std::fs::File::create(&trace_file).unwrap();
+                info!("writing tracing info");
+                dump_tracing(timing, &mut f).unwrap();
+            }
+        });
     }
 
     info!("KV Server");
@@ -114,13 +119,18 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
     .await
 }
 
-fn dump_tracing(timing: &'_ tracing_timing::TimingLayer) {
+fn dump_tracing(
+    timing: &'_ tracing_timing::TimingLayer,
+    f: &mut std::fs::File,
+) -> Result<(), Report> {
+    use std::io::prelude::*;
     timing.force_synchronize();
     timing.with_histograms(|hs| {
         for (span_group, hs) in hs {
             for (event_group, h) in hs {
-                let tag = format!("{}:{}", span_group, event_group);
-                println!(
+                let tag = format!("{}.{}", span_group, event_group);
+                write!(
+                    f,
                     "tracing: \
                         event = {}, \
                         min   = {}, \
@@ -139,10 +149,12 @@ fn dump_tracing(timing: &'_ tracing_timing::TimingLayer) {
                     h.value_at_quantile(0.95),
                     h.max(),
                     h.len(),
-                );
+                )?;
             }
         }
-    });
 
-    std::process::exit(0);
+        Ok::<_, Report>(())
+    })?;
+
+    Ok(())
 }

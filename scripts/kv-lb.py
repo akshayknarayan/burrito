@@ -54,11 +54,12 @@ def start_lb(conn, redis_addr, shard_addrs, outf):
     time.sleep(2)
     conn.check_proc(f"burrito-lb", f"{outf}.err")
 
-def do_exp(outdir, lb, shards, clients, shardtype, ops_per_sec):
+def do_exp(outdir, lb, shards, clients, shardtype, ops_per_sec, wrkload):
+    wrkname = wrkload.split("/")[-1].split(".")[0]
     num_shards = len(shards)
-    server_prefix = f"{outdir}/{shardtype}shard-{ops_per_sec}-lb"
-    shard_prefix = f"{outdir}/{shardtype}shard-{ops_per_sec}-shard"
-    outf = f"{outdir}/{shardtype}shard-{ops_per_sec}-client"
+    server_prefix = f"{outdir}/{shardtype}shard-{ops_per_sec}-{wrkname}-lb"
+    shard_prefix = f"{outdir}/{shardtype}shard-{ops_per_sec}-{wrkname}-shard"
+    outf = f"{outdir}/{shardtype}shard-{ops_per_sec}-{wrkname}-client"
 
     agenda.task(f"checking {outf}0-{clients[0].addr}.data")
     if os.path.exists(f"{outf}0-{clients[0].addr}.data"):
@@ -69,7 +70,8 @@ def do_exp(outdir, lb, shards, clients, shardtype, ops_per_sec):
 
     # load = (4 (client threads / proc) * 1 (procs/machine) * {len(machines) - 1} (machines))
     #        / {interarrival} (per client thread)
-    interarrival_secs = 4 * len(clients) / ops_per_sec
+    num_client_threads = int(wrkname.split('-')[-1])
+    interarrival_secs = num_client_threads * len(clients) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
 
     redis_addr = start_redis(lb)
@@ -90,7 +92,7 @@ def do_exp(outdir, lb, shards, clients, shardtype, ops_per_sec):
     # prime the server with loads
     # conn, server, redis_addr, outf, wrkload='uniform'
     agenda.task("doing loads")
-    run_loads(clients[0], server_addr, redis_addr, outf)
+    run_loads(clients[0], server_addr, redis_addr, outf, wrkload)
     # others are clients
     agenda.task("starting clients")
     client_threads = [threading.Thread(target=run_client, args=(
@@ -99,7 +101,8 @@ def do_exp(outdir, lb, shards, clients, shardtype, ops_per_sec):
             redis_addr,
             interarrival_us,
             shardtype,
-            outf
+            outf,
+            wrkload
         ),
     ) for m in clients]
 
@@ -188,6 +191,7 @@ if __name__ == '__main__':
     parser.add_argument('--client', type=str, action='append', required=True)
     parser.add_argument('--load', type=int, action='append', required=True)
     parser.add_argument('--shardtype', type=str, action='append')
+    parser.add_argument('--wrk', type=str, action='append', required=True)
     args = parser.parse_args()
 
     outdir = args.outdir
@@ -200,6 +204,11 @@ if __name__ == '__main__':
     for t in args.shardtype:
         if t not in ['client', 'server']:
             agenda.failure(f"Unknown shardtype {t}")
+            sys.exit(1)
+
+    for t in args.wrk:
+        if not t.endswith(".access") or '-' not in t:
+            agenda.failure(f"Workload file should be <name>-<concurrency>.access, got {t}")
             sys.exit(1)
 
     agenda.task(f"connecting to lb machine")
@@ -245,8 +254,9 @@ if __name__ == '__main__':
         sys.exit(1)
     agenda.task("...done building burrito")
 
-    for t in args.shardtype:
-        for o in args.load:
-            do_exp(outdir, lb_conn, shard_conns, client_conns, t, o)
+    for w in args.wrk:
+        for t in args.shardtype:
+            for o in args.load:
+                do_exp(outdir, lb_conn, shard_conns, client_conns, t, o, w)
 
     agenda.task("done")
