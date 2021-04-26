@@ -245,7 +245,7 @@ impl ShenangoUdpSk {
         Self {
             incoming: Arc::new(Mutex::new(Recv {
                 r: inc,
-                h: hdrhistogram::Histogram::new_with_max(1_000, 2).unwrap(),
+                h: hdrhistogram::Histogram::new_with_max(10_000, 2).unwrap(),
                 s: c.raw(),
             })),
             outgoing: out,

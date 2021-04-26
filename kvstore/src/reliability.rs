@@ -134,12 +134,12 @@ impl<C, A, D> Drop for KvReliability<C, A, D> {
     fn drop(&mut self) {
         let (ref h1, ref h2) = *self.h.lock().unwrap();
         println!(
-            "kvreliability_e2e: p50 = {:?} p95 = {:?}",
+            "kvreliability_over: p50 = {:?} p95 = {:?}",
             h1.value_at_quantile(0.5),
             h1.value_at_quantile(0.95)
         );
         println!(
-            "kvreliability_over: p50 = {:?} p95 = {:?}",
+            "kvreliability_e2e: p50 = {:?} p95 = {:?}",
             h2.value_at_quantile(0.5),
             h2.value_at_quantile(0.95)
         );
