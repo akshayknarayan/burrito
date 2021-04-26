@@ -429,7 +429,7 @@ where
 
                 // 0. receive the packet.
                 let data = inner.recv().await?;
-                trace!("got packet");
+                trace!("got request");
 
                 // 1. evaluate the hash fn to determine where to forward to.
                 let shard_idx = (shard_fn)(&data);
@@ -439,8 +439,8 @@ where
                 // 2. Forward to the shard.
                 // TODO this assumes no reordering.
                 conn.send(data).await.wrap_err("Forward to shard")?;
-
                 trace!(shard_idx, "wait for shard response");
+
                 // 3. Get response from the shard, and send back to client.
                 let resp = conn
                     .recv()
@@ -449,7 +449,7 @@ where
                     .wrap_err("Receive from shard")?;
                 trace!(shard_idx, "got shard response");
                 inner.send(resp).await?;
-
+                trace!(shard_idx, "send response");
                 Ok(None)
             }
             .instrument(trace_span!("server-shard-recv")),
