@@ -199,7 +199,7 @@ fn main() -> Result<(), Report> {
         if let Some((td, d)) = tracing {
             if let Some(of) = opt.out_file.clone() {
                 let timing = td.downcast(&d).expect("downcast timing layer");
-                let fname = of.with_extension(".trace");
+                let fname = of.with_extension("trace");
                 let mut f = std::fs::File::create(&fname).unwrap();
                 dump_tracing(&timing, &mut f)?;
             }
