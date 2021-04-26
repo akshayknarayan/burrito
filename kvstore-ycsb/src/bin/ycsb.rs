@@ -111,7 +111,7 @@ fn main() -> Result<(), Report> {
     rt.block_on(async move {
         let ctr = get_raw_connector(opt.shenango_config)?;
         if !opt.skip_loads {
-            let mut basic_client = KvClient::new_basicclient(
+            let mut basic_client = KvClient::new_nonshardclient(
                 ctr.clone().connect(()).await.map_err(Into::into)?,
                 opt.addr,
             )
