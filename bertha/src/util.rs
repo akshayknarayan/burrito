@@ -23,8 +23,28 @@ pub trait MsgId {
 /// Match incoming messages to previously sent ones on the given id() field.
 pub struct MsgIdMatcher<C: ChunnelConnection, D> {
     inner: Arc<C>,
-    inflight: Arc<DashMap<usize, oneshot::Sender<D>>>,
-    sent: Arc<DashMap<usize, oneshot::Receiver<D>>>,
+    inflight: Arc<DashMap<usize, oneshot::Sender<(D, u64)>>>,
+    sent: Arc<DashMap<usize, (oneshot::Receiver<(D, u64)>, u64)>>,
+    clk: quanta::Clock,
+    h1: Arc<StdMutex<hdrhistogram::Histogram<u64>>>,
+    h2: Arc<StdMutex<hdrhistogram::Histogram<u64>>>,
+}
+
+impl<C: ChunnelConnection, D> Drop for MsgIdMatcher<C, D> {
+    fn drop(&mut self) {
+        let h1 = self.h1.lock().unwrap();
+        println!(
+            "msgidmatcher_e2e: p50 = {:?} p95 = {:?}",
+            h1.value_at_quantile(0.5),
+            h1.value_at_quantile(0.95)
+        );
+        let h2 = self.h2.lock().unwrap();
+        println!(
+            "msgidmatcher_over: p50 = {:?} p95 = {:?}",
+            h2.value_at_quantile(0.5),
+            h2.value_at_quantile(0.95)
+        );
+    }
 }
 
 impl<C: ChunnelConnection, D> Clone for MsgIdMatcher<C, D> {
@@ -33,6 +53,9 @@ impl<C: ChunnelConnection, D> Clone for MsgIdMatcher<C, D> {
             inner: Arc::clone(&self.inner),
             inflight: Arc::clone(&self.inflight),
             sent: Arc::clone(&self.sent),
+            clk: self.clk.clone(),
+            h1: Arc::clone(&self.h1),
+            h2: Arc::clone(&self.h2),
         }
     }
 }
@@ -47,34 +70,45 @@ where
             inner: Arc::new(inner),
             inflight: Default::default(),
             sent: Default::default(),
+            clk: quanta::Clock::new(),
+            h1: Arc::new(StdMutex::new(
+                hdrhistogram::Histogram::new_with_max(100_000_000, 3).unwrap(),
+            )),
+            h2: Arc::new(StdMutex::new(
+                hdrhistogram::Histogram::new_with_max(100_000_000, 3).unwrap(),
+            )),
         }
     }
 
     pub async fn send_msg(&self, data: D) -> Result<(), Report> {
         if !self.sent.contains_key(&data.id()) {
             let (s, r) = oneshot::channel();
-            self.sent.insert(data.id(), r);
             self.inflight.insert(data.id(), s);
+            self.sent.insert(data.id(), (r, self.clk.start()));
         }
 
         self.inner.send(data).await
     }
 
     pub async fn recv_msg(&self, msg_id: usize) -> Result<D, Report> {
-        let (_, mut r) = self
+        let (_, (mut r, st)) = self
             .sent
             .remove(&msg_id)
             .ok_or_else(|| eyre!("Requested msg id {:?} isn't known", msg_id))?;
         loop {
             tokio::select! {
                 res = &mut r => {
-                    trace!("MsgIdMatcher done");
-                    return Ok(res.expect("sender won't be dropped"));
+                    let (res, t) = res.expect("sender won't be dropped");
+                    let end = self.clk.end();
+                    self.h1.lock().unwrap().record(self.clk.delta(st, end).as_micros() as u64).unwrap();
+                    self.h2.lock().unwrap().record(self.clk.delta(t, end).as_micros() as u64).unwrap();
+                    return Ok(res);
                 }
                 res = self.inner.recv() => {
                     let res = res?;
+                    let end = self.clk.end();
                     if let Some((_, s)) = self.inflight.remove(&res.id()) {
-                        s.send(res).map_err(|_| ()).expect("receiver won't be dropped");
+                        s.send((res, end)).map_err(|_| ()).expect("receiver won't be dropped");
                     } else {
                         continue;
                     }
