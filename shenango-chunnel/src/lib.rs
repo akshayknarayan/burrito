@@ -8,9 +8,12 @@ use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex as StdMutex,
+};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 lazy_static::lazy_static! {
 static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>>>> =
@@ -292,23 +295,43 @@ impl ChunnelListener for ShenangoUdpReqChunnel {
     }
 }
 
+struct StRecv {
+    r: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>, u64)>,
+    h: hdrhistogram::Histogram<u64>,
+}
+
+impl std::fmt::Debug for StRecv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StRecv").finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
-    recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
+    recv: Arc<Mutex<StRecv>>,
     send: ShenangoUdpSk,
+    clk: quanta::Clock,
+    start_time: Arc<AtomicU64>,
 }
 
 impl UdpConn {
     fn new(
         resp_addr: SocketAddr,
         send: ShenangoUdpSk,
-        recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
+        recv: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>, u64)>,
     ) -> Self {
+        let clk = quanta::Clock::new();
+        let start_time = Arc::new(AtomicU64::new(clk.raw()));
         UdpConn {
             resp_addr,
-            recv,
+            recv: Arc::new(Mutex::new(StRecv {
+                r: recv,
+                h: hdrhistogram::Histogram::new_with_max(1_000, 2).unwrap(),
+            })),
             send,
+            clk,
+            start_time,
         }
     }
 }
@@ -330,11 +353,33 @@ impl ChunnelConnection for UdpConn {
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let r = Arc::clone(&self.recv);
+        let recv = Arc::clone(&self.recv);
+        let c = self.clk.clone();
+        let mut print = false;
+        let st = self.start_time.load(Ordering::Relaxed);
+        if c.delta(st, c.raw()).as_secs() > 14 {
+            self.start_time.store(c.raw(), Ordering::Relaxed);
+            print = true;
+        }
+
         Box::pin(async move {
-            let d = r.lock().await.recv().await;
-            trace!(from = ?&d.as_ref().map(|x| x.0), "recv pkt");
-            d.ok_or_else(|| eyre!("Nothing more to receive"))
+            let StRecv {
+                ref mut r,
+                ref mut h,
+            } = *recv.lock().await;
+            let (a, d, rt) = r
+                .recv()
+                .await
+                .ok_or_else(|| eyre!("Nothing more to receive"))?;
+            h.record(c.delta(rt, c.end()).as_micros() as u64).unwrap();
+            if print {
+                warn!(
+                    p50 = h.value_at_quantile(0.5),
+                    p95 = h.value_at_quantile(0.95),
+                    "bertha::steer recv"
+                );
+            }
+            Ok((a, d))
         }) as _
     }
 }

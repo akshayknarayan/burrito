@@ -146,7 +146,7 @@ impl ChunnelListener for UnixReqChunnel {
 #[derive(Debug, Clone)]
 pub struct UnixConn {
     resp_addr: PathBuf,
-    recv: Arc<Mutex<mpsc::UnboundedReceiver<(PathBuf, Vec<u8>)>>>,
+    recv: Arc<Mutex<mpsc::UnboundedReceiver<(PathBuf, Vec<u8>, u64)>>>,
     send: UnixSk,
 }
 
@@ -154,11 +154,11 @@ impl UnixConn {
     fn new(
         resp_addr: PathBuf,
         send: UnixSk,
-        recv: Arc<Mutex<mpsc::UnboundedReceiver<(PathBuf, Vec<u8>)>>>,
+        recv: mpsc::UnboundedReceiver<(PathBuf, Vec<u8>, u64)>,
     ) -> Self {
         UnixConn {
             resp_addr,
-            recv,
+            recv: Arc::new(Mutex::new(recv)),
             send,
         }
     }
@@ -185,6 +185,7 @@ impl ChunnelConnection for UnixConn {
         Box::pin(async move {
             let d = r.lock().await.recv().await;
             d.ok_or_else(|| eyre!("Nothing more to receive"))
+                .map(|(x, y, _)| (x, y))
         }) as _
     }
 }

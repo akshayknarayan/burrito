@@ -43,7 +43,7 @@ async fn main() -> Result<(), Report> {
         let timing_downcaster = timing_layer.downcaster();
         let subscriber = subscriber
             .with(timing_layer)
-            .with(tracing_subscriber::fmt::layer())
+            //.with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let d = tracing::Dispatch::new(subscriber);

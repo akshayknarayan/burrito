@@ -140,7 +140,7 @@ impl ChunnelListener for UdpReqChunnel {
 #[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
-    recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
+    recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>, u64)>>>,
     send: UdpSk<SocketAddr>,
 }
 
@@ -148,11 +148,11 @@ impl UdpConn {
     fn new(
         resp_addr: SocketAddr,
         send: UdpSk<SocketAddr>,
-        recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
+        recv: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>, u64)>,
     ) -> Self {
         UdpConn {
             resp_addr,
-            recv,
+            recv: Arc::new(Mutex::new(recv)),
             send,
         }
     }
@@ -180,6 +180,7 @@ impl ChunnelConnection for UdpConn {
             let d = r.lock().await.recv().await;
             trace!(from = ?&d.as_ref().map(|x| x.0), "recv pkt");
             d.ok_or_else(|| eyre!("Nothing more to receive"))
+                .map(|(x, y, _)| (x, y))
         }) as _
     }
 }
