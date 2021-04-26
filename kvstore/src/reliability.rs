@@ -7,7 +7,7 @@ use color_eyre::eyre::{self, WrapErr};
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -105,9 +105,11 @@ where
 pub struct KvReliability<C, A, D> {
     inner: Arc<C>,
     timeout: Duration,
-    sends: Arc<dashmap::DashMap<usize, oneshot::Sender<()>>>,
+    sends: Arc<dashmap::DashMap<usize, oneshot::Sender<u64>>>,
     signal_recv: mpsc::Sender<(A, D)>,
     recvs: Arc<Mutex<mpsc::Receiver<(A, D)>>>,
+    h: Arc<StdMutex<(hdrhistogram::Histogram<u64>, hdrhistogram::Histogram<u64>)>>,
+    clk: quanta::Clock,
 }
 
 impl<C, A, D> KvReliability<C, A, D> {
@@ -119,7 +121,28 @@ impl<C, A, D> KvReliability<C, A, D> {
             sends: Default::default(),
             signal_recv: s,
             recvs: Arc::new(Mutex::new(r)),
+            h: Arc::new(StdMutex::new((
+                hdrhistogram::Histogram::new_with_max(100_000_000, 3).unwrap(),
+                hdrhistogram::Histogram::new_with_max(100_000_000, 3).unwrap(),
+            ))),
+            clk: quanta::Clock::new(),
         }
+    }
+}
+
+impl<C, A, D> Drop for KvReliability<C, A, D> {
+    fn drop(&mut self) {
+        let (ref h1, ref h2) = *self.h.lock().unwrap();
+        println!(
+            "kvreliability_e2e: p50 = {:?} p95 = {:?}",
+            h1.value_at_quantile(0.5),
+            h1.value_at_quantile(0.95)
+        );
+        println!(
+            "kvreliability_over: p50 = {:?} p95 = {:?}",
+            h2.value_at_quantile(0.5),
+            h2.value_at_quantile(0.95)
+        );
     }
 }
 
@@ -144,8 +167,11 @@ where
         // state map id -> chan sender
         self.sends.insert(msg_id, s);
         let sends = Arc::clone(&self.sends);
+        let c = self.clk.clone();
+        let h = Arc::clone(&self.h);
         Box::pin(async move {
             inner.send(data.clone()).await?;
+            let start = c.start();
             loop {
                 tokio::select!(
                     resp = inner.recv() => {
@@ -158,12 +184,21 @@ where
                         } else { continue; };
 
                         if recv_msg_id == msg_id {
+                            let end = c.end();
+                            let (ref mut h1, ref mut h2) = *h.lock().unwrap();
+                            h1.record(0).unwrap();
+                            h2.record(c.delta(start, end).as_micros() as u64).unwrap();
                             return Ok(());
                         } else {
-                            send_ch.1.send(()).map_err(|_| ()).expect("send done notification failed");
+                            send_ch.1.send(c.start()).map_err(|_| ()).expect("send done notification failed");
                         }
                     }
-                    _ = &mut r => {
+                    s = &mut r => {
+                        let s = s.unwrap();
+                        let end = c.end();
+                        let (ref mut h1, ref mut h2) = *h.lock().unwrap();
+                        h1.record(c.delta(s, end).as_micros() as u64).unwrap();
+                        h2.record(c.delta(start, end).as_micros() as u64).unwrap();
                         return Ok(());
                     }
                     _ = tokio::time::sleep(to) => {

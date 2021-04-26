@@ -296,7 +296,7 @@ impl ChunnelConnection for ShenangoUdpSk {
             } = r.recv().await.expect("shenango side will never drop");
             let ov = clk.delta(ts, clk.end()).as_micros() as u64;
             h.record(ov).unwrap();
-            if clk.delta(*s, clk.raw()).as_secs() > 2 {
+            if clk.delta(*s, clk.raw()).as_secs() > 1 {
                 println!(
                     "shenango recv: p50 = {:?} p95 = {:?}",
                     h.value_at_quantile(0.5),
