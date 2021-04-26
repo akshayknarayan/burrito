@@ -88,7 +88,7 @@ fn main() -> Result<(), Report> {
     let tracing = if opt.logging {
         let timing_layer = tracing_timing::Builder::default()
             .no_span_recursion()
-            .layer(|| tracing_timing::Histogram::new_with_max(1_000_000, 2).unwrap());
+            .layer(|| tracing_timing::Histogram::new_with_max(100_000_000, 3).unwrap());
         let timing_downcaster = timing_layer.downcaster();
         let subscriber = tracing_subscriber::registry()
             .with(timing_layer)
