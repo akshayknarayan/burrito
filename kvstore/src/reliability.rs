@@ -10,8 +10,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{trace, trace_span};
-use tracing_futures::Instrument;
 
 /// Reliable transmission of request/response pairs.
 ///
@@ -147,18 +145,14 @@ where
         self.sends.insert(msg_id, s);
         let sends = Arc::clone(&self.sends);
         Box::pin(async move {
-            trace!("start");
             inner.send(data.clone()).await?;
             loop {
                 tokio::select!(
                     resp = inner.recv() => {
                         let resp = resp.wrap_err("kvreliability recv acks")?;
-
-                        // careful about blocking here, could deadlock
                         let recv_msg_id = resp.1.id();
-                        trace!(id = ?recv_msg_id, "recv");
+                        // careful about blocking here, could deadlock
                         signal_recv.send(resp).await.map_err(|_| ()).expect("receiver won't hang up");
-
                         let send_ch = if let Some(s) = sends.remove(&msg_id) {
                             s
                         } else { continue; };
@@ -170,16 +164,14 @@ where
                         }
                     }
                     _ = &mut r => {
-                        trace!("signaled");
                         return Ok(());
                     }
                     _ = tokio::time::sleep(to) => {
-                        trace!("retx");
                         inner.send(data.clone()).await?;
                     }
                 );
             }
-        }.instrument(trace_span!("send", ?msg_id)))
+        })
     }
 
     fn recv(
