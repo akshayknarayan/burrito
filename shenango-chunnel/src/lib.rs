@@ -23,6 +23,7 @@ static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>
 struct Msg {
     addr: SocketAddrV4,
     buf: Vec<u8>,
+    ts: u64,
 }
 
 enum NewConn {
@@ -73,6 +74,7 @@ impl NewConn {
         let rsk = Arc::clone(&sk);
         // receive
         shenango::thread::spawn(move || {
+            let clk = quanta::Clock::new();
             let mut buf = [0u8; 1024];
             loop {
                 let (read_len, from_addr) = rsk
@@ -82,6 +84,7 @@ impl NewConn {
                 if let Err(_) = incoming.send(Msg {
                     addr: from_addr,
                     buf: buf[..read_len].to_vec(),
+                    ts: clk.start(),
                 }) {
                     warn!(sk=?laddr, "Incoming channel dropped, recv thread exiting");
                     break;
@@ -92,7 +95,9 @@ impl NewConn {
         // send
         shenango::thread::spawn(move || loop {
             match outgoing.try_recv() {
-                Ok(Msg { addr: a, buf: data }) => {
+                Ok(Msg {
+                    addr: a, buf: data, ..
+                }) => {
                     sk.write_to(&data, a).wrap_err("shenango write_to").unwrap();
                 }
                 Err(crossbeam::channel::TryRecvError::Empty) => {
@@ -217,12 +222,15 @@ impl ChunnelConnector for ShenangoUdpSkChunnel {
 
 struct Recv {
     r: mpsc::UnboundedReceiver<Msg>,
+    h: hdrhistogram::Histogram<u64>,
+    s: u64,
 }
 
 #[derive(Clone)]
 pub struct ShenangoUdpSk {
     outgoing: channel::Sender<Msg>,
     incoming: Arc<Mutex<Recv>>,
+    clk: quanta::Clock,
 }
 
 impl std::fmt::Debug for ShenangoUdpSk {
@@ -233,9 +241,15 @@ impl std::fmt::Debug for ShenangoUdpSk {
 
 impl ShenangoUdpSk {
     fn new(inc: mpsc::UnboundedReceiver<Msg>, out: channel::Sender<Msg>) -> Self {
+        let c = quanta::Clock::new();
         Self {
-            incoming: Arc::new(Mutex::new(Recv { r: inc })),
+            incoming: Arc::new(Mutex::new(Recv {
+                r: inc,
+                h: hdrhistogram::Histogram::new_with_max(1_000, 2).unwrap(),
+                s: c.raw(),
+            })),
             outgoing: out,
+            clk: c,
         }
     }
 }
@@ -251,7 +265,11 @@ impl ChunnelConnection for ShenangoUdpSk {
         match data {
             (V4(addr), d) => {
                 self.outgoing
-                    .send(Msg { addr, buf: d })
+                    .send(Msg {
+                        addr,
+                        buf: d,
+                        ts: 0,
+                    })
                     .expect("shenango won't drop");
                 Box::pin(futures_util::future::ready(Ok(())))
             }
@@ -264,9 +282,28 @@ impl ChunnelConnection for ShenangoUdpSk {
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let inc = Arc::clone(&self.incoming);
+        let clk = self.clk.clone();
         Box::pin(async move {
-            let Recv { ref mut r } = *inc.lock().await;
-            let Msg { addr: a, buf: d } = r.recv().await.expect("shenango side will never drop");
+            let Recv {
+                ref mut r,
+                ref mut h,
+                ref mut s,
+            } = *inc.lock().await;
+            let Msg {
+                addr: a,
+                buf: d,
+                ts,
+            } = r.recv().await.expect("shenango side will never drop");
+            let ov = clk.delta(ts, clk.end()).as_micros() as u64;
+            h.record(ov).unwrap();
+            if clk.delta(*s, clk.raw()).as_secs() > 2 {
+                println!(
+                    "shenango recv: p50 = {:?} p95 = {:?}",
+                    h.value_at_quantile(0.5),
+                    h.value_at_quantile(0.95)
+                );
+                *s = clk.raw();
+            }
             Ok((SocketAddr::V4(a), d))
         })
     }
