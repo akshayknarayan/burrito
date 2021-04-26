@@ -154,11 +154,11 @@ impl UnixConn {
     fn new(
         resp_addr: PathBuf,
         send: UnixSk,
-        recv: Arc<Mutex<mpsc::UnboundedReceiver<(PathBuf, Vec<u8>)>>>,
+        recv: mpsc::UnboundedReceiver<(PathBuf, Vec<u8>)>,
     ) -> Self {
         UnixConn {
             resp_addr,
-            recv,
+            recv: Arc::new(Mutex::new(recv)),
             send,
         }
     }

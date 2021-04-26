@@ -10,7 +10,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 lazy_static::lazy_static! {
 static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>>>> =
@@ -89,7 +89,9 @@ impl NewConn {
         // send
         shenango::thread::spawn(move || loop {
             match outgoing.try_recv() {
-                Ok(Msg { addr: a, buf: data }) => {
+                Ok(Msg {
+                    addr: a, buf: data, ..
+                }) => {
                     sk.write_to(&data, a).wrap_err("shenango write_to").unwrap();
                 }
                 Err(crossbeam::channel::TryRecvError::Empty) => {
@@ -292,10 +294,20 @@ impl ChunnelListener for ShenangoUdpReqChunnel {
     }
 }
 
+struct StRecv {
+    r: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+}
+
+impl std::fmt::Debug for StRecv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StRecv").finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
-    recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
+    recv: Arc<Mutex<StRecv>>,
     send: ShenangoUdpSk,
 }
 
@@ -303,11 +315,11 @@ impl UdpConn {
     fn new(
         resp_addr: SocketAddr,
         send: ShenangoUdpSk,
-        recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
+        recv: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
     ) -> Self {
         UdpConn {
             resp_addr,
-            recv,
+            recv: Arc::new(Mutex::new(StRecv { r: recv })),
             send,
         }
     }
@@ -330,11 +342,14 @@ impl ChunnelConnection for UdpConn {
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let r = Arc::clone(&self.recv);
+        let recv = Arc::clone(&self.recv);
         Box::pin(async move {
-            let d = r.lock().await.recv().await;
-            trace!(from = ?&d.as_ref().map(|x| x.0), "recv pkt");
-            d.ok_or_else(|| eyre!("Nothing more to receive"))
+            let StRecv { ref mut r } = *recv.lock().await;
+            let (a, d) = r
+                .recv()
+                .await
+                .ok_or_else(|| eyre!("Nothing more to receive"))?;
+            Ok((a, d))
         }) as _
     }
 }

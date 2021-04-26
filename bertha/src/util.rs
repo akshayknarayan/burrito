@@ -13,7 +13,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tracing::trace;
 
 pub trait MsgId {
@@ -53,8 +53,8 @@ where
     pub async fn send_msg(&self, data: D) -> Result<(), Report> {
         if !self.sent.contains_key(&data.id()) {
             let (s, r) = oneshot::channel();
-            self.sent.insert(data.id(), r);
             self.inflight.insert(data.id(), s);
+            self.sent.insert(data.id(), r);
         }
 
         self.inner.send(data).await
@@ -68,8 +68,8 @@ where
         loop {
             tokio::select! {
                 res = &mut r => {
-                    trace!("MsgIdMatcher done");
-                    return Ok(res.expect("sender won't be dropped"));
+                    let res = res.expect("sender won't be dropped");
+                    return Ok(res);
                 }
                 res = self.inner.recv() => {
                     let res = res?;
@@ -186,8 +186,7 @@ where
         make_conn: MkConn,
     ) -> Pin<Box<dyn Stream<Item = Result<Conn, Report>> + Send + 'static>>
     where
-        MkConn:
-            Fn(A, C, Arc<Mutex<mpsc::UnboundedReceiver<(A, Vec<u8>)>>>) -> Conn + Send + 'static,
+        MkConn: Fn(A, C, mpsc::UnboundedReceiver<(A, Vec<u8>)>) -> Conn + Send + 'static,
         Conn: ChunnelConnection,
     {
         let sk = self.0;
@@ -207,11 +206,7 @@ where
                         let mut done = None;
                         let c = map.entry(from.clone()).or_insert_with(|| {
                             let (sch, rch) = mpsc::unbounded_channel();
-                            done = Some(make_conn(
-                                from.clone(),
-                                sk.clone(),
-                                Arc::new(Mutex::new(rch)),
-                            ));
+                            done = Some(make_conn(from.clone(), sk.clone(), rch));
                             sch
                         });
 
@@ -219,11 +214,7 @@ where
                         // so this becomes a new connection
                         if let Err(mpsc::error::SendError(data)) = c.send((from.clone(), data)) {
                             let (sch, rch) = mpsc::unbounded_channel();
-                            done = Some(make_conn(
-                                from.clone(),
-                                sk.clone(),
-                                Arc::new(Mutex::new(rch)),
-                            ));
+                            done = Some(make_conn(from.clone(), sk.clone(), rch));
                             // Send again because the previous one failed, so the message would
                             // otherwise be dropped. This won't block because it's an unbounded
                             // channel.

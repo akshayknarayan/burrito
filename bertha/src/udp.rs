@@ -148,11 +148,11 @@ impl UdpConn {
     fn new(
         resp_addr: SocketAddr,
         send: UdpSk<SocketAddr>,
-        recv: Arc<Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>,
+        recv: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
     ) -> Self {
         UdpConn {
             resp_addr,
-            recv,
+            recv: Arc::new(Mutex::new(recv)),
             send,
         }
     }
