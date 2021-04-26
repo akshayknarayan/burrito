@@ -85,14 +85,23 @@ fn get_raw_connector(
 
 fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
-    if opt.logging {
-        tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
+    let tracing = if opt.logging {
+        let timing_layer = tracing_timing::Builder::default()
+            .no_span_recursion()
+            .layer(|| tracing_timing::Histogram::new_with_max(100_000_000, 3).unwrap());
+        let timing_downcaster = timing_layer.downcaster();
+        let subscriber = tracing_subscriber::registry()
+            .with(timing_layer)
+            //.with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
-            .with(ErrorLayer::default())
-            .init();
+            .with(ErrorLayer::default());
+        let d = tracing::Dispatch::new(subscriber);
+        d.clone().init();
         color_eyre::install()?;
-    }
+        Some((timing_downcaster, d))
+    } else {
+        None
+    };
 
     if opt.loads_only && opt.skip_loads {
         return Err(eyre!("Must do either loads or skip them"));
@@ -187,6 +196,15 @@ fn main() -> Result<(), Report> {
             )
         };
 
+        if let Some((td, d)) = tracing {
+            if let Some(of) = opt.out_file.clone() {
+                let timing = td.downcast(&d).expect("downcast timing layer");
+                let fname = of.with_extension("trace");
+                let mut f = std::fs::File::create(&fname).unwrap();
+                dump_tracing(&timing, &mut f)?;
+            }
+        }
+
         // done
         write_results(
             durs,
@@ -199,6 +217,46 @@ fn main() -> Result<(), Report> {
 
         Ok(())
     })
+}
+
+fn dump_tracing(
+    timing: &'_ tracing_timing::TimingLayer,
+    f: &mut std::fs::File,
+) -> Result<(), Report> {
+    use std::io::prelude::*;
+    timing.force_synchronize();
+    timing.with_histograms(|hs| {
+        for (span_group, hs) in hs {
+            for (event_group, h) in hs {
+                let tag = format!("{}.{}", span_group, event_group);
+                write!(
+                    f,
+                    "tracing: \
+                        event = {}, \
+                        min   = {}, \
+                        p25   = {}, \
+                        p50   = {}, \
+                        p75   = {}, \
+                        p95   = {}, \
+                        max   = {}, \
+                        cnt   = {} \
+                        ",
+                    &tag,
+                    h.min(),
+                    h.value_at_quantile(0.25),
+                    h.value_at_quantile(0.5),
+                    h.value_at_quantile(0.75),
+                    h.value_at_quantile(0.95),
+                    h.max(),
+                    h.len(),
+                )?;
+            }
+        }
+
+        Ok::<_, Report>(())
+    })?;
+
+    Ok(())
 }
 
 /// Issue a workload of requests, divided by client worker.
