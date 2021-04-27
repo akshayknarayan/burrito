@@ -6,6 +6,9 @@ mod msg;
 pub mod reliability;
 mod server;
 
+#[cfg(feature = "bin")]
+pub mod bin;
+
 pub use client::KvClient;
 pub use msg::Msg;
 pub use server::{serve, serve_lb, single_shard};

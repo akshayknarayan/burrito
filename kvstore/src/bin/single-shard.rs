@@ -1,10 +1,9 @@
 use color_eyre::eyre::Report;
+use kvstore::bin::tracing_init;
 use kvstore::single_shard;
 use std::net::SocketAddr;
 use structopt::StructOpt;
 use tracing::info;
-use tracing_error::ErrorLayer;
-use tracing_subscriber::prelude::*;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "burrito-lb")]
@@ -20,21 +19,16 @@ struct Opt {
 
     #[structopt(short, long)]
     log: bool,
+
+    #[structopt(short, long)]
+    trace_time: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
     color_eyre::install()?;
-    if opt.log {
-        let subscriber = tracing_subscriber::registry();
-        let subscriber = subscriber
-            .with(tracing_subscriber::fmt::layer())
-            .with(tracing_subscriber::EnvFilter::from_default_env())
-            .with(ErrorLayer::default());
-        let d = tracing::Dispatch::new(subscriber);
-        d.init();
-    }
+    tracing_init(opt.log, opt.trace_time, std::time::Duration::from_secs(5)).await;
 
     info!(addr = ?&opt.addr, internal_addr = ?&opt.internal_addr, "starting shard");
     let listener = shenango_chunnel::ShenangoUdpReqChunnel(
