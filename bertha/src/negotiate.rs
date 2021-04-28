@@ -192,7 +192,7 @@ where
 pub struct Select<T1, T2, Inner = Either<T1, T2>> {
     pub left: T1,
     pub right: T2,
-    prefer: Either<(), ()>,
+    pub prefer: Either<(), ()>,
     _inner: std::marker::PhantomData<Inner>,
 }
 

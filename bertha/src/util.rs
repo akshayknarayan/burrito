@@ -259,6 +259,7 @@ where
 /// Given a `impl ChunnelConnection`s which expect `(addr, data)`, expose an interface which
 /// accepts just the `data`.
 /// On `send`, wraps the data in the addr provided in `new()`. On `recv`, ignores the addr.
+#[derive(Clone, Debug)]
 pub struct ProjectLeft<A, C>(A, C);
 
 impl<A, C> ProjectLeft<A, C> {
