@@ -3,6 +3,7 @@
 mod client;
 mod kv;
 mod msg;
+mod opt;
 pub mod reliability;
 mod server;
 

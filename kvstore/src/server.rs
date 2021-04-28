@@ -76,6 +76,7 @@ pub async fn serve_lb(
     )
     .await
     .wrap_err("Create ShardCanonicalServer")?;
+    use crate::opt::SerdeOpt;
     let external = CxList::from(cnsrv).wrap(
         Select::from((
             CxList::from(OrderedChunnelProj::default())
@@ -86,6 +87,7 @@ pub async fn serve_lb(
         ))
         .prefer_right(),
     );
+    let external = external.serde_opt();
     let st = raw_listener
         .listen(si.canonical_addr)
         .await
