@@ -39,6 +39,9 @@ struct Opt {
     #[structopt(short, long)]
     logging: bool,
 
+    #[structopt(short, long)]
+    tracing: bool,
+
     #[structopt(long)]
     loads_only: bool,
 
@@ -85,20 +88,29 @@ fn get_raw_connector(
 
 fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
-    let tracing = if opt.logging {
+    let tracing = if opt.logging && opt.tracing {
         let timing_layer = tracing_timing::Builder::default()
             .no_span_recursion()
             .layer(|| tracing_timing::Histogram::new_with_max(100_000_000, 3).unwrap());
         let timing_downcaster = timing_layer.downcaster();
         let subscriber = tracing_subscriber::registry()
             .with(timing_layer)
-            //.with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let d = tracing::Dispatch::new(subscriber);
         d.clone().init();
         color_eyre::install()?;
         Some((timing_downcaster, d))
+    } else if opt.logging {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let d = tracing::Dispatch::new(subscriber);
+        d.clone().init();
+        color_eyre::install()?;
+        None
     } else {
         None
     };
