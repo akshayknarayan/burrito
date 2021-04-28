@@ -114,26 +114,6 @@ impl Negotiate for CxNil {
     }
 }
 
-impl<T1, T2, C> Negotiate for Either<T1, T2>
-where
-    T1: Negotiate<Capability = C>,
-    T2: Negotiate<Capability = C>,
-    C: CapabilitySet,
-{
-    type Capability = C;
-
-    fn guid() -> u64 {
-        T1::guid() ^ T2::guid()
-    }
-
-    fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
-        match self {
-            Either::Left(a) => a.picked(nonce),
-            Either::Right(a) => a.picked(nonce),
-        }
-    }
-}
-
 pub trait NegotiatePicked {
     fn call_negotiate_picked<'s>(
         &mut self,
@@ -183,6 +163,24 @@ where
         let f = match self {
             DataEither::Left(l) => l.call_negotiate_picked(nonce),
             DataEither::Right(r) => r.call_negotiate_picked(nonce),
+        };
+
+        Box::pin(f)
+    }
+}
+
+impl<L, R> NegotiatePicked for Either<L, R>
+where
+    L: NegotiatePicked,
+    R: NegotiatePicked,
+{
+    fn call_negotiate_picked<'s>(
+        &mut self,
+        nonce: &'s [u8],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        let f = match self {
+            Either::Left(l) => l.call_negotiate_picked(nonce),
+            Either::Right(r) => r.call_negotiate_picked(nonce),
         };
 
         Box::pin(f)
