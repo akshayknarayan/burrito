@@ -4,10 +4,9 @@ use crate::kv::Store;
 use crate::msg::Msg;
 use crate::reliability::KvReliabilityServerChunnel;
 use bertha::{
-    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel, either::DataEither,
-    negotiate::Offer, reliable::ReliabilityProjChunnel, select::SelectListener,
-    tagger::OrderedChunnelProj, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
-    GetOffers, Select,
+    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel, negotiate::Offer,
+    reliable::ReliabilityProjChunnel, select::SelectListener, tagger::OrderedChunnelProj,
+    ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers, Select,
 };
 use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{Report, WrapErr};
@@ -32,7 +31,11 @@ pub async fn serve_lb(
     shards_internal: Vec<SocketAddr>,
     shard_connector: impl ChunnelConnector<
             Addr = (),
-            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>
+                             + Clone
+                             + Send
+                             + Sync
+                             + 'static,
             Error = impl Into<Report> + Send + Sync + 'static,
         > + Clone
         + Send
@@ -63,11 +66,7 @@ pub async fn serve_lb(
     let mut offer: Vec<_> = shard_stack.offers().collect();
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
 
-    // TODO write sharding optimization to make this route raw packets.
-    // If the ordered |> reliable path is picked, we can't do the optimization because the bytes
-    // have semantics. `KvReliabilityServerChunnel` is basically a no-op though, so we can
-    // pass-through without the serialization.
-    let cnsrv = burrito_shard_ctl::ShardCanonicalServer::new(
+    let cnsrv = burrito_shard_ctl::ShardCanonicalServer::<_, _, _, (SocketAddr, Msg)>::new(
         si.clone(),
         Some(shards_internal),
         udp_to_shard::UdpToShard(shard_connector),
@@ -117,9 +116,7 @@ pub async fn serve_lb(
                     .await
                     .wrap_err("kvstore/server: Error while processing requests")
                 {
-                    Ok(x) => {
-                        let _: Option<(_, Msg)> = x;
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         warn!(err = ?e, ?ctr, "exiting");
                         break;
@@ -421,9 +418,7 @@ async fn serve_canonical(
                     .await
                     .wrap_err("kvstore/server: Error while processing requests")
                 {
-                    Ok(x) => {
-                        let _: Option<(_, Msg)> = x;
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         warn!(err = ?e, ?ctr, "exiting");
                         break;

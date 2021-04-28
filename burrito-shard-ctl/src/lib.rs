@@ -104,16 +104,17 @@ enumerate_enum!(pub ShardFns, 0xe898734df758d0c0, Sharding);
 /// Forwards incoming messages to one of the internal connections specified by `shards_inner` after
 /// evaluating the sharding function.
 #[derive(Clone)]
-pub struct ShardCanonicalServer<A, S, Ss> {
+pub struct ShardCanonicalServer<A, S, Ss, D> {
     addr: ShardInfo<A>,
     internal_addr: Vec<A>,
     shards_inner: S,
     shards_inner_stack: Ss,
     shards_extern_nonce: HashMap<u64, Offer>,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
+    _phantom: std::marker::PhantomData<D>,
 }
 
-impl<A: std::fmt::Debug, S, Ss> std::fmt::Debug for ShardCanonicalServer<A, S, Ss> {
+impl<A: std::fmt::Debug, S, Ss, D> std::fmt::Debug for ShardCanonicalServer<A, S, Ss, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardCanonicalServer")
             .field("addr", &self.addr)
@@ -121,7 +122,7 @@ impl<A: std::fmt::Debug, S, Ss> std::fmt::Debug for ShardCanonicalServer<A, S, S
     }
 }
 
-impl<A, S, Ss> ShardCanonicalServer<A, S, Ss>
+impl<A, S, Ss, D> ShardCanonicalServer<A, S, Ss, D>
 where
     A: Clone + std::fmt::Debug,
 {
@@ -160,11 +161,12 @@ where
             shards_inner_stack,
             shards_extern_nonce,
             redis_listen_connection,
+            _phantom: Default::default(),
         })
     }
 }
 
-impl<A, S, Ss> Negotiate for ShardCanonicalServer<A, S, Ss>
+impl<A, S, Ss, D> Negotiate for ShardCanonicalServer<A, S, Ss, D>
 where
     A: IpPort
         + Serialize
@@ -284,7 +286,7 @@ where
     }
 }
 
-impl<I, A, S, Ss, D, E> Chunnel<I> for ShardCanonicalServer<A, S, Ss>
+impl<I, A, S, Ss, D, E> Chunnel<I> for ShardCanonicalServer<A, S, Ss, D>
 where
     I: ChunnelConnection<Data = D> + Send + Sync + 'static,
     A: IpPort
@@ -309,7 +311,7 @@ where
     E: Into<Error> + Send + Sync + 'static,
 {
     type Connection =
-        ShardCanonicalServerConnection<I, bertha::negotiate::NegotiatedConn<S::Connection, Ss>>;
+        ShardCanonicalServerConnection<I, bertha::negotiate::NegotiatedConn<S::Connection, Ss>, D>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Error;
@@ -356,7 +358,7 @@ where
                 Ok(ShardCanonicalServerConnection {
                     inner: Arc::new(conn),
                     shards: conns,
-                    shard_fn: Arc::new(move |d| {
+                    shard_fn: Arc::new(move |d: &D| {
                         /* xdp_shard version of FNV: take the first 4 bytes of the key
                         * u64 hash = FNV1_64_INIT;
                         * // ...
@@ -395,11 +397,31 @@ where
 ///
 /// Otherwise just wrap `ShardCanonicalServer`, functionality is identical (even the connection
 /// type is identical).
-pub struct ShardCanonicalServerRaw<A, S, Ss, const OFFSET: usize> {
-    inner: ShardCanonicalServer<A, S, Ss>,
+#[derive(Clone)]
+pub struct ShardCanonicalServerRaw<A, S, Ss, D, const OFFSET: usize> {
+    inner: ShardCanonicalServer<A, S, Ss, D>,
 }
 
-impl<A, S, Ss, const OFFSET: usize> Negotiate for ShardCanonicalServerRaw<A, S, Ss, OFFSET>
+impl<A: std::fmt::Debug, S, Ss, D, const OFFSET: usize> std::fmt::Debug
+    for ShardCanonicalServerRaw<A, S, Ss, D, OFFSET>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardCanonicalServerRaw")
+            .field("addr", &self.inner.addr)
+            .field("offset", &OFFSET)
+            .finish()
+    }
+}
+
+impl<A, S, Ss, D, const OFFSET: usize> From<ShardCanonicalServer<A, S, Ss, D>>
+    for ShardCanonicalServerRaw<A, S, Ss, D, OFFSET>
+{
+    fn from(inner: ShardCanonicalServer<A, S, Ss, D>) -> Self {
+        ShardCanonicalServerRaw { inner }
+    }
+}
+
+impl<A, S, Ss, D, const OFFSET: usize> Negotiate for ShardCanonicalServerRaw<A, S, Ss, D, OFFSET>
 where
     A: IpPort
         + Serialize
@@ -417,11 +439,11 @@ where
 {
     type Capability = ShardFns;
     fn guid() -> u64 {
-        ShardCanonicalServer::<A, S, Ss>::guid()
+        ShardCanonicalServer::<A, S, Ss, D>::guid()
     }
 
     fn capabilities() -> Vec<ShardFns> {
-        ShardCanonicalServer::<A, S, Ss>::capabilities()
+        ShardCanonicalServer::<A, S, Ss, D>::capabilities()
     }
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
@@ -429,7 +451,8 @@ where
     }
 }
 
-impl<I, A, S, Ss, E, const OFFSET: usize> Chunnel<I> for ShardCanonicalServerRaw<A, S, Ss, OFFSET>
+impl<I, A, S, Ss, E, D, const OFFSET: usize> Chunnel<I>
+    for ShardCanonicalServerRaw<A, S, Ss, D, OFFSET>
 where
     I: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     A: IpPort
@@ -442,17 +465,16 @@ where
         + Sync
         + 'static,
     S: ChunnelConnector<Addr = A, Error = E> + Clone + Send + Sync + 'static,
-    S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Clone + Send + Sync + 'static,
     Ss: Apply + GetOffers + Clone + Send + Sync + 'static,
     <Ss as Apply>::Applied:
         Chunnel<S::Connection> + bertha::NegotiatePicked + Clone + Debug + Send + 'static,
     <<Ss as Apply>::Applied as Chunnel<S::Connection>>::Connection:
-        ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+        ChunnelConnection<Data = D> + Send + Sync + 'static,
     <<Ss as Apply>::Applied as Chunnel<S::Connection>>::Error: Into<Error> + Send + Sync + 'static,
     E: Into<Error> + Send + Sync + 'static,
 {
-    type Connection =
-        ShardCanonicalServerConnection<I, bertha::negotiate::NegotiatedConn<S::Connection, Ss>>;
+    type Connection = ShardCanonicalServerConnection<I, S::Connection, (A, Vec<u8>)>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Error;
@@ -467,8 +489,7 @@ where
             async move {
                 let num_shards = addr.shard_addrs.len();
 
-                // TODO factor into a function
-                // connect to shards
+                // negotiate with shards
                 let conns: Vec<Arc<_>> =
                     futures_util::future::join_all(internal_addr.into_iter().map(|a| async {
                         debug!(?a, "connecting to shard");
@@ -479,9 +500,20 @@ where
                             .await
                             .map_err(Into::into)
                             .wrap_err(eyre!("Could not connect to {}", a.clone()))?;
-                        let cn = bertha::negotiate::negotiate_client(
+                        // What is happening here???
+                        //
+                        // We have a problem: we want our ShardCanonicalServerConnection to operate
+                        // on (A, Vec<u8>) because doing shards_inner_stack is expensive at
+                        // runtime. But, we need to make the shard still expect
+                        // `shards_inner_stack` semantics, since that's what the packets will be.
+                        // So, we do negotiation to make the shard think we are using
+                        // `shards_inner_stack`, but then we don't use that connection (with the
+                        // semantics) and instead we directly use the raw `cn`.
+                        //
+                        // TODO is this unsafe?
+                        let _ = bertha::negotiate::negotiate_client(
                             shards_inner_stack.clone(),
-                            cn,
+                            cn.clone(),
                             a.clone(),
                         )
                         .await
@@ -500,7 +532,7 @@ where
                 Ok(ShardCanonicalServerConnection {
                     inner: Arc::new(conn),
                     shards: conns,
-                    shard_fn: Arc::new(move |d| {
+                    shard_fn: Arc::new(move |d: &(_, Vec<u8>)| {
                         let mut hash = FNV1_64_INIT;
                         for b in d.1[OFFSET..OFFSET + 4].iter() {
                             hash ^= *b as u64;
@@ -521,25 +553,19 @@ where
 /// Does not implement `send()`, since the server does not send messages unprompted.  Similarly,
 /// the Data type is `()`, since any received message is forwarded to the appropriate shard.
 /// Expected usage is to call `recv()` in a loop.
-pub struct ShardCanonicalServerConnection<C, S>
-where
-    C: ChunnelConnection,
-    S: ChunnelConnection,
-{
+pub struct ShardCanonicalServerConnection<C, S, D> {
     inner: Arc<C>,
     shards: Vec<Arc<S>>,
-    shard_fn: Arc<dyn Fn(&C::Data) -> usize + Send + Sync + 'static>,
+    shard_fn: Arc<dyn Fn(&D) -> usize + Send + Sync + 'static>,
 }
 
-impl<C, S, D> ChunnelConnection for ShardCanonicalServerConnection<C, S>
+impl<C, S, D> ChunnelConnection for ShardCanonicalServerConnection<C, S, D>
 where
     C: ChunnelConnection<Data = D> + Send + Sync + 'static,
     S: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    /// This Option<D> is entirely unnecessary and will always be `None`, it only exists for type
-    /// hinting.
-    type Data = Option<D>;
+    type Data = ();
 
     fn recv(
         &self,
@@ -578,7 +604,7 @@ where
                 trace!(shard_idx, "got shard response");
                 inner.send(resp).await?;
                 trace!(shard_idx, "send response");
-                Ok(None)
+                Ok(())
             }
             .instrument(trace_span!("server-shard-recv")),
         )
