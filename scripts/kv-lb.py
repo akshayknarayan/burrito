@@ -18,10 +18,10 @@ def start_shard(conn, outf_prefix):
     time.sleep(2)
 
     outf = f"{outf_prefix}-{conn.addr}"
-    conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/single-shard \
+    conn.run(f"RUST_LOG=info ./target/release/single-shard \
             --addr 0.0.0.0:4242 \
             --internal-addr 0.0.0.0:4342 \
-            -s host.config --log",
+            -s host.config",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -40,11 +40,11 @@ def start_lb(conn, redis_addr, shard_addrs, outf):
     time.sleep(2)
 
     shards_args = ' '.join(f'--shards={s}:4242' for s in shard_addrs)
-    conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/burrito-lb \
-            --addr 0.0.0.0:4242 \
+    conn.run(f"RUST_LOG=info ./target/release/burrito-lb \
+            --addr {conn.addr}:4242 \
             {shards_args} \
             --redis-addr {redis_addr} \
-            -s host.config --log",
+            -s host.config",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -132,6 +132,7 @@ def do_exp(outdir, lb, shards, clients, shardtype, ops_per_sec, wrkload):
         if not s.local:
             s.get(f"burrito/{shard_prefix}-{s.addr}.out", local=f"{shard_prefix}-{s.addr}.out", preserve_mode=False)
             s.get(f"burrito/{shard_prefix}-{s.addr}.err", local=f"{shard_prefix}-{s.addr}.err", preserve_mode=False)
+            #s.get(f"burrito/{shard_prefix}-{s.addr}.trace", local=f"{shard_prefix}-{s.addr}.trace", preserve_mode=False)
 
     def get_files(num):
         fn = c.get
@@ -151,6 +152,12 @@ def do_exp(outdir, lb, shards, clients, shardtype, ops_per_sec, wrkload):
             local=f"{outf}{num}-{c.addr}.out",
             preserve_mode=False,
         )
+        #agenda.subtask(f"getting {outf}{num}-{c.addr}.trace")
+        #fn(
+        #    f"burrito/{outf}{num}.trace",
+        #    local=f"{outf}{num}-{c.addr}.trace",
+        #    preserve_mode=False,
+        #)
         agenda.subtask(f"getting {outf}{num}-{c.addr}.data1")
         fn(
             f"burrito/{outf}{num}.data1",

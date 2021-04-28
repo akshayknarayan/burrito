@@ -259,7 +259,7 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile)
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout}")
-    ok = conn.run(f"RUST_LOG=info,bertha=trace,ycsb=debug ./target/release/ycsb \
+    ok = conn.run(f"RUST_LOG=info,bertha=debug,ycsb=debug,burrito_shard_ctl=debug ./target/release/ycsb \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
             -i {interarrival} \
