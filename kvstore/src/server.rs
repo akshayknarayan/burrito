@@ -52,16 +52,21 @@ pub async fn serve_lb(
 
     let shard_stack = CxList::from(
         Select::from((
-            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-            KvReliabilityServerChunnel::default(),
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(KvReliabilityServerChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
         ))
-        .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
         .prefer_right(),
-    )
-    .wrap(SerializeChunnelProject::default());
+    );
     let mut offer: Vec<_> = shard_stack.offers().collect();
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
 
+    // TODO write sharding optimization to make this route raw packets.
+    // If the ordered |> reliable path is picked, we can't do the optimization because the bytes
+    // have semantics. `KvReliabilityServerChunnel` is basically a no-op though, so we can
+    // pass-through without the serialization.
     let cnsrv = burrito_shard_ctl::ShardCanonicalServer::new(
         si.clone(),
         Some(shards_internal),
@@ -72,16 +77,16 @@ pub async fn serve_lb(
     )
     .await
     .wrap_err("Create ShardCanonicalServer")?;
-    let external = CxList::from(cnsrv)
-        .wrap(
-            Select::from((
-                CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-                KvReliabilityServerChunnel::default(),
-            ))
-            .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
-            .prefer_right(),
-        )
-        .wrap(SerializeChunnelProject::default());
+    let external = CxList::from(cnsrv).wrap(
+        Select::from((
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(KvReliabilityServerChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+        ))
+        .prefer_right(),
+    );
     let st = raw_listener
         .listen(si.canonical_addr)
         .await
@@ -170,15 +175,14 @@ pub async fn single_shard(
         C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         Se: Into<Report> + Send + Sync + 'static,
     {
-        let external = CxList::from(
-            Select::from((
-                CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-                KvReliabilityServerChunnel::default(),
-            ))
-            .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
-            .prefer_right(),
-        )
-        .wrap(SerializeChunnelProject::default());
+        let external = Select::from((
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(KvReliabilityServerChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+        ))
+        .prefer_right();
         let offers = external.clone().offers().collect();
         let st = bertha::negotiate::negotiate_server(external, st)
             .await
@@ -349,13 +353,14 @@ async fn serve_canonical(
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
     let shard_stack = CxList::from(
         Select::from((
-            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-            KvReliabilityServerChunnel::default(),
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(KvReliabilityServerChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
         ))
-        .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
         .prefer_right(),
-    )
-    .wrap(SerializeChunnelProject::default());
+    );
 
     #[cfg(not(feature = "ebpf"))]
     let cnsrv = burrito_shard_ctl::ShardCanonicalServer::new(
@@ -380,17 +385,16 @@ async fn serve_canonical(
     )
     .await
     .wrap_err("Create ShardCanonicalServer")?;
-
-    let external = CxList::from(cnsrv)
-        .wrap(
-            Select::from((
-                CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-                KvReliabilityServerChunnel::default(),
-            ))
-            .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
-            .prefer_right(),
-        )
-        .wrap(SerializeChunnelProject::default());
+    let external = CxList::from(cnsrv).wrap(
+        Select::from((
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(KvReliabilityServerChunnel::default())
+                .wrap(SerializeChunnelProject::<Msg>::default()),
+        ))
+        .prefer_right(),
+    );
     info!(shard_info = ?&si, "start canonical server");
     let st = bertha::negotiate::negotiate_server(external, st)
         .instrument(info_span!("negotiate_server"))

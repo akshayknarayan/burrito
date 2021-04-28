@@ -34,13 +34,15 @@ impl KvClient<NeverCn> {
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         // the is ugly but needed to match the DataEither data type the server wants.
-        let sel = Select::from((
-            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
+        let neg_stack = Select::from((
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
         ))
-        .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, bertha::reliable::Pkt<Msg>>>()
         .prefer_left();
-        let neg_stack = CxList::from(sel).wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
@@ -56,13 +58,13 @@ impl KvClient<NeverCn> {
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         use crate::reliability::KvReliabilityChunnel;
-        let sel = Select::from((
-            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-            KvReliabilityChunnel::default(),
+        let stack = Select::from((
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(KvReliabilityChunnel::default()).wrap(SerializeChunnelProject::default()),
         ))
-        .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
         .prefer_right();
-        let stack = CxList::from(sel).wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(stack, raw_cn, canonical_addr)
@@ -82,15 +84,17 @@ impl KvClient<NeverCn> {
         let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
         let cl = ClientShardChunnelClient::new(canonical_addr, &redis_addr).await?;
         let sel = Select::from((
-            CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default()),
-            KvReliabilityChunnel::default(),
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(KvReliabilityChunnel::default()).wrap(SerializeChunnelProject::default()),
         ))
-        .inner_type::<DataEither<bertha::reliable::Pkt<Msg>, Msg>>()
         .prefer_right();
-        let ser = SerializeChunnelProject::default();
-        let stack = CxList::from(Select::from((cl, Nothing::<_>::default())))
-            .wrap(sel)
-            .wrap(ser);
+        let stack = CxList::from(Select::from((
+            cl,
+            Nothing::<burrito_shard_ctl::ShardFns>::default(),
+        )))
+        .wrap(sel);
 
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(stack, raw_cn, canonical_addr)
