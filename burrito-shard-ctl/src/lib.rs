@@ -388,6 +388,134 @@ where
     }
 }
 
+/// Skip serde in situations where possible.
+///
+/// If we know the client's serialization format (and it is constant), then we know `OFFSET`, so we
+/// can just hash based on looking at the Vec<u8> instead of deserializing.
+///
+/// Otherwise just wrap `ShardCanonicalServer`, functionality is identical (even the connection
+/// type is identical).
+pub struct ShardCanonicalServerRaw<A, S, Ss, const OFFSET: usize> {
+    inner: ShardCanonicalServer<A, S, Ss>,
+}
+
+impl<A, S, Ss, const OFFSET: usize> Negotiate for ShardCanonicalServerRaw<A, S, Ss, OFFSET>
+where
+    A: IpPort
+        + Serialize
+        + DeserializeOwned
+        + Clone
+        + PartialEq
+        + std::fmt::Debug
+        + std::fmt::Display
+        + Send
+        + Sync
+        + 'static,
+    S: ChunnelConnector<Addr = A> + Clone + Send + Sync + 'static,
+    <S as ChunnelConnector>::Error: Into<eyre::Report>,
+    S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+{
+    type Capability = ShardFns;
+    fn guid() -> u64 {
+        ShardCanonicalServer::<A, S, Ss>::guid()
+    }
+
+    fn capabilities() -> Vec<ShardFns> {
+        ShardCanonicalServer::<A, S, Ss>::capabilities()
+    }
+
+    fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        self.inner.picked(nonce)
+    }
+}
+
+impl<I, A, S, Ss, E, const OFFSET: usize> Chunnel<I> for ShardCanonicalServerRaw<A, S, Ss, OFFSET>
+where
+    I: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    A: IpPort
+        + Serialize
+        + DeserializeOwned
+        + Clone
+        + std::fmt::Debug
+        + std::fmt::Display
+        + Send
+        + Sync
+        + 'static,
+    S: ChunnelConnector<Addr = A, Error = E> + Clone + Send + Sync + 'static,
+    S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    Ss: Apply + GetOffers + Clone + Send + Sync + 'static,
+    <Ss as Apply>::Applied:
+        Chunnel<S::Connection> + bertha::NegotiatePicked + Clone + Debug + Send + 'static,
+    <<Ss as Apply>::Applied as Chunnel<S::Connection>>::Connection:
+        ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    <<Ss as Apply>::Applied as Chunnel<S::Connection>>::Error: Into<Error> + Send + Sync + 'static,
+    E: Into<Error> + Send + Sync + 'static,
+{
+    type Connection =
+        ShardCanonicalServerConnection<I, bertha::negotiate::NegotiatedConn<S::Connection, Ss>>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Error;
+
+    fn connect_wrap(&mut self, conn: I) -> Self::Future {
+        let addr = self.inner.addr.clone();
+        let internal_addr = self.inner.internal_addr.clone();
+        let a1 = addr.clone();
+        let shards_inner = self.inner.shards_inner.clone();
+        let shards_inner_stack = self.inner.shards_inner_stack.clone();
+        Box::pin(
+            async move {
+                let num_shards = addr.shard_addrs.len();
+
+                // TODO factor into a function
+                // connect to shards
+                let conns: Vec<Arc<_>> =
+                    futures_util::future::join_all(internal_addr.into_iter().map(|a| async {
+                        debug!(?a, "connecting to shard");
+                        let a = a;
+                        let cn = shards_inner
+                            .clone()
+                            .connect(a.clone())
+                            .await
+                            .map_err(Into::into)
+                            .wrap_err(eyre!("Could not connect to {}", a.clone()))?;
+                        let cn = bertha::negotiate::negotiate_client(
+                            shards_inner_stack.clone(),
+                            cn,
+                            a.clone(),
+                        )
+                        .await
+                        .wrap_err("negotiate_client failed")?;
+                        Ok::<_, Error>(Arc::new(cn))
+                    }))
+                    .await
+                    .into_iter()
+                    .collect::<Result<_, Error>>()
+                    .wrap_err("Could not connect to at least one shard")?;
+
+                trace!("connected to shards");
+
+                // serve canonical address
+                // we are only responsible for the canonical address here.
+                Ok(ShardCanonicalServerConnection {
+                    inner: Arc::new(conn),
+                    shards: conns,
+                    shard_fn: Arc::new(move |d| {
+                        let mut hash = FNV1_64_INIT;
+                        for b in d.1[OFFSET..OFFSET + 4].iter() {
+                            hash ^= *b as u64;
+                            hash = u64::wrapping_mul(hash, FNV_64_PRIME);
+                        }
+
+                        hash as usize % num_shards
+                    }),
+                })
+            }
+            .instrument(debug_span!("serve_raw", addr = ?&a1)),
+        )
+    }
+}
+
 /// Chunnel connection type for serving the shard canonical address.
 ///
 /// Does not implement `send()`, since the server does not send messages unprompted.  Similarly,
