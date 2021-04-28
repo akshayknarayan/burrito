@@ -3,7 +3,6 @@
 use crate::msg::Msg;
 use bertha::{
     bincode::SerializeChunnelProject,
-    either::DataEither,
     negotiate::Select,
     reliable::ReliabilityProjChunnel,
     tagger::OrderedChunnelProj,
@@ -33,16 +32,9 @@ impl KvClient<NeverCn> {
         raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         canonical_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
-        // the is ugly but needed to match the DataEither data type the server wants.
-        let neg_stack = Select::from((
-            CxList::from(OrderedChunnelProj::default())
-                .wrap(ReliabilityProjChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
-            CxList::from(OrderedChunnelProj::default())
-                .wrap(ReliabilityProjChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
-        ))
-        .prefer_left();
+        let neg_stack = CxList::from(OrderedChunnelProj::default())
+            .wrap(ReliabilityProjChunnel::default())
+            .wrap(SerializeChunnelProject::default());
 
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
