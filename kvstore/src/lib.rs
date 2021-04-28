@@ -134,7 +134,7 @@ mod tests {
             .unwrap();
         rt.block_on(
             async move {
-                let redis_port = 61179;
+                let redis_port = 60179;
                 info!(port = ?redis_port, "start redis");
                 let _redis_guard = test_util::start_redis(redis_port);
 
