@@ -538,37 +538,41 @@ where
     T::Picked: Debug,
 {
     let pr = t.pick(pairs).wrap_err(eyre!("pick failed"))?;
-    trace!(?pr, "try pick");
     let touched = &pr.touched_cap_guids;
     let pairs: Vec<_> = pr
         .filtered_pairs
         .into_iter()
         .filter(|(client, server)| {
-            touched.iter().all(|t| {
-                let of = server.get(t).unwrap();
-                trace!(offer = ?&of, cap = ?t, "checking");
-                match of {
-                    Offer { impl_guid, .. } if *impl_guid == 0 => true,
-                    Offer {
-                        sidedness: Some(univ),
-                        available,
-                        ..
-                    } => {
-                        if let Some(cl_of) = client.get(t) {
-                            let h: HashSet<&[u8]> = cl_of
-                                .available
-                                .iter()
-                                .map(Vec::as_slice)
-                                .chain(available.iter().map(Vec::as_slice))
-                                .collect();
-                            h.len() == univ.len()
-                        } else {
-                            available.len() == univ.len()
+            // if client has something with sidedness none, that means the server has to match its
+            // capabilities. So if we didn't touch it, then invalid.
+            client
+                .iter()
+                .all(|(guid, of)| of.sidedness.is_some() || touched.get(&guid).is_some())
+                && touched.iter().all(|t| {
+                    // for all the things we did touch, the impls should match.
+                    let of = server.get(t).unwrap();
+                    match of {
+                        Offer { impl_guid, .. } if *impl_guid == 0 => true,
+                        Offer {
+                            sidedness: Some(univ),
+                            available,
+                            ..
+                        } => {
+                            if let Some(cl_of) = client.get(t) {
+                                let h: HashSet<&[u8]> = cl_of
+                                    .available
+                                    .iter()
+                                    .map(Vec::as_slice)
+                                    .chain(available.iter().map(Vec::as_slice))
+                                    .collect();
+                                h.len() == univ.len()
+                            } else {
+                                available.len() == univ.len()
+                            }
                         }
+                        _ => false,
                     }
-                    _ => false,
-                }
-            })
+                })
         })
         .collect();
 
@@ -619,7 +623,7 @@ where
                         stack: Inner::left(stack),
                         filtered_pairs,
                         touched_cap_guids,
-                    })
+                    });
                 }
                 Ok(_) => eyre!("first choice pick left no options"),
                 Err(e) => e.wrap_err(eyre!("first choice pick erred")),
@@ -983,9 +987,7 @@ where
     // enumerate possible offer groups from `stack`.
     let possibilities: Vec<_> = stack.offers().collect();
     let saved_possibilities = possibilities.clone();
-
     let valid_pairs = compare_offers(client_offers, possibilities);
-
     // 3. monomorphize: transform the CxList<impl Serve/Select<impl Serve,
     //    impl Serve>> into a CxList<impl Serve>
     let PickResult {
@@ -994,7 +996,6 @@ where
         ..
     } = check_touched(stack, valid_pairs).wrap_err(eyre!("error monomorphizing stack"))?;
     assert!(!filtered_pairs.is_empty());
-
     let (client_choices, mut server_choices): (Vec<_>, Vec<_>) = filtered_pairs.into_iter().unzip();
     let server_choice = server_choices.pop().unwrap();
 
