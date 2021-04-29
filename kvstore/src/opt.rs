@@ -132,7 +132,7 @@ where
             >,
         >,
         // why 18?: see msg.rs, bincode will put the key starting at byte 18.
-        ShardCanonicalServerRaw<A, S, Ss, D, 18>,
+        CxList<KvReliabilityServerChunnel, CxList<ShardCanonicalServerRaw<A, S, Ss, D, 18>, CxNil>>,
     >;
 
     fn serde_opt(self) -> Self::Opt {
@@ -152,7 +152,15 @@ where
                                         },
                                 },
                         },
-                    right: _right,
+                    right:
+                        CxList {
+                            head: _ser,
+                            tail:
+                                CxList {
+                                    head: kv_server_rel,
+                                    tail: _,
+                                },
+                        },
                     prefer,
                     ..
                 },
@@ -175,7 +183,15 @@ where
                 },
             },
         };
-        let mut sel = Select::from((left, cnsrv.into()));
+        let right = CxList {
+            head: kv_server_rel,
+            tail: CxList {
+                head: cnsrv.into(),
+                tail: CxNil,
+            },
+        };
+
+        let mut sel = Select::from((left, right));
         sel.prefer = prefer;
         sel
     }
