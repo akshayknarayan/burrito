@@ -231,7 +231,7 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     with_ebpf = "ebpf" if ebpf else "noebpf"
-    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug,burrito_shard_ctl=trace ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --trace-time={outf}.trace",
+    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug,bertha=trace,burrito_shard_ctl=trace ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --trace-time={outf}.trace",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -259,7 +259,7 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile)
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout}")
-    ok = conn.run(f"RUST_LOG=info,bertha=debug,ycsb=debug,burrito_shard_ctl=debug ./target/release/ycsb \
+    ok = conn.run(f"RUST_LOG=info,bertha=trace,ycsb=trace ./target/release/ycsb \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
             -i {interarrival} \
@@ -267,7 +267,7 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile)
             --out-file={outf}0.data1 \
             -s host.config \
             {shard_arg} \
-            --logging --skip-loads",
+            --tracing --skip-loads",
         wd="~/burrito",
         stdout=f"{outf}0.out",
         stderr=f"{outf}0.err",
@@ -302,17 +302,17 @@ def run_loads(conn, server, redis_addr, outf, wrkfile):
         agenda.subtask(f"loads client starting")
         ok = None
         try:
-            ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/ycsb \
+            ok = conn.run(f"RUST_LOG=info,ycsb=trace ./target/release/ycsb \
                     --addr {server}:4242 \
                     --redis-addr={redis_addr} \
                     -i 1000 \
                     --accesses {wrkfile} \
                     -s host.config \
-                    --logging --loads-only",
+                    --logging --tracing --loads-only",
                 wd="~/burrito",
                 stdout=f"{outf}-loads.out",
                 stderr=f"{outf}-loads.err",
-                timeout=200,
+                timeout=15,
                 )
         except:
             agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
@@ -366,6 +366,12 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
     # prime the server with loads
     agenda.task("doing loads")
     run_loads(machines[1], server_addr, redis_addr, outf, wrkload)
+    try:
+        machines[1].get(f"{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
+        machines[1].get(f"{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
+    except:
+        agenda.subfailure("Could not get file from loads client")
+
     # others are clients
     agenda.task("starting clients")
     clients = [threading.Thread(target=run_client, args=(
@@ -414,29 +420,25 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
             local=f"{outf}{num}-{c.addr}.out",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.trace")
-        fn(
-            f"burrito/{outf}{num}.trace",
-            local=f"{outf}{num}-{c.addr}.trace",
-            preserve_mode=False,
-        )
         agenda.subtask(f"getting {outf}{num}-{c.addr}.data1")
         fn(
             f"burrito/{outf}{num}.data1",
             local=f"{outf}{num}-{c.addr}.data1",
             preserve_mode=False,
         )
+        agenda.subtask(f"getting {outf}{num}-{c.addr}.trace")
+        fn(
+            f"burrito/{outf}{num}.trace",
+            local=f"{outf}{num}-{c.addr}.trace",
+            preserve_mode=False,
+        )
 
     agenda.task("get client files")
-    ok = True
     for c in machines[1:]:
         try:
             get_files(0)
         except Exception as e:
             agenda.subfailure(f"At least one file missing for {c}: {e}")
-            ok = False
-    if not ok:
-        return ok
 
     def awk_files(num):
         subprocess.run(f"awk '{{if (!hdr) {{hdr=$1; print \"ShardType NumShards Wrkload Ops \"$0;}} else {{print \"{shardtype} {num_shards} {wrkload} {ops_per_sec} \"$0}} }}' {outf}{num}-{c.addr}.data1 > {outf}{num}-{c.addr}.data", shell=True, check=True)

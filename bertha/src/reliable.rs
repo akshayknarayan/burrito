@@ -445,7 +445,7 @@ where
                     );
                 }
             }
-            .instrument(tracing::debug_span!("send_retx_loop")),
+            .instrument(tracing::trace_span!("send_retx_loop")),
         ),
         Box::pin(
             async move {
@@ -463,7 +463,7 @@ where
                     st.pending_payload.push_back((addr, pkt));
                 }
             }
-            .instrument(tracing::debug_span!("send_select_recv")),
+            .instrument(tracing::trace_span!("send_select_recv")),
         ),
     )
     .await
@@ -490,7 +490,7 @@ where
         let flow_id = pkt.flow_id;
         trace!("called inner recv");
         if !pkt.acks.is_empty() && !state.contains_key(&flow_id) {
-            trace!(pkt = ?&pkt, from = ?&addr, event = "bad ack, unknown addr", "got pkt");
+            trace!(pkt = ?&pkt, from = ?&addr, "got pkt, bad ack, unknown addr");
             continue;
         }
 
@@ -507,7 +507,7 @@ where
         for seq in acks {
             if let Some((_, Some(s), send_time)) = st.inflight.remove(&seq) {
                 let elapsed = send_time.elapsed();
-                trace!(seq = ?&seq, from = ?&addr, rtt = ?elapsed, event = "good ack", "got pkt");
+                trace!(seq = ?&seq, from = ?&addr, rtt = ?elapsed, "got good ack");
                 st.raw_rtts.saturating_record(elapsed.as_micros() as _);
                 match st.last_print {
                     None => {
@@ -527,7 +527,7 @@ where
                 //);
                 s.send(Ok(())).unwrap();
             } else {
-                trace!(seq = ?&seq, from = ?&addr, event = "bad ack, unknown ack", "got pkt");
+                trace!(seq = ?&seq, from = ?&addr, "got bad unknown ack");
                 st.extra_acks += 1;
             }
         }
@@ -535,10 +535,11 @@ where
         if let Some((seq, _)) = pkt.payload {
             // queue an ack
             st.pending_acks.acks.push(seq);
-            trace!(pkt = ?&pkt, from = ?&addr, event = "payload, queued ack", "got pkt");
+            trace!(pkt = ?&pkt, from = ?&addr, "got payload, queued ack");
             if st.pending_acks.acks.len() > 1 {
                 let mut send_p = Default::default();
                 std::mem::swap(&mut send_p, &mut st.pending_acks);
+                trace!(cnt = send_p.acks.len(), from = ?&addr, "sending pending acks");
                 inner.send((addr.clone(), send_p)).await?;
             }
 
@@ -564,7 +565,7 @@ async fn nagler<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
                 let addr = st.addr.clone().unwrap();
                 let mut send_p = Pkt::with_flow_id(*flow_id);
                 std::mem::swap(&mut send_p, &mut st.pending_acks);
-                trace!(?addr, ?send_p, "sent delayed acks");
+                trace!(?addr, cnt = ?send_p.acks.len(), "sending delayed acks");
                 if let Err(e) = inner.send((addr.clone(), send_p)).await {
                     debug!(err = ?e, ?addr, "failed sending delayed acks");
                 }
@@ -602,7 +603,7 @@ mod test {
                     debug!(m = ?m, "rcvd");
                 }
             }
-            .instrument(tracing::debug_span!("receiver")),
+            .instrument(tracing::info_span!("receiver")),
         );
 
         futures_util::future::join_all(msgs.into_iter().map(|m| {
@@ -759,7 +760,7 @@ mod test {
                     debug!(m = ?m, "rcvd");
                 }
             }
-            .instrument(tracing::debug_span!("receiver")),
+            .instrument(tracing::info_span!("receiver")),
         );
 
         futures_util::future::join_all(msgs.into_iter().map(|m| {
