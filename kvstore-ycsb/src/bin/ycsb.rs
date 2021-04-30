@@ -102,6 +102,19 @@ fn main() -> Result<(), Report> {
         d.clone().init();
         color_eyre::install()?;
         Some((timing_downcaster, d))
+    } else if opt.tracing {
+        let timing_layer = tracing_timing::Builder::default()
+            .no_span_recursion()
+            .layer(|| tracing_timing::Histogram::new_with_max(100_000_000, 3).unwrap());
+        let timing_downcaster = timing_layer.downcaster();
+        let subscriber = tracing_subscriber::registry()
+            .with(timing_layer)
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let d = tracing::Dispatch::new(subscriber);
+        d.clone().init();
+        color_eyre::install()?;
+        Some((timing_downcaster, d))
     } else if opt.logging {
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
@@ -128,7 +141,7 @@ fn main() -> Result<(), Report> {
         .worker_threads(4)
         .enable_all()
         .build()?;
-
+    let of = opt.out_file.clone();
     rt.block_on(async move {
         let ctr = get_raw_connector(opt.shenango_config)?;
         if !opt.skip_loads {
@@ -208,15 +221,6 @@ fn main() -> Result<(), Report> {
             )
         };
 
-        if let Some((td, d)) = tracing {
-            if let Some(of) = opt.out_file.clone() {
-                let timing = td.downcast(&d).expect("downcast timing layer");
-                let fname = of.with_extension("trace");
-                let mut f = std::fs::File::create(&fname).unwrap();
-                dump_tracing(&timing, &mut f)?;
-            }
-        }
-
         // done
         write_results(
             durs,
@@ -227,8 +231,19 @@ fn main() -> Result<(), Report> {
             opt.out_file,
         );
 
-        Ok(())
-    })
+        Ok::<_, Report>(())
+    })?;
+
+    if let Some((td, d)) = tracing {
+        if let Some(of) = of {
+            let timing = td.downcast(&d).expect("downcast timing layer");
+            let fname = of.with_extension("trace");
+            let mut f = std::fs::File::create(&fname).unwrap();
+            dump_tracing(&timing, &mut f)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn dump_tracing(
