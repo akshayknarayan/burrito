@@ -573,7 +573,6 @@ where
         let inner = Arc::clone(&self.inner);
         let shard_fn = Arc::clone(&self.shard_fn);
         let shard_conns = self.shards.clone();
-        let mut resps = futures_util::stream::FuturesUnordered::new();
         Box::pin(
             async move {
                 // received a packet on the canonical_addr.
@@ -583,44 +582,30 @@ where
                 //    preserving the src addr so the response goes back to the client
 
                 // 0. receive the packet.
-                let mut recv_fut = None;
-                loop {
-                    if recv_fut.is_none() {
-                        recv_fut = Some(inner.recv());
-                    }
+                let data = inner.recv().await?;
+                trace!("got request");
 
-                    use futures_util::{future::Either, stream::TryStreamExt};
-                    let send_fut = resps.try_next();
-                    match futures_util::future::select(recv_fut.take().unwrap(), send_fut).await {
-                        Either::Left((recv_fut_result, _)) => {
-                            let data = recv_fut_result?;
-                            trace!("got request");
-                            // 1. evaluate the hash fn to determine where to forward to.
-                            let shard_idx = (shard_fn)(&data);
-                            let conn = shard_conns[shard_idx].clone();
-                            trace!(shard_idx, "checked shard");
+                // 1. evaluate the hash fn to determine where to forward to.
+                let shard_idx = (shard_fn)(&data);
+                let conn = shard_conns[shard_idx].clone();
+                trace!(shard_idx, "checked shard");
 
-                            // 2. Forward to the shard.
-                            // TODO this assumes no reordering.
-                            conn.send(data).await.wrap_err("Forward to shard")?;
-                            trace!(shard_idx, "wait for shard response");
+                // 2. Forward to the shard.
+                // TODO this assumes no reordering.
+                conn.send(data).await.wrap_err("Forward to shard")?;
+                trace!(shard_idx, "wait for shard response");
 
-                            // 3. Get response from the shard, and send back to client.
-                            let resp = conn
-                                .recv()
-                                .instrument(trace_span!("canonical-server-internal-recv"))
-                                .await
-                                .wrap_err("Receive from shard")?;
-                            trace!(shard_idx, "got shard response");
-                            resps.push(inner.send(resp));
-                        }
-                        Either::Right((send_fut_result, rf)) => {
-                            send_fut_result?;
-                            recv_fut = Some(rf); // put the recv future back
-                            continue;
-                        }
-                    }
-                }
+                // 3. Get response from the shard, and send back to client.
+                let resp = conn
+                    .recv()
+                    .instrument(trace_span!("canonical-server-internal-recv"))
+                    .await
+                    .wrap_err("Receive from shard")?;
+                trace!(shard_idx, "got shard response");
+                let resp_fut = inner.send(resp);
+                tokio::spawn(resp_fut);
+                trace!(shard_idx, "send response");
+                Ok(())
             }
             .instrument(trace_span!("server-shard-recv")),
         )
