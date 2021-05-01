@@ -7,7 +7,7 @@ use crate::{
     util::{ProjectLeft, Unproject},
     Chunnel, ChunnelConnection, Negotiate,
 };
-use color_eyre::eyre;
+use color_eyre::eyre::{self, ensure};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -175,7 +175,6 @@ impl<A: Eq + Hash, C, D> Clone for ReliabilityProj<A, D, C> {
 /// Message format for reliability chunnel
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pkt<D> {
-    pub flow_id: u64,
     pub acks: Vec<u32>,
     pub payload: Option<(u32, D)>,
 }
@@ -183,7 +182,6 @@ pub struct Pkt<D> {
 impl<D> Default for Pkt<D> {
     fn default() -> Self {
         Pkt {
-            flow_id: 0,
             acks: Default::default(),
             payload: None,
         }
@@ -191,13 +189,6 @@ impl<D> Default for Pkt<D> {
 }
 
 impl<D> Pkt<D> {
-    pub fn with_flow_id(flow_id: u64) -> Self {
-        Self {
-            flow_id,
-            ..Default::default()
-        }
-    }
-
     pub fn payload(seq: u32, payload: D) -> Self {
         Pkt {
             payload: Some((seq, payload)),
@@ -228,7 +219,6 @@ impl<D> Pkt<D> {
 impl<D> std::fmt::Debug for Pkt<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut p = f.debug_struct("Pkt");
-        p.field("flow", &self.flow_id);
         if let Some((s, _)) = self.payload {
             p.field("seq", &s);
         }
@@ -253,7 +243,6 @@ struct ReliabilityState<A, D> {
     pending_payload: VecDeque<(A, Pkt<D>)>, // payloads we have received that are waiting for a recv() call
     pending_acks: Pkt<D>,
     rtt_est: Duration,
-    last_print: Option<Instant>,
     raw_rtts: hdrhistogram::Histogram<u64>,
     extra_acks: usize,
     retx_ctrs: hdrhistogram::Histogram<u64>,
@@ -291,7 +280,6 @@ impl<A, D> Default for ReliabilityState<A, D> {
             pending_payload: VecDeque::new(),
             pending_acks: Default::default(),
             rtt_est: Duration::from_micros(1_000_000),
-            last_print: None,
             raw_rtts: hdrhistogram::Histogram::new_with_max(10_000_000, 2).unwrap(),
             extra_acks: 0,
             retx_ctrs: hdrhistogram::Histogram::new_with_max(100, 2).unwrap(),
@@ -313,12 +301,6 @@ fn calculate_hash<T: Hash>(t: &T) -> u64 {
     s.finish()
 }
 
-// make sure we set pending_acks.flow_id, because it'll get mem::replaced out and sent if transmit gets
-// called.
-fn init_entry_in_state<A, D>(state: &Arc<DashMap<u64, ReliabilityState<A, D>>>, flow_id: u64) {
-    state.entry(flow_id).or_default().pending_acks.flow_id = flow_id;
-}
-
 impl<A, C, D> ChunnelConnection for ReliabilityProj<A, D, C>
 where
     A: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'static,
@@ -333,7 +315,6 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
         let (addr, data) = data;
         let flow_id = calculate_hash(&addr);
-        init_entry_in_state(&self.state, flow_id);
         let seq = data.0;
         let a = addr.clone();
 
@@ -344,14 +325,13 @@ where
             async move {
                 let (s, r) = oneshot::channel();
                 let (mut pkt, to) = {
-                    // unwrap ok because of .or_default() above
-                    let mut st = state.get_mut(&flow_id).unwrap();
+                    let mut st = state.entry(flow_id).or_default();
                     st.addr = Some(addr.clone());
                     st.inflight
                         .insert(seq, (data.1.clone(), Some(s), Instant::now()));
-                    let new_p: Pkt<D> = Pkt::with_flow_id(flow_id);
+                    let new_p: Pkt<D> = Default::default();
                     let p = std::mem::replace(&mut st.pending_acks, new_p);
-                    trace!(inflight = st.inflight.len(), "sending");
+                    trace!(to = ?&addr, inflight = st.inflight.len(), acks = p.acks.len(), "sending");
                     (p, st.rtt_est * (timeout as _))
                 };
 
@@ -412,6 +392,7 @@ where
 {
     let inner1 = Arc::clone(&inner);
     let state1 = Arc::clone(&state);
+    let flow_id = calculate_hash(&segment.0);
     futures_util::future::select(
         Box::pin(
             async move {
@@ -424,7 +405,7 @@ where
                             done??;
                             let (_, pkt) = segment;
                             trace!(?pkt, ?retx_ctr, "transmit done");
-                            let mut st = state.get_mut(&pkt.flow_id).expect("conn not found");
+                            let mut st = state.get_mut(&flow_id).expect("conn not found");
                             st.retx_ctrs.saturating_record(retx_ctr);
                             return Ok::<_, eyre::Report>(());
                         }
@@ -437,7 +418,7 @@ where
                             trace!(?addr, ?pkt, ?retx_ctr, ?to, "retransmitted");
 
                             // send_time is the time since the last transmission
-                            let mut st = state.get_mut(&pkt.flow_id).expect("conn not found");
+                            let mut st = state.get_mut(&flow_id).expect("conn not found");
                             let seq = pkt.payload.as_ref().unwrap().0;
                             let (_, _, ref mut send_time) = st.inflight.get_mut(&seq).expect("pkt state not found");
                             *send_time = Instant::now();
@@ -453,9 +434,8 @@ where
                 let mut state = state1;
                 loop {
                     let (addr, pkt) = do_recv(&mut inner, &mut state).await?;
-                    init_entry_in_state(&state, pkt.flow_id);
-                    // init_entry_in_state guarantees the entry is present
-                    let mut st = state.get_mut(&pkt.flow_id).unwrap();
+                    let flow_id = calculate_hash(&addr);
+                    let mut st = state.entry(flow_id).or_default();
                     if st.addr.is_none() {
                         st.addr = Some(addr.clone());
                     }
@@ -487,20 +467,21 @@ where
 {
     loop {
         let (addr, mut pkt) = inner.recv().await?;
-        let flow_id = pkt.flow_id;
         trace!("called inner recv");
-        if !pkt.acks.is_empty() && !state.contains_key(&flow_id) {
-            trace!(pkt = ?&pkt, from = ?&addr, "got pkt, bad ack, unknown addr");
-            continue;
-        }
+        let flow_id = calculate_hash(&addr);
 
-        // there are no acks so we don't expect there to be state, but we need to init state to
-        // handle delayed acks.
-        init_entry_in_state(state, flow_id);
-        // init_entry_in_state guarantees the entry is present
-        let mut st = state.get_mut(&pkt.flow_id).unwrap();
-        if st.addr.is_none() {
-            st.addr = Some(addr.clone());
+        // if there are acks and we don't have an entry, something is wrong.
+        // so we are ok if either there are no acks, or there is an entry.
+        // because otherwise, what are the acks acking?
+        ensure!(
+            pkt.acks.is_empty() || state.contains_key(&flow_id),
+            "Got acks for unknown flow"
+        );
+
+        let mut st = state.entry(flow_id).or_default();
+        match &st.addr {
+            None => st.addr = Some(addr.clone()),
+            Some(s) => ensure!(*s == addr, "Addr <=> flow_id mapping wrong"),
         }
 
         let acks = pkt.take_acks();
@@ -509,25 +490,13 @@ where
                 let elapsed = send_time.elapsed();
                 trace!(seq = ?&seq, from = ?&addr, rtt = ?elapsed, "got good ack");
                 st.raw_rtts.saturating_record(elapsed.as_micros() as _);
-                match st.last_print {
-                    None => {
-                        st.last_print = Some(Instant::now());
-                    }
-                    Some(t) if t.elapsed() > Duration::from_secs(10) => {
-                        st.dump();
-                        st.raw_rtts.clear();
-                        st.last_print = Some(Instant::now());
-                    }
-                    _ => (),
-                }
-
                 //let rtt = send_time.elapsed();
                 //st.rtt_est = Duration::from_secs_f64(
                 //    st.rtt_est.as_secs_f64() * 0.9 + rtt.as_secs_f64() * 0.1,
                 //);
                 s.send(Ok(())).unwrap();
             } else {
-                trace!(seq = ?&seq, from = ?&addr, "got bad unknown ack");
+                trace!(?seq, from = ?&addr, extra_acks = ?&st.extra_acks, "got bad unknown ack");
                 st.extra_acks += 1;
             }
         }
@@ -535,7 +504,7 @@ where
         if let Some((seq, _)) = pkt.payload {
             // queue an ack
             st.pending_acks.acks.push(seq);
-            trace!(pkt = ?&pkt, from = ?&addr, "got payload, queued ack");
+            trace!(pkt = ?&pkt, from = ?&addr, pending_acks = ?st.pending_acks.acks.len(), "got payload, queued ack");
             if st.pending_acks.acks.len() > 1 {
                 let mut send_p = Default::default();
                 std::mem::swap(&mut send_p, &mut st.pending_acks);
@@ -560,10 +529,10 @@ async fn nagler<A: Eq + Hash + Clone + std::fmt::Debug, D, C>(
     loop {
         tokio::time::sleep(Duration::from_millis(10)).await;
         for mut entry in state.iter_mut() {
-            let (flow_id, st) = entry.pair_mut();
+            let (_, st) = entry.pair_mut();
             if !st.pending_acks.acks.is_empty() {
                 let addr = st.addr.clone().unwrap();
-                let mut send_p = Pkt::with_flow_id(*flow_id);
+                let mut send_p = Default::default();
                 std::mem::swap(&mut send_p, &mut st.pending_acks);
                 trace!(?addr, cnt = ?send_p.acks.len(), "sending delayed acks");
                 if let Err(e) = inner.send((addr.clone(), send_p)).await {

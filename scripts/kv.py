@@ -231,7 +231,7 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     with_ebpf = "ebpf" if ebpf else "noebpf"
-    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug,bertha=trace,burrito_shard_ctl=trace ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --trace-time={outf}.trace",
+    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=trace,bertha=trace,burrito_shard_ctl=trace ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --log --trace-time={outf}.trace",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -267,7 +267,7 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile)
             --out-file={outf}0.data1 \
             -s host.config \
             {shard_arg} \
-            --tracing --skip-loads",
+            --logging --tracing --skip-loads",
         wd="~/burrito",
         stdout=f"{outf}0.out",
         stderr=f"{outf}0.err",
@@ -325,7 +325,7 @@ def run_loads(conn, server, redis_addr, outf, wrkfile):
             agenda.subtask(f"loads client done: {time.time() - loads_start} s")
             break
 
-def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrkload):
+def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrkload, overwrite):
     wrkname = wrkload.split("/")[-1].split(".")[0]
     server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkname}-{iter_num}-kvserver"
     outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkname}-{iter_num}-client"
@@ -337,7 +337,7 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
         m.run(f"rm -rf {outdir}", wd="~/burrito")
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
-    if os.path.exists(f"{outf}0-{machines[1].addr}.data"):
+    if not overwrite and os.path.exists(f"{outf}0-{machines[1].addr}.data"):
         agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
         return True
     else:
@@ -464,6 +464,7 @@ if __name__ == '__main__':
     parser.add_argument('--shards', type=int, action='append', required=True)
     parser.add_argument('--shardtype', type=str, action='append', required=True)
     parser.add_argument('--wrk', type=str, action='append', required=True)
+    parser.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
 
     outdir = args.outdir
@@ -520,11 +521,7 @@ if __name__ == '__main__':
         for s in args.shards:
             for t in args.shardtype:
                 for o in ops_per_sec:
-                    if int(s) < 4 and int(o) > 100000:
-                        agenda.task(f"skipping: num_shards = {s}, shardtype = {t}, load = {o} ops/s")
-                        continue
-
-                    do_exp(outdir, machines, s, t, o, 0, w)
+                    do_exp(outdir, machines, s, t, o, 0, w, args.overwrite)
 
     agenda.task("done")
 
