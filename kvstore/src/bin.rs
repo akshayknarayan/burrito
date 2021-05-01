@@ -51,6 +51,19 @@ pub async fn tracing_init(
     };
 
     if let Some((trace_file, timing_downcaster, d)) = timing_downcaster {
+        let tf = trace_file.clone();
+        let down = d.clone();
+        ctrlc::set_handler(move || {
+            let timing = timing_downcaster
+                .downcast(&down)
+                .expect("downcast timing layer");
+            let mut f = std::fs::File::create(&tf).unwrap();
+            info!("writing tracing info");
+            dump_tracing(timing, &mut f).unwrap();
+            std::process::exit(0)
+        })
+        .unwrap();
+
         tokio::spawn(async move {
             let timing = timing_downcaster
                 .downcast(&d)
