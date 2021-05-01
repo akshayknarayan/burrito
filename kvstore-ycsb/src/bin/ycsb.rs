@@ -165,7 +165,7 @@ fn main() -> Result<(), Report> {
         let (num_clients, (durs, remaining_inflight, time)) = if !opt.use_clientsharding {
             if !opt.use_basicclient {
                 let mut access_by_client = HashMap::default();
-                info!(mode = "basicclient", "make clients");
+                info!(mode = "nonshardclient", "make clients");
                 for (cid, ops) in group_by_client(accesses).into_iter() {
                     let client = KvClient::new_nonshardclient(
                         ctr.clone().connect(()).await.map_err(Into::into)?,
