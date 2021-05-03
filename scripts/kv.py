@@ -231,7 +231,7 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     with_ebpf = "ebpf" if ebpf else "noebpf"
-    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=trace,bertha=trace,burrito_shard_ctl=trace ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --log --trace-time={outf}.trace",
+    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --log --trace-time={outf}.trace",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -259,7 +259,7 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile)
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout}")
-    ok = conn.run(f"RUST_LOG=info,bertha=trace,ycsb=trace ./target/release/ycsb \
+    ok = conn.run(f"RUST_LOG=info,ycsb=debug ./target/release/ycsb \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
             -i {interarrival} \
@@ -302,7 +302,7 @@ def run_loads(conn, server, redis_addr, outf, wrkfile):
         agenda.subtask(f"loads client starting")
         ok = None
         try:
-            ok = conn.run(f"RUST_LOG=info,ycsb=trace ./target/release/ycsb \
+            ok = conn.run(f"RUST_LOG=info,ycsb=debug ./target/release/ycsb \
                     --addr {server}:4242 \
                     --redis-addr={redis_addr} \
                     -i 1000 \
