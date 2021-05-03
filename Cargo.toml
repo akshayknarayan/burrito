@@ -18,6 +18,7 @@ members = [
     "round-order",
     "redis-basechunnel",
     "tls-tunnel",
+    "negotiation-bench",
 ]
 
 [profile.release]

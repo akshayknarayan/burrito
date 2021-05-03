@@ -1,0 +1,17 @@
+[package]
+name = "negotiation-bench"
+version = "0.1.0"
+authors = ["Akshay Narayan <akshayn@mit.edu>"]
+edition = "2018"
+
+[dependencies]
+bertha = { path = "../bertha" }
+color-eyre = "0.5"
+futures-util = "0.3"
+structopt = "0.3"
+tokio = { version = "1", features = ["time", "rt", "rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-error = "0.1"
+tracing-futures = "0.2"
+tracing-subscriber = "0.2"
+tracing-timing  = { version = "0.4", features = ["layer"] }
