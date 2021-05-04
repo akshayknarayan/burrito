@@ -12,7 +12,7 @@ futures-util = "0.3"
 tracing = { version = "0.1" }
 tracing-futures = "0.2"
 rand = "0.7"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 bincode = "1"
 pin-project = "1"
 paste = "1"

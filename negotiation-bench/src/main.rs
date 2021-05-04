@@ -1,3 +1,168 @@
-fn main() {
-    println!("Hello, world!");
+use bertha::{
+    bincode::SerializeChunnelProject,
+    negotiate_client, negotiate_rendezvous, negotiate_server,
+    udp::{UdpReqChunnel, UdpSkChunnel},
+    util::ProjectLeft,
+    Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, Negotiate,
+};
+use color_eyre::eyre::{bail, eyre, Report, WrapErr};
+use redis_basechunnel::RedisBase;
+use std::net::SocketAddr;
+use std::time::Duration;
+use structopt::StructOpt;
+use tracing::info;
+use tracing_error::ErrorLayer;
+use tracing_subscriber::prelude::*;
+
+#[derive(Clone, Debug, StructOpt)]
+#[structopt(name = "negotiation-bench")]
+struct Opt {
+    #[structopt(short, long)]
+    client: bool,
+    #[structopt(short, long)]
+    addr: SocketAddr,
+    #[structopt(short, long)]
+    num_reqs: usize,
+    #[structopt(short, long)]
+    redis: Option<String>,
+    #[structopt(short, long)]
+    out_file: std::path::PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Report> {
+    color_eyre::install().unwrap();
+    let subscriber = tracing_subscriber::registry();
+    let subscriber = subscriber
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(ErrorLayer::default());
+    let d = tracing::Dispatch::new(subscriber);
+    d.init();
+    let opt = Opt::from_args();
+    info!(?opt.addr, opt.num_reqs, client_mode = ?opt.client, rendezvous_mode = ?opt.redis.is_some(), "starting");
+    if let Some(redis) = opt.redis {
+        let redis_base = RedisBase::new(&redis).await?;
+        if opt.client {
+            //let durs = client_rendezvous(opt.addr, redis_base, opt.num_reqs).await;
+            //dump(durs, "Consensus", opt.out_file);
+        } else {
+            server_rendezvous(opt.addr, redis_base).await;
+        }
+    } else {
+        if opt.client {
+            let durs = client_direct(opt.addr, opt.num_reqs)
+                .await
+                .wrap_err("running client")?;
+            dump(durs, "Simplified", opt.out_file).wrap_err("writing outfile")?;
+        } else {
+            server_direct(opt.addr).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn dump(durs: Vec<Duration>, mode: &str, out_file: std::path::PathBuf) -> Result<(), Report> {
+    use std::io::prelude::*;
+    let mut f = std::fs::File::create(&out_file)?;
+    writeln!(&mut f, "Mode NumReqs Latency_us")?;
+    let num_reqs = durs.len();
+    for d in durs {
+        writeln!(&mut f, "{} {} {}", mode, num_reqs, d.as_micros())?;
+    }
+
+    Ok(())
+}
+
+fn stack() -> TimeMsgChunnel {
+    Default::default()
+}
+
+async fn server_rendezvous(addr: SocketAddr, redis: RedisBase) {}
+
+async fn client_rendezvous(addr: SocketAddr, redis: RedisBase, num_reqs: usize) {}
+
+async fn server_direct(addr: SocketAddr) -> Result<(), Report> {
+    let mut st = negotiate_server(stack(), UdpReqChunnel::default().listen(addr).await?).await?;
+    use futures_util::stream::TryStreamExt;
+    while let Some(cn) = st.try_next().await? {
+        tokio::spawn(async move {
+            loop {
+                let d = cn.recv().await.unwrap();
+                cn.send(d).await.unwrap();
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn client_direct(addr: SocketAddr, num_reqs: usize) -> Result<Vec<Duration>, Report> {
+    let start = std::time::Instant::now();
+    let mut durs = Vec::with_capacity(num_reqs);
+    for _ in 0..num_reqs {
+        let t = TimeMsg::new(start);
+        let cn = ProjectLeft::new(
+            addr,
+            negotiate_client(stack(), UdpSkChunnel.connect(()).await?, addr).await?,
+        );
+        cn.send(t).await?;
+        let m = cn.recv().await?;
+        durs.push(m.elapsed(start));
+    }
+
+    Ok(durs)
+}
+
+#[derive(Clone, Debug, Copy, serde::Serialize, serde::Deserialize)]
+struct TimeMsg(std::time::Duration);
+
+impl TimeMsg {
+    fn new(start: std::time::Instant) -> Self {
+        Self(start.elapsed())
+    }
+
+    fn elapsed(&self, start: std::time::Instant) -> Duration {
+        start.elapsed() - self.0
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct TimeMsgChunnel(SerializeChunnelProject<TimeMsg>);
+
+impl<InC> Chunnel<InC> for TimeMsgChunnel
+where
+    SerializeChunnelProject<TimeMsg>: Chunnel<InC>,
+{
+    type Future = <SerializeChunnelProject<TimeMsg> as Chunnel<InC>>::Future;
+    type Connection = <SerializeChunnelProject<TimeMsg> as Chunnel<InC>>::Connection;
+    type Error = <SerializeChunnelProject<TimeMsg> as Chunnel<InC>>::Error;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        self.0.connect_wrap(cn)
+    }
+}
+
+impl Negotiate for TimeMsgChunnel {
+    type Capability = TimeMsgCap;
+    fn guid() -> u64 {
+        0xdf3b07a7e6a847b5
+    }
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![TimeMsgCap]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+struct TimeMsgCap;
+
+impl bertha::negotiate::CapabilitySet for TimeMsgCap {
+    fn guid() -> u64 {
+        0xdb41bc16f620d494
+    }
+
+    fn universe() -> Option<Vec<Self>> {
+        None
+    }
 }
