@@ -1823,10 +1823,12 @@ where
             rp.negotiate(addr.clone(), offer, false)
                 .await
                 .map_err(Into::into)
+                .wrap_err("Could not query rendezvous_point")
         }? {
             Matched => {
                 // use superceded-case logic below.
                 res = Superceded(picked);
+                debug!("Matched");
             }
             NeedUpgrade => {
                 return Err(eyre!(

@@ -130,7 +130,7 @@ impl ChunnelListener for UdpReqChunnel {
         Box::pin(async move {
             let sk = tokio::net::UdpSocket::bind(a)
                 .await
-                .wrap_err("socket bind failed")?;
+                .wrap_err(eyre!("socket bind failed on {:?}", a))?;
             let sk = crate::util::AddrSteer::new(UdpSk::new(sk));
             Ok(sk.steer(UdpConn::new))
         })
