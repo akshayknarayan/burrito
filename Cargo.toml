@@ -19,6 +19,7 @@ members = [
     "redis-basechunnel",
     "tls-tunnel",
     "negotiation-bench",
+    "cx-list-opt",
 ]
 
 [profile.release]
