@@ -20,6 +20,7 @@ members = [
     "tls-tunnel",
     "negotiation-bench",
     "cx-list-opt",
+    "cx-list-opt-test",
 ]
 
 [profile.release]

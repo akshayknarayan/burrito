@@ -1,0 +1,16 @@
+[package]
+name = "cx-list-opt"
+version = "0.1.0"
+authors = ["Akshay Narayan <akshayn@mit.edu>"]
+edition = "2018"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+nom = "6"
+syn = { version = "1", features = ["full", "extra-traits", "parsing", "printing"] }
+quote = "1"
+serde = "1"
+bincode = "1"
