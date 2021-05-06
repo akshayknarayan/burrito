@@ -50,7 +50,7 @@ impl Transform {
         let ret_type_name = &ret_type.ident;
 
         let mut tokens = quote::quote! {};
-        for i in 0..3 {
+        for i in 0..2 {
             let (impltypes, from_type) = self.left.get_type(i);
             let (_impltypes2, to_type) = self.right.get_type(i);
 
@@ -84,9 +84,18 @@ enum Stack {
 impl Stack {
     fn get_restructure(&self, max_level: u8) -> proc_macro2::TokenStream {
         match self {
-            Stack::Leaf(Expr::Ident(_)) => {
-                quote::quote! { v0.into() }
-            }
+            Stack::Leaf(Expr::Ident(_, varsp)) => match varsp {
+                Var::CreateDefault => {
+                    quote::quote! { Default::default() }
+                }
+                Var::FromName(n) => {
+                    quote::quote! { #n.into() }
+                }
+                Var::StoreDefaultName => {
+                    quote::quote! { v0.into }
+                }
+                _ => unreachable!(),
+            },
             Stack::Leaf(Expr::Wildcard) => {
                 let mut exp = None;
                 for i in 0..max_level {
@@ -106,13 +115,26 @@ impl Stack {
                 let mut val = 0;
                 for elem in elems {
                     match elem {
-                        Expr::Ident(_) => {
-                            let varname: syn::Ident = syn::parse_str(&format!("v{}", val)).unwrap();
-                            val += 1;
+                        Expr::Ident(_, varsp) => {
+                            let varname = match varsp {
+                                Var::StoreDefaultName => {
+                                    let varname: syn::Ident =
+                                        syn::parse_str(&format!("v{}", val)).unwrap();
+                                    val += 1;
+                                    quote::quote! { #varname.into() }
+                                }
+                                Var::CreateDefault => {
+                                    quote::quote! { Default::default() }
+                                }
+                                Var::FromName(n) => {
+                                    quote::quote! { #n.into() }
+                                }
+                                _ => unreachable!(),
+                            };
                             exp = Some(if let Some(e) = exp {
-                                quote::quote! { bertha::CxList { head: #varname.into(), tail: #e  } }
+                                quote::quote! { bertha::CxList { head: #varname, tail: #e  } }
                             } else {
-                                quote::quote! { bertha::CxList { head: #varname.into(), tail: bertha::CxNil  } }
+                                quote::quote! { bertha::CxList { head: #varname, tail: bertha::CxNil  } }
                             });
                         }
                         Expr::Wildcard => {
@@ -137,9 +159,15 @@ impl Stack {
 
     fn get_destructure(&self, max_level: u8) -> proc_macro2::TokenStream {
         match self {
-            Stack::Leaf(Expr::Ident(_)) => {
-                quote::quote! { let v0 = self; }
-            }
+            Stack::Leaf(Expr::Ident(_, varsp)) => match varsp {
+                Var::StoreDefaultName => {
+                    quote::quote! { let v0 = self; }
+                }
+                Var::StoreName(n) => {
+                    quote::quote! { let #n = self; }
+                }
+                _ => unreachable!(),
+            },
             Stack::Leaf(Expr::Wildcard) => {
                 let mut exp = None;
                 for i in 0..max_level {
@@ -159,9 +187,19 @@ impl Stack {
                 let mut val = 0;
                 for elem in elems {
                     match elem {
-                        Expr::Ident(_) => {
-                            let varname: syn::Ident = syn::parse_str(&format!("v{}", val)).unwrap();
-                            val += 1;
+                        Expr::Ident(_, varsp) => {
+                            let varname = match varsp {
+                                Var::StoreDefaultName => {
+                                    let varname: syn::Ident =
+                                        syn::parse_str(&format!("v{}", val)).unwrap();
+                                    val += 1;
+                                    quote::quote! { #varname }
+                                }
+                                Var::StoreName(n) => {
+                                    quote::quote! { #n }
+                                }
+                                _ => unreachable!(),
+                            };
                             exp = Some(if let Some(e) = exp {
                                 quote::quote! { bertha::CxList { head: #varname, tail: #e  } }
                             } else {
@@ -190,7 +228,7 @@ impl Stack {
 
     fn get_type(&self, max_level: u8) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
         match self {
-            Stack::Leaf(Expr::Ident(name)) => (quote::quote! {}, quote::quote! { #name }),
+            Stack::Leaf(Expr::Ident(name, _)) => (quote::quote! {}, quote::quote! { #name }),
             x @ Stack::Leaf(Expr::Wildcard) => {
                 if max_level == 0 {
                     (
@@ -220,7 +258,7 @@ impl Stack {
                             w @ Expr::Wildcard => {
                                 return Stack::Leaf(w.clone()).get_type(max_level)
                             }
-                            Expr::Ident(ref name) => {
+                            Expr::Ident(ref name, _) => {
                                 return (
                                     quote::quote! {},
                                     quote::quote! { bertha::CxList<#name, bertha::CxNil> },
@@ -244,7 +282,7 @@ impl Stack {
 
                             rest_type
                         }
-                        Expr::Ident(name) => {
+                        Expr::Ident(name, _) => {
                             let (deftypes, rtype) = rest_type;
                             (deftypes, quote::quote! { bertha::CxList<#name, #rtype> })
                         }
@@ -266,8 +304,16 @@ impl Stack {
 }
 
 #[derive(Debug, Clone)]
+enum Var {
+    StoreDefaultName,
+    StoreName(TokenStream),
+    CreateDefault,
+    FromName(TokenStream),
+}
+
+#[derive(Debug, Clone)]
 enum Expr {
-    Ident(TokenStream),
+    Ident(TokenStream, Var),
     Wildcard,
 }
 
@@ -347,12 +393,34 @@ fn parse_expr(input: &str) -> IResult<&str, Expr> {
     }
 
     fn parse_ident(input: &str) -> IResult<&str, Expr> {
-        let (remain, ident) = take_till(|c| c == ' ' || c == ',')(input)?;
+        fn parse_var(input: &str) -> IResult<&str, Var> {
+            let (remain, var_str) = delimited(tag("["), take_until("]"), tag("]"))(input)?;
+            if var_str == "default" {
+                Ok((remain, Var::CreateDefault))
+            } else if var_str.starts_with("from :") {
+                let var_ident = syn::parse_str(var_str.trim_start_matches("from :")).unwrap();
+                Ok((remain, Var::FromName(var_ident)))
+            } else {
+                let var_ident = syn::parse_str(var_str).unwrap();
+                Ok((remain, Var::StoreName(var_ident)))
+            }
+        }
+
+        let (remain, (ident, _, var_spec, _)) = tuple((
+            take_till(|c| c == ' ' || c == '['),
+            opt(tag(" ")),
+            opt(parse_var),
+            opt(tag(" ")),
+        ))(input)?;
         let ident = syn::parse_str(ident).unwrap();
-        Ok((remain, Expr::Ident(ident)))
+        Ok((
+            remain,
+            Expr::Ident(ident, var_spec.unwrap_or(Var::StoreDefaultName)),
+        ))
     }
 
-    alt((parse_wild, parse_ident))(input)
+    let (r, (_, e)) = tuple((opt(tag(" ")), alt((parse_wild, parse_ident))))(input)?;
+    Ok((r, e))
 }
 
 #[derive(Debug)]
