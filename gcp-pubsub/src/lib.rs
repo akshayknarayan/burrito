@@ -338,6 +338,7 @@ mod test {
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+    #[ignore]
     #[test]
     fn pubsub_ordered() {
         let subscriber = tracing_subscriber::registry()
@@ -433,6 +434,7 @@ mod test {
         .unwrap();
     }
 
+    #[ignore]
     #[test]
     fn pubsub_send_recv() {
         let subscriber = tracing_subscriber::registry()

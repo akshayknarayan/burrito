@@ -902,7 +902,7 @@ mod test {
             .await
         {
             warn!(shard_addr = ?addr, err = ?e, "Shard errorred");
-            panic!(e);
+            panic!("{}", e);
         }
     }
 
@@ -1032,8 +1032,9 @@ mod test {
         let mut offers: Vec<Vec<HashMap<u64, Offer>>> = rdy.try_collect().await.unwrap();
 
         // 4. start canonical server
-        let cnsrv = ShardCanonicalServer::new(
+        let cnsrv = ShardCanonicalServer::<_, _, _, (_, Msg)>::new(
             si.clone(),
+            None,
             internal_cli,
             CxList::from(TaggerProjChunnel)
                 .wrap(ReliabilityProjChunnel::default())
@@ -1068,7 +1069,7 @@ mod test {
                     .try_for_each_concurrent(None, |r| {
                         async move {
                             loop {
-                                let _: Option<(_, Msg)> = r.recv().await?; // ShardCanonicalServerConnection is recv-only
+                                r.recv().await?; // ShardCanonicalServerConnection is recv-only
                             }
                         }
                     })
@@ -1076,7 +1077,7 @@ mod test {
                     .await
                 {
                     warn!(err = ?e, "canonical server crashed");
-                    panic!(e);
+                    panic!("{}", e);
                 }
             }
             .instrument(tracing::info_span!("canonicalsrv", addr = ?&si.canonical_addr)),

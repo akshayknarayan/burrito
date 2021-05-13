@@ -186,6 +186,7 @@ mod test {
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+    #[ignore]
     #[test]
     fn kafka_send_recv() {
         // relies on Kafka running

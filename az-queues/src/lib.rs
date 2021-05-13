@@ -216,6 +216,7 @@ mod test {
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+    #[ignore]
     #[test]
     fn azqueue_send_recv() {
         // relies on Azure queue "test-queue" being available.

@@ -431,6 +431,7 @@ mod test {
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+    #[ignore]
     #[test]
     fn sqs_ordered_groups() {
         // relies on SQS queue "test.fifo" being available.
@@ -519,6 +520,7 @@ mod test {
         .unwrap();
     }
 
+    #[ignore]
     #[test]
     fn sqs_ordering() {
         // relies on SQS queue "test1.fifo" being available.
@@ -598,6 +600,7 @@ mod test {
         .unwrap();
     }
 
+    #[ignore]
     #[test]
     fn sqs_send_recv() {
         // relies on SQS queue "test" being available.
