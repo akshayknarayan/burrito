@@ -2,3 +2,7 @@
 **/target/
 **/*.rs.bk
 Cargo.lock
+scripts/__pycache__/
+.ipynb_checkpoints/
+*.data
+*.csv
