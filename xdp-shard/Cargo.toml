@@ -34,7 +34,7 @@ tracing-futures = "0.2"
 tracing-subscriber = "0.2"
 
 [build-dependencies]
-bindgen = "0.53"
+bindgen = "0.58"
 
 [[bin]]
 name = "dump_stats"

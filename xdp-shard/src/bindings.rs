@@ -2,6 +2,7 @@
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 #[allow(unused)]
+#[allow(deref_nullptr)] // https://github.com/rust-lang/rust-bindgen/issues/1651
 pub mod libbpf {
     // libbpf rust bindings
     include!(concat!(env!("OUT_DIR"), "/libbpf.rs"));
@@ -28,6 +29,7 @@ pub mod if_link {
 
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
+#[allow(deref_nullptr)] // https://github.com/rust-lang/rust-bindgen/issues/1651
 pub mod xdp_shard_prog {
     include!(concat!(env!("OUT_DIR"), "/xdp_shard.rs"));
 

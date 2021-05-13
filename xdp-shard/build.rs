@@ -15,15 +15,15 @@ fn main() {
 
         let libbpf_bindings = bindgen::Builder::default()
             .header("./src/libbpf/src/libbpf.h")
-            .whitelist_function("bpf_prog_load_xattr")
-            .whitelist_function("bpf_object__find_map_by_name")
-            .whitelist_function("bpf_object__find_map_fd_by_name")
-            .whitelist_function("bpf_object__unload")
-            .whitelist_function("bpf_map__fd")
-            .whitelist_function("bpf_map__def")
-            .whitelist_function("bpf_set_link_xdp_fd")
-            .whitelist_function("libbpf_num_possible_cpus")
-            .blacklist_type(r#"u\d+"#)
+            .allowlist_function("bpf_prog_load_xattr")
+            .allowlist_function("bpf_object__find_map_by_name")
+            .allowlist_function("bpf_object__find_map_fd_by_name")
+            .allowlist_function("bpf_object__unload")
+            .allowlist_function("bpf_map__fd")
+            .allowlist_function("bpf_map__def")
+            .allowlist_function("bpf_set_link_xdp_fd")
+            .allowlist_function("libbpf_num_possible_cpus")
+            .blocklist_type(r#"u\d+"#)
             .generate()
             .expect("Unable to generate bindings");
         libbpf_bindings
@@ -37,11 +37,11 @@ fn main() {
 
         let bpf_bindings = bindgen::Builder::default()
             .header("./src/libbpf/src/bpf.h")
-            .whitelist_function("bpf_map_update_elem")
-            .whitelist_function("bpf_map_delete_elem")
-            .whitelist_function("bpf_map_lookup_elem")
-            .whitelist_function("bpf_get_map_by_name")
-            .blacklist_type(r#"u\d+"#)
+            .allowlist_function("bpf_map_update_elem")
+            .allowlist_function("bpf_map_delete_elem")
+            .allowlist_function("bpf_map_lookup_elem")
+            .allowlist_function("bpf_get_map_by_name")
+            .blocklist_type(r#"u\d+"#)
             .generate()
             .expect("Unable to generate bindings");
         bpf_bindings
@@ -50,8 +50,8 @@ fn main() {
 
         let if_link_bindings = bindgen::Builder::default()
             .header("./src/libbpf/include/uapi/linux/if_link.h")
-            .whitelist_var("XDP_FLAGS_.*")
-            .blacklist_type(r#"u\d+"#)
+            .allowlist_var("XDP_FLAGS_.*")
+            .blocklist_type(r#"u\d+"#)
             .generate()
             .expect("Unable to generate bindings");
         if_link_bindings
@@ -61,7 +61,7 @@ fn main() {
         let if_xdp_bindings = bindgen::Builder::default()
             .header("./src/libbpf/include/uapi/linux/if_xdp.h")
             .derive_default(true)
-            .blacklist_type(r#"u\d+"#)
+            .blocklist_type(r#"u\d+"#)
             .generate()
             .expect("Unable to generate bindings");
         if_xdp_bindings
@@ -72,11 +72,11 @@ fn main() {
         let xdp_prog_types_bindings = bindgen::Builder::default()
             .header("./src/xdp_shard.h")
             .derive_default(true)
-            .blacklist_type(r#"u\d+"#)
-            .whitelist_type(r#"datarec"#)
-            .whitelist_type(r#"active_client"#)
-            .whitelist_var(r#"NUM_PORTS"#)
-            .whitelist_type(r#"available_shards"#)
+            .blocklist_type(r#"u\d+"#)
+            .allowlist_type(r#"datarec"#)
+            .allowlist_type(r#"active_client"#)
+            .allowlist_var(r#"NUM_PORTS"#)
+            .allowlist_type(r#"available_shards"#)
             .generate()
             .expect("Unable to generate bindings");
         xdp_prog_types_bindings
