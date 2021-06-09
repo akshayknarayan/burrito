@@ -1562,8 +1562,8 @@ where
         upgrade_entry: RendezvousEntry,
     ) -> Self
     where
-        R: Rendezvous + Send + 'static,
-        <R as Rendezvous>::Error: Into<Report> + Send,
+        R: RendezvousBackend + Send + 'static,
+        <R as RendezvousBackend>::Error: Into<Report> + Send,
     {
         let (s, r) = oneshot::channel();
         let negotiation = Arc::new(TokioMutex::new(Some(r)));
@@ -1681,43 +1681,76 @@ where
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RendezvousEntry {
     pub nonce: HashMap<u64, Offer>,
-    pub multi: bool,
 }
 
 #[derive(Clone, Debug)]
 pub enum NegotiateRendezvousResult {
-    /// the offer provided either matched the rendezvous or superceded it.
-    Matched,
-    /// the offer did not match, and we need to provide an upgraded version.
-    NeedUpgrade,
-    /// the offer is superceded, and we should use the returned entry.
-    Superceded(RendezvousEntry),
+    /// Either:
+    /// 1. the client tried to set new semantics, and they matched.
+    /// 2. an endpoint left the connection (`num_participants` decremented).
+    Matched { num_participants: usize },
+    /// The offer did not match.
+    /// The currently active semantics are returned.
+    NoMatch {
+        entry: RendezvousEntry,
+        num_participants: usize,
+    },
 }
 
 /// Mechanism to register semantics on an address.
 ///
 /// Basically a KV store.
-pub trait Rendezvous {
+pub trait RendezvousBackend {
     type Error: Send + Sync;
 
-    /// anything supercedes a null entry.
-    /// `multi = false` + `multi = false` => `multi = true`
-    fn negotiate<'a>(
+    /// Set semantics on `addr`, only if no value was previously set.
+    fn try_init<'a>(
         &'a mut self,
         addr: String,
         offer: RendezvousEntry,
-        new: bool,
     ) -> Pin<Box<dyn Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a>>;
 
-    fn commit_upgrade<'a>(
+    /// Query semantics on `addr`.
+    ///
+    /// Returns whether the semantics match `curr_entry` (`NegotiateRendezvousResult`), and updates
+    /// the expiration timer for this endpoint in the connection.
+    fn poll_entry<'a>(
         &'a mut self,
         addr: String,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
+        curr_entry: RendezvousEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a>>;
 
-    /// Should return when semantics on addr need to be upgraded or have been superceded.
+    /// After how long without a poll should a connection be considered dead?
+    fn set_liveness_expiration(&mut self, expiration: std::time::Duration);
+
+    /// Leave the connection.
+    ///
+    /// This method is optional, since we have a liveness expiration timeout which will auto-delete
+    /// us if we just do nothing. Therefore implementations can't rely on this being called
+    /// explicitly.
+    fn leave<'a>(
+        &'a mut self,
+        addr: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    /// Subscribe to the next event on this connection.
+    ///
+    /// In general, there are three cases to notify about:
+    /// 1. A new participant has joined.
+    /// 2. A participant left.
+    /// 3. The semantics were transitioned.
+    ///
+    /// If a participant joined, we don't want to have a thundering-horde problem on possibly updating the
+    /// semantics, so we just let that participant possibly transition semantics, turning thaat
+    /// case into (3). For (2) this is unavoidable - we need the notification.
+    ///
+    /// Implementors can detect (2) with heartbeats (or timeouts) inside `notify`. e.g. for redis,
+    /// using SETEX and/or EXPIRE.
     ///
     /// Default is a poll-based implementation. A more efficient (or correct!) implementation might use
     /// notifications instead.
@@ -1730,26 +1763,44 @@ pub trait Rendezvous {
         Self: Send,
     {
         Box::pin(async move {
+            use NegotiateRendezvousResult::*;
+            let conn_ctr = match self.poll_entry(addr.clone(), curr_entry.clone()).await? {
+                Matched { num_participants } => num_participants,
+                x @ NoMatch { .. } => return Ok(x),
+            };
+
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                let res = {
-                    self.negotiate(addr.clone(), curr_entry.clone(), false)
-                        .await
-                };
+                let res = self.poll_entry(addr.clone(), curr_entry.clone()).await;
                 match res {
-                    Ok(NegotiateRendezvousResult::Matched) => {
+                    Ok(Matched { num_participants }) if num_participants == conn_ctr => {
                         debug!("no change");
                         continue;
                     }
-                    r @ Ok(NegotiateRendezvousResult::Superceded(_))
-                    | r @ Ok(NegotiateRendezvousResult::NeedUpgrade)
-                    | r @ Err(_) => {
-                        return r;
-                    }
+                    r => return r,
                 }
             }
         })
     }
+
+    /// Transition to the new semantics `new_entry` on `addr`.
+    ///
+    /// Begins a commit. Waits for the staged update counter to == `commit_count` before returning.
+    /// At that time the new semantics are in play.
+    fn transition<'a>(
+        &'a mut self,
+        addr: String,
+        new_entry: RendezvousEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
+
+    /// Increment the staged update counter on `addr`.
+    ///
+    /// Returns once the commit concludes: when the staged update counter the number of unexpired
+    /// partiparticipants.
+    fn staged_update<'a>(
+        &'a mut self,
+        addr: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
 }
 
 /// Rendezvous-based negotiation.
@@ -1772,8 +1823,8 @@ where
         Chunnel<NeverCn, Connection = UpgradeEitherConn<Ssingle, Smulti, SsingleCn, SmultiCn>>,
     <UpgradeEitherApply<Ssingle, Smulti> as Chunnel<NeverCn>>::Error: Into<Report>,
     UpgradeEitherConn<Ssingle, Smulti, SsingleCn, SmultiCn>: ChunnelConnection,
-    R: Rendezvous + Send + 'static,
-    <R as Rendezvous>::Error: Into<Report> + Send,
+    R: RendezvousBackend + Send + 'static,
+    <R as RendezvousBackend>::Error: Into<Report> + Send,
 {
     // first try assuming we are first. So, "negotiate" against ourselves for a nonce.
     // we impl Pick just to pass to monomorphize, for our actual stack we will use the nonce, since
@@ -1783,10 +1834,7 @@ where
     let offer = if let (_stack, NegotiateMsg::ServerNonce { picked, .. }, _client_offers) =
         monomorphize(stack_left, offers, &addr)?
     {
-        RendezvousEntry {
-            nonce: picked,
-            multi: false,
-        }
+        RendezvousEntry { nonce: picked }
     } else {
         unreachable!()
     };
@@ -1808,10 +1856,7 @@ where
         let offer = if let (_stack, NegotiateMsg::ServerNonce { picked, .. }, _client_offers) =
             monomorphize(stack_right, offers, &addr)?
         {
-            RendezvousEntry {
-                nonce: picked,
-                multi: true,
-            }
+            RendezvousEntry { nonce: picked }
         } else {
             unreachable!()
         };
@@ -1852,10 +1897,7 @@ where
                 if let (_stack, NegotiateMsg::ServerNonce { picked, .. }, _client_offers) =
                     monomorphize(stack_right, offers, &addr)?
                 {
-                    RendezvousEntry {
-                        nonce: picked,
-                        multi: true,
-                    }
+                    RendezvousEntry { nonce: picked }
                 } else {
                     unreachable!()
                 };
