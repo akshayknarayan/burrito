@@ -43,8 +43,18 @@ impl Redis {
 
         let red_conn_string = format!("redis://localhost:{}", port);
         let cl = redis::Client::open(red_conn_string.as_str())?;
-        while cl.get_connection().is_err() {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        loop {
+            match cl.get_connection() {
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Ok(mut c) => {
+                    redis::cmd("CONFIG")
+                        .arg("SET")
+                        .arg("notify-keyspace-events")
+                        .arg("KEA")
+                        .query::<()>(&mut c)?;
+                    break;
+                }
+            }
         }
 
         let s = Self { port };
