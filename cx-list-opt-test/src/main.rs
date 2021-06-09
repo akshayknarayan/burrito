@@ -1,13 +1,16 @@
 use bertha;
 use cx_list_opt::cx_list_opt;
 
+#[derive(Default, Clone, Copy)]
 struct Foo;
+#[derive(Default, Clone, Copy)]
 struct NewFoo;
 impl From<Foo> for NewFoo {
     fn from(_: Foo) -> NewFoo {
         NewFoo
     }
 }
+#[derive(Default, Clone, Copy)]
 struct Bar;
 
 #[cx_list_opt(* |> Foo => * |> NewFoo)]
