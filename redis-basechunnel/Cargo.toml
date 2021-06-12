@@ -5,7 +5,8 @@ authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2018"
 
 [dependencies]
-redis = { version = "0.20", default-features = false, features = ["aio", "tokio-comp"] }
+# cargo version as of 0.20.1 has a bug. Patch with this fork until https://github.com/mitsuhiko/redis-rs/pull/486 is merged and there's a release with that fix.
+redis = { git = "https://github.com/akshayknarayan/redis-rs", branch="async-pubsub-hang-fix", default-features = false, features = ["aio", "tokio-comp", "script"] }
 tokio = { version = "1", features = ["sync"] }
 bertha = { path = "../bertha" }
 futures-util = "0.3"

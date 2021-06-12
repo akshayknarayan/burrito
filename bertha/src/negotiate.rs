@@ -1349,12 +1349,16 @@ pub enum NegotiateRendezvousResult {
     /// Either:
     /// 1. the client tried to set new semantics, and they matched.
     /// 2. an endpoint left the connection (`num_participants` decremented).
-    Matched { num_participants: usize },
+    Matched {
+        num_participants: usize,
+        round_number: usize,
+    },
     /// The offer did not match.
     /// The currently active semantics are returned.
     NoMatch {
         entry: RendezvousEntry,
         num_participants: usize,
+        round_number: usize,
     },
 }
 
@@ -1379,10 +1383,14 @@ pub trait RendezvousBackend {
     ///
     /// Returns whether the semantics match `curr_entry` (`NegotiateRendezvousResult`), and updates
     /// (or initializes) the expiration timer for this endpoint in the connection.
+    ///
+    /// If the next semantics round has started, returns the proposed new semantics via `NoMatch`. To accept
+    /// these, call `staged_update`. Otherwise do nothing and error out.
     fn poll_entry<'a>(
         &'a mut self,
         addr: String,
         curr_entry: RendezvousEntry,
+        curr_round: usize,
     ) -> Pin<Box<dyn Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a>>;
 
     /// After how long without a poll should a connection be considered dead?
@@ -1422,23 +1430,40 @@ pub trait RendezvousBackend {
         &'a mut self,
         addr: String,
         curr_entry: RendezvousEntry,
+        curr_round: usize,
     ) -> Pin<Box<dyn Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a>>
     where
         Self: Send,
     {
         Box::pin(async move {
             use NegotiateRendezvousResult::*;
-            let conn_ctr = match self.poll_entry(addr.clone(), curr_entry.clone()).await? {
-                Matched { num_participants } => num_participants,
+            let (conn_ctr, round_number) = match self
+                .poll_entry(addr.clone(), curr_entry.clone(), curr_round)
+                .await?
+            {
+                Matched {
+                    num_participants,
+                    round_number,
+                } => (num_participants, round_number),
                 x @ NoMatch { .. } => return Ok(x),
             };
 
+            assert_eq!(
+                curr_round, round_number,
+                "Semantic round number mismatch: got {:?} expected {:?}",
+                round_number, curr_round
+            );
+
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                let res = self.poll_entry(addr.clone(), curr_entry.clone()).await;
+                let res = self
+                    .poll_entry(addr.clone(), curr_entry.clone(), curr_round)
+                    .await;
                 match res {
-                    Ok(Matched { num_participants }) if num_participants == conn_ctr => {
-                        debug!("no change");
+                    Ok(Matched {
+                        num_participants, ..
+                    }) if num_participants == conn_ctr => {
+                        debug!("did poll; no change");
                         continue;
                     }
                     r => return r,
@@ -1456,7 +1481,7 @@ pub trait RendezvousBackend {
         &'a mut self,
         addr: String,
         new_entry: RendezvousEntry,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>>;
 
     /// Increment the staged update counter on `addr`.
     ///
@@ -1465,7 +1490,8 @@ pub trait RendezvousBackend {
     fn staged_update<'a>(
         &'a mut self,
         addr: String,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
+        round_ctr: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>>;
 }
 
 /// A policy to select which side of a Select to use.
@@ -1552,7 +1578,7 @@ impl<T1, T2> UpgradeSelect<T1, T2> {
     /// Use the left semantics if there are less than two participants and the right if there are
     /// more than four.
     /// ```
-    /// use bertha:{Either, UpgradeSelect, SelectPolicy};
+    /// use bertha::{Either, Select, UpgradeSelect, SelectPolicy};
     /// let mut select: UpgradeSelect<_, _> = Select::from(((), ())).into();
     /// select
     ///   .prefer_when(SelectPolicy::Lt { participant_threshold: 2, preference: Either::Left(()) })
@@ -1825,6 +1851,7 @@ where
         addr: String,
         curr_entry: RendezvousEntry,
         mut curr_participant_count: usize,
+        mut curr_round: usize,
     ) -> Self
     where
         R: RendezvousBackend + Send + 'static,
@@ -1867,8 +1894,8 @@ where
             async move {
                 debug!("starting");
                 loop {
-                    let nonce = match negotiator.notify(addr.clone(), curr_entry.clone()).await {
-                        Ok(NegotiateRendezvousResult::Matched { num_participants })
+                    let nonce = match negotiator.notify(addr.clone(), curr_entry.clone(), curr_round).await {
+                        Ok(NegotiateRendezvousResult::Matched { num_participants, .. })
                             if num_participants == curr_participant_count =>
                         {
                             continue; // do nothing.
@@ -1876,9 +1903,10 @@ where
                         Ok(NegotiateRendezvousResult::NoMatch {
                             entry,
                             num_participants,
+                            round_number,
                         }) => {
-                            // XXX is this assignment correct??
                             curr_participant_count = num_participants;
+                            curr_round = round_number;
                             // Check if `entry` is compatible. If so, ACK with staged_update.
                             // Don't actually use the applied value, try_upgrade will handle that.
                             let sel = Select::from((left_opt.clone(), right_opt.clone()));
@@ -1888,7 +1916,7 @@ where
                                     debug!(?num_participants, ?curr_branch_is_left, "Got new compatible semantics");
                                     // we lock this not to use it, but to prevent a send while the commit is happening.
                                     let _neg_g = neg_l.lock().await;
-                                    if let Err(e) = negotiator.staged_update(addr.clone()).await {
+                                    if let Err(e) = negotiator.staged_update(addr.clone(), curr_round).await {
                                         let r = e.into();
                                         warn!(err = ?r, "staged_update failed");
                                         return;
@@ -1907,7 +1935,9 @@ where
                             warn!(err = ?r, "notify failed");
                             continue;
                         }
-                        Ok(NegotiateRendezvousResult::Matched { num_participants }) => {
+                        Ok(NegotiateRendezvousResult::Matched { num_participants, .. }) => {
+                            // the semantics are the same, but the number of participants changed.
+                            // consider transitioning.
                             if let Some(ent) = policies.iter().find_map(|&p| {
                                 if !p.eval(num_participants) { None } else {
                                     match p.pref() {
@@ -2002,7 +2032,10 @@ where
     };
 
     match res {
-        NegotiateRendezvousResult::Matched { num_participants } => {
+        NegotiateRendezvousResult::Matched {
+            num_participants,
+            round_number,
+        } => {
             // if Matched, we joined the connection.
             let ApplyResult { mut applied, .. } = stack
                 .apply(picked.clone())
@@ -2017,6 +2050,7 @@ where
                 addr.clone(),
                 RendezvousEntry { nonce: picked },
                 num_participants,
+                round_number,
             )
             .await;
             debug!("returning upgradable connection");
@@ -2024,6 +2058,7 @@ where
         }
         NegotiateRendezvousResult::NoMatch {
             num_participants,
+            round_number,
             entry,
         } => {
             let ApplyResult { mut applied, .. } = stack
@@ -2039,6 +2074,7 @@ where
                 addr.clone(),
                 entry,
                 num_participants,
+                round_number,
             )
             .await;
             debug!("returning upgradable connection");

@@ -1,4 +1,4 @@
-use eyre::{eyre, Error};
+use eyre::{eyre, Error, WrapErr};
 use tracing::debug;
 
 pub fn reset_root_dir(path: &std::path::Path) {
@@ -42,7 +42,7 @@ impl Redis {
         }
 
         let red_conn_string = format!("redis://localhost:{}", port);
-        let cl = redis::Client::open(red_conn_string.as_str())?;
+        let cl = redis::Client::open(red_conn_string.as_str()).wrap_err("Connect to redis")?;
         loop {
             match cl.get_connection() {
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
