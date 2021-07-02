@@ -9,6 +9,7 @@ edition = "2018"
 redis = { git = "https://github.com/akshayknarayan/redis-rs", branch="async-pubsub-hang-fix", default-features = false, features = ["aio", "tokio-comp", "script"] }
 tokio = { version = "1", features = ["sync"] }
 bertha = { path = "../bertha" }
+lazy_static = "1.4"
 futures-util = "0.3"
 color-eyre = "=0.5.7"
 tracing = "0.1"

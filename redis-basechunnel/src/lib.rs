@@ -5,7 +5,7 @@ use bertha::negotiate::{NegotiateRendezvousResult, RendezvousBackend, Rendezvous
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use futures_util::stream::StreamExt;
 use std::{future::Future, pin::Pin};
-use tracing::{debug, debug_span};
+use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
 
 pub struct RedisBase {
@@ -38,6 +38,11 @@ impl RedisBase {
     }
 }
 
+lazy_static::lazy_static! {
+    static ref ROUND_CTR_LOCK_SCRIPT: redis::Script = redis::Script::new(include_str!("./transition.lua"));
+    static ref TRY_INIT_SCRIPT: redis::Script = redis::Script::new(include_str!("./tryinit.lua"));
+}
+
 // TODO XXX replace expiry_time with redis server TIME.
 impl RendezvousBackend for RedisBase {
     type Error = Report;
@@ -64,69 +69,50 @@ impl RendezvousBackend for RedisBase {
                 let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                     .as_millis() as u64;
-                // DO NOT zadd here, since we don't know if we're joining yet.
-                // but DO zrembyscore, since what if the old one was timed out?
-                let mut r = redis::pipe();
-                let (addr_setnx, roundctr_setnx, got_value, round_ctr_value, removed, conn_count): (isize, isize, Vec<u8>, usize, isize, usize) = r
-                    .atomic()
-                    .set_nx(&addr, &neg_nonce[..])
-                    .set_nx(&round_ctr, 0)
-                    .get(addr.clone())
-                    .get(&round_ctr)
-                    .zrembyscore(&addr_ctr, 0, expiry_time)
-                    .zcard(&addr_ctr)
-                    .query_async(&mut self.redis_conn)
-                    .await?;
+                let insert_time = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                    .as_millis() as u64;
 
-                if addr_setnx == 1 {
-                    // was set
-                    // anything supercedes a null entry.
-                    debug!(res = "new_entry", "polled redis");
-                    ensure!(roundctr_setnx == 1 && round_ctr_value == 0,
-                        "KV store polluted: roundctr key already present", 
-                    );
-                    ensure!(
-                        conn_count == 0,
-                        "KV store polluted: {:?} != 0 on setnx",
-                        conn_count
-                    );
-                    ensure!(got_value == neg_nonce, "Nonce values mismatched");
-                    // now join with zadd. if either of the two ensures above failed, the next client will
-                    // see the setnx fail but conn_count == 0, so it will override.
-                    self.join(&addr_ctr).await?;
+                let (joined, round_ctr_value, conn_count, got_semantics): (
+                    bool,
+                    usize,
+                    usize,
+                    Vec<u8>,
+                ) = TRY_INIT_SCRIPT
+                    .key(&addr)
+                    .key(&round_ctr)
+                    .key(&addr_ctr)
+                    .arg(&neg_nonce[..])
+                    .arg(&self.client_name)
+                    .arg(expiry_time)
+                    .arg(insert_time)
+                    .invoke_async(&mut self.redis_conn)
+                    .await
+                    .wrap_err(eyre!("try_init failed on {:?}", &addr))?;
+                if joined {
                     Ok(NegotiateRendezvousResult::Matched {
                         num_participants: 1,
                         round_number: round_ctr_value,
                     })
-                } else if addr_setnx == 0 {
+                } else {
+                    debug!(res = "existed", ?conn_count, "got try_init response");
                     // was not set, which means someone was already here.
-                    debug!(res = "existed", ?removed, ?conn_count, "polled redis");
                     if conn_count == 0 {
                         // setnx failed, but we're the only ones home. override.
-                        // transition will call zadd.
                         self.transition(addr.clone(), offer).await?;
                         Ok(NegotiateRendezvousResult::Matched {
                             num_participants: 1,
                             round_number: round_ctr_value,
                         })
-                    } else if got_value == neg_nonce {
-                        self.join(&addr_ctr).await?;
-                        Ok(NegotiateRendezvousResult::Matched {
-                            num_participants: conn_count,
-                            round_number: round_ctr_value,
-                        })
                     } else {
-                        // DO NOT join if semantics didn't match.
                         let present_semantics: RendezvousEntry =
-                            bincode::deserialize(&got_value).wrap_err("deserialize entry")?;
+                            bincode::deserialize(&got_semantics).wrap_err("deserialize entry")?;
                         Ok(NegotiateRendezvousResult::NoMatch {
                             entry: present_semantics,
                             num_participants: conn_count,
                             round_number: round_ctr_value,
                         })
                     }
-                } else {
-                    unreachable!()
                 }
             }
             .instrument(debug_span!("redis::try_init", addr = ?&a)),
@@ -295,7 +281,10 @@ impl RendezvousBackend for RedisBase {
                     )
                     .await
                     {
-                        futures_util::future::Either::Left((Some(_), _)) => break,
+                        futures_util::future::Either::Left((Some(m), _)) => {
+                            trace!(?channel_ctr_name, ?channel_name, ?m, "subscribe got msg");
+                            break;
+                        }
                         futures_util::future::Either::Left((None, _)) => unreachable!(),
                         futures_util::future::Either::Right((_, _pubsub_fut)) => (),
                     };
@@ -364,13 +353,11 @@ impl RendezvousBackend for RedisBase {
         // 2. read staged key. if == our proposal, just call wait_commit and exit once it returns.
         //    otherwise, error out.
 
-        let round_ctr_lock_script = redis::Script::new(include_str!("./transition.lua"));
-
         Box::pin(
             async move {
                 let neg_nonce = bincode::serialize(&new_entry).wrap_err("serialize entry")?;
                 debug!("starting transition");
-                let (locked, round_ctr): (bool, usize) = round_ctr_lock_script.key(&round_ctr_key).invoke_async(&mut self.redis_conn).await?;
+                let (locked, round_ctr): (bool, usize) = ROUND_CTR_LOCK_SCRIPT.key(&round_ctr_key).invoke_async(&mut self.redis_conn).await?;
                 let staged_val = format!("{}-{}-staged", &addr, round_ctr);
                 let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
 
@@ -650,19 +637,6 @@ impl RedisBase {
             .zcard(&addr_members)
             .query_async(&mut self.redis_conn)
             .await?;
-        Ok(())
-    }
-
-    async fn join(&mut self, addr_ctr: &str) -> Result<(), Report> {
-        let insert_time = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-            .as_millis() as u64;
-        let mut r = redis::pipe();
-        r.atomic()
-            .zadd(addr_ctr, &self.client_name, insert_time as usize)
-            .query_async(&mut self.redis_conn)
-            .await
-            .wrap_err(eyre!("redis zadd on {:?}", addr_ctr))?;
         Ok(())
     }
 }
