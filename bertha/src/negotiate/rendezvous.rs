@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
-use tracing::{debug, debug_span, instrument, warn};
+use tracing::{debug, debug_span, instrument, trace, warn};
 use tracing_futures::Instrument;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -477,6 +477,7 @@ where
             if let Some(u) = rg.recv().await {
                 u
             } else {
+                std::mem::drop(rg);
                 future::pending().await
             }
         };
@@ -566,7 +567,13 @@ where
             async move {
                 debug!("starting");
                 loop {
-                    let nonce = match negotiator.notify(addr.clone(), curr_entry.clone(), curr_round).await {
+                    let res = negotiator.notify(addr.clone(), curr_entry.clone(), curr_round).await;
+                    if s.is_closed() {
+                        debug!("upgrade receiver closed, exiting");
+                        return;
+                    }
+
+                    let nonce = match res {
                         Ok(NegotiateRendezvousResult::Matched { num_participants, .. })
                             if num_participants == curr_participant_count =>
                         {
@@ -673,6 +680,7 @@ where
     R: RendezvousBackend + Send + 'static,
     <R as RendezvousBackend>::Error: Into<Report> + Send,
 {
+    debug!("starting");
     let left_offer = solo_monomorphize(stack.left.clone())?;
     let right_offer = solo_monomorphize(stack.right.clone())?;
 
@@ -691,7 +699,7 @@ where
         })
         .unwrap_or_else(|| left_offer.clone());
 
-    debug!(?offer, "monomorphized sole occupancy stack");
+    trace!(?offer, "monomorphized sole occupancy stack");
     let picked = offer.clone();
 
     // 1. try_init our favored semantics.
@@ -703,6 +711,7 @@ where
             .wrap_err("rendezvous backend try_init")?
     };
 
+    trace!(?res, "got try_init response");
     match res {
         NegotiateRendezvousResult::Matched {
             num_participants,
@@ -725,7 +734,7 @@ where
                 round_number,
             )
             .await;
-            debug!("returning upgradable connection");
+            debug!(matched = true, "returning upgradable connection");
             Ok(cn)
         }
         NegotiateRendezvousResult::NoMatch {
@@ -749,7 +758,7 @@ where
                 round_number,
             )
             .await;
-            debug!("returning upgradable connection");
+            debug!(matched = false, "returning upgradable connection");
             Ok(cn)
         }
     }
