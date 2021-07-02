@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 bertha = { path = "../bertha" }
+test-util = { path = "../test-util" }
 color-eyre = "0.5"
 futures-util = "0.3"
 structopt = "0.3"

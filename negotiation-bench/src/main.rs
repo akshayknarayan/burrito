@@ -5,13 +5,14 @@ use bertha::{
     util::{NeverCn, ProjectLeft},
     Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, Negotiate,
 };
-use color_eyre::eyre::{Report, WrapErr};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use redis_basechunnel::RedisBase;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
 use structopt::StructOpt;
-use tracing::{debug, info, instrument};
+use test_util::start_redis;
+use tracing::{debug, info, instrument, trace};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
@@ -40,9 +41,17 @@ async fn main() -> Result<(), Report> {
     info!(?opt.num_reqs, rendezvous_mode = ?opt.redis.is_some(), "starting");
     let mut addr: SocketAddr = "127.0.0.1:12315".parse().unwrap();
     if let Some(redis) = opt.redis {
+        let redis_port = redis
+            .split(':')
+            .last()
+            .ok_or(eyre!("Bad redis address: {:?}", redis))?
+            .parse()
+            .wrap_err(eyre!("Bad redis address: {:?}", redis))?;
+        let _r = start_redis(redis_port);
         let mut durs = Vec::with_capacity(opt.num_reqs);
         for i in 0..opt.num_reqs {
-            addr.set_port(addr.port() + i as u16);
+            info!(?i, "running iteration");
+            addr.set_port(addr.port() + 1 as u16);
             let redis_base = RedisBase::new(&redis).await?;
             let srv_task = tokio::spawn(server_rendezvous(addr, redis_base));
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -60,6 +69,7 @@ async fn main() -> Result<(), Report> {
         let durs = client_direct(addr, opt.num_reqs)
             .await
             .wrap_err("running client")?;
+        info!("done");
         dump(durs, "Simplified", opt.out_file).wrap_err("writing outfile")?;
     }
 
@@ -92,6 +102,7 @@ async fn client_rendezvous(addr: SocketAddr, redis: RedisBase) -> Result<Duratio
     ))
     .into();
     let cn = negotiate_rendezvous(st, redis, format!("{:?}", addr)).await?;
+    trace!("finished negotiation");
     cn.send((addr, t)).await?;
     let (_, m) = cn.recv().await?;
     Ok(m.elapsed(start))
@@ -119,7 +130,8 @@ async fn server_direct(addr: SocketAddr) -> Result<(), Report> {
 async fn client_direct(addr: SocketAddr, num_reqs: usize) -> Result<Vec<Duration>, Report> {
     let start = std::time::Instant::now();
     let mut durs = Vec::with_capacity(num_reqs);
-    for _ in 0..num_reqs {
+    for i in 0..num_reqs {
+        info!(?i, "running iteration");
         let t = TimeMsg::new(start);
         let cn = ProjectLeft::new(
             addr,
@@ -130,6 +142,7 @@ async fn client_direct(addr: SocketAddr, num_reqs: usize) -> Result<Vec<Duration
             )
             .await?,
         );
+        trace!("finished negotiation");
         cn.send(t).await?;
         let m = cn.recv().await?;
         durs.push(m.elapsed(start));
