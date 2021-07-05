@@ -5,7 +5,7 @@ use bertha::{
     util::{NeverCn, ProjectLeft},
     Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, Negotiate,
 };
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use redis_basechunnel::RedisBase;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -60,7 +60,10 @@ async fn main() -> Result<(), Report> {
             let dur = client_rendezvous(addr, redis_base).await?;
             durs.push(dur);
             srv_task.abort();
-            srv_task.await.unwrap_err();
+            ensure!(
+                srv_task.await.unwrap_err().is_cancelled(),
+                "Server task was not cancelled"
+            );
         }
         dump(durs, "Consensus", opt.out_file).wrap_err("writing outfile")?;
     } else {
@@ -69,10 +72,10 @@ async fn main() -> Result<(), Report> {
         let durs = client_direct(addr, opt.num_reqs)
             .await
             .wrap_err("running client")?;
-        info!("done");
         dump(durs, "Simplified", opt.out_file).wrap_err("writing outfile")?;
     }
 
+    info!("done");
     Ok(())
 }
 
