@@ -1,6 +1,7 @@
 use super::{monomorphize, Apply, ApplyResult, GetOffers, NegotiateMsg, Offer, Pick, Select};
 use crate::{util::NeverCn, Chunnel, ChunnelConnection, Either};
 use color_eyre::eyre::{Report, WrapErr};
+use futures_util::future;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -431,6 +432,13 @@ where
 pub struct UpgradeEitherConnWrap<A, B, Acn, Bcn> {
     negotiation: Arc<TokioMutex<mpsc::Receiver<HashMap<u64, Offer>>>>,
     inner: Arc<TokioMutex<UpgradeEitherConn<A, B, Acn, Bcn>>>,
+    dropped: tokio::task::JoinHandle<()>,
+}
+
+impl<A, B, Acn, Bcn> Drop for UpgradeEitherConnWrap<A, B, Acn, Bcn> {
+    fn drop(&mut self) {
+        self.dropped.abort();
+    }
 }
 
 impl<D, A, B, Acn, Bcn> ChunnelConnection for UpgradeEitherConnWrap<A, B, Acn, Bcn>
@@ -457,6 +465,7 @@ where
         let neg = Arc::clone(&self.negotiation);
         Box::pin(async move {
             let mut upgrade_receiver = neg.lock().await;
+            // tokio::mpsc does not have try_recv: https://github.com/tokio-rs/tokio/pull/3263
             let f = Box::pin(upgrade_receiver.recv());
             if let Poll::Ready(Some(upgrade)) = futures_util::poll!(f) {
                 debug!("applying upgraded semantics (send)");
@@ -469,7 +478,6 @@ where
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        use futures_util::future;
         let inner = Arc::clone(&self.inner);
         let neg = Arc::clone(&self.negotiation);
         let upgrade_fut = async move {
@@ -563,17 +571,24 @@ where
             } else {
                 unreachable!()
             };
-        tokio::spawn(
+        let neg_task = tokio::spawn(
             async move {
                 debug!("starting");
+                use future::Either as FEither;
                 loop {
-                    let res = negotiator.notify(addr.clone(), curr_entry.clone(), curr_round).await;
-                    if s.is_closed() {
-                        debug!("upgrade receiver closed, exiting");
-                        return;
-                    }
+                    let close_fut = s.closed();
+                    tokio::pin!(close_fut);
+                    let notify_res = match future::select(negotiator.notify(addr.clone(), curr_entry.clone(), curr_round), close_fut).await {
+                        FEither::Right(_) => {
+                            debug!("upgrade receiver closed, exiting");
+                            return;
+                        }
+                        FEither::Left((res, _)) => {
+                            res
+                        }
+                    };
 
-                    let nonce = match res {
+                    let nonce = match notify_res {
                         Ok(NegotiateRendezvousResult::Matched { num_participants, .. })
                             if num_participants == curr_participant_count =>
                         {
@@ -611,8 +626,8 @@ where
                         }
                         Err(e) => {
                             let r = e.into();
-                            warn!(err = ?r, "notify failed");
-                            continue;
+                            debug!(err = %format!("{:#}", r), "notify failed");
+                            return;
                         }
                         Ok(NegotiateRendezvousResult::Matched { num_participants, .. }) => {
                             // the semantics are the same, but the number of participants changed.
@@ -637,7 +652,7 @@ where
 
                                 ent
                             } else {
-                                debug!(?num_participants, "No policies applied, doing nothing");
+                                trace!(?num_participants, "No policies applied, doing nothing");
                                 continue;
                             }
                         }
@@ -653,6 +668,7 @@ where
         Self {
             negotiation,
             inner: Arc::new(TokioMutex::new(inner)),
+            dropped: neg_task,
         }
     }
 }
