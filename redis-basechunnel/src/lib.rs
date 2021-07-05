@@ -165,7 +165,7 @@ impl RendezvousBackend for RedisBase {
                 // won't have changed.
                 // if it did change, then we need to look for the staged semantics.
                 if round_ctr == curr_round {
-                    debug!(?round_ctr, ?conn_count, "Same round");
+                    trace!(?round_ctr, ?conn_count, "Same round");
                     let present_semantics: RendezvousEntry =
                         bincode::deserialize(&got_value).wrap_err("deserialize entry")?;
                     ensure!(
@@ -285,14 +285,18 @@ impl RendezvousBackend for RedisBase {
                             trace!(?channel_ctr_name, ?channel_name, ?m, "subscribe got msg");
                             break;
                         }
-                        futures_util::future::Either::Left((None, _)) => unreachable!(),
+                        futures_util::future::Either::Left((None, _)) => {
+                            return Err(eyre!("redis server shut down"))
+                        }
                         futures_util::future::Either::Right((_, _pubsub_fut)) => (),
                     };
 
-                    self.refresh_client(addr.clone()).await?;
+                    self.refresh_client(addr.clone())
+                        .await
+                        .wrap_err("call to refresh_client")?;
                 }
 
-                debug!("semantics changed");
+                trace!("semantics changed");
                 self.redis_pubsub.punsubscribe(&channel_name).await?;
                 self.redis_pubsub.punsubscribe(&channel_ctr_name).await?;
                 // return result of polling now
@@ -307,13 +311,15 @@ impl RendezvousBackend for RedisBase {
                     {
                         x @ Ok(_) => return x,
                         Err(e) => {
-                            debug!(err = ?&e, ?poll_retries, "Poll failed");
+                            debug!(err = %format!("{:#}", &e), ?poll_retries, "Poll failed");
                             if poll_retries > 10 {
                                 return Err(e).wrap_err("Poll after notify failed 10 times");
                             }
 
                             poll_retries += 1;
-                            self.refresh_client(addr.clone()).await?;
+                            self.refresh_client(addr.clone())
+                                .await
+                                .wrap_err("call to refresh_client")?;
                         }
                     }
                 }
@@ -356,7 +362,7 @@ impl RendezvousBackend for RedisBase {
         Box::pin(
             async move {
                 let neg_nonce = bincode::serialize(&new_entry).wrap_err("serialize entry")?;
-                debug!("starting transition");
+                trace!("starting transition");
                 let (locked, round_ctr): (bool, usize) = ROUND_CTR_LOCK_SCRIPT.key(&round_ctr_key).invoke_async(&mut self.redis_conn).await?;
                 let staged_val = format!("{}-{}-staged", &addr, round_ctr);
                 let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
@@ -381,16 +387,16 @@ impl RendezvousBackend for RedisBase {
                         .query_async(&mut self.redis_conn)
                         .await.wrap_err("Set staged value")?;
                     ensure!(set_staged == 1 && set_commit_ctr == 1, "Polluted KV store: Locked commit but staged values already present");
-                    debug!(?set_staged, ?staged_val, "Wrote staged value");
+                    trace!(?set_staged, ?staged_val, "Wrote staged value");
                     if conn_count > 1 {
                         self.wait_committer(addr.clone(), round_ctr, 1, conn_count).await?;
                     } else {
-                        debug!(?conn_count, "Trivial commit");
+                        trace!(?conn_count, "Trivial commit");
                     }
 
                     // done. write to real key, delete staging keys, and re-incr round counter to even
                     let mut r = redis::pipe();
-                    debug!("Cleaning up commit keys");
+                    trace!("Cleaning up commit keys");
                     let (_, _, _, round_ctr): ((), isize, isize, usize) = match r.atomic().set(&addr, neg_nonce).del(&staged_val).del(&staged_commit_counter).incr(&round_ctr_key, 1usize).query_async(&mut self.redis_conn).await.wrap_err("Cleanup on commit keys") {
                         Ok(x) => x,
                         Err(e) => {
@@ -636,7 +642,8 @@ impl RedisBase {
             .zadd(&addr_members, &self.client_name, insert_time as usize)
             .zcard(&addr_members)
             .query_async(&mut self.redis_conn)
-            .await?;
+            .await
+            .wrap_err("refresh_client redis query failed")?;
         Ok(())
     }
 }
