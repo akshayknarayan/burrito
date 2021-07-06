@@ -134,6 +134,44 @@ pub trait ChunnelConnection {
     fn recv(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>>;
+
+    fn send_batch<'cn, D>(
+        &'cn self,
+        data: D,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'cn>>
+    where
+        D: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <D as IntoIterator>::IntoIter: Send,
+        Self::Data: Send,
+        Self: Sync,
+    {
+        Box::pin(async move {
+            for d in data {
+                self.send(d).await?;
+            }
+
+            Ok(())
+        })
+    }
+
+    // associated type defaults aren't possible, and we can't use impl trait here. so we're stuck
+    // with a Vec
+    fn recv_batch<'cn, const SIZE: usize>(
+        &'cn self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Self::Data>, eyre::Report>> + Send + 'cn>>
+    where
+        Self::Data: Send,
+        Self: Sync,
+    {
+        Box::pin(async move {
+            let mut recv_batch = Vec::with_capacity(SIZE);
+            for _ in 0..SIZE {
+                recv_batch.push(self.recv().await?);
+            }
+
+            Ok(recv_batch)
+        })
+    }
 }
 
 impl<T, C, D> ChunnelConnection for T
