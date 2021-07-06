@@ -233,27 +233,6 @@ impl IpPort for std::net::SocketAddr {
     }
 }
 
-/// Where the Chunnel implementation allows functionality to be implemented.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Scope {
-    /// Must be inside the application.
-    Application,
-    /// Anywhere on the same host.
-    Host,
-    /// Anywhere in the local network.
-    Local,
-    /// Anywhere.
-    Global,
-}
-
-/// Semantics of the Chunnel.
-pub enum Endedness {
-    /// Chunnel uses wrap/unwrap semantics
-    Both,
-    /// Chunnel doesn't change semantics
-    Either,
-}
-
 #[cfg(test)]
 mod test {
     use crate::chan_transport::Chan;
