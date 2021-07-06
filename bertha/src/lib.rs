@@ -100,66 +100,6 @@ where
     }
 }
 
-pub trait AppendBack<T> {
-    type Appended;
-    fn append(self, it: T) -> Self::Appended;
-}
-
-impl<T> AppendBack<T> for CxNil {
-    type Appended = CxList<T, CxNil>;
-
-    fn append(self, it: T) -> Self::Appended {
-        CxList {
-            head: it,
-            tail: self,
-        }
-    }
-}
-
-impl<H, T, I> AppendBack<I> for CxList<H, T>
-where
-    T: AppendBack<I>,
-{
-    type Appended = CxList<H, <T as AppendBack<I>>::Appended>;
-    fn append(self, it: I) -> Self::Appended {
-        CxList {
-            head: self.head,
-            tail: self.tail.append(it),
-        }
-    }
-}
-
-pub trait CxListReverse {
-    type Reversed;
-    fn rev(self) -> Self::Reversed;
-}
-
-//impl<N: Negotiate> CxListReverse for N {
-//    type Reversed = Self;
-//    fn rev(self) -> Self::Reversed {
-//        self
-//    }
-//}
-
-impl<H, T> CxListReverse for CxList<H, T>
-where
-    T: CxListReverse,
-    <T as CxListReverse>::Reversed: AppendBack<H>,
-{
-    type Reversed = <<T as CxListReverse>::Reversed as AppendBack<H>>::Appended;
-
-    fn rev(self) -> Self::Reversed {
-        self.tail.rev().append(self.head)
-    }
-}
-
-impl CxListReverse for CxNil {
-    type Reversed = Self;
-    fn rev(self) -> Self::Reversed {
-        self
-    }
-}
-
 pub trait ChunnelListener {
     type Future: Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static;
     type Addr;
@@ -230,6 +170,66 @@ impl IpPort for std::net::SocketAddr {
 
     fn port(&self) -> u16 {
         self.port()
+    }
+}
+
+pub trait AppendBack<T> {
+    type Appended;
+    fn append(self, it: T) -> Self::Appended;
+}
+
+impl<T> AppendBack<T> for CxNil {
+    type Appended = CxList<T, CxNil>;
+
+    fn append(self, it: T) -> Self::Appended {
+        CxList {
+            head: it,
+            tail: self,
+        }
+    }
+}
+
+impl<H, T, I> AppendBack<I> for CxList<H, T>
+where
+    T: AppendBack<I>,
+{
+    type Appended = CxList<H, <T as AppendBack<I>>::Appended>;
+    fn append(self, it: I) -> Self::Appended {
+        CxList {
+            head: self.head,
+            tail: self.tail.append(it),
+        }
+    }
+}
+
+pub trait CxListReverse {
+    type Reversed;
+    fn rev(self) -> Self::Reversed;
+}
+
+//impl<N: Negotiate> CxListReverse for N {
+//    type Reversed = Self;
+//    fn rev(self) -> Self::Reversed {
+//        self
+//    }
+//}
+
+impl<H, T> CxListReverse for CxList<H, T>
+where
+    T: CxListReverse,
+    <T as CxListReverse>::Reversed: AppendBack<H>,
+{
+    type Reversed = <<T as CxListReverse>::Reversed as AppendBack<H>>::Appended;
+
+    fn rev(self) -> Self::Reversed {
+        self.tail.rev().append(self.head)
+    }
+}
+
+impl CxListReverse for CxNil {
+    type Reversed = Self;
+    fn rev(self) -> Self::Reversed {
+        self
     }
 }
 
