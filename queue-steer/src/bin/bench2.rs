@@ -41,6 +41,8 @@ struct Opt {
     #[structopt(short = "r", long)]
     num_receivers: usize,
     #[structopt(long)]
+    batch_size: usize,
+    #[structopt(long)]
     service_mode: bool, // client-side or service-side impl.
     #[structopt(short, long)]
     out_file: std::path::PathBuf,
@@ -89,6 +91,7 @@ async fn main() -> Result<(), Report> {
         mode,
         num_reqs,
         num_receivers,
+        batch_size,
         inter_request_ms,
         service_mode,
         out_file,
@@ -105,6 +108,7 @@ async fn main() -> Result<(), Report> {
             num_reqs,
             inter_request_ms,
             num_receivers,
+            batch_size,
         )
         .await?;
 
@@ -154,6 +158,7 @@ impl Provider {
         num_reqs: usize,
         inter_request_ms: u64,
         num_receivers: usize,
+        batch_size: usize,
     ) -> Result<(Vec<RecvdMsg>, Duration), Report> {
         if !service_mode && num_receivers != 1 {
             return Err(eyre!("Cannot have > 1 receiver with client mode"));
@@ -175,7 +180,7 @@ impl Provider {
         });
 
         macro_rules! do_exp_service {
-            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr) => {{
+            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr, $batch_size: expr) => {{
                 use bertha::util::NeverCn;
                 match mode {
                     Mode::BestEffort => {
@@ -193,6 +198,7 @@ impl Provider {
                             $num_reqs,
                             $inter_request_ms,
                             $num_receivers,
+                            $batch_size,
                         )
                         .await?
                     }
@@ -210,6 +216,7 @@ impl Provider {
                             n,
                             $inter_request_ms,
                             $num_receivers,
+                            $batch_size,
                         )
                         .await?
                     }
@@ -218,7 +225,7 @@ impl Provider {
         }
 
         macro_rules! do_exp {
-            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr) => {{
+            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr, $batch_size: expr) => {{
                 use bertha::util::NeverCn;
                 match mode {
                     Mode::BestEffort => {
@@ -232,6 +239,7 @@ impl Provider {
                             $num_reqs,
                             $inter_request_ms,
                             $num_receivers,
+                            $batch_size,
                         )
                         .await?
                     }
@@ -248,6 +256,7 @@ impl Provider {
                             $num_reqs,
                             $inter_request_ms,
                             $num_receivers,
+                            $batch_size,
                         )
                         .await?
                     }
@@ -267,6 +276,7 @@ impl Provider {
                             n,
                             $inter_request_ms,
                             $num_receivers,
+                            $batch_size,
                         )
                         .await?
                     }
@@ -304,9 +314,25 @@ impl Provider {
                 let cn: SqsChunnelWrap = SqsChunnel::new(sqs_client, once(queue.as_str())).into();
                 let (msgs, elapsed) = if service_mode {
                     let cn: OrderedSqsChunnelWrap = cn.into();
-                    do_exp_service!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
+                    do_exp_service!(
+                        mode,
+                        cn,
+                        addr,
+                        num_reqs,
+                        inter_request_ms,
+                        num_receivers,
+                        batch_size
+                    )
                 } else {
-                    do_exp!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
+                    do_exp!(
+                        mode,
+                        cn,
+                        addr,
+                        num_reqs,
+                        inter_request_ms,
+                        num_receivers,
+                        batch_size
+                    )
                 };
 
                 if let Some(gen) = generated {
@@ -341,8 +367,15 @@ impl Provider {
                     AzStorageQueueChunnel::new(az_client, once(queue.as_str())).into();
                 let cn = CxList::from(FakeSetGroup::default()).wrap(cn);
                 let addr: FakeSetGroupAddr = queue.into();
-                let (msgs, elapsed) =
-                    do_exp!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers);
+                let (msgs, elapsed) = do_exp!(
+                    mode,
+                    cn,
+                    addr,
+                    num_reqs,
+                    inter_request_ms,
+                    num_receivers,
+                    batch_size
+                );
                 if let Some(gen) = generated {
                     gen.cleanup().await?;
                 }
@@ -360,9 +393,25 @@ impl Provider {
                 };
 
                 let (msgs, elapsed) = if service_mode {
-                    do_exp_service!(mode, cn, c_addr, num_reqs, inter_request_ms, num_receivers)
+                    do_exp_service!(
+                        mode,
+                        cn,
+                        c_addr,
+                        num_reqs,
+                        inter_request_ms,
+                        num_receivers,
+                        batch_size
+                    )
                 } else {
-                    do_exp!(mode, cn, c_addr, num_reqs, inter_request_ms, num_receivers)
+                    do_exp!(
+                        mode,
+                        cn,
+                        c_addr,
+                        num_reqs,
+                        inter_request_ms,
+                        num_receivers,
+                        batch_size
+                    )
                 };
 
                 kafka::delete_topic(&addr, &queue).await?;
@@ -397,9 +446,25 @@ impl Provider {
                     .into();
                 let (msgs, elapsed) = if service_mode {
                     let cn = OrderedGcpPubSubWrap::convert(cn).await?;
-                    do_exp_service!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
+                    do_exp_service!(
+                        mode,
+                        cn,
+                        addr,
+                        num_reqs,
+                        inter_request_ms,
+                        num_receivers,
+                        batch_size
+                    )
                 } else {
-                    do_exp!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
+                    do_exp!(
+                        mode,
+                        cn,
+                        addr,
+                        num_reqs,
+                        inter_request_ms,
+                        num_receivers,
+                        batch_size
+                    )
                 };
 
                 if let Some(gen) = generated {

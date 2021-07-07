@@ -70,6 +70,7 @@ pub async fn do_best_effort_exp<A: Clone + Debug + PartialEq + Send + Sync + 'st
     num_reqs: usize,
     inter_request_ms: u64,
     num_receivers: usize,
+    batch_size: usize,
 ) -> Result<(Vec<RecvdMsg>, Duration), Report>
 where
     A: Clone + crate::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
@@ -99,6 +100,7 @@ pub async fn do_atmostonce_exp<A>(
     num_reqs: usize,
     inter_request_ms: u64,
     num_receivers: usize,
+    batch_size: usize,
 ) -> Result<(Vec<RecvdMsg>, Duration), Report>
 where
     A: Clone + crate::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
@@ -145,6 +147,7 @@ pub async fn do_ordered_groups_exp<A>(
     num_groups: usize,
     inter_request_ms: u64,
     num_receivers: usize,
+    batch_size: usize,
 ) -> Result<(Vec<RecvdMsg>, Duration), Report>
 where
     A: Clone + crate::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
