@@ -43,7 +43,7 @@ struct Opt {
     #[structopt(long)]
     batch_size: usize,
     #[structopt(long)]
-    service_mode: bool, // client-side or service-side impl.
+    service_mode: bool, // client-side or service-side impl. it is a flag, so if not provided its value is false, which is client mode.
     #[structopt(short, long)]
     out_file: std::path::PathBuf,
 
@@ -99,7 +99,15 @@ async fn main() -> Result<(), Report> {
         provider,
     } = Opt::from_args();
     let prov = provider.provider().to_owned();
-    info!(?mode, ?num_reqs, ?inter_request_ms, provider = ?provider, "starting");
+    info!(
+        ?mode,
+        ?num_reqs,
+        ?inter_request_ms,
+        ?batch_size,
+        ?service_mode,
+        ?provider,
+        "starting"
+    );
     let (msgs, elapsed) = provider
         .run_exp(
             queue,
