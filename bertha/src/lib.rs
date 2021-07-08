@@ -156,16 +156,17 @@ pub trait ChunnelConnection {
 
     // associated type defaults aren't possible, and we can't use impl trait here. so we're stuck
     // with a Vec
-    fn recv_batch<'cn, const SIZE: usize>(
+    fn recv_batch<'cn>(
         &'cn self,
+        batch_size: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Self::Data>, eyre::Report>> + Send + 'cn>>
     where
         Self::Data: Send,
         Self: Sync,
     {
         Box::pin(async move {
-            let mut recv_batch = Vec::with_capacity(SIZE);
-            for _ in 0..SIZE {
+            let mut recv_batch = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
                 recv_batch.push(self.recv().await?);
             }
 
