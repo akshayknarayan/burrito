@@ -10,6 +10,7 @@ use rusoto_sqs::{
     DeleteMessageRequest, Message, ReceiveMessageRequest, ReceiveMessageResult, SendMessageRequest,
     SendMessageResult, Sqs,
 };
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{atomic::AtomicUsize, Arc};
@@ -278,15 +279,31 @@ impl SqsChunnel {
     }
 }
 
+const MESSAGE_GROUP_ID_ATTRIBUTE_NAME: &str = "MessageGroupId";
+
 impl ChunnelConnection for SqsChunnel {
     type Data = (SqsAddr, String);
 
     fn send(
         &self,
-        (SqsAddr { queue_id, .. }, body): Self::Data,
+        (SqsAddr { queue_id, group }, body): Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let sqs = self.sqs_client.clone();
         Box::pin(async move {
+            let attributes: HashMap<_, _> = group
+                .clone()
+                .into_iter()
+                .map(|g| {
+                    (
+                        MESSAGE_GROUP_ID_ATTRIBUTE_NAME.to_owned(),
+                        rusoto_sqs::MessageAttributeValue {
+                            data_type: "String".to_owned(),
+                            string_value: Some(g),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
             let SendMessageResult {
                 message_id,
                 sequence_number,
@@ -295,6 +312,7 @@ impl ChunnelConnection for SqsChunnel {
                 .send_message(SendMessageRequest {
                     message_body: body,
                     queue_url: queue_id.clone(),
+                    message_attributes: Some(attributes),
                     ..Default::default()
                 })
                 .await
@@ -303,6 +321,7 @@ impl ChunnelConnection for SqsChunnel {
                 ?message_id,
                 ?sequence_number,
                 ?queue_id,
+                ?group,
                 "sent unordered sqs message"
             );
             Ok(())
@@ -327,6 +346,7 @@ impl ChunnelConnection for SqsChunnel {
                         body,
                         receipt_handle,
                         attributes,
+                        message_attributes,
                         ..
                     },
                 ) = loop {
@@ -343,9 +363,12 @@ impl ChunnelConnection for SqsChunnel {
                                             queue_url: qu.clone(),
                                             visibility_timeout: Some(5),
                                             wait_time_seconds: Some(5),
-                                            attribute_names: Some(
-                                                vec!["MessageGroupId".to_owned()],
-                                            ),
+                                            attribute_names: Some(vec![
+                                                MESSAGE_GROUP_ID_ATTRIBUTE_NAME.to_owned(),
+                                            ]),
+                                            message_attribute_names: Some(vec![
+                                                MESSAGE_GROUP_ID_ATTRIBUTE_NAME.to_owned(),
+                                            ]),
                                             ..Default::default()
                                         })
                                         .await
@@ -392,6 +415,14 @@ impl ChunnelConnection for SqsChunnel {
                     }
                 };
 
+                // remember that to get any attributes back you have to ask for them in the
+                // request.
+                trace!(
+                    ?attributes,
+                    ?message_attributes,
+                    "receive_message attributes"
+                );
+
                 // delete the message that we got
                 sqs.delete_message(DeleteMessageRequest {
                     queue_url: queue_id.clone(),
@@ -399,16 +430,29 @@ impl ChunnelConnection for SqsChunnel {
                 })
                 .await
                 .wrap_err(eyre!("sqs.delete_message on {:?}", queue_id))?;
-
-                // remember that to get any attributes back you have to ask for them in the
-                // request.
-                trace!(?attributes, "receive_message attributes");
                 //let dedup_id = attrs.get("MessageDeduplicationId");
                 let from_addr = SqsAddr {
                     queue_id,
+                    // try `attributes` first, then look at `message_attributes`. `attributes` is the
+                    // one amazon sets for a FIFO queue, and `message_attributes` is the one we set
+                    // since non-fifo queues won't give us the group id attribute
                     group: attributes
-                        .and_then(|attrs| attrs.get("MessageGroupId").map(Clone::clone)),
+                        .and_then(|mut attrs| attrs.remove(MESSAGE_GROUP_ID_ATTRIBUTE_NAME))
+                        .or_else(|| {
+                            message_attributes.and_then(|mut attrs| {
+                                attrs.remove(MESSAGE_GROUP_ID_ATTRIBUTE_NAME).and_then(|v| {
+                                    v.string_value.and_then(|s| {
+                                        if s.is_empty() {
+                                            None
+                                        } else {
+                                            Some(s)
+                                        }
+                                    })
+                                })
+                            })
+                        }),
                 };
+
                 trace!(?from_addr, "receive_message succeeded");
                 Ok((from_addr, body.unwrap()))
             }
