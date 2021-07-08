@@ -308,7 +308,7 @@ where
 
                 }
             }
-            .instrument(info_span!("receive thread", num=?i))
+            .instrument(info_span!("receive-reqs", num=?i))
         },
     ))
     .await?;
