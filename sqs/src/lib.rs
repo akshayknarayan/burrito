@@ -422,9 +422,10 @@ mod test {
     use super::{OrderedSqsChunnel, SqsAddr, SqsChunnel};
     use bertha::ChunnelConnection;
     use color_eyre::{
-        eyre::{ensure, WrapErr},
+        eyre::{ensure, eyre, WrapErr},
         Report,
     };
+    use rand::Rng;
     use rusoto_sqs::SqsClient;
     use tracing::{info, info_span};
     use tracing_error::ErrorLayer;
@@ -434,9 +435,6 @@ mod test {
     #[ignore]
     #[test]
     fn sqs_ordered_groups() {
-        // relies on SQS queue "test.fifo" being available.
-        const FIFO_TEST_QUEUE_URL: &'static str =
-            "https://sqs.us-east-1.amazonaws.com/413104736560/test.fifo";
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -450,11 +448,32 @@ mod test {
             .build()
             .unwrap();
 
-        rt.block_on(
+        let rng = rand::thread_rng();
+        let mut queue_name: String = "bertha-"
+            .chars()
+            .chain(
+                rng.sample_iter(&rand::distributions::Alphanumeric)
+                    .take(10)
+                    .flat_map(char::to_lowercase),
+            )
+            .collect();
+        queue_name.push_str(".fifo");
+        let queue_name = rt
+            .block_on(async move {
+                let err = eyre!("Create fifo sqs queue: {:?}", &queue_name);
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                super::make_fifo_queue(&sqs_client, queue_name)
+                    .await
+                    .wrap_err(err)
+            })
+            .unwrap();
+        let qn = queue_name.clone();
+        let res = rt.block_on(
             async move {
+                let queue_name = qn;
                 // each sqs client has its own http client, so make new ones
                 let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
-                let rch = OrderedSqsChunnel::new(sqs_client, vec![FIFO_TEST_QUEUE_URL])?;
+                let rch = OrderedSqsChunnel::new(sqs_client, vec![queue_name.as_str()])?;
                 let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
                 let sch = OrderedSqsChunnel::new(sqs_client, vec![])?;
 
@@ -465,8 +484,8 @@ mod test {
                 const B1: &'static str = "message B1";
                 const B2: &'static str = "message B2";
 
-                let addr_a: SqsAddr = (FIFO_TEST_QUEUE_URL.to_string(), GROUP_A.to_string()).into();
-                let addr_b: SqsAddr = (FIFO_TEST_QUEUE_URL.to_string(), GROUP_B.to_string()).into();
+                let addr_a: SqsAddr = (queue_name.clone(), GROUP_A.to_string()).into();
+                let addr_b: SqsAddr = (queue_name.clone(), GROUP_B.to_string()).into();
 
                 sch.send((addr_a.clone(), A1.to_string()))
                     .await
@@ -486,16 +505,16 @@ mod test {
                 info!("sent b2");
 
                 let (q, msg1) = rch.recv().await.wrap_err("sqs recv")?;
-                assert_eq!(q.queue_id, FIFO_TEST_QUEUE_URL);
+                assert_eq!(&q.queue_id, &queue_name);
                 info!(?msg1, "recvd");
                 let (q, msg2) = rch.recv().await.wrap_err("sqs recv")?;
-                assert_eq!(q.queue_id, FIFO_TEST_QUEUE_URL);
+                assert_eq!(&q.queue_id, &queue_name);
                 info!(?msg2, "recvd");
                 let (q, msg3) = rch.recv().await.wrap_err("sqs recv")?;
-                assert_eq!(q.queue_id, FIFO_TEST_QUEUE_URL);
+                assert_eq!(&q.queue_id, &queue_name);
                 info!(?msg3, "recvd");
                 let (q, msg4) = rch.recv().await.wrap_err("sqs recv")?;
-                assert_eq!(q.queue_id, FIFO_TEST_QUEUE_URL);
+                assert_eq!(&q.queue_id, &queue_name);
                 info!(?msg4, "recvd");
 
                 let valid_orders = [
@@ -516,16 +535,19 @@ mod test {
                 Ok::<_, Report>(())
             }
             .instrument(info_span!("sqs_ordered_groups")),
-        )
+        );
+
+        rt.block_on(async move {
+            let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+            super::delete_queue(&sqs_client, queue_name).await
+        })
         .unwrap();
+        res.unwrap()
     }
 
     #[ignore]
     #[test]
     fn sqs_ordering() {
-        // relies on SQS queue "test1.fifo" being available.
-        const FIFO_TEST_QUEUE_URL: &'static str =
-            "https://sqs.us-east-1.amazonaws.com/413104736560/test1.fifo";
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -539,11 +561,31 @@ mod test {
             .build()
             .unwrap();
 
-        rt.block_on(
+        let rng = rand::thread_rng();
+        let mut queue_name: String = "bertha-"
+            .chars()
+            .chain(
+                rng.sample_iter(&rand::distributions::Alphanumeric)
+                    .take(10)
+                    .flat_map(char::to_lowercase),
+            )
+            .collect();
+        queue_name.push_str(".fifo");
+        let queue_name = rt
+            .block_on(async move {
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                super::make_fifo_queue(&sqs_client, queue_name)
+                    .await
+                    .wrap_err("Create fifo sqs queue")
+            })
+            .unwrap();
+        let qn = queue_name.clone();
+        let res = rt.block_on(
             async move {
+                let queue_name = qn;
                 // each sqs client has its own http client, so make new ones
                 let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
-                let rch = OrderedSqsChunnel::new(sqs_client, vec![FIFO_TEST_QUEUE_URL])?;
+                let rch = OrderedSqsChunnel::new(sqs_client, vec![queue_name.as_str()])?;
                 let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
                 let sch = OrderedSqsChunnel::new(sqs_client, vec![])?;
 
@@ -553,7 +595,7 @@ mod test {
                 const A3: &'static str = "message A3";
                 const A4: &'static str = "message A4";
 
-                let addr_a: SqsAddr = (FIFO_TEST_QUEUE_URL.to_string(), GROUP_A.to_string()).into();
+                let addr_a: SqsAddr = (queue_name.to_string(), GROUP_A.to_string()).into();
 
                 sch.send((addr_a.clone(), A1.to_string()))
                     .await
@@ -573,16 +615,16 @@ mod test {
                 info!("sent a4");
 
                 let (q, msg1) = rch.recv().await.wrap_err("sqs recv")?;
-                assert_eq!(q.queue_id, FIFO_TEST_QUEUE_URL);
+                assert_eq!(q.queue_id, queue_name);
                 info!(?msg1, "recvd");
                 let (q, msg2) = rch.recv().await.wrap_err("sqs recv")?;
-                assert_eq!(q.queue_id, FIFO_TEST_QUEUE_URL);
+                assert_eq!(q.queue_id, queue_name);
                 info!(?msg2, "recvd");
                 let (q, msg3) = rch.recv().await.wrap_err("sqs recv")?;
-                assert_eq!(q.queue_id, FIFO_TEST_QUEUE_URL);
+                assert_eq!(q.queue_id, queue_name);
                 info!(?msg3, "recvd");
                 let (q, msg4) = rch.recv().await.wrap_err("sqs recv")?;
-                assert_eq!(q.queue_id, FIFO_TEST_QUEUE_URL);
+                assert_eq!(q.queue_id, queue_name);
                 info!(?msg4, "recvd");
 
                 let valid_orders = [[A1, A2, A3, A4]];
@@ -596,16 +638,19 @@ mod test {
                 Ok::<_, Report>(())
             }
             .instrument(info_span!("sqs_ordering")),
-        )
+        );
+
+        rt.block_on(async move {
+            let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+            super::delete_queue(&sqs_client, queue_name).await
+        })
         .unwrap();
+        res.unwrap()
     }
 
     #[ignore]
     #[test]
     fn sqs_send_recv() {
-        // relies on SQS queue "test" being available.
-        const TEST_QUEUE_URL: &'static str =
-            "https://sqs.us-east-1.amazonaws.com/413104736560/test";
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -619,14 +664,33 @@ mod test {
             .build()
             .unwrap();
 
-        rt.block_on(
-            async move {
+        let rng = rand::thread_rng();
+        let queue_name: String = "bertha-"
+            .chars()
+            .chain(
+                rng.sample_iter(&rand::distributions::Alphanumeric)
+                    .take(10)
+                    .flat_map(char::to_lowercase),
+            )
+            .collect();
+        let queue_name = rt
+            .block_on(async move {
                 let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
-                let ch = SqsChunnel::new(sqs_client, vec![TEST_QUEUE_URL]);
+                super::make_be_queue(&sqs_client, queue_name)
+                    .await
+                    .wrap_err("Create be sqs queue")
+            })
+            .unwrap();
+        let qn = queue_name.clone();
+        let res = rt.block_on(
+            async move {
+                let queue_name = qn;
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                let ch = SqsChunnel::new(sqs_client, vec![queue_name.as_str()]);
 
                 ch.send((
                     SqsAddr {
-                        queue_id: TEST_QUEUE_URL.to_string(),
+                        queue_id: queue_name.to_string(),
                         group: None,
                     },
                     "test message".to_string(),
@@ -634,12 +698,18 @@ mod test {
                 .await
                 .wrap_err("sqs send")?;
                 let (q, msg) = ch.recv().await.wrap_err("sqs recv")?;
-                assert_eq!(q.queue_id, TEST_QUEUE_URL);
+                assert_eq!(q.queue_id, queue_name);
                 assert_eq!(&msg, "test message");
                 Ok::<_, Report>(())
             }
             .instrument(info_span!("sqs_send_recv")),
-        )
+        );
+
+        rt.block_on(async move {
+            let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+            super::delete_queue(&sqs_client, queue_name).await
+        })
         .unwrap();
+        res.unwrap()
     }
 }
