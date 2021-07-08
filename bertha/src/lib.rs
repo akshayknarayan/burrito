@@ -166,8 +166,9 @@ pub trait ChunnelConnection {
     {
         Box::pin(async move {
             let mut recv_batch = Vec::with_capacity(batch_size);
-            for _ in 0..batch_size {
+            for i in 0..batch_size {
                 recv_batch.push(self.recv().await?);
+                tracing::debug!(?i, "batch recv");
             }
 
             Ok(recv_batch)
