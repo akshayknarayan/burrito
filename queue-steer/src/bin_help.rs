@@ -117,17 +117,22 @@ where
     // our local version of send_reqs, which uses a unique ordering key
     debug!("starting sends");
     let cn = send_cn;
-    for req_num in 0..num_reqs {
-        debug!(?req_num, "sending request");
-        let mut addr = addr.clone();
-        addr.set_group(req_num.to_string());
-        cn.send((
-            addr,
-            Msg {
-                send_time: start.elapsed(),
-                req_num,
-            },
-        ))
+    let num_batches = num_reqs / batch_size + 1;
+    for batch_num in 0..num_batches {
+        debug!(?batch_num, "sending batch");
+        cn.send_batch((0..batch_size).map(|i| {
+            let mut addr = addr.clone();
+            let req_num = batch_num * batch_size + i;
+            addr.set_group(req_num.to_string());
+
+            (
+                addr,
+                Msg {
+                    send_time: start.elapsed(),
+                    req_num,
+                },
+            )
+        }))
         .await?;
         if inter_request.as_nanos() > 0 {
             tokio::time::sleep(inter_request).await;
@@ -217,7 +222,7 @@ async fn send_reqs(
 ) -> Result<(), Report> {
     debug!("starting sends");
     let mut curr_group: usize = 0;
-    let num_batches = num_reqs / batch_size;
+    let num_batches = num_reqs / batch_size + 1;
     for batch_num in 0..num_batches {
         debug!(?curr_group, ?batch_num, "sending batch");
         send_chunnels[curr_group]
