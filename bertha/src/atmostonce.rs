@@ -8,7 +8,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, debug_span, trace};
+use tracing::{debug, trace, trace_span};
 use tracing_futures::Instrument;
 
 /// At Most Once Delivery semantics with no other assumptions.
@@ -32,7 +32,15 @@ impl Default for AtMostOnceChunnel {
 impl<InC, A, D> Chunnel<InC> for AtMostOnceChunnel
 where
     InC: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
-    A: serde::Serialize + serde::de::DeserializeOwned + Clone + Eq + Hash + Send + Sync + 'static,
+    A: serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + Eq
+        + Hash
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
     type Connection = AtMostOnceCn<InC, A>;
@@ -66,7 +74,15 @@ where
 
 impl<C, A, D> ChunnelConnection for AtMostOnceCn<C, A>
 where
-    A: serde::Serialize + serde::de::DeserializeOwned + Clone + Eq + Hash + Send + Sync + 'static,
+    A: serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + Eq
+        + Hash
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
     C: ChunnelConnection<Data = (A, (u32, D))> + Send + Sync + 'static,
 {
     type Data = (A, D);
@@ -77,6 +93,7 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let mut next_seq = self.next_seq.entry(addr.clone()).or_insert(0);
         *next_seq += 1;
+        trace!(?addr, seq=?*next_seq, "sending");
         self.inner.send((addr, (*next_seq, data)))
     }
 
@@ -94,7 +111,7 @@ where
                     }
                 }
             }
-            .instrument(debug_span!("at-most-once:recv")),
+            .instrument(trace_span!("at-most-once:recv")),
         )
     }
 }
