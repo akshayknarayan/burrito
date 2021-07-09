@@ -7,8 +7,10 @@
 use bertha::ChunnelConnection;
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use rusoto_sqs::{
-    DeleteMessageRequest, Message, ReceiveMessageRequest, ReceiveMessageResult, SendMessageRequest,
-    SendMessageResult, Sqs,
+    DeleteMessageBatchRequest, DeleteMessageBatchRequestEntry, DeleteMessageBatchResult,
+    DeleteMessageRequest, Message, ReceiveMessageRequest, ReceiveMessageResult,
+    SendMessageBatchRequest, SendMessageBatchRequestEntry, SendMessageBatchResult,
+    SendMessageRequest, SendMessageResult, Sqs,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -189,6 +191,12 @@ impl OrderedSqsChunnel {
     }
 }
 
+fn get_dedup(ctr: usize, body: &[u8]) -> String {
+    let mut dedup_id = format!("{}", ctr);
+    base64::encode_config_buf(&body[..8], base64::STANDARD, &mut dedup_id);
+    dedup_id
+}
+
 impl ChunnelConnection for OrderedSqsChunnel {
     type Data = (SqsAddr, String);
 
@@ -217,8 +225,7 @@ impl ChunnelConnection for OrderedSqsChunnel {
 
             // message_deduplication_id is optional if cloud-side "content-based deduplication" is
             // enabled, but required if it is not.
-            let mut dedup_id = format!("{}", ctr);
-            base64::encode_config_buf(body[..8].as_bytes(), base64::STANDARD, &mut dedup_id);
+            let dedup_id = get_dedup(ctr, &body[..].as_bytes());
             let SendMessageResult {
                 sequence_number,
                 message_id,
@@ -246,6 +253,148 @@ impl ChunnelConnection for OrderedSqsChunnel {
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         self.inner.recv()
+    }
+}
+
+/// OrderedSqsChunnel but with send_batch and recv_batch impls.
+pub struct OrderedSqsChunnelBatch(pub OrderedSqsChunnel);
+
+impl ChunnelConnection for OrderedSqsChunnelBatch {
+    type Data = (SqsAddr, String);
+
+    fn send(
+        &self,
+        d: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        self.0.send(d)
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        self.0.recv()
+    }
+
+    // TODO advertise max batch size, in our case 10
+    fn send_batch<'cn, D>(
+        &'cn self,
+        data: D,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        D: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <D as IntoIterator>::IntoIter: Send,
+        Self::Data: Send,
+        Self: Sync,
+    {
+        #[tracing::instrument(skip(sqs, msgs), err, level = "trace")]
+        async fn send_batch(
+            sqs: &SqsClient,
+            qid: String,
+            ctr: usize,
+            msgs: Vec<(SqsAddr, String)>,
+        ) -> Result<(), Report> {
+            let batch_request_entries = msgs
+                .into_iter()
+                .enumerate()
+                .map(|(id, (SqsAddr { group, .. }, body))| {
+                    let dedup_id = get_dedup(ctr + id, &body[..].as_bytes());
+                    SendMessageBatchRequestEntry {
+                        message_body: body,
+                        message_group_id: group.clone(),
+                        message_deduplication_id: Some(dedup_id),
+                        id: id.to_string(), // batch id
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let SendMessageBatchResult { failed, successful } = sqs
+                .send_message_batch(SendMessageBatchRequest {
+                    entries: batch_request_entries,
+                    queue_url: qid.clone(),
+                })
+                .await
+                .wrap_err(eyre!("send_message_batch to {:?}", &qid))?;
+            if !failed.is_empty() {
+                return Err(failed.into_iter().fold(
+                    eyre!("one or more messages failed to send to {:?}", &qid),
+                    |err, failed_msg| err.wrap_err(eyre!("{:?}", failed_msg)),
+                ));
+            }
+
+            trace!(?qid, batch=?successful.len(), "send ordered sqs message batch");
+            Ok(())
+        }
+
+        let sqs = self.0.inner.sqs_client.clone();
+        let send_ctr = Arc::clone(&self.0.send_ctr);
+        Box::pin(async move {
+            let mut pending_batches = HashMap::new();
+            let mut data = data.into_iter();
+            loop {
+                // group the messages by destination queue. If we fill a queue's batch (to 10),
+                // stop pulling messages and send that batch, setting `batch_to_send` to `Some`
+                // accordingly.  After the loop, if `batch_to_send` is None, then we couldn't fill any batches
+                // and there are no more messages, so just send the residual batches and we're done.
+                let mut batch_to_send = None;
+                for (
+                    SqsAddr {
+                        mut queue_id,
+                        group,
+                    },
+                    body,
+                ) in &mut data
+                {
+                    if !queue_id.ends_with(".fifo") {
+                        queue_id.push_str(".fifo");
+                    }
+
+                    let q_batch = pending_batches
+                        .entry(queue_id.clone())
+                        .or_insert(Vec::with_capacity(10));
+                    q_batch.push((
+                        SqsAddr {
+                            queue_id: queue_id.clone(),
+                            group,
+                        },
+                        body,
+                    ));
+                    if q_batch.len() == 10 {
+                        batch_to_send = Some(queue_id.clone());
+                        break;
+                    }
+                }
+
+                if let Some(qid) = batch_to_send {
+                    // we filled a batch. send it and loop back for any other messages.
+                    let msgs = pending_batches.remove(&qid).unwrap(); // for loop above guarantees presence
+                    let ctr = send_ctr.fetch_add(msgs.len(), std::sync::atomic::Ordering::SeqCst);
+                    send_batch(&sqs, qid, ctr, msgs).await?;
+                } else {
+                    // send the residual batches and break.
+                    for (qid, msgs) in pending_batches {
+                        let ctr =
+                            send_ctr.fetch_add(msgs.len(), std::sync::atomic::Ordering::SeqCst);
+                        send_batch(&sqs, qid, ctr, msgs).await?;
+                    }
+
+                    break;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn recv_batch<'cn>(
+        &'cn self,
+        batch_size: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Self::Data>, Report>> + Send + 'cn>>
+    where
+        Self::Data: Send,
+        Self: Sync,
+    {
+        // first inner: OrderedSqsChunnel. second: SqsChunnel
+        let sqs = self.0.inner.sqs_client.clone();
+        let recv_queue_urls = self.0.inner.recv_queue_urls.clone();
+        Box::pin(do_recv_batch(sqs, recv_queue_urls, batch_size))
     }
 }
 
@@ -459,6 +608,292 @@ impl ChunnelConnection for SqsChunnel {
             .instrument(debug_span!("sqs_recv")),
         )
     }
+}
+
+/// SqsChunnel but with send_batch and recv_batch impls.
+#[derive(Debug, Clone)]
+pub struct SqsChunnelBatch(pub SqsChunnel);
+
+impl ChunnelConnection for SqsChunnelBatch {
+    type Data = (SqsAddr, String);
+
+    fn send(
+        &self,
+        d: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        self.0.send(d)
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        self.0.recv()
+    }
+
+    // TODO advertise max batch size, in our case 10
+    // XXX this implementation is very similar to the ordered one (with shared batching logic). find a way
+    // to merge.
+    fn send_batch<'cn, D>(
+        &'cn self,
+        data: D,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        D: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <D as IntoIterator>::IntoIter: Send,
+        Self::Data: Send,
+        Self: Sync,
+    {
+        #[tracing::instrument(skip(sqs, msgs), err, level = "trace")]
+        async fn send_batch(
+            sqs: &SqsClient,
+            qid: String,
+            msgs: Vec<(SqsAddr, String)>,
+        ) -> Result<(), Report> {
+            let batch_request_entries = msgs
+                .into_iter()
+                .enumerate()
+                .map(|(id, (SqsAddr { group, .. }, body))| {
+                    let attributes: HashMap<_, _> = group
+                        .clone()
+                        .into_iter()
+                        .map(|g| {
+                            (
+                                MESSAGE_GROUP_ID_ATTRIBUTE_NAME.to_owned(),
+                                rusoto_sqs::MessageAttributeValue {
+                                    data_type: "String".to_owned(),
+                                    string_value: Some(g),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect();
+                    SendMessageBatchRequestEntry {
+                        message_body: body,
+                        message_attributes: Some(attributes),
+                        id: id.to_string(), // batch id
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let SendMessageBatchResult { failed, successful } = sqs
+                .send_message_batch(SendMessageBatchRequest {
+                    entries: batch_request_entries,
+                    queue_url: qid.clone(),
+                })
+                .await
+                .wrap_err(eyre!("send_message_batch to {:?}", &qid))?;
+            if !failed.is_empty() {
+                return Err(failed.into_iter().fold(
+                    eyre!("one or more messages failed to send to {:?}", &qid),
+                    |err, failed_msg| err.wrap_err(eyre!("{:?}", failed_msg)),
+                ));
+            }
+
+            trace!(?qid, batch=?successful.len(), "send sqs message batch");
+            Ok(())
+        }
+
+        let sqs = self.0.sqs_client.clone();
+        Box::pin(async move {
+            let mut pending_batches = HashMap::new();
+            let mut data = data.into_iter();
+            loop {
+                // group the messages by destination queue. If we fill a queue's batch (to 10),
+                // stop pulling messages and send that batch, setting `batch_to_send` to `Some`
+                // accordingly.  After the loop, if `batch_to_send` is None, then we couldn't fill any batches
+                // and there are no more messages, so just send the residual batches and we're done.
+                let mut batch_to_send = None;
+                for (SqsAddr { queue_id, group }, body) in &mut data {
+                    let q_batch = pending_batches
+                        .entry(queue_id.clone())
+                        .or_insert(Vec::with_capacity(10));
+                    q_batch.push((
+                        SqsAddr {
+                            queue_id: queue_id.clone(),
+                            group,
+                        },
+                        body,
+                    ));
+                    if q_batch.len() == 10 {
+                        batch_to_send = Some(queue_id.clone());
+                        break;
+                    }
+                }
+
+                if let Some(qid) = batch_to_send {
+                    // we filled a batch. send it and loop back for any other messages.
+                    let msgs = pending_batches.remove(&qid).unwrap(); // for loop above guarantees presence
+                    send_batch(&sqs, qid, msgs).await?;
+                } else {
+                    // send the residual batches and break.
+                    for (qid, msgs) in pending_batches {
+                        send_batch(&sqs, qid, msgs).await?;
+                    }
+
+                    break;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn recv_batch<'cn>(
+        &'cn self,
+        batch_size: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Self::Data>, Report>> + Send + 'cn>>
+    where
+        Self::Data: Send,
+        Self: Sync,
+    {
+        let sqs = self.0.sqs_client.clone();
+        let recv_queue_urls = self.0.recv_queue_urls.clone();
+        let batch_size = std::cmp::min(batch_size, 10);
+        Box::pin(do_recv_batch(sqs, recv_queue_urls, batch_size))
+    }
+}
+
+#[instrument(skip(sqs), err, level = "debug")]
+async fn do_recv_batch(
+    sqs: SqsClient,
+    recv_queue_urls: Vec<String>,
+    batch_size: usize,
+) -> Result<Vec<(SqsAddr, String)>, Report> {
+    tokio::pin!(sqs);
+    let mut futs = vec![];
+    let (queue_id, mut msgs) = loop {
+        if futs.is_empty() {
+            futs = recv_queue_urls
+                .iter()
+                .map(|q_url| {
+                    let qu = q_url.to_string();
+                    let sqs = &sqs; // don't move sqs, we need to use it in the other concurrent reqs
+                    Box::pin(async move {
+                        let resp = sqs
+                            .receive_message(ReceiveMessageRequest {
+                                max_number_of_messages: Some(batch_size as _),
+                                queue_url: qu.clone(),
+                                visibility_timeout: Some(5),
+                                wait_time_seconds: Some(5),
+                                attribute_names: Some(vec![
+                                    MESSAGE_GROUP_ID_ATTRIBUTE_NAME.to_owned()
+                                ]),
+                                message_attribute_names: Some(vec![
+                                    MESSAGE_GROUP_ID_ATTRIBUTE_NAME.to_owned(),
+                                ]),
+                                ..Default::default()
+                            })
+                            .await
+                            .wrap_err(eyre!("sqs.receive_message on {:?}", qu))?;
+                        trace!(
+                            messages = ?resp.messages.as_ref().map(Vec::len),
+                            "sqs receive_message future completed"
+                        );
+                        Ok::<_, Report>((resp, qu))
+                    })
+                })
+                .collect();
+        }
+
+        let (
+            (
+                ReceiveMessageResult {
+                    messages: recvd_message,
+                },
+                qid,
+            ),
+            leftover,
+        ) = futures_util::future::select_ok(futs).await?;
+
+        match recvd_message {
+            None => {
+                // try again with the rest of the futs.
+                futs = leftover;
+                trace!("receive_message returned None");
+                continue;
+            }
+            Some(msg) if msg.is_empty() => {
+                // try again with the rest of the futs.
+                futs = leftover;
+                trace!("receive_message returned empty list");
+                continue;
+            }
+            Some(msgs) => {
+                // done. can drop leftover. if the leftover futures happen to successfully
+                // resolve, that is fine, we're not going to clear them from the queue.
+                trace!(
+                    recvd_batch_size = msgs.len(),
+                    "receive_message returned batch"
+                );
+                break (qid, msgs);
+            }
+        }
+    };
+
+    // delete the batch
+    let delete_message_batch_entries: Vec<_> = msgs
+        .iter_mut()
+        .enumerate()
+        .map(|(id, msg)| {
+            let receipt_handle = msg.receipt_handle.take().unwrap();
+            DeleteMessageBatchRequestEntry {
+                id: id.to_string(),
+                receipt_handle,
+            }
+        })
+        .collect();
+
+    // delete the message that we got
+    let DeleteMessageBatchResult { failed, successful } = sqs
+        .delete_message_batch(DeleteMessageBatchRequest {
+            queue_url: queue_id.clone(),
+            entries: delete_message_batch_entries,
+        })
+        .await
+        .wrap_err(eyre!("sqs.delete_message_batch on {:?}", &queue_id))?;
+    if !failed.is_empty() {
+        return Err(failed.into_iter().fold(
+            eyre!("one or more messages failed to delete on {:?}", &queue_id),
+            |err, failed_msg| err.wrap_err(eyre!("{:?}", failed_msg)),
+        ));
+    }
+
+    trace!(num=?successful.len(), "deleted received messages");
+
+    Ok(msgs
+        .into_iter()
+        .map(
+            |Message {
+                 body,
+                 attributes,
+                 message_attributes,
+                 ..
+             }| {
+                let from_addr = SqsAddr {
+                    queue_id: queue_id.clone(),
+                    // try `attributes` first, then look at `message_attributes`. `attributes` is the
+                    // one amazon sets for a FIFO queue, and `message_attributes` is the one we set
+                    // since non-fifo queues won't give us the group id attribute
+                    group: attributes
+                        .and_then(|mut attrs| attrs.remove(MESSAGE_GROUP_ID_ATTRIBUTE_NAME))
+                        .or_else(|| {
+                            message_attributes.and_then(|mut attrs| {
+                                attrs.remove(MESSAGE_GROUP_ID_ATTRIBUTE_NAME).and_then(|v| {
+                                    v.string_value.and_then(|s| {
+                                        if s.is_empty() {
+                                            None
+                                        } else {
+                                            Some(s)
+                                        }
+                                    })
+                                })
+                            })
+                        }),
+                };
+
+                trace!(?from_addr, "receive_message succeeded");
+                (from_addr, body.unwrap())
+            },
+        )
+        .collect())
 }
 
 #[cfg(test)]
@@ -747,6 +1182,87 @@ mod test {
                 Ok::<_, Report>(())
             }
             .instrument(info_span!("sqs_send_recv")),
+        );
+
+        rt.block_on(async move {
+            let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+            super::delete_queue(&sqs_client, queue_name).await
+        })
+        .unwrap();
+        res.unwrap()
+    }
+
+    #[ignore]
+    #[test]
+    fn sqs_batch() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or(());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        let rng = rand::thread_rng();
+        let queue_name: String = "bertha-"
+            .chars()
+            .chain(
+                rng.sample_iter(&rand::distributions::Alphanumeric)
+                    .take(10)
+                    .flat_map(char::to_lowercase),
+            )
+            .collect();
+        let queue_name = rt
+            .block_on(async move {
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                info!(?queue_name, "make queue");
+                super::make_be_queue(&sqs_client, queue_name)
+                    .await
+                    .wrap_err("Create be sqs queue")
+            })
+            .unwrap();
+        info!(?queue_name, "made queue");
+        let qn = queue_name.clone();
+        let res = rt.block_on(
+            async move {
+                let queue_name = qn;
+                let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
+                let ch = SqsChunnel::new(sqs_client, vec![queue_name.as_str()]);
+
+                info!("sending 20 messages");
+                ch.send_batch(
+                    std::iter::repeat((
+                        SqsAddr {
+                            queue_id: queue_name.to_string(),
+                            group: None,
+                        },
+                        "test message".to_string(),
+                    ))
+                    .take(20),
+                )
+                .await
+                .wrap_err("sqs send")?;
+
+                let mut recvd = 0;
+                while recvd < 20 {
+                    info!("calling recv_batch");
+                    let msgs = ch.recv_batch(10).await.wrap_err("sqs recv")?;
+                    let l = msgs.len();
+                    for (q, msg) in msgs {
+                        assert_eq!(q.queue_id, queue_name);
+                        assert_eq!(&msg, "test message");
+                    }
+                    recvd += l;
+                }
+
+                Ok::<_, Report>(())
+            }
+            .instrument(info_span!("sqs_batch")),
         );
 
         rt.block_on(async move {
