@@ -118,6 +118,7 @@ where
     debug!("starting sends");
     let cn = send_cn;
     let num_batches = num_reqs / batch_size + 1;
+    let inter_request = inter_request * batch_size as _;
     for batch_num in 0..num_batches {
         debug!(?batch_num, "sending batch");
         cn.send_batch((0..batch_size).map(|i| {
@@ -223,6 +224,7 @@ async fn send_reqs(
     debug!("starting sends");
     let mut curr_group: usize = 0;
     let num_batches = num_reqs / batch_size + 1;
+    let inter_request = inter_request * batch_size as _;
     for batch_num in 0..num_batches {
         debug!(?curr_group, ?batch_num, "sending batch");
         send_chunnels[curr_group]
