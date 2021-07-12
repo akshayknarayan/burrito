@@ -15,10 +15,10 @@ use queue_steer::bin_help::{
     do_atmostonce_exp, do_best_effort_exp, do_ordered_groups_exp, dump_results, Mode, RecvdMsg,
 };
 use queue_steer::{
-    AtMostOnce, AzQueueChunnelWrap, GcpPubSubWrap, KafkaChunnelWrap, Ordered, OrderedGcpPubSubWrap,
-    OrderedSqsChunnelWrap, SqsChunnelWrap,
+    AtMostOnce, AzQueueChunnelWrap, BatchSqsChunnelWrap, GcpPubSubWrap, KafkaChunnelWrap, Ordered,
+    OrderedGcpPubSubWrap, OrderedSqsChunnelWrap, SqsChunnelWrap,
 };
-use sqs::{SqsAddr, SqsChunnel};
+use sqs::{SqsAddr, SqsChunnel, SqsChunnelBatch};
 use std::fmt::Debug;
 use std::iter::once;
 use std::sync::Arc;
@@ -42,6 +42,8 @@ struct Opt {
     num_receivers: usize,
     #[structopt(long)]
     batch_size: usize,
+    #[structopt(long)]
+    batch_opt: bool, // a flag, if given the value is true, which is with the API optimization
     #[structopt(long)]
     service_mode: bool, // client-side or service-side impl. it is a flag, so if not provided its value is false, which is client mode.
     #[structopt(short, long)]
@@ -92,6 +94,7 @@ async fn main() -> Result<(), Report> {
         num_reqs,
         num_receivers,
         batch_size,
+        batch_opt,
         inter_request_ms,
         service_mode,
         out_file,
@@ -104,6 +107,7 @@ async fn main() -> Result<(), Report> {
         ?num_reqs,
         ?inter_request_ms,
         ?batch_size,
+        ?batch_opt,
         ?service_mode,
         ?provider,
         "starting"
@@ -113,6 +117,7 @@ async fn main() -> Result<(), Report> {
             queue,
             mode,
             service_mode,
+            batch_opt,
             num_reqs,
             inter_request_ms,
             num_receivers,
@@ -163,6 +168,7 @@ impl Provider {
         queue: Option<String>,
         mode: Mode,
         service_mode: bool,
+        batch_opt: bool,
         num_reqs: usize,
         inter_request_ms: u64,
         num_receivers: usize,
@@ -319,28 +325,48 @@ impl Provider {
                     queue_id: queue.clone(),
                     group: None,
                 };
-                let cn: SqsChunnelWrap = SqsChunnel::new(sqs_client, once(queue.as_str())).into();
-                let (msgs, elapsed) = if service_mode {
-                    let cn: OrderedSqsChunnelWrap = cn.into();
-                    do_exp_service!(
-                        mode,
-                        cn,
-                        addr,
-                        num_reqs,
-                        inter_request_ms,
-                        num_receivers,
-                        batch_size
-                    )
+
+                let (msgs, elapsed) = if batch_opt {
+                    let cn: BatchSqsChunnelWrap =
+                        SqsChunnelBatch(SqsChunnel::new(sqs_client, once(queue.as_str()))).into();
+                    if service_mode {
+                        todo!()
+                    } else {
+                        do_exp!(
+                            mode,
+                            cn,
+                            addr,
+                            num_reqs,
+                            inter_request_ms,
+                            num_receivers,
+                            batch_size
+                        )
+                    }
                 } else {
-                    do_exp!(
-                        mode,
-                        cn,
-                        addr,
-                        num_reqs,
-                        inter_request_ms,
-                        num_receivers,
-                        batch_size
-                    )
+                    let cn: SqsChunnelWrap =
+                        SqsChunnel::new(sqs_client, once(queue.as_str())).into();
+                    if service_mode {
+                        let cn: OrderedSqsChunnelWrap = cn.into();
+                        do_exp_service!(
+                            mode,
+                            cn,
+                            addr,
+                            num_reqs,
+                            inter_request_ms,
+                            num_receivers,
+                            batch_size
+                        )
+                    } else {
+                        do_exp!(
+                            mode,
+                            cn,
+                            addr,
+                            num_reqs,
+                            inter_request_ms,
+                            num_receivers,
+                            batch_size
+                        )
+                    }
                 };
 
                 if let Some(gen) = generated {

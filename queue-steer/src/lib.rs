@@ -12,7 +12,7 @@ use std::hash::Hash;
 pub mod bin_help;
 
 mod aws;
-pub use aws::{OrderedSqsChunnelWrap, SqsChunnelWrap};
+pub use aws::{BatchSqsChunnelWrap, OrderedSqsChunnelWrap, SqsChunnelWrap};
 mod azure;
 pub use azure::AzQueueChunnelWrap;
 mod gcp;
