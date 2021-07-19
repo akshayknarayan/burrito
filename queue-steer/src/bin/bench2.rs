@@ -1,4 +1,4 @@
-//! Measure message throughput, latency, and ordered-ness for an experiment [`Mode`].
+//! Measure message latency and ordered-ness for an experiment [`Mode`].
 //!
 //! This program is both the producer and the consumer (in different threads).
 //! The chunnel stacks it benchmarks should support the (addr, data) = (impl SetGroup, String)
@@ -418,7 +418,7 @@ impl Provider {
             Kafka { addr } => {
                 kafka::make_topic(&addr, &queue).await?;
                 info!(?queue, ?addr, "Kafka queue");
-                let ch = kafka::KafkaChunnel::new(&addr)?;
+                let ch = kafka::KafkaChunnel::new_with_batch_size(&addr, batch_size)?;
                 ch.listen(&[&queue])?;
                 let cn: KafkaChunnelWrap = ch.into();
                 let c_addr = kafka::KafkaAddr {
@@ -434,7 +434,7 @@ impl Provider {
                         num_reqs,
                         inter_request_ms,
                         num_receivers,
-                        batch_size
+                        1
                     )
                 } else {
                     do_exp!(
@@ -444,7 +444,7 @@ impl Provider {
                         num_reqs,
                         inter_request_ms,
                         num_receivers,
-                        batch_size
+                        1
                     )
                 };
 

@@ -355,20 +355,21 @@ pub fn dump_results(
     let mut f = std::fs::File::create(path)?;
     writeln!(
         &mut f,
-        "mode provider inter_request_ms num_msgs elapsed_us msg_send_time req_latency_us req_orderedness"
+        "mode provider inter_request_ms num_msgs elapsed_us msg_send_time req_num req_latency_us req_orderedness"
     )?;
     let num_msgs = msgs.len();
     for (i, m) in msgs.into_iter().enumerate() {
         let orderedness = ((i as isize) - (m.req_num as isize)).abs() as f32 / num_msgs as f32;
         writeln!(
             &mut f,
-            "{} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {}",
             mode,
             provider,
             inter_request_ms,
             num_msgs,
             recv_span.as_micros(),
             m.send_time.as_micros(),
+            m.req_num,
             m.elapsed.as_micros(),
             orderedness,
         )?;
