@@ -70,20 +70,42 @@ impl std::fmt::Debug for KafkaChunnel {
     }
 }
 
+fn default_consumer_cfg(addr: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", addr);
+    cfg.set("group.id", gen_resource_id())
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "smallest")
+        .set("enable.partition.eof", "false");
+    cfg
+}
+
+fn default_producer_cfg(addr: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", addr);
+    cfg
+}
+
 impl KafkaChunnel {
     pub fn new(addr: &str) -> Result<Self, Report> {
-        let mut cfg = ClientConfig::new();
-        cfg.set("bootstrap.servers", addr);
-        let producer = cfg.create()?;
-        cfg.set("group.id", gen_resource_id())
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "smallest")
-            .set("enable.partition.eof", "false");
-        tracing::debug!(group_id = ?&cfg.get("group.id"), "making consumer");
+        Self::new_with_cfg(default_producer_cfg(addr), default_consumer_cfg(addr))
+    }
 
+    pub fn new_with_batch_size(addr: &str, batch_size_bytes: usize) -> Result<Self, Report> {
+        let mut cfg = default_producer_cfg(addr);
+        cfg.set("batch.size", batch_size_bytes.to_string());
+        tracing::debug!(?batch_size_bytes, "kafka producer config");
+        Self::new_with_cfg(cfg, default_consumer_cfg(addr))
+    }
+
+    pub fn new_with_cfg(
+        producer_cfg: ClientConfig,
+        consumer_cfg: ClientConfig,
+    ) -> Result<Self, Report> {
+        tracing::debug!(consumer_group_id = ?&consumer_cfg.get("group.id"), "making KafkaChunnel");
         Ok(KafkaChunnel {
-            producer,
-            consumer: Arc::new(cfg.create()?),
+            producer: producer_cfg.create()?,
+            consumer: Arc::new(consumer_cfg.create()?),
         })
     }
 
