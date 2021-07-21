@@ -154,8 +154,11 @@ fn have_all(univ: &[Vec<u8>], joint: &[Vec<u8>]) -> bool {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NegotiateMsg {
+    /// A list of stacks the client supports
     ClientOffer(Vec<HashMap<u64, Offer>>),
+    /// A list of stacks the server supports
     ServerReply(Result<Vec<HashMap<u64, Offer>>, String>),
+    /// A specific stack the server should use on the given address.
     ServerNonce {
         addr: Vec<u8>,
         picked: HashMap<u64, Offer>,
