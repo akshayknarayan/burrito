@@ -191,7 +191,9 @@ mod server;
 use server::monomorphize;
 pub use server::negotiate_server;
 mod client;
-pub use client::{negotiate_client, NegotiatedConn};
+pub use client::{
+    negotiate_client, negotiate_client_fixed_stack, negotiate_client_nonce, NegotiatedConn,
+};
 mod rendezvous;
 pub use rendezvous::{
     negotiate_rendezvous, NegotiateRendezvousResult, RendezvousBackend, RendezvousEntry,

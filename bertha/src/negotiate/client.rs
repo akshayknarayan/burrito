@@ -1,9 +1,13 @@
-use super::{Apply, ApplyResult, GetOffers, NegotiateMsg, NegotiatePicked};
+use super::{Apply, ApplyResult, GetOffers, NegotiateMsg, NegotiatePicked, StackNonce};
 use crate::{Chunnel, ChunnelConnection};
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
-use std::future::Future;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::{future::Future, pin::Pin};
 use tracing::{debug, trace};
 
 pub type NegotiatedConn<C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
@@ -76,6 +80,58 @@ where
     }
 }
 
+pub fn negotiate_client_nonce<C, A, S>(
+    stack: S,
+    cn: C,
+    nonce: StackNonce,
+) -> impl Future<
+    Output = Result<
+        <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection,
+        Report,
+    >,
+> + Send
+       + 'static
+where
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    S: Apply + Clone + Send + 'static,
+    <S as Apply>::Applied:
+        Chunnel<CheckZeroRttNegotiationReply<C>> + GetOffers + Clone + Debug + Send + 'static,
+    <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection: Send,
+    <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Error:
+        Into<Report> + Send + Sync + 'static,
+    A: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static,
+{
+    let res = stack.apply(nonce);
+    match res {
+        Ok(super::ApplyResult { applied, .. }) => {
+            Box::pin(negotiate_client_fixed_stack(applied, cn))
+                as Pin<Box<dyn Future<Output = _> + Send + 'static>>
+        }
+        Err(e) => Box::pin(futures_util::future::ready(Err(e)))
+            as Pin<Box<dyn Future<Output = _> + Send + 'static>>,
+    }
+}
+
+pub fn negotiate_client_fixed_stack<C, A, S>(
+    mut stack: S,
+    cn: C,
+) -> impl Future<Output = Result<<S as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection, Report>>
+       + Send
+       + 'static
+where
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    A: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static,
+    S: Chunnel<CheckZeroRttNegotiationReply<C>> + GetOffers + Clone + Send + 'static,
+    <S as Chunnel<CheckZeroRttNegotiationReply<C>>>::Error: Into<Report> + Send + Sync + 'static,
+{
+    Box::pin(async move {
+        Ok(stack
+            .connect_wrap(CheckZeroRttNegotiationReply::from(cn))
+            .await
+            .map_err(Into::into)?)
+    })
+}
+
 #[tracing::instrument(skip(cn, offer), err)]
 async fn try_negotiate_offer_loop<A, C>(
     cn: &C,
@@ -118,5 +174,91 @@ where
             "Could not deserialize negotiate_server response: {:?}",
             rbuf
         ))
+    }
+}
+
+/// Ensures safety for zero-rtt negotiation.
+///
+/// On recv, errors if the received message (a response to something that was sent) is a
+/// negotiation response. This only would happen in the error case, so we just return the error
+/// [`ZeroRttNegotiationError`] - can downcast the [`Report`] to get it.
+pub struct CheckZeroRttNegotiationReply<C> {
+    inner: C,
+    success: Arc<AtomicBool>,
+}
+
+impl<C> From<C> for CheckZeroRttNegotiationReply<C> {
+    fn from(inner: C) -> Self {
+        Self {
+            inner,
+            success: Default::default(),
+        }
+    }
+}
+
+impl<C, A> ChunnelConnection for CheckZeroRttNegotiationReply<C>
+where
+    C: ChunnelConnection<Data = (A, Vec<u8>)>,
+    A: 'static,
+{
+    type Data = (A, Vec<u8>);
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        self.inner.send(data)
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        let f = self.inner.recv();
+        if !self.success.load(Ordering::SeqCst) {
+            let success = Arc::clone(&self.success);
+            Box::pin(async move {
+                let (addr, data) = f.await?;
+                // try parsing a NegotiateMsg::ServerReply
+                let m: Result<NegotiateMsg, _> = bincode::deserialize(&data);
+                match m {
+                    Ok(NegotiateMsg::ServerReply(Err(s))) => {
+                        bail!(ZeroRttNegotiationError::NotAccepted(s))
+                    }
+                    Ok(m) => {
+                        // if the ServerReply was ok, then our nonce would have been accepted.
+                        // so there would have been no response.
+                        // further, other NegotiateMsg states are also wrong/unexpected
+                        bail!(ZeroRttNegotiationError::UnexpectedResponse(m))
+                    }
+                    Err(_) => {
+                        trace!("zero-rtt negotiation returned app message");
+                        success.as_ref().store(true, Ordering::SeqCst);
+                        Ok((addr, data))
+                    }
+                }
+            })
+        } else {
+            f
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ZeroRttNegotiationError {
+    NotAccepted(String),
+    UnexpectedResponse(NegotiateMsg),
+}
+
+impl std::fmt::Display for ZeroRttNegotiationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        use ZeroRttNegotiationError::*;
+        let e = match self {
+            NotAccepted(s) => {
+                format!("Negotiation nonce was not accepted: {}", s)
+            }
+            UnexpectedResponse(m) => {
+                format!("Unexpected negotiation response: {:?}", m)
+            }
+        };
+
+        f.write_str(&e)
     }
 }
