@@ -152,16 +152,26 @@ fn have_all(univ: &[Vec<u8>], joint: &[Vec<u8>]) -> bool {
     univ.iter().all(|x| joint.contains(x))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StackNonce(HashMap<u64, Offer>);
+
+impl StackNonce {
+    #[doc(hidden)]
+    pub fn __from_inner(h: HashMap<u64, Offer>) -> StackNonce {
+        StackNonce(h)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NegotiateMsg {
     /// A list of stacks the client supports
-    ClientOffer(Vec<HashMap<u64, Offer>>),
+    ClientOffer(Vec<StackNonce>),
     /// A list of stacks the server supports
-    ServerReply(Result<Vec<HashMap<u64, Offer>>, String>),
+    ServerReply(Result<Vec<StackNonce>, String>),
     /// A specific stack the server should use on the given address.
     ServerNonce {
         addr: Vec<u8>,
-        picked: HashMap<u64, Offer>,
+        picked: StackNonce,
     },
     ServerNonceAck,
 }

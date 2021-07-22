@@ -863,18 +863,20 @@ mod t {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         RendezvousEntry {
-            nonce: [(
-                rng.gen::<u64>(),
-                bertha::negotiate::Offer {
-                    capability_guid: rng.gen(),
-                    impl_guid: rng.gen(),
-                    sidedness: None,
-                    available: vec![],
-                },
-            )]
-            .iter()
-            .cloned()
-            .collect(),
+            nonce: bertha::negotiate::StackNonce::__from_inner(
+                [(
+                    rng.gen::<u64>(),
+                    bertha::negotiate::Offer {
+                        capability_guid: rng.gen(),
+                        impl_guid: rng.gen(),
+                        sidedness: None,
+                        available: vec![],
+                    },
+                )]
+                .iter()
+                .cloned()
+                .collect(),
+            ),
         }
     }
 

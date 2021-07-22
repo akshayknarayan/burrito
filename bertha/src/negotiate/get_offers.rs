@@ -1,4 +1,4 @@
-use super::{CapabilitySet, Negotiate, Select};
+use super::{CapabilitySet, Negotiate, Select, StackNonce};
 use crate::CxList;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,7 +57,7 @@ where
 /// println!("{:?}", offers);
 /// ```
 pub trait GetOffers {
-    type Iter: Iterator<Item = HashMap<u64, Offer>>;
+    type Iter: Iterator<Item = StackNonce>;
     fn offers(&self) -> Self::Iter;
 }
 
@@ -66,7 +66,7 @@ where
     N: Negotiate<Capability = C>,
     C: CapabilitySet + Serialize + DeserializeOwned,
 {
-    type Iter = IterOnce<HashMap<u64, Offer>>;
+    type Iter = IterOnce<StackNonce>;
 
     fn offers(&self) -> Self::Iter {
         let mut h = HashMap::default();
@@ -74,7 +74,7 @@ where
             h.insert(C::guid(), o);
         }
 
-        once(h)
+        once(StackNonce(h))
     }
 }
 
@@ -84,7 +84,7 @@ where
     <H as GetOffers>::Iter: Clone,
     T: GetOffers,
 {
-    type Iter = std::vec::IntoIter<HashMap<u64, Offer>>;
+    type Iter = std::vec::IntoIter<StackNonce>;
 
     fn offers(&self) -> Self::Iter {
         let tail_iter = self.tail.offers();
@@ -106,7 +106,7 @@ where
         let mut opts = vec![];
         for tail_opt in tail_iter {
             for head_opt in head_iter.clone() {
-                opts.push(merge(head_opt, tail_opt.clone()));
+                opts.push(StackNonce(merge(head_opt.0, tail_opt.0.clone())));
             }
         }
 

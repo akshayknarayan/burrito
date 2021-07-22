@@ -1,9 +1,8 @@
-use super::{monomorphize, Apply, ApplyResult, GetOffers, NegotiateMsg, Offer, Pick, Select};
+use super::{monomorphize, Apply, ApplyResult, GetOffers, NegotiateMsg, Pick, Select, StackNonce};
 use crate::{util::NeverCn, Chunnel, ChunnelConnection, Either};
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::future;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
@@ -14,7 +13,7 @@ use tracing_futures::Instrument;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RendezvousEntry {
-    pub nonce: HashMap<u64, Offer>,
+    pub nonce: StackNonce,
 }
 
 #[derive(Clone, Debug)]
@@ -270,10 +269,7 @@ where
 {
     type Applied = UpgradeEitherApply<T1, T2>;
 
-    fn apply(
-        mut self,
-        picked_offers: HashMap<u64, Offer>,
-    ) -> Result<ApplyResult<Self::Applied>, Report> {
+    fn apply(mut self, picked_offers: StackNonce) -> Result<ApplyResult<Self::Applied>, Report> {
         let left_saved = self.left.clone();
         let right_saved = self.right.clone();
 
@@ -418,7 +414,7 @@ where
         Chunnel<NeverCn, Connection = Either<Acn, Bcn>>,
     <Either<<A as Apply>::Applied, <B as Apply>::Applied> as Chunnel<NeverCn>>::Error: Into<Report>,
 {
-    async fn try_upgrade(&mut self, new_offers: HashMap<u64, Offer>) -> Result<(), Report> {
+    async fn try_upgrade(&mut self, new_offers: StackNonce) -> Result<(), Report> {
         let sel = Select::from((self.left.clone(), self.right.clone()));
         let ApplyResult { mut applied, .. } = sel.apply(new_offers)?;
         self.current = applied
@@ -430,7 +426,7 @@ where
 }
 
 pub struct UpgradeEitherConnWrap<A, B, Acn, Bcn> {
-    negotiation: Arc<TokioMutex<mpsc::Receiver<HashMap<u64, Offer>>>>,
+    negotiation: Arc<TokioMutex<mpsc::Receiver<StackNonce>>>,
     inner: Arc<TokioMutex<UpgradeEitherConn<A, B, Acn, Bcn>>>,
     dropped: tokio::task::JoinHandle<()>,
 }
@@ -783,7 +779,7 @@ where
 // "negotiate" against ourselves for a nonce.
 // we impl Pick just to pass to monomorphize, for our actual stack we will use the nonce, since
 // our Either type explicitly handles apply.
-fn solo_monomorphize<T>(stack: T) -> Result<HashMap<u64, Offer>, Report>
+fn solo_monomorphize<T>(stack: T) -> Result<StackNonce, Report>
 where
     T: Pick + Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
     <T as Pick>::Picked: Clone + Debug + Send + 'static,

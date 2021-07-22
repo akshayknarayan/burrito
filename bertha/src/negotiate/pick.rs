@@ -1,8 +1,8 @@
-use super::{have_all, CapabilitySet, Negotiate, Offer, Select};
+use super::{have_all, CapabilitySet, Negotiate, Offer, Select, StackNonce};
 use crate::{either::MakeEither, CxList, Either, FlipEither};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Debug;
 
 /// Result of a `Pick`.
@@ -12,7 +12,7 @@ use std::fmt::Debug;
 #[derive(Debug, Clone)]
 pub struct PickResult<P> {
     pub(crate) stack: P,
-    pub(crate) filtered_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+    pub(crate) filtered_pairs: Vec<(StackNonce, StackNonce)>,
     pub(crate) touched_cap_guids: HashSet<u64>,
 }
 
@@ -25,7 +25,7 @@ pub trait Pick {
     /// Returns (new_stack, mutated_pairs, handled_cap_guids).
     fn pick(
         self,
-        offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+        offer_pairs: Vec<(StackNonce, StackNonce)>,
     ) -> Result<PickResult<Self::Picked>, Report>;
 }
 
@@ -38,7 +38,7 @@ where
 
     fn pick(
         self,
-        offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+        offer_pairs: Vec<(StackNonce, StackNonce)>,
     ) -> Result<PickResult<Self::Picked>, Report> {
         if C::guid() == 0 {
             return Ok(PickResult {
@@ -50,7 +50,9 @@ where
 
         let filtered_pairs = offer_pairs
             .into_iter()
-            .filter_map(|(client, mut server)| {
+            .filter_map(|(client, server)| {
+                let client = client.0;
+                let mut server = server.0;
                 let cap_guid = C::guid();
                 if let Some(offer) = server.get_mut(&cap_guid) {
                     // one-sided checked in `check_touched`
@@ -78,7 +80,7 @@ where
                     }
                 }
 
-                Some((client, server))
+                Some((StackNonce(client), StackNonce(server)))
             })
             .collect();
 
@@ -99,7 +101,7 @@ where
 
     fn pick(
         self,
-        offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+        offer_pairs: Vec<(StackNonce, StackNonce)>,
     ) -> Result<PickResult<Self::Picked>, Report> {
         let PickResult {
             stack: head_pick,
@@ -125,7 +127,7 @@ where
 
 pub(crate) fn check_touched<T: Pick>(
     t: T,
-    pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+    pairs: Vec<(StackNonce, StackNonce)>,
 ) -> Result<PickResult<T::Picked>, Report>
 where
     T::Picked: Debug,
@@ -136,6 +138,8 @@ where
         .filtered_pairs
         .into_iter()
         .filter(|(client, server)| {
+            let client = &client.0;
+            let server = &server.0;
             // if client has something with sidedness none, that means the server has to match its
             // capabilities. So if we didn't touch it, then invalid.
             client
@@ -192,12 +196,12 @@ where
 
     fn pick(
         self,
-        offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+        offer_pairs: Vec<(StackNonce, StackNonce)>,
     ) -> Result<PickResult<Self::Picked>, Report> {
         fn pick_in_preference_order<T1, T2, Inner>(
             first_pick: T1,
             second_pick: T2,
-            offer_pairs: Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)>,
+            offer_pairs: Vec<(StackNonce, StackNonce)>,
         ) -> Result<PickResult<Inner::Either>, Report>
         where
             T1: Pick,

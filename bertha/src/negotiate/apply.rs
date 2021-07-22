@@ -1,24 +1,21 @@
-use super::{CapabilitySet, Negotiate, Offer, Select};
+use super::{CapabilitySet, Negotiate, Offer, Select, StackNonce};
 use crate::{either::MakeEither, CxList, Either, FlipEither};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use serde::de::DeserializeOwned;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tracing::{debug, trace};
 
 #[derive(Debug, Clone)]
 pub struct ApplyResult<A> {
     pub(crate) applied: A,
-    pub(crate) picked: HashMap<u64, Offer>,
+    pub(crate) picked: StackNonce,
     pub(crate) touched: HashSet<u64>,
     pub(crate) score: usize,
 }
 
 pub trait Apply {
     type Applied;
-    fn apply(
-        self,
-        picked_offers: HashMap<u64, Offer>,
-    ) -> Result<ApplyResult<Self::Applied>, Report>;
+    fn apply(self, picked_offers: StackNonce) -> Result<ApplyResult<Self::Applied>, Report>;
 }
 
 impl<N> Apply for N
@@ -29,13 +26,13 @@ where
     type Applied = Self;
     fn apply(
         self,
-        mut picked_offers: HashMap<u64, Offer>,
+        StackNonce(mut picked_offers): StackNonce,
     ) -> Result<ApplyResult<Self::Applied>, Report> {
         let cap_guid = N::Capability::guid();
         if cap_guid == 0 {
             return Ok(ApplyResult {
                 applied: self,
-                picked: picked_offers,
+                picked: StackNonce(picked_offers),
                 touched: Default::default(),
                 score: 0,
             });
@@ -54,7 +51,7 @@ where
 
         Ok(ApplyResult {
             applied: self,
-            picked: picked_offers,
+            picked: StackNonce(picked_offers),
             touched: [N::Capability::guid()].iter().copied().collect(),
             score: 0,
         })
@@ -68,10 +65,7 @@ where
 {
     type Applied = CxList<H::Applied, T::Applied>;
 
-    fn apply(
-        self,
-        picked_offers: HashMap<u64, Offer>,
-    ) -> Result<ApplyResult<Self::Applied>, Report> {
+    fn apply(self, picked_offers: StackNonce) -> Result<ApplyResult<Self::Applied>, Report> {
         let ApplyResult {
             applied: head_pick,
             picked,
@@ -98,10 +92,10 @@ where
 
 pub(crate) fn check_apply<T: Apply>(
     t: T,
-    picked: HashMap<u64, Offer>,
+    picked: StackNonce,
 ) -> Result<ApplyResult<T::Applied>, Report> {
     let ar = t.apply(picked)?;
-    let p = &ar.picked;
+    let p = &ar.picked.0;
     trace!(checking = ?p, "checking apply");
     if ar.touched.iter().all(|c| match p.get(c) {
         Some(Offer {
@@ -131,14 +125,11 @@ where
 {
     type Applied = E;
 
-    fn apply(
-        self,
-        picked_offers: HashMap<u64, Offer>,
-    ) -> Result<ApplyResult<Self::Applied>, Report> {
+    fn apply(self, picked_offers: StackNonce) -> Result<ApplyResult<Self::Applied>, Report> {
         fn apply_in_preference_order<T1, T2, Inner>(
             first_pick: T1,
             second_pick: T2,
-            picked_offers: HashMap<u64, Offer>,
+            picked_offers: StackNonce,
         ) -> Result<ApplyResult<Inner::Either>, Report>
         where
             T1: Apply,

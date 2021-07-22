@@ -5,13 +5,12 @@
 
 use bertha::{
     enumerate_enum,
-    negotiate::{Apply, GetOffers, Offer},
+    negotiate::{Apply, GetOffers, StackNonce},
     Chunnel, ChunnelConnection, ChunnelConnector, IpPort, Negotiate,
 };
 use color_eyre::eyre;
 use eyre::{eyre, Error, WrapErr};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
@@ -109,7 +108,7 @@ pub struct ShardCanonicalServer<A, S, Ss, D> {
     internal_addr: Vec<A>,
     shards_inner: S,
     shards_inner_stack: Ss,
-    shards_extern_nonce: HashMap<u64, Offer>,
+    shards_extern_nonce: StackNonce,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
     _phantom: std::marker::PhantomData<D>,
 }
@@ -133,7 +132,7 @@ where
         internal_addr: Option<Vec<A>>,
         shards_inner: S,
         shards_inner_stack: Ss,
-        shards_extern_nonce: HashMap<u64, Offer>,
+        shards_extern_nonce: StackNonce,
         redis_addr: &str,
     ) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)
@@ -825,7 +824,7 @@ mod test {
     use bertha::{
         bincode::SerializeChunnelProject,
         chan_transport::RendezvousChannel,
-        negotiate::Offer,
+        negotiate::StackNonce,
         reliable::ReliabilityProjChunnel,
         select::SelectListener,
         tagger::TaggerProjChunnel,
@@ -837,7 +836,7 @@ mod test {
     use eyre::{eyre, WrapErr};
     use futures_util::TryStreamExt;
     use serde::{Deserialize, Serialize};
-    use std::{collections::HashMap, net::SocketAddr};
+    use std::net::SocketAddr;
     use tracing::{debug, debug_span, info, trace, warn};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
@@ -863,7 +862,7 @@ mod test {
     pub(crate) async fn start_shard(
         addr: SocketAddr,
         internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
-        s: tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>,
+        s: tokio::sync::oneshot::Sender<Vec<StackNonce>>,
     ) {
         let external = CxList::from(TaggerProjChunnel)
             .wrap(ReliabilityProjChunnel::default())
@@ -1029,7 +1028,7 @@ mod test {
             rdy.push(r);
         }
 
-        let mut offers: Vec<Vec<HashMap<u64, Offer>>> = rdy.try_collect().await.unwrap();
+        let mut offers: Vec<Vec<StackNonce>> = rdy.try_collect().await.unwrap();
 
         // 4. start canonical server
         let cnsrv = ShardCanonicalServer::<_, _, _, (_, Msg)>::new(

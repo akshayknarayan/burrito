@@ -1,6 +1,6 @@
 use super::{
     have_all, inject_with_channel::InjectWithChannel, Apply, ApplyResult, GetOffers, NegotiateMsg,
-    NegotiatePicked, Offer, Pick, PickResult,
+    NegotiatePicked, Offer, Pick, PickResult, StackNonce,
 };
 use crate::{and_then_concurrent::TryStreamExtExt, Chunnel, ChunnelConnection, Either};
 use color_eyre::eyre::{eyre, Report, WrapErr};
@@ -55,8 +55,7 @@ where
     async move {
         // 1. serve (A, Vec<u8>) connections.
         let st = raw_cn_st.map_err(Into::into); // stream of incoming Vec<u8> conns.
-        let pending_negotiated_connections: Arc<Mutex<HashMap<A, HashMap<u64, Offer>>>> =
-            Default::default();
+        let pending_negotiated_connections: Arc<Mutex<HashMap<A, StackNonce>>> = Default::default();
         Ok(st
             .map_err(Into::into)
             // and_then_concurrent will concurrently poll the stream, and any futures returned by
@@ -76,7 +75,7 @@ where
 async fn negotiate_server_connection<C, A, Srv>(
     cn: C,
     stack: Srv,
-    pending_negotiated_connections: Arc<Mutex<HashMap<A, HashMap<u64, Offer>>>>,
+    pending_negotiated_connections: Arc<Mutex<HashMap<A, StackNonce>>>,
 ) -> Result<
     Option<
         Either<
@@ -210,7 +209,7 @@ where
 #[instrument(level = "debug", skip(cn, pending_negotiated_connections))]
 async fn process_nonces_connection<A>(
     cn: impl ChunnelConnection<Data = (A, Vec<u8>)>,
-    pending_negotiated_connections: Arc<Mutex<HashMap<A, HashMap<u64, Offer>>>>,
+    pending_negotiated_connections: Arc<Mutex<HashMap<A, StackNonce>>>,
 ) -> Result<(), Report>
 where
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
@@ -273,16 +272,16 @@ fn stack_pair_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, Offer>) 
 
 // returns (client, server) stack pairs to use.
 fn compare_offers(
-    client: Vec<HashMap<u64, Offer>>,
-    server: Vec<HashMap<u64, Offer>>,
-) -> Vec<(HashMap<u64, Offer>, HashMap<u64, Offer>)> {
+    client: Vec<StackNonce>,
+    server: Vec<StackNonce>,
+) -> Vec<(StackNonce, StackNonce)> {
     let mut valid_pairs = vec![];
-    for client_stack_candidate in client.iter() {
-        for server_stack_candidate in server.iter() {
+    for StackNonce(ref client_stack_candidate) in client.iter() {
+        for StackNonce(ref server_stack_candidate) in server.iter() {
             if stack_pair_valid(client_stack_candidate, server_stack_candidate) {
                 valid_pairs.push((
-                    client_stack_candidate.clone(),
-                    server_stack_candidate.clone(),
+                    StackNonce(client_stack_candidate.clone()),
+                    StackNonce(server_stack_candidate.clone()),
                 ));
             }
         }
@@ -293,16 +292,9 @@ fn compare_offers(
 
 pub(crate) fn monomorphize<Srv, A>(
     stack: Srv,
-    client_offers: Vec<HashMap<u64, Offer>>,
+    client_offers: Vec<StackNonce>,
     from_addr: &A,
-) -> Result<
-    (
-        <Srv as Pick>::Picked,
-        NegotiateMsg,
-        Vec<HashMap<u64, Offer>>,
-    ),
-    Report,
->
+) -> Result<(<Srv as Pick>::Picked, NegotiateMsg, Vec<StackNonce>), Report>
 where
     Srv: Pick + GetOffers + Clone + Debug + Send + 'static,
     // main-line branch: Pick on incoming negotiation handshake.
@@ -325,14 +317,11 @@ where
     let (client_choices, mut server_choices): (Vec<_>, Vec<_>) = filtered_pairs.into_iter().unzip();
     let server_choice = server_choices.pop().unwrap();
 
-    fn check_possibilities(
-        picked: HashMap<u64, Offer>,
-        choices: Vec<HashMap<u64, Offer>>,
-    ) -> HashMap<u64, Offer> {
+    fn check_possibilities(StackNonce(picked): StackNonce, choices: Vec<StackNonce>) -> StackNonce {
         choices
             .into_iter()
             .find(|option| {
-                option.iter().all(|(cap_guid, offer)| {
+                option.0.iter().all(|(cap_guid, offer)| {
                     if let Some(picked_offer) = picked.get(&cap_guid) {
                         picked_offer.available == offer.available
                     } else {

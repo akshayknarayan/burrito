@@ -4,14 +4,13 @@ use crate::kv::Store;
 use crate::msg::Msg;
 use crate::reliability::KvReliabilityServerChunnel;
 use bertha::{
-    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel, negotiate::Offer,
+    bincode::SerializeChunnelProject, chan_transport::RendezvousChannel, negotiate::StackNonce,
     reliable::ReliabilityProjChunnel, select::SelectListener, tagger::OrderedChunnelProj,
     ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers, Select,
 };
 use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt};
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{atomic::AtomicUsize, Arc};
 use tracing::{debug, debug_span, info, info_span, trace, warn};
@@ -160,16 +159,14 @@ pub async fn single_shard(
         + Sync
         + 'static,
     need_address_embedding: bool,
-    s: impl Into<Option<tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>>>,
+    s: impl Into<Option<tokio::sync::oneshot::Sender<Vec<StackNonce>>>>,
 ) {
     let s = s.into();
     let internal_addr = internal_addr.unwrap_or(addr);
     info!(?addr, ?internal_addr, "listening");
 
-    async fn srv<C, Sc, Se>(
-        st: Sc,
-        s: Option<tokio::sync::oneshot::Sender<Vec<HashMap<u64, Offer>>>>,
-    ) where
+    async fn srv<C, Sc, Se>(st: Sc, s: Option<tokio::sync::oneshot::Sender<Vec<StackNonce>>>)
+    where
         Sc: Stream<Item = Result<C, Se>> + Send + 'static,
         C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         Se: Into<Report> + Send + Sync + 'static,
@@ -316,7 +313,7 @@ pub async fn serve(
         rdy.push(r);
     }
 
-    let mut offers: Vec<Vec<HashMap<u64, Offer>>> = rdy.try_collect().await.unwrap();
+    let mut offers: Vec<Vec<StackNonce>> = rdy.try_collect().await.unwrap();
 
     let st = raw_listener
         .listen(si.canonical_addr)
@@ -345,7 +342,7 @@ async fn serve_canonical(
         + 'static,
     internal_cli: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Cln>,
     redis_addr: SocketAddr,
-    mut offer: Vec<HashMap<u64, Offer>>,
+    mut offer: Vec<StackNonce>,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
 ) -> Result<(), Report> {
     // 3. start canonical server
