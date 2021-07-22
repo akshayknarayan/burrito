@@ -166,6 +166,7 @@ pub enum NegotiateMsg {
     ServerNonceAck,
 }
 
+mod inject_with_channel;
 mod negotiate_picked;
 pub use negotiate_picked::NegotiatePicked;
 mod get_offers;

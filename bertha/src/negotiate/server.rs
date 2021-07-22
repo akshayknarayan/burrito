@@ -1,19 +1,15 @@
 use super::{
-    have_all, Apply, ApplyResult, GetOffers, NegotiateMsg, NegotiatePicked, Offer, Pick, PickResult,
+    have_all, inject_with_channel::InjectWithChannel, Apply, ApplyResult, GetOffers, NegotiateMsg,
+    NegotiatePicked, Offer, Pick, PickResult,
 };
 use crate::{and_then_concurrent::TryStreamExtExt, Chunnel, ChunnelConnection, Either};
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use futures_util::{
-    future::{select, FutureExt},
-    stream::{Stream, TryStreamExt},
-};
+use futures_util::stream::{Stream, TryStreamExt};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
-use std::pin::Pin;
-use std::sync::{atomic::AtomicBool, Arc, Mutex};
-use tokio::sync::{oneshot, Mutex as TokioMutex};
+use std::sync::{Arc, Mutex};
 use tracing::{debug, debug_span, instrument, trace, warn};
 use tracing_futures::Instrument;
 
@@ -359,59 +355,3 @@ where
 }
 
 type ClientInput<C, A> = InjectWithChannel<C, (A, Vec<u8>)>;
-pub struct InjectWithChannel<C, D>(C, Arc<AtomicBool>, Arc<TokioMutex<oneshot::Receiver<D>>>);
-
-impl<C, D> InjectWithChannel<C, D> {
-    pub fn make(inner: C) -> (Self, oneshot::Sender<D>) {
-        let (s, r) = oneshot::channel();
-        (
-            Self(
-                inner,
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(TokioMutex::new(r)),
-            ),
-            s,
-        )
-    }
-}
-
-impl<C, D> ChunnelConnection for InjectWithChannel<C, D>
-where
-    C: ChunnelConnection<Data = D>,
-    D: Send + 'static,
-{
-    type Data = D;
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.0.send(data)
-    }
-
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let f = self.0.recv();
-        if self.1.load(std::sync::atomic::Ordering::SeqCst) {
-            f
-        } else {
-            let done = Arc::clone(&self.1);
-            let r = Arc::clone(&self.2);
-            let sel = select(
-                f,
-                Box::pin(async move {
-                    use std::ops::DerefMut;
-                    match r.lock().await.deref_mut().await {
-                        Ok(d) => {
-                            trace!("recirculate first packet on prenegotiated connection");
-                            done.store(true, std::sync::atomic::Ordering::SeqCst);
-                            Ok(d)
-                        }
-                        Err(_) => futures_util::future::pending().await,
-                    }
-                }),
-            )
-            .map(|e| e.factor_first().0);
-            Box::pin(sel)
-        }
-    }
-}
