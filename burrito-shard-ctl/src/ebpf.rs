@@ -1,7 +1,7 @@
 use super::eyre::{eyre, Report, WrapErr};
 use super::ShardCanonicalServer;
 use crate::ShardInfo;
-use bertha::{negotiate::Offer, Chunnel, ChunnelConnection, IpPort, Negotiate};
+use bertha::{negotiate::StackNonce, Chunnel, ChunnelConnection, IpPort, Negotiate};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
@@ -17,12 +17,12 @@ use tracing_futures::Instrument;
 /// evaluating the sharding function. Also registers with shard-ctl, which will perform other setup
 /// (loading XDP program, answering client queries, etc).
 #[derive(Clone)]
-pub struct ShardCanonicalServerEbpf<A, S, Ss> {
-    inner: ShardCanonicalServer<A, S, Ss>,
+pub struct ShardCanonicalServerEbpf<A, S, Ss, D> {
+    inner: ShardCanonicalServer<A, S, Ss, D>,
     handles: Arc<Mutex<HashMap<String, xdp_shard::BpfHandles<xdp_shard::Ingress>>>>,
 }
 
-impl<A: std::fmt::Debug, S, Ss> std::fmt::Debug for ShardCanonicalServerEbpf<A, S, Ss> {
+impl<A: std::fmt::Debug, S, Ss, D> std::fmt::Debug for ShardCanonicalServerEbpf<A, S, Ss, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardCanonicalServerEbpf")
             .field("inner", &self.inner)
@@ -30,7 +30,7 @@ impl<A: std::fmt::Debug, S, Ss> std::fmt::Debug for ShardCanonicalServerEbpf<A, 
     }
 }
 
-impl<A, S, Ss> ShardCanonicalServerEbpf<A, S, Ss>
+impl<A, S, Ss, D> ShardCanonicalServerEbpf<A, S, Ss, D>
 where
     A: Clone + std::fmt::Debug,
 {
@@ -41,7 +41,7 @@ where
         internal_addr: Option<Vec<A>>,
         shards_inner: S,
         shards_inner_stack: Ss,
-        shards_extern_nonce: HashMap<u64, Offer>,
+        shards_extern_nonce: StackNonce,
         redis_addr: &str,
     ) -> Result<Self, Report> {
         let inner = ShardCanonicalServer::new(
@@ -87,10 +87,10 @@ fn get_addr_from_nonce(nonce: &[u8]) -> Result<SocketAddrV4, Report> {
     }
 }
 
-impl<A, S, Ss, Cap> Negotiate for ShardCanonicalServerEbpf<A, S, Ss>
+impl<A, S, Ss, D, Cap> Negotiate for ShardCanonicalServerEbpf<A, S, Ss, D>
 where
     Cap: bertha::negotiate::CapabilitySet,
-    ShardCanonicalServer<A, S, Ss>: Negotiate<Capability = Cap>,
+    ShardCanonicalServer<A, S, Ss, D>: Negotiate<Capability = Cap>,
 {
     type Capability = Cap;
 
@@ -99,7 +99,7 @@ where
     }
 
     fn capabilities() -> Vec<Cap> {
-        ShardCanonicalServer::<A, S, Ss>::capabilities()
+        ShardCanonicalServer::<A, S, Ss, D>::capabilities()
     }
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
@@ -129,10 +129,10 @@ where
     }
 }
 
-impl<I, A, S, Ss, Ic, Ie> Chunnel<I> for ShardCanonicalServerEbpf<A, S, Ss>
+impl<I, A, S, Ss, D, Ic, Ie> Chunnel<I> for ShardCanonicalServerEbpf<A, S, Ss, D>
 where
     A: Clone + IpPort + Sync + Send + 'static,
-    ShardCanonicalServer<A, S, Ss>: Chunnel<I, Connection = Ic, Error = Ie>,
+    ShardCanonicalServer<A, S, Ss, D>: Chunnel<I, Connection = Ic, Error = Ie>,
     Ic: ChunnelConnection + Send + 'static,
     Ie: Send + Sync + 'static,
 {
@@ -397,7 +397,7 @@ mod test {
             rdy.push(r);
         }
 
-        let mut offers: Vec<Vec<HashMap<u64, Offer>>> = rdy.try_collect().await.unwrap();
+        let mut offers: Vec<Vec<StackNonce>> = rdy.try_collect().await.unwrap();
 
         let stack = CxList::from(TaggerProjChunnel)
             .wrap(ReliabilityProjChunnel::default())
