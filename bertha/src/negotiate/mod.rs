@@ -200,7 +200,8 @@ use server::monomorphize;
 pub use server::negotiate_server;
 mod client;
 pub use client::{
-    negotiate_client, negotiate_client_fixed_stack, negotiate_client_nonce, NegotiatedConn,
+    negotiate_client, negotiate_client_fixed_stack, negotiate_client_nonce, ClientNegotiator,
+    NegotiatedConn,
 };
 mod rendezvous;
 pub use rendezvous::{
@@ -212,14 +213,17 @@ pub use rendezvous::{
 #[cfg(test)]
 mod test {
     use super::{negotiate_client, negotiate_server, CapabilitySet, Negotiate, Select};
+    use crate::udp::{UdpReqChunnel, UdpSkChunnel};
     use crate::{
         chan_transport::Chan, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     };
     use color_eyre::eyre::{eyre, Report};
+    use futures_util::TryStreamExt;
     use futures_util::{
         future::{ready, Ready},
         stream::StreamExt,
     };
+    use std::net::ToSocketAddrs;
     use tracing::{debug, debug_span, info, info_span};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
@@ -361,10 +365,6 @@ mod test {
 
     #[test]
     fn multiclient() {
-        use crate::udp::{UdpReqChunnel, UdpSkChunnel};
-        use futures_util::TryStreamExt;
-        use std::net::ToSocketAddrs;
-
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -479,10 +479,6 @@ mod test {
 
     #[test]
     fn ensure_bothsides() {
-        use crate::udp::{UdpReqChunnel, UdpSkChunnel};
-        use futures_util::TryStreamExt;
-        use std::net::ToSocketAddrs;
-
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -538,6 +534,128 @@ mod test {
                 Ok::<_, Report>(())
             }
             .instrument(info_span!("negotiate::multiclient")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn zero_rtt() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or(());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                info!("starting");
+                let stack = CxList::from(ChunnelA).wrap(ChunnelD);
+                debug!(chunnelA = ?*ChunnelACapGuid, chunnelD = ?*ChunnelDCapGuid, "guids");
+                let srv_stack = stack.clone();
+                let addr = "127.0.0.1:52185".to_socket_addrs().unwrap().next().unwrap();
+                let (s, r) = tokio::sync::oneshot::channel();
+                tokio::spawn(
+                    async move {
+                        info!("starting");
+                        let raw_st = UdpReqChunnel::default().listen(addr).await?;
+                        let srv_stream = negotiate_server(srv_stack, raw_st).await?;
+                        s.send(()).unwrap();
+                        srv_stream
+                            .try_for_each_concurrent(None, |cn| async move {
+                                info!("got connection");
+                                loop {
+                                    let buf = cn.recv().await?;
+                                    cn.send(buf).await?;
+                                    debug!("echoed");
+                                }
+                            })
+                            .instrument(info_span!("negotiate_server"))
+                            .await
+                            .unwrap();
+                        Ok::<_, Report>(())
+                    }
+                    .instrument(info_span!("server")),
+                );
+
+                r.await.unwrap();
+                let mut cl_neg = super::ClientNegotiator::default();
+                async {
+                    info!("starting client");
+                    let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                    let cn = cl_neg
+                        .negotiate_fetch_nonce(stack.clone(), raw_cn, addr)
+                        .instrument(info_span!("negotiate_client"))
+                        .await?;
+
+                    info!("sending");
+                    cn.send((addr, vec![1u8; 8])).await?;
+                    let (a, r) = cn.recv().await?;
+                    info!("received");
+                    assert_eq!(a, addr, "Address mismatched");
+                    assert_eq!(r, [1u8; 8], "Payload mismatched");
+                    Ok::<_, Report>(())
+                }
+                .instrument(info_span!("normal client"))
+                .await?;
+
+                async {
+                    info!("starting client");
+                    let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                    let cn = cl_neg
+                        .negotiate_zero_rtt(stack.clone(), raw_cn, addr)
+                        .instrument(info_span!("negotiate_client"))
+                        .await?;
+
+                    info!("sending");
+                    cn.send((addr, vec![2u8; 8])).await?;
+                    let (a, r) = cn.recv().await?;
+                    info!("recvd");
+                    assert_eq!(a, addr, "Address mismatched");
+                    assert_eq!(r, [2u8; 8], "Payload mismatched");
+                    Ok::<_, Report>(())
+                }
+                .instrument(info_span!("zero-rtt client"))
+                .await?;
+
+                async {
+                    use super::GetOffers;
+                    // make a fake bad nonce
+                    let cl_stack = ChunnelA;
+                    let bad_nonce = cl_stack.offers().next().unwrap();
+                    let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                    let cn = super::client::negotiate_client_nonce(
+                        cl_stack,
+                        raw_cn.clone(),
+                        bad_nonce,
+                        addr,
+                    )
+                    .await?;
+                    info!(attempt = 1, "sending");
+                    cn.send((addr, vec![3u8; 8])).await?;
+
+                    let e = cn.recv().await.unwrap_err();
+                    info!("re-negotiate");
+                    let cn = cl_neg.re_negotiate(stack.clone(), raw_cn, addr, e).await?;
+
+                    info!(attempt = 2, "sending");
+                    cn.send((addr, vec![3u8; 8])).await?;
+                    let (a, r) = cn.recv().await?;
+                    info!(attempt = 2, "recvd");
+                    assert_eq!(a, addr, "Address mismatched");
+                    assert_eq!(r, [3u8; 8], "Payload mismatched");
+                    Ok::<_, Report>(())
+                }
+                .instrument(info_span!("zero-rtt retry client"))
+                .await?;
+
+                Ok::<_, Report>(())
+            }
+            .instrument(info_span!("negotiate::zero_rtt")),
         )
         .unwrap();
     }
