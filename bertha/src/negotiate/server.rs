@@ -104,9 +104,8 @@ where
     debug!("new connection");
     let (cn, s) = InjectWithChannel::make(cn);
     loop {
-        // 2. on new connection, read off Vec<Vec<Offer>> from client
         let (a, buf): (_, Vec<u8>) = cn.recv().await?;
-        trace!("got offer pkt");
+        trace!("got portential negotiation pkt");
 
         // if `a` is in pending_negotiated_connections, this is a post-negotiation message and we
         // should return the applied connection.
@@ -161,6 +160,7 @@ where
 
                 unreachable!();
             }
+            // one-rtt case
             ClientOffer(client_offers) => {
                 let s = stack.clone();
                 let (new_stack, client_resp) = match monomorphize(s, client_offers, &a) {
@@ -183,18 +183,49 @@ where
                     }
                 };
 
-                // 4. Respond to client with offer choice
                 let buf = bincode::serialize(&client_resp)?;
-                // response has to fit in a packet
-                assert!(buf.len() < 1500);
+                assert!(buf.len() < 1500); // response has to fit in a packet
                 cn.send((a, buf)).await?;
-
+                debug!("sent client response");
                 if let Some(mut new_stack) = new_stack {
                     debug!(stack = ?&new_stack, "handshake done, picked stack");
-
-                    // 5. new_stack.serve(vec_u8_stream)
                     let new_cn = new_stack.connect_wrap(cn).await.map_err(Into::into)?;
+                    debug!("returning connection");
+                    return Ok(Some(Either::Left(new_cn)));
+                } else {
+                    continue;
+                }
+            }
+            // zero-rtt case
+            ClientNonce(client_offer) => {
+                let s = stack.clone();
+                let (new_stack, client_resp) = match monomorphize(s, vec![client_offer], &a) {
+                    Ok((mut new_stack, nonce, _)) => {
+                        let nonce_buf = bincode::serialize(&nonce)
+                            .wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
 
+                        new_stack
+                            .call_negotiate_picked(&nonce_buf)
+                            .instrument(debug_span!("call_negotiate_picked"))
+                            .await;
+                        (Some(new_stack), NegotiateMsg::ServerNonceAck)
+                    }
+                    Err(e) => {
+                        debug!(err = %format!("{:#}", &e), "negotiation handshake failed");
+                        (
+                            None,
+                            NegotiateMsg::ServerReply(Ok(stack.offers().collect())),
+                        )
+                    }
+                };
+
+                let client_resp_buf = bincode::serialize(&client_resp).unwrap();
+                assert!(client_resp_buf.len() < 1500);
+                cn.send((a, client_resp_buf)).await?;
+                debug!("sent client response");
+                if let Some(mut new_stack) = new_stack {
+                    debug!(stack = ?&new_stack, "zero-rtt handshake done, picked stack");
+                    let new_cn = new_stack.connect_wrap(cn).await.map_err(Into::into)?;
                     debug!("returning connection");
                     return Ok(Some(Either::Left(new_cn)));
                 } else {

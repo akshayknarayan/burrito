@@ -1,4 +1,7 @@
-use super::{Apply, ApplyResult, GetOffers, NegotiateMsg, NegotiatePicked, StackNonce};
+use super::{
+    Apply, ApplyResult, CapabilitySet, GetOffers, Negotiate, NegotiateMsg, NegotiatePicked,
+    StackNonce,
+};
 use crate::{Chunnel, ChunnelConnection};
 use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 use serde::{de::DeserializeOwned, Serialize};
@@ -13,12 +16,34 @@ use tracing::{debug, trace};
 pub type NegotiatedConn<C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
 
 /// Return a connection with `stack`'s semantics, connecting to `a`.
+///
+/// This is the traditional "one-rtt" version. It will block until the remote end completes the
+/// negotiation handshake.
 #[allow(clippy::manual_async_fn)] // we need the + 'static which async fn does not do.
 pub fn negotiate_client<C, A, S>(
     stack: S,
     cn: C,
     addr: A,
 ) -> impl Future<Output = Result<NegotiatedConn<C, S>, Report>> + Send + 'static
+where
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    S: Apply + GetOffers + Clone + Send + 'static,
+    <S as Apply>::Applied: Chunnel<C> + NegotiatePicked + Clone + Debug + Send + 'static,
+    <<S as Apply>::Applied as Chunnel<C>>::Error: Into<Report> + Send + Sync + 'static,
+    A: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static,
+{
+    async move {
+        let (cn, _) = negotiate_client_fetch_nonce(stack, cn, addr).await?;
+        Ok(cn)
+    }
+}
+
+/// Same as [`negotiate_client`], but also return the [`StackNonce`].
+pub fn negotiate_client_fetch_nonce<C, A, S>(
+    stack: S,
+    cn: C,
+    addr: A,
+) -> impl Future<Output = Result<(NegotiatedConn<C, S>, StackNonce), Report>> + Send + 'static
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     S: Apply + GetOffers + Clone + Send + 'static,
@@ -35,7 +60,7 @@ where
                 // 4. monomorphize `stack`, picking received choices
                 trace!(?picked, "received server pairs, applying");
                 let mut sc = 0;
-                let mut new_stack = None;
+                let mut applied = None;
                 let mut apply_err = eyre!("Apply error");
                 for p in picked {
                     let p2 = p.clone();
@@ -48,9 +73,9 @@ where
                             ..
                         }) => {
                             // TODO what if two options are tied? This will arbitrarily pick the first.
-                            if p_sc > sc || new_stack.is_none() {
+                            if p_sc > sc || applied.is_none() {
                                 sc = p_sc;
-                                new_stack = Some((ns, p2));
+                                applied = Some((ns, p2));
                             }
                         }
                         Err(e) => {
@@ -61,18 +86,20 @@ where
                     }
                 }
 
-                let (mut new_stack, nonce) = new_stack.ok_or_else(|| {
+                let (mut applied, nonce) = applied.ok_or_else(|| {
                     apply_err.wrap_err(eyre!("All received options failed to apply"))
                 })?;
-                debug!(applied = ?&new_stack, "applied to stack");
-                let nonce = bincode::serialize(&NegotiateMsg::ServerNonce {
+                debug!(?applied, "applied to stack");
+                let inform_picked_nonce_buf = bincode::serialize(&NegotiateMsg::ServerNonce {
                     addr: bincode::serialize(&addr)?,
-                    picked: nonce,
+                    picked: nonce.clone(),
                 })?;
-                new_stack.call_negotiate_picked(&nonce).await;
+                applied
+                    .call_negotiate_picked(&inform_picked_nonce_buf)
+                    .await;
 
-                // 5. return new_stack.connect_wrap(vec_u8_conn)
-                new_stack.connect_wrap(cn).await.map_err(Into::into)
+                // 5. return applied.connect_wrap(vec_u8_conn)
+                Ok((applied.connect_wrap(cn).await.map_err(Into::into)?, nonce))
             }
             NegotiateMsg::ServerReply(Err(errmsg)) => Err(eyre!("{:?}", errmsg)),
             _ => Err(eyre!("Received unknown message type")),
@@ -80,10 +107,50 @@ where
     }
 }
 
+/// Similar to `negotiate_client_nonce`, but the nonce is implicit.
+///
+/// The nonce in this case is determined by inspecting the provided `stack`. The stack must be
+/// fully-determined, i.e., it cannot have any [`Select`]s. This is enforced with the [`Negotiate`]
+/// trait bound.
+pub fn negotiate_client_fixed_stack<C, A, S>(
+    mut stack: S,
+    cn: C,
+    addr: A,
+) -> impl Future<Output = Result<<S as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection, Report>>
+       + Send
+       + 'static
+where
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    A: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static,
+    S: Chunnel<CheckZeroRttNegotiationReply<C>> + Negotiate + Clone + Send + 'static,
+    <S as Chunnel<CheckZeroRttNegotiationReply<C>>>::Error: Into<Report> + Send + Sync + 'static,
+    <S as Negotiate>::Capability: CapabilitySet + Serialize + DeserializeOwned,
+{
+    async move {
+        // since S: Negotiate, `stack.offers()` is guaranteed to be a length-1 iterator.
+        let nonce: StackNonce = stack.offers().next().unwrap();
+        let msg = NegotiateMsg::ClientNonce(nonce);
+        let buf = bincode::serialize(&msg)?;
+        cn.send((addr, buf)).await?;
+
+        Ok(stack
+            .connect_wrap(CheckZeroRttNegotiationReply::from(cn))
+            .await
+            .map_err(Into::into)?)
+    }
+}
+
+/// Pass an existing `nonce` to get a "zero-rtt" negotiated connection that be be used immediately.
+///
+/// The connection might return an error later if `nonce` was incompatible with the other side.
+/// This error will be `.downcast`-able to a [`ZeroRttNegotiationError`], which will contain the
+/// list of valid remote nonces.
+/// From this, callers can monomorphize a new nonce and try again with this function.
 pub fn negotiate_client_nonce<C, A, S>(
     stack: S,
     cn: C,
     nonce: StackNonce,
+    addr: A,
 ) -> impl Future<
     Output = Result<
         <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection,
@@ -95,41 +162,17 @@ where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     S: Apply + Clone + Send + 'static,
     <S as Apply>::Applied:
-        Chunnel<CheckZeroRttNegotiationReply<C>> + GetOffers + Clone + Debug + Send + 'static,
+        Chunnel<CheckZeroRttNegotiationReply<C>> + Negotiate + Clone + Debug + Send + 'static,
     <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection: Send,
     <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Error:
         Into<Report> + Send + Sync + 'static,
+    <<S as Apply>::Applied as Negotiate>::Capability: CapabilitySet + Serialize + DeserializeOwned,
     A: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static,
 {
-    let res = stack.apply(nonce);
-    match res {
-        Ok(super::ApplyResult { applied, .. }) => {
-            Box::pin(negotiate_client_fixed_stack(applied, cn))
-                as Pin<Box<dyn Future<Output = _> + Send + 'static>>
-        }
-        Err(e) => Box::pin(futures_util::future::ready(Err(e)))
-            as Pin<Box<dyn Future<Output = _> + Send + 'static>>,
+    async move {
+        let super::ApplyResult { applied, .. } = stack.apply(nonce)?;
+        negotiate_client_fixed_stack(applied, cn, addr).await
     }
-}
-
-pub fn negotiate_client_fixed_stack<C, A, S>(
-    mut stack: S,
-    cn: C,
-) -> impl Future<Output = Result<<S as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection, Report>>
-       + Send
-       + 'static
-where
-    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
-    A: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static,
-    S: Chunnel<CheckZeroRttNegotiationReply<C>> + GetOffers + Clone + Send + 'static,
-    <S as Chunnel<CheckZeroRttNegotiationReply<C>>>::Error: Into<Report> + Send + Sync + 'static,
-{
-    Box::pin(async move {
-        Ok(stack
-            .connect_wrap(CheckZeroRttNegotiationReply::from(cn))
-            .await
-            .map_err(Into::into)?)
-    })
 }
 
 #[tracing::instrument(skip(cn, offer), err)]
@@ -199,7 +242,7 @@ impl<C> From<C> for CheckZeroRttNegotiationReply<C> {
 impl<C, A> ChunnelConnection for CheckZeroRttNegotiationReply<C>
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)>,
-    A: 'static,
+    A: Send + 'static,
 {
     type Data = (A, Vec<u8>);
 
@@ -213,26 +256,33 @@ where
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let f = self.inner.recv();
         if !self.success.load(Ordering::SeqCst) {
+            let f2 = self.inner.recv(); // keep this around in case we need it
             let success = Arc::clone(&self.success);
             Box::pin(async move {
                 let (addr, data) = f.await?;
                 // try parsing a NegotiateMsg::ServerReply
                 let m: Result<NegotiateMsg, _> = bincode::deserialize(&data);
                 match m {
-                    Ok(NegotiateMsg::ServerReply(Err(s))) => {
-                        bail!(ZeroRttNegotiationError::NotAccepted(s))
-                    }
-                    Ok(m) => {
-                        // if the ServerReply was ok, then our nonce would have been accepted.
-                        // so there would have been no response.
-                        // further, other NegotiateMsg states are also wrong/unexpected
-                        bail!(ZeroRttNegotiationError::UnexpectedResponse(m))
+                    Ok(NegotiateMsg::ServerNonceAck) => {
+                        trace!("zero-rtt negotiation succeeded");
+                        success.as_ref().store(true, Ordering::SeqCst);
+                        // the next recv, f2, will get application data.
+                        // this is safe because we set success to true, so a subsequent call
+                        // to this function would skip negotiaton logic anyway
+                        return f2.await;
                     }
                     Err(_) => {
-                        trace!("zero-rtt negotiation returned app message");
+                        trace!("zero-rtt negotiation succeeded");
                         success.as_ref().store(true, Ordering::SeqCst);
                         Ok((addr, data))
                     }
+                    Ok(NegotiateMsg::ServerReply(Ok(options))) => {
+                        bail!(ZeroRttNegotiationError::NotAccepted(options))
+                    }
+                    Ok(NegotiateMsg::ServerReply(Err(s))) => {
+                        bail!(ZeroRttNegotiationError::UnexpectedError(s))
+                    }
+                    Ok(m) => bail!(ZeroRttNegotiationError::UnexpectedResponse(m)),
                 }
             })
         } else {
@@ -243,22 +293,24 @@ where
 
 #[derive(Debug, Clone)]
 pub enum ZeroRttNegotiationError {
-    NotAccepted(String),
+    NotAccepted(Vec<StackNonce>),
     UnexpectedResponse(NegotiateMsg),
+    UnexpectedError(String),
 }
 
 impl std::fmt::Display for ZeroRttNegotiationError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         use ZeroRttNegotiationError::*;
-        let e = match self {
-            NotAccepted(s) => {
-                format!("Negotiation nonce was not accepted: {}", s)
+        match self {
+            NotAccepted(_) => f.write_str("Negotiation nonce was not accepted"),
+            UnexpectedError(m) => {
+                let e = format!("Unexpected negotiation response: {:?}", m);
+                f.write_str(&e)
             }
             UnexpectedResponse(m) => {
-                format!("Unexpected negotiation response: {:?}", m)
+                let e = format!("Unexpected negotiation response: {:?}", m);
+                f.write_str(&e)
             }
-        };
-
-        f.write_str(&e)
+        }
     }
 }

@@ -164,15 +164,23 @@ impl StackNonce {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NegotiateMsg {
-    /// A list of stacks the client supports
+    /// A list of stacks the client supports. Response from the server is a `ServerReply`.
     ClientOffer(Vec<StackNonce>),
-    /// A list of stacks the server supports
+    /// Can mean one of two things.
+    /// 1. In response to a `ClientOffer`, a list of *client* stacks (a subset of those passed in
+    ///    the `ClientOffer`) the server supports, given the one the server has chosen.
+    /// 2. In response to a `ClientNonce`, a list of *server* stacks the server supports. In this
+    ///    case the client can monomorphize to a working stack and try zero-rtt with `ClientNonce`
+    ///    again, so the worst case is still one-rtt (the one that returned this `ServerReply`)
     ServerReply(Result<Vec<StackNonce>, String>),
     /// A specific stack the server should use on the given address.
     ServerNonce {
         addr: Vec<u8>,
         picked: StackNonce,
     },
+    /// A nonce representing the stack the client wants to use.
+    /// If it works, server sends a `ServerNonceAck`. Otherwise, a `ServerReply`
+    ClientNonce(StackNonce),
     ServerNonceAck,
 }
 
