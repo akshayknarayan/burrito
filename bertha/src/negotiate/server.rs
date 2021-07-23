@@ -72,6 +72,7 @@ where
     }
 }
 
+#[instrument(skip(cn, stack, pending_negotiated_connections), level = "debug", err)]
 async fn negotiate_server_connection<C, A, Srv>(
     cn: C,
     stack: Srv,
@@ -104,8 +105,9 @@ where
     debug!("new connection");
     let (cn, s) = InjectWithChannel::make(cn);
     loop {
+        trace!("listening for potential negotiation pkt");
         let (a, buf): (_, Vec<u8>) = cn.recv().await?;
-        trace!("got portential negotiation pkt");
+        trace!("got potential negotiation pkt");
 
         // if `a` is in pending_negotiated_connections, this is a post-negotiation message and we
         // should return the applied connection.
@@ -131,7 +133,13 @@ where
 
         // else, do negotiation
         let negotiate_msg: NegotiateMsg =
-            bincode::deserialize(&buf).wrap_err("offer deserialize failed")?;
+            match bincode::deserialize(&buf).wrap_err("offer deserialize failed") {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(err = %format!("{:#?}", e), "Discarding message");
+                    continue;
+                }
+            };
 
         use NegotiateMsg::*;
         match negotiate_msg {
