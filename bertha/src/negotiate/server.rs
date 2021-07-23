@@ -310,7 +310,7 @@ fn stack_pair_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, Offer>) 
 }
 
 // returns (client, server) stack pairs to use.
-fn compare_offers(
+pub(crate) fn compare_offers(
     client: Vec<StackNonce>,
     server: Vec<StackNonce>,
 ) -> Vec<(StackNonce, StackNonce)> {
@@ -335,10 +335,10 @@ pub(crate) fn monomorphize<Srv, A>(
     from_addr: &A,
 ) -> Result<(<Srv as Pick>::Picked, NegotiateMsg, Vec<StackNonce>), Report>
 where
-    Srv: Pick + GetOffers + Clone + Debug + Send + 'static,
+    Srv: Pick + GetOffers,
     // main-line branch: Pick on incoming negotiation handshake.
-    <Srv as Pick>::Picked: Clone + Debug + Send + 'static,
-    A: Serialize + DeserializeOwned + Debug + Send + Sync + 'static,
+    <Srv as Pick>::Picked: Debug,
+    A: Serialize + DeserializeOwned,
 {
     // enumerate possible offer groups from `stack`.
     let possibilities: Vec<_> = stack.offers().collect();
