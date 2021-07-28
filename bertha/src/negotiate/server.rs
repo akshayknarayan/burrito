@@ -136,7 +136,7 @@ where
             match bincode::deserialize(&buf).wrap_err("offer deserialize failed") {
                 Ok(m) => m,
                 Err(e) => {
-                    debug!(err = %format!("{:#?}", e), "Discarding message");
+                    debug!(err = %format!("{:#?}", e), ?buf, "Discarding message");
                     continue;
                 }
             };
