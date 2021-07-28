@@ -642,12 +642,13 @@ where
 
 impl<A, A2> ClientShardChunnelClient<A, A2> {
     pub async fn new(addr: A, redis_addr: &str) -> Result<Self, Error> {
-        let redis_client = redis::Client::open(redis_addr)?;
+        let redis_client = redis::Client::open(redis_addr)
+            .wrap_err(eyre!("Opening redis connection: {:?}", redis_addr))?;
         let redis_listen_connection = Arc::new(Mutex::new(
             redis_client
                 .get_async_connection()
                 .await
-                .wrap_err(eyre!("Opening redis connection: {:?}", redis_addr))?,
+                .wrap_err(eyre!("Opening redis async connection: {:?}", redis_addr))?,
         ));
 
         Ok(ClientShardChunnelClient {

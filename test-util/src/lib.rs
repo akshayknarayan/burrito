@@ -67,12 +67,13 @@ impl Redis {
     }
 
     pub fn get_addr(&self) -> String {
-        format!("redis://localhost:{}", self.get_port())
+        format!("redis://127.0.0.1:{}", self.get_port())
     }
 }
 
 impl Drop for Redis {
     fn drop(&mut self) {
+        debug!(port = ?self.port, "dropped redis handle");
         kill_redis(self.port);
     }
 }
