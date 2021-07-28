@@ -3,11 +3,13 @@ use bertha::{
     negotiate_client, negotiate_rendezvous, negotiate_server,
     udp::{UdpReqChunnel, UdpSkChunnel},
     util::{NeverCn, ProjectLeft},
-    Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, Negotiate,
+    Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, ClientNegotiator, CxList,
+    Negotiate,
 };
-use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
+use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use redis_basechunnel::RedisBase;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
 use structopt::StructOpt;
@@ -16,13 +18,35 @@ use tracing::{debug, info, instrument, trace};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
+#[derive(Clone, Debug)]
+enum Mode {
+    Rendezvous(String),
+    OneRtt,
+    ZeroRtt,
+}
+
+impl FromStr for Mode {
+    type Err = Report;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let sp: Vec<_> = s.splitn(2, ':').collect();
+        match sp.as_slice() {
+            ["Rendezvous", r] | ["rendezvous", r] | ["rd", r] => {
+                Ok(Mode::Rendezvous(r.to_string()))
+            }
+            ["OneRtt"] | ["onertt"] | ["1r"] => Ok(Mode::OneRtt),
+            ["ZeroRtt"] | ["zerortt"] | ["0r"] => Ok(Mode::ZeroRtt),
+            _ => bail!("Unkown mode {:?}", s),
+        }
+    }
+}
+
 #[derive(Clone, Debug, StructOpt)]
 #[structopt(name = "negotiation-bench")]
 struct Opt {
     #[structopt(short, long)]
     num_reqs: usize,
     #[structopt(short, long)]
-    redis: Option<String>,
+    mode: Mode,
     #[structopt(short, long)]
     out_file: std::path::PathBuf,
 }
@@ -38,41 +62,50 @@ async fn main() -> Result<(), Report> {
     let d = tracing::Dispatch::new(subscriber);
     d.init();
     let opt = Opt::from_args();
-    info!(?opt.num_reqs, rendezvous_mode = ?opt.redis.is_some(), "starting");
+    info!(?opt.num_reqs, rendezvous_mode = ?opt.mode, "starting");
     let mut addr: SocketAddr = "127.0.0.1:12315".parse().unwrap();
-    if let Some(redis) = opt.redis {
-        let redis_port = redis
-            .split(':')
-            .last()
-            .ok_or(eyre!("Bad redis address: {:?}", redis))?
-            .parse()
-            .wrap_err(eyre!("Bad redis address: {:?}", redis))?;
-        let _r = start_redis(redis_port);
-        let mut durs = Vec::with_capacity(opt.num_reqs);
-        for i in 0..opt.num_reqs {
-            info!(?i, "running iteration");
-            addr.set_port(addr.port() + 1 as u16);
-            let redis_base = RedisBase::new(&redis).await?;
-            let srv_task = tokio::spawn(server_rendezvous(addr, redis_base));
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    match opt.mode {
+        Mode::Rendezvous(redis) => {
+            let redis_port = redis
+                .split(':')
+                .last()
+                .ok_or(eyre!("Bad redis address: {:?}", redis))?
+                .parse()
+                .wrap_err(eyre!("Bad redis address: {:?}", redis))?;
+            let _r = start_redis(redis_port);
+            let mut durs = Vec::with_capacity(opt.num_reqs);
+            for i in 0..opt.num_reqs {
+                info!(?i, "running iteration");
+                addr.set_port(addr.port() + 1 as u16);
+                let redis_base = RedisBase::new(&redis).await?;
+                let srv_task = tokio::spawn(server_rendezvous(addr, redis_base));
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-            let redis_base = RedisBase::new(&redis).await?;
-            let dur = client_rendezvous(addr, redis_base).await?;
-            durs.push(dur);
-            srv_task.abort();
-            ensure!(
-                srv_task.await.unwrap_err().is_cancelled(),
-                "Server task was not cancelled"
-            );
+                let redis_base = RedisBase::new(&redis).await?;
+                let dur = client_rendezvous(addr, redis_base).await?;
+                durs.push(dur);
+                srv_task.abort();
+                ensure!(
+                    srv_task.await.unwrap_err().is_cancelled(),
+                    "Server task was not cancelled"
+                );
+            }
+            dump(durs, "Consensus", opt.out_file).wrap_err("writing outfile")?;
         }
-        dump(durs, "Consensus", opt.out_file).wrap_err("writing outfile")?;
-    } else {
-        tokio::spawn(server_direct(addr));
-
-        let durs = client_direct(addr, opt.num_reqs)
-            .await
-            .wrap_err("running client")?;
-        dump(durs, "Simplified", opt.out_file).wrap_err("writing outfile")?;
+        Mode::OneRtt => {
+            tokio::spawn(server_direct(addr));
+            let durs = client_direct(addr, opt.num_reqs)
+                .await
+                .wrap_err("running client")?;
+            dump(durs, "Simplified-1rtt", opt.out_file).wrap_err("writing outfile")?;
+        }
+        Mode::ZeroRtt => {
+            tokio::spawn(server_direct(addr));
+            let durs = client_direct_zerortt(addr, opt.num_reqs)
+                .await
+                .wrap_err("running client")?;
+            dump(durs, "Simplified-0rtt", opt.out_file).wrap_err("writing outfile")?;
+        }
     }
 
     info!("done");
@@ -111,7 +144,18 @@ async fn client_rendezvous(addr: SocketAddr, redis: RedisBase) -> Result<Duratio
     Ok(m.elapsed(start))
 }
 
+#[instrument(err, level = "info")]
 async fn server_direct(addr: SocketAddr) -> Result<(), Report> {
+    #[instrument(skip(cn), err, level = "debug")]
+    async fn one_conn(
+        cn: impl ChunnelConnection<Data = (SocketAddr, TimeMsg)>,
+    ) -> Result<(), Report> {
+        let d = cn.recv().await?;
+        cn.send(d).await?;
+        trace!("conn done");
+        Ok(())
+    }
+
     let mut st = negotiate_server(
         TimeMsgChunnel::default(),
         UdpReqChunnel::default().listen(addr).await?,
@@ -119,12 +163,7 @@ async fn server_direct(addr: SocketAddr) -> Result<(), Report> {
     .await?;
     use futures_util::stream::TryStreamExt;
     while let Some(cn) = st.try_next().await? {
-        tokio::spawn(async move {
-            loop {
-                let d = cn.recv().await.unwrap();
-                cn.send(d).await.unwrap();
-            }
-        });
+        tokio::spawn(one_conn(cn));
     }
 
     Ok(())
@@ -154,16 +193,71 @@ async fn client_direct(addr: SocketAddr, num_reqs: usize) -> Result<Vec<Duration
     Ok(durs)
 }
 
+#[instrument(err)]
+async fn client_direct_zerortt(addr: SocketAddr, num_reqs: usize) -> Result<Vec<Duration>, Report> {
+    let start = std::time::Instant::now();
+    let mut durs = Vec::with_capacity(num_reqs);
+    let mut cl_neg = ClientNegotiator::default();
+
+    // do the first one
+    let i = 0;
+    let cn = cl_neg
+        .negotiate_fetch_nonce(
+            TimeMsgChunnel::default(),
+            UdpSkChunnel.connect(()).await?,
+            addr,
+        )
+        .await?;
+    info!(?i, "running iteration");
+    let t = TimeMsg::new(start);
+    let cn = ProjectLeft::new(addr, cn);
+    trace!("finished negotiation");
+    cn.send(t).await?;
+    let m = cn.recv().await?;
+    durs.push(m.elapsed(start));
+
+    for i in 1..num_reqs {
+        info!(?i, elapsed = ?start.elapsed(), "running iteration");
+        let t = TimeMsg::new(start);
+        let cn = ProjectLeft::new(
+            addr,
+            cl_neg
+                .negotiate_zero_rtt(
+                    TimeMsgChunnel::default(),
+                    UdpSkChunnel.connect(()).await?,
+                    addr,
+                )
+                .await?,
+        );
+        trace!("finished negotiation");
+        cn.send(t).await?;
+        let m = cn.recv().await?;
+        durs.push(m.elapsed(start));
+    }
+
+    Ok(durs)
+}
+
 #[derive(Clone, Debug, Copy, serde::Serialize, serde::Deserialize)]
-struct TimeMsg(std::time::Duration);
+struct TimeMsg(std::time::Duration, u32);
 
 impl TimeMsg {
     fn new(start: std::time::Instant) -> Self {
-        Self(start.elapsed())
+        let t = start.elapsed();
+        assert!(t < std::time::Duration::from_secs(100));
+        Self(start.elapsed(), 242947)
     }
 
     fn elapsed(&self, start: std::time::Instant) -> Duration {
-        start.elapsed() - self.0
+        assert_eq!(self.1, 242947);
+        let t = start.elapsed();
+        if let Some(d) = t.checked_sub(self.0) {
+            d
+        } else {
+            let diff = self.0 - t;
+            debug!(?diff, start = ?self.0, now = ?t, "TimeMsg was negative");
+            std::time::Duration::ZERO
+        }
     }
 }
 
@@ -206,14 +300,35 @@ impl bertha::negotiate::CapabilitySet for TimeMsgCap {
     }
 }
 
-fn dump(durs: Vec<Duration>, mode: &str, out_file: std::path::PathBuf) -> Result<(), Report> {
+fn dump(mut durs: Vec<Duration>, mode: &str, out_file: std::path::PathBuf) -> Result<(), Report> {
+    use std::fs::OpenOptions;
     use std::io::prelude::*;
-    let mut f = std::fs::File::create(&out_file)?;
-    writeln!(&mut f, "Mode NumReqs Latency_us")?;
+    info!(?out_file, ?mode, "writing");
+    let mut f = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&out_file)
+        .wrap_err(eyre!("opening file: {:?}", out_file))?;
+    writeln!(&mut f, "Mode NumReqs ReqNum Latency_us")?;
     let num_reqs = durs.len();
-    for d in durs {
-        writeln!(&mut f, "{} {} {}", mode, num_reqs, d.as_micros())?;
+    for (i, d) in durs.iter().enumerate() {
+        writeln!(&mut f, "{} {} {} {}", mode, num_reqs, i, d.as_micros())?;
     }
+
+    durs.sort();
+    let len = durs.len() as f64;
+    let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
+    let quantiles: Vec<_> = quantile_idxs
+        .iter()
+        .map(|q| (len * q) as usize)
+        .map(|i| durs[i])
+        .collect();
+    info!(
+        ?mode, num = ?&durs.len(),
+        min = ?durs[0], p25 = ?quantiles[0], p50 = ?quantiles[1],
+        p75 = ?quantiles[2], p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
+        "done"
+    );
 
     Ok(())
 }
