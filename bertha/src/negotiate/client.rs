@@ -385,9 +385,21 @@ where
                         // to this function would skip negotiaton logic anyway
                         return f2.await;
                     }
-                    Err(_) => {
-                        trace!("zero-rtt negotiation succeeded");
-                        success.as_ref().store(true, Ordering::SeqCst);
+                    Err(e) => {
+                        // do NOT set success because we still need to listen for the
+                        // ServerNonceAck, but getting a non-`NegotiateMsg` means that negotiaton
+                        // succeeded but there was some reordering.
+                        //
+                        // This is because the negotiaton server will only return a connection to
+                        // the application if negotiaton succeeded, and if it did that then it will
+                        // have sent the ServerNonceAck.
+                        //
+                        // This assumes that:
+                        // 1. client and server both implement the negotiaton protocol correctly.
+                        // 2. the error `e` is actually a deserialization error and not some other
+                        //    error from the base connection.
+                        //    TODO check the error type
+                        trace!(err = %format!("{:#}", e), ?data, "return reordered message");
                         Ok((addr, data))
                     }
                     Ok(NegotiateMsg::ServerReply(Ok(options))) => {
