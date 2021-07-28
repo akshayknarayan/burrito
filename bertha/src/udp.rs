@@ -165,13 +165,9 @@ impl ChunnelConnection for UdpConn {
         &self,
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let sk = self.send.clone();
         let addr = self.resp_addr;
         let (_, data) = data;
-        Box::pin(async move {
-            sk.send((addr, data)).await?;
-            Ok(())
-        })
+        self.send.send((addr, data))
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
