@@ -158,6 +158,7 @@ async fn main() -> Result<(), Report> {
     let trigger_trace_rewrite = if let Some(path) = opt.out_file.take() {
         let timing_layer = tracing_timing::Builder::default()
             .no_span_recursion()
+            .span_close_events()
             .layer(|| tracing_timing::Histogram::new_with_max(1_000_000, 2).unwrap());
         let timing_downcaster = timing_layer.downcaster();
         let subscriber = subscriber

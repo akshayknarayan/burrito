@@ -24,7 +24,7 @@ tracing-futures = "0.2"
 tracing-error = "0.1"
 structopt = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
-tracing-timing  = { version = "0.4", features = ["layer"], optional = true }
+tracing-timing  = { version = "0.5", features = ["layer"], optional = true }
 ctrlc = { version = "3", optional = true }
 shenango-chunnel = { path = "../shenango-chunnel", optional = true }
 

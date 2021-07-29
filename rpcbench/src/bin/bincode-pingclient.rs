@@ -77,6 +77,7 @@ async fn main() -> Result<(), Report> {
     let timing_downcaster = if opt.out_file.is_some() {
         let timing_layer = tracing_timing::Builder::default()
             .no_span_recursion()
+            .span_close_events()
             .events(|e: &tracing::Event| {
                 let mut val = String::new();
                 let mut f = |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
