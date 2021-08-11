@@ -7,7 +7,7 @@
 #![allow(clippy::type_complexity)]
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
-use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -86,6 +86,7 @@ where
             .sample_iter(&rand::distributions::Alphanumeric)
             .take(10)
             .collect();
+        debug!("called picked");
 
         let listen = self.listen.map(|srv| {
             debug!("enabling listen");
@@ -93,51 +94,54 @@ where
             srv_unix_name.push_str("-srv");
             let mut srv_unix = root.clone();
             srv_unix.push(srv_unix_name);
-            let gt = ghostunnel::GhostTunnel::start_server(
-                srv,
-                &srv_unix,
-                &self.binary_path,
-                &self.certs_location,
-            )
-            .wrap_err("listen-side tunnel process");
-            let ul = UnixListener::bind(srv_unix).wrap_err("bind unix listener");
-            ( Arc::clone(&self.listen_cn),
-            async move {
-                let mut gt = gt?;
-                let ul = ul?;
-                let try_conn_addr = if srv.ip().is_unspecified() {
-                    let mut addr = srv;
-                    addr.set_ip("127.0.0.1".parse().unwrap());
-                    addr
-                } else {
-                    srv
-                };
+            let ul = UnixListener::bind(srv_unix.clone()).wrap_err("bind unix listener");
+            let binary_path = self.binary_path.clone();
+            let certs_location = self.certs_location.clone();
+            (
+                Arc::clone(&self.listen_cn),
+                async move {
+                    let mut gt = ghostunnel::GhostTunnel::start_server(
+                        srv,
+                        &srv_unix,
+                        &binary_path,
+                        &certs_location,
+                    ).await
+                        .wrap_err("listen-side tunnel process")?;
+                    let ul = ul?;
+                    let try_conn_addr = if srv.ip().is_unspecified() {
+                        let mut addr = srv;
+                        addr.set_ip("127.0.0.1".parse().unwrap());
+                        addr
+                    } else {
+                        srv
+                    };
 
-                let start = std::time::Instant::now();
-                let mut tries = 0usize;
-                trace!("waiting for external addr to come up");
-                ensure!(gt.wait_up(), "ghostunnel did not start listening");
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    if let Err(e) = tokio::net::TcpStream::connect(try_conn_addr).await {
-                        if start.elapsed() > std::time::Duration::from_millis(1000) {
-                            let ctx = eyre!(
-                                "can't connect to {:?} after {:?} tries ({:?})",
-                                try_conn_addr,
-                                tries,
-                                start.elapsed(),
-                            );
-                            return Err(Report::from(e).wrap_err(ctx));
-                        } else {
-                            tries += 1;
-                            trace!(addr = ?&try_conn_addr, ?tries, err = %format!("{:#}", e), "failed connection");
-                        }
-                    } else { break; }
+                    let start = std::time::Instant::now();
+                    let mut tries = 0usize;
+                    trace!("waiting for external addr to come up");
+                    gt.wait_up().await.wrap_err("ghostunnel did not start listening")?;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        if let Err(e) = tokio::net::TcpStream::connect(try_conn_addr).await {
+                            if start.elapsed() > std::time::Duration::from_millis(1000) {
+                                let ctx = eyre!(
+                                    "can't connect to {:?} after {:?} tries ({:?})",
+                                    try_conn_addr,
+                                    tries,
+                                    start.elapsed(),
+                                );
+                                return Err(Report::from(e).wrap_err(ctx));
+                            } else {
+                                tries += 1;
+                                trace!(addr = ?&try_conn_addr, ?tries, err = %format!("{:#}", e), "failed connection");
+                            }
+                        } else { break; }
+                    }
+
+                    debug!(addr = ?try_conn_addr, elapsed = ?start.elapsed(), "remote is up");
+                    Ok((ul, gt))
                 }
-
-                debug!(addr = ?try_conn_addr, elapsed = ?start.elapsed(), "remote is up");
-                Ok((ul, gt))
-            })
+            )
         });
 
         let send = self.remote.map(|rem| {
@@ -146,62 +150,66 @@ where
             cli_unix_name.push_str("-cli");
             let mut cli_unix = root.clone();
             cli_unix.push(cli_unix_name);
-            let gt = ghostunnel::GhostTunnel::start_client(
-                rem,
-                &cli_unix,
-                &self.binary_path,
-                &self.certs_location,
-            ).wrap_err("client-side tunnel process");
-            (send_cn, async move {
-                let mut gt = gt?;
-                debug!(tunnel_entry = ?&cli_unix, "connecting to remote");
-                ensure!(gt.wait_up(), "ghostunnel did not start listening");
-                // retry loop until the ghostunnel process starts listening
-                let start = std::time::Instant::now();
-                let mut tries = 0usize;
-                let uc = loop {
-                    match UnixStream::connect(&cli_unix).await {
-                        Ok(uc) => break uc,
-                        Err(e) => {
+            let binary_path = self.binary_path.clone();
+            let certs_location = self.certs_location.clone();
+            (
+                send_cn,
+                async move {
+                    let mut gt = ghostunnel::GhostTunnel::start_client(
+                        rem,
+                        &cli_unix,
+                        &binary_path,
+                        &certs_location,
+                    ).await.wrap_err("client-side tunnel process")?;
+                    debug!(tunnel_entry = ?&cli_unix, "connecting to remote");
+                    gt.wait_up().await.wrap_err("ghostunnel did not start listening")?;
+                    // retry loop until the ghostunnel process starts listening
+                    let start = std::time::Instant::now();
+                    let mut tries = 0usize;
+                    let uc = loop {
+                        match UnixStream::connect(&cli_unix).await {
+                            Ok(uc) => break uc,
+                            Err(e) => {
+                                if start.elapsed() > std::time::Duration::from_millis(1000) {
+                                    let ctx = eyre!(
+                                        "can't connect unix socket to {:?} after {:?} tries ({:?})",
+                                        cli_unix,
+                                        tries,
+                                        start.elapsed(),
+                                    );
+                                    return Err(Report::from(e).wrap_err(ctx));
+                                } else {
+                                    tries += 1;
+                                    trace!(addr = ?&cli_unix, ?tries, err = %format!("{:#}", e), "failed connection");
+                                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                }
+                            }
+                        }
+                    };
+
+                    let start = std::time::Instant::now();
+                    let mut tries = 0usize;
+                    loop {
+                        if let Err(e) = tokio::net::TcpStream::connect(rem).await {
                             if start.elapsed() > std::time::Duration::from_millis(1000) {
                                 let ctx = eyre!(
-                                    "can't connect unix socket to {:?} after {:?} tries ({:?})",
-                                    cli_unix,
+                                    "can't connect to {:?} after {:?} tries ({:?})",
+                                    rem,
                                     tries,
                                     start.elapsed(),
                                 );
                                 return Err(Report::from(e).wrap_err(ctx));
                             } else {
                                 tries += 1;
-                                trace!(addr = ?&cli_unix, ?tries, err = %format!("{:#}", e), "failed connection");
-                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                trace!(addr = ?&rem, ?tries, err = %format!("{:#}", e), "failed connection");
                             }
-                        }
-                    }
-                };
+                        } else { break}
+                    };
 
-                let start = std::time::Instant::now();
-                let mut tries = 0usize;
-                loop {
-                    if let Err(e) = tokio::net::TcpStream::connect(rem).await {
-                        if start.elapsed() > std::time::Duration::from_millis(1000) {
-                            let ctx = eyre!(
-                                "can't connect to {:?} after {:?} tries ({:?})",
-                                rem,
-                                tries,
-                                start.elapsed(),
-                            );
-                            return Err(Report::from(e).wrap_err(ctx));
-                        } else {
-                            tries += 1;
-                            trace!(addr = ?&rem, ?tries, err = %format!("{:#}", e), "failed connection");
-                        }
-                    } else { break}
-                };
-
-                debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to remote");
-                Ok((uc, gt))
-            })
+                    debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to remote");
+                    Ok((uc, gt))
+                }
+            )
         });
 
         Box::pin(async move {
@@ -267,6 +275,7 @@ where
                 return Err(eyre!("Need at least one of send and listen sides"));
             }
 
+            debug!("connect_wrap");
             Ok(TlsConn::new(
                 remote_skaddr,
                 lcn_g.take().transpose()?,
