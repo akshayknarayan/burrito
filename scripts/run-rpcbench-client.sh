@@ -13,23 +13,25 @@ if [[ $6 != "none" ]]; then
     sudo docker cp $6 rpcbench-cli:/gt
 fi
 
+RLOG="info"
+
 # 1 = outdir, 2 = addr, 3 = i, 4 = reqs-per-iter, 5 = outfile, 6 = encr, 7 = burrito-root
 if [[ $2 =~ ":" ]]; then 
     if [[ $6 != "none" ]]; then
         if [[ $7 != "none"  ]]; then
-            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
-                --addr $2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $7
+            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
+                --addr $2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $7 $8
         else
-            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
-                --addr $2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt
+            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
+                --addr $2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $8
         fi
     else
         if [[ $7 != "none"  ]]; then
-            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
-                --addr $2 -w=imm $3 $4 -o="/$5.data" $7
+            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
+                --addr $2 -w=imm $3 $4 -o="/$5.data" $7 $8
         else
-            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
-                --addr $2 -w=imm $3 $4 -o="/$5.data"
+            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
+                --addr $2 -w=imm $3 $4 -o="/$5.data" $8
         fi
     fi
 
@@ -41,24 +43,24 @@ else
     container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-srv)
     if [[ $6 != "none" ]]; then
         if [[ $7 != "none"  ]]; then
-            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
-                --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $7
+            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
+                --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $7 $8
         else
-            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
-                --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt
+            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
+                --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $8
         fi
     else
         if [[ $7 != "none"  ]]; then
-            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
-                --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" $7
+            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
+                --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" $7 $8
         else
-            sudo docker exec -e RUST_LOG=debug,rpcbench=trace,bertha=trace rpcbench-cli /client \
-                --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data"
+            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
+                --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" $8
         fi
     fi
 
     # local experiment. get server tracefile
-    sudo docker cp rpcbench-srv:/server.trace $1/"$5.srvtrace"
+    sudo docker cp rpcbench-srv:/server.trace $1/"$5.srvtrace" || true
 fi
 sudo docker cp rpcbench-cli:/"$5.data" $1/"$5.data"
 sudo docker cp rpcbench-cli:/"$5.trace" $1/"$5.trace"

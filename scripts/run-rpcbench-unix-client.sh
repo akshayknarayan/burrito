@@ -8,8 +8,8 @@ sudo docker rm -f rpcbench-cli || true
 sudo docker run --mount type=bind,source=/tmp/burrito/,target=/burrito -it --name rpcbench-cli -d ubuntu:20.04 /bin/bash
 sudo docker cp ./target/release/bincode-pingclient rpcbench-cli:/client
 
-sudo docker exec -e RUST_LOG=debug,burrito_localname_ctl=trace,rpcbench=trace,bertha=trace rpcbench-cli /client \
-    --unix-addr /burrito/relhc --burrito-root=/burrito -w=imm $2 $3 -o="/$4.data"
+sudo docker exec -e RUST_LOG=info,burrito_localname_ctl=debug rpcbench-cli /client \
+    --unix-addr /burrito/relhc --burrito-root=/burrito -w=imm $2 $3 -o="/$4.data" "${@:5}"
 
 # local experiment. get server tracefile
 sudo docker cp rpcbench-srv:/server.trace $1/"$4.srvtrace"
