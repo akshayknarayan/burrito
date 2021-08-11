@@ -9,6 +9,8 @@ use futures_util::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::convert::TryInto;
 use std::future::Future;
+use std::io::Write;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::Duration;
@@ -175,6 +177,7 @@ impl Server {
         l: impl futures_util::stream::Stream<
             Item = Result<impl ChunnelConnection<Data = (A, crate::Msg)>, Report>,
         >,
+        timeout_conns: bool,
     ) -> Result<(), Report> {
         let mut conn_ctr = 0;
         l.try_for_each_concurrent(None, |cn| {
@@ -184,7 +187,6 @@ impl Server {
             async move {
                 debug!("New connection");
                 loop {
-                    trace!("listening");
                     let (a, i, p) = match tokio::time::timeout(
                         std::time::Duration::from_millis(1000),
                         cn.recv(),
@@ -198,12 +200,15 @@ impl Server {
                             return Ok(());
                         }
                         Ok(Ok(d)) => bail!("Expected PingParams, got {:?}", d),
-                        Err(_to) => {
+                        Err(_to) if timeout_conns => {
                             debug!("Connection timing out");
                             if let Some(ref ch) = srv.collect_traces {
                                 ch.send(()).expect("Receiver won't drop");
                             }
                             return Ok(());
+                        }
+                        Err(_) => {
+                            continue;
                         }
                     };
                     trace!("got req");
@@ -295,7 +300,97 @@ fn gen_poisson_duration(amt: f64) -> Result<std::time::Duration, Report> {
     Ok(std::time::Duration::from_micros(pois.sample(&mut rng)))
 }
 
-pub fn dump_durs(durs: &[(Duration, i64, i64)]) {
+pub fn write_durs(path: &std::path::Path, durs: Vec<(Duration, i64, i64)>) -> Result<(), Report> {
+    debug!("writing latencies file");
+    let mut f = std::fs::File::create(path).wrap_err(eyre!("Create file: {:?}", path))?;
+    writeln!(&mut f, "Elapsed_us,Total_us,Server_us")?;
+    for (time, t, s) in durs.iter() {
+        writeln!(&mut f, "{},{},{}", time.as_micros(), t, s)?;
+    }
+
+    Ok(())
+}
+
+pub fn write_tracing<S, E>(
+    path: &std::path::Path,
+    downcaster: tracing_timing::LayerDowncaster<S, E>,
+    d: &tracing::Dispatch,
+    tag: &str,
+) -> Result<(), Report>
+where
+    S: tracing_timing::SpanGroup + 'static,
+    E: tracing_timing::EventGroup + 'static,
+    S::Id: Clone + std::hash::Hash + Eq + std::fmt::Display + 'static,
+    E::Id: Clone + std::hash::Hash + Eq + std::fmt::Display + 'static,
+{
+    let mut f = std::fs::File::create(path)?;
+    let timing = downcaster
+        .downcast(d)
+        .ok_or_else(|| eyre!("downcast timing layer"))?;
+    timing.force_synchronize();
+    // these values are in nanoseconds
+    timing.with_histograms(|hs| {
+        for (span_group, hs) in hs {
+            for (event_group, h) in hs {
+                writeln!(
+                    &mut f,
+                    "{} {}:{} (ns:min,p25,p50,p75,p95): {} {} {} {} {} {} {}",
+                    tag,
+                    span_group,
+                    event_group,
+                    h.min(),
+                    h.value_at_quantile(0.25),
+                    h.value_at_quantile(0.5),
+                    h.value_at_quantile(0.75),
+                    h.value_at_quantile(0.95),
+                    h.max(),
+                    h.len(),
+                )
+                .expect("write to trace file");
+            }
+        }
+    });
+
+    Ok(())
+}
+
+pub trait AsEncryptOpt {
+    fn gt_root(&self) -> Option<PathBuf>;
+    fn unix_root(&self) -> PathBuf;
+}
+
+#[derive(Debug, Clone)]
+pub struct EncryptOpt {
+    unix_root: PathBuf,
+    ghostunnel_root: PathBuf,
+}
+
+impl EncryptOpt {
+    pub fn from(o: &impl AsEncryptOpt) -> Option<Self> {
+        if let Some(ref gt) = o.gt_root() {
+            Some(EncryptOpt {
+                ghostunnel_root: gt.clone(),
+                unix_root: o.unix_root().clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn unix_root(&self) -> PathBuf {
+        self.unix_root.clone()
+    }
+
+    pub fn bin_path(&self) -> PathBuf {
+        self.ghostunnel_root.join("ghostunnel")
+    }
+
+    pub fn cert_dir_path(&self) -> PathBuf {
+        self.ghostunnel_root.join("test-keys/")
+    }
+}
+
+fn dump_durs(durs: &[(Duration, i64, i64)]) {
     let mut just_durs: Vec<_> = durs.iter().map(|(_, x, _)| x).collect();
     just_durs.sort();
     let len = just_durs.len() as f64;

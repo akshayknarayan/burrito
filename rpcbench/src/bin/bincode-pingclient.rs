@@ -1,16 +1,21 @@
 use bertha::{
-    bincode::SerializeChunnelProject, either::Either, negotiate_client, udp::UdpSkChunnel,
-    uds::UnixSkChunnel, util::ProjectLeft, ChunnelConnector, CxList,
+    bincode::SerializeChunnelProject,
+    either::Either,
+    negotiate::{GetOffers, NegotiatePicked},
+    negotiate_client,
+    udp::UdpSkChunnel,
+    uds::UnixSkChunnel,
+    util::ProjectLeft,
+    Chunnel, ChunnelConnector, CxList,
 };
 use burrito_localname_ctl::LocalNameChunnel;
-use color_eyre::eyre::{bail, eyre, Report, WrapErr};
-//use kvstore::reliability::KvReliabilityChunnel;
-use std::io::Write;
+use color_eyre::eyre::{bail, Report, WrapErr};
+use rpcbench::EncryptOpt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use structopt::StructOpt;
 use tls_tunnel::{TLSChunnel, TlsConnAddr};
-use tracing::info;
+use tracing::{debug, info};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -23,10 +28,10 @@ struct Opt {
     addr: Option<SocketAddr>,
     #[structopt(long)]
     unix_addr: Option<PathBuf>,
-    #[structopt(long, default_value = "/tmp")]
-    encr_unix_root: PathBuf,
+
     #[structopt(long)]
-    encr_ghostunnel_root: Option<PathBuf>,
+    no_negotiation: bool,
+
     #[structopt(short, long)]
     work: rpcbench::Work,
     #[structopt(short, long)]
@@ -35,43 +40,28 @@ struct Opt {
     iters: usize,
     #[structopt(long)]
     reqs_per_iter: usize,
+
+    #[structopt(long, default_value = "/tmp")]
+    encr_unix_root: PathBuf,
+    #[structopt(long)]
+    encr_ghostunnel_root: Option<PathBuf>,
+
     #[structopt(short, long)]
     out_file: Option<std::path::PathBuf>,
 }
 
-#[derive(Debug, Clone)]
-struct EncryptOpt {
-    unix_root: PathBuf,
-    ghostunnel_root: PathBuf,
-}
-
-impl EncryptOpt {
-    fn from(o: &Opt) -> Option<Self> {
-        if let Some(ref gt) = o.encr_ghostunnel_root {
-            Some(EncryptOpt {
-                ghostunnel_root: gt.clone(),
-                unix_root: o.encr_unix_root.clone(),
-            })
-        } else {
-            None
-        }
+impl rpcbench::AsEncryptOpt for Opt {
+    fn gt_root(&self) -> Option<PathBuf> {
+        self.encr_ghostunnel_root.clone()
     }
-
     fn unix_root(&self) -> PathBuf {
-        self.unix_root.clone()
-    }
-
-    fn bin_path(&self) -> PathBuf {
-        self.ghostunnel_root.join("ghostunnel")
-    }
-
-    fn cert_dir_path(&self) -> PathBuf {
-        self.ghostunnel_root.join("test-keys/")
+        self.encr_unix_root.clone()
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
+    color_eyre::install().unwrap();
     let opt = Opt::from_args();
     let subscriber = tracing_subscriber::registry();
     let timing_downcaster = if opt.out_file.is_some() {
@@ -94,8 +84,8 @@ async fn main() -> Result<(), Report> {
         let timing_downcaster = timing_layer.downcaster();
         let subscriber = subscriber
             .with(timing_layer)
-            //.with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer())
             .with(ErrorLayer::default());
         let d = tracing::Dispatch::new(subscriber);
         d.clone().init();
@@ -109,8 +99,6 @@ async fn main() -> Result<(), Report> {
         d.init();
         None
     };
-
-    color_eyre::install().unwrap();
 
     let enc = EncryptOpt::from(&opt);
 
@@ -128,6 +116,7 @@ async fn main() -> Result<(), Report> {
                 burrito_root,
                 iters,
                 reqs_per_iter,
+                no_negotiation,
                 ..
             },
             _,
@@ -151,7 +140,26 @@ async fn main() -> Result<(), Report> {
                     Ok(ProjectLeft::new(addr, cn))
                 }
             };
-            rpcbench::client_ping(addr, ctr, pp, iters, reqs_per_iter).await?
+
+            let noneg_ctr = |addr: PathBuf| {
+                let br = burrito_root.clone();
+                async move {
+                    let u = if let Some(r) = br {
+                        UnixSkChunnel::with_root(r).connect(()).await?
+                    } else {
+                        UnixSkChunnel::default().connect(()).await?
+                    };
+                    let mut ch = SerializeChunnelProject::default();
+                    let cn = ch.connect_wrap(u).await?;
+                    Ok(ProjectLeft::new(addr, cn))
+                }
+            };
+
+            if no_negotiation {
+                rpcbench::client_ping(addr, noneg_ctr, pp, iters, reqs_per_iter).await?
+            } else {
+                rpcbench::client_ping(addr, ctr, pp, iters, reqs_per_iter).await?
+            }
         }
         (
             Opt {
@@ -159,6 +167,7 @@ async fn main() -> Result<(), Report> {
                 addr: Some(addr),
                 iters,
                 reqs_per_iter,
+                no_negotiation,
                 ..
             },
             None,
@@ -178,8 +187,27 @@ async fn main() -> Result<(), Report> {
                     Ok(ProjectLeft::new(Either::Left(addr), cn))
                 }
             };
+            let noneg_fncl = |addr| {
+                let r = root.clone();
+                async move {
+                    let lch = LocalNameChunnel::<_, _, SocketAddr>::new(
+                        r.clone(),
+                        None,
+                        UnixSkChunnel::with_root(r),
+                        bertha::CxNil,
+                    )
+                    .await?;
+                    let mut stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
+                    let cn = stack.connect_wrap(UdpSkChunnel.connect(()).await?).await?;
+                    Ok(ProjectLeft::new(Either::Left(addr), cn))
+                }
+            };
             info!(?root, ?addr, encryption = "no", "Burrito mode");
-            rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
+            if no_negotiation {
+                rpcbench::client_ping(addr, noneg_fncl, pp, iters, reqs_per_iter).await?
+            } else {
+                rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
+            }
         }
         (
             Opt {
@@ -187,6 +215,7 @@ async fn main() -> Result<(), Report> {
                 addr: Some(addr),
                 iters,
                 reqs_per_iter,
+                no_negotiation,
                 ..
             },
             Some(enc),
@@ -211,13 +240,57 @@ async fn main() -> Result<(), Report> {
                     let stack = CxList::from(SerializeChunnelProject::default())
                         .wrap(lch)
                         .wrap(tls);
-                    let cn = negotiate_client(stack, UdpSkChunnel.connect(()).await?, addr).await?;
+                    let cn = negotiate_client(stack, UdpSkChunnel.connect(()).await?, addr)
+                        .await
+                        .wrap_err("burrito-mode yes-neg connector")?;
                     Ok(ProjectLeft::new(Either::Left((addr, x)), cn))
                 }
             };
+            let noneg_fncl = |(addr, x)| {
+                let enc = enc.clone();
+                let r = root.clone();
+                async move {
+                    let lch = LocalNameChunnel::new(
+                        r.clone(),
+                        None,
+                        UnixSkChunnel::with_root(r),
+                        bertha::CxNil,
+                    )
+                    .await?;
+                    let tls = TLSChunnel::<(SocketAddr, TlsConnAddr)>::new(
+                        enc.unix_root(),
+                        enc.bin_path(),
+                        enc.cert_dir_path(),
+                    )
+                    .connect(addr);
+                    let mut stack = CxList::from(SerializeChunnelProject::default())
+                        .wrap(lch)
+                        .wrap(tls);
+                    let nonce = stack.offers().next().unwrap();
+                    let nonce_buf = bincode::serialize(&nonce)?;
+                    stack.call_negotiate_picked(&nonce_buf).await;
+                    let cn = stack
+                        .connect_wrap(UdpSkChunnel.connect(()).await?)
+                        .await
+                        .wrap_err("burrito-mode no-neg connector")?;
+                    Ok(ProjectLeft::new(Either::Left((addr, x)), cn))
+                }
+            };
+
             info!(?root, ?addr, encryption = "yes", "Burrito mode");
-            rpcbench::client_ping((addr, TlsConnAddr::Request), fncl, pp, iters, reqs_per_iter)
+            if no_negotiation {
+                rpcbench::client_ping(
+                    (addr, TlsConnAddr::Request),
+                    noneg_fncl,
+                    pp,
+                    iters,
+                    reqs_per_iter,
+                )
                 .await?
+            } else {
+                rpcbench::client_ping((addr, TlsConnAddr::Request), fncl, pp, iters, reqs_per_iter)
+                    .await?
+            }
         }
         (
             Opt {
@@ -225,6 +298,7 @@ async fn main() -> Result<(), Report> {
                 addr: Some(addr),
                 iters,
                 reqs_per_iter,
+                no_negotiation,
                 ..
             },
             None,
@@ -240,7 +314,17 @@ async fn main() -> Result<(), Report> {
                 .await?;
                 Ok(ProjectLeft::new(addr, cn))
             };
-            rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
+            let noneg_fncl = |addr| async move {
+                let mut ch = SerializeChunnelProject::default();
+                let cn = ch.connect_wrap(UdpSkChunnel.connect(()).await?).await?;
+                Ok(ProjectLeft::new(addr, cn))
+            };
+
+            if no_negotiation {
+                rpcbench::client_ping(addr, noneg_fncl, pp, iters, reqs_per_iter).await?
+            } else {
+                rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
+            }
         }
         (
             Opt {
@@ -248,6 +332,7 @@ async fn main() -> Result<(), Report> {
                 addr: Some(addr),
                 iters,
                 reqs_per_iter,
+                no_negotiation,
                 ..
             },
             Some(enc),
@@ -272,50 +357,47 @@ async fn main() -> Result<(), Report> {
                     Ok(ProjectLeft::new(TlsConnAddr::Request, cn))
                 }
             };
-            rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
+
+            let noneg_fncl = |addr| {
+                let enc = enc.clone();
+                async move {
+                    let tls = TLSChunnel::<TlsConnAddr>::new(
+                        enc.unix_root(),
+                        enc.bin_path(),
+                        enc.cert_dir_path(),
+                    )
+                    .connect(addr);
+                    let mut ch = CxList::from(SerializeChunnelProject::default()).wrap(tls);
+                    let nonce = ch.offers().next().unwrap();
+                    let nonce_buf = bincode::serialize(&nonce)?;
+                    ch.call_negotiate_picked(&nonce_buf).await;
+                    let cn = ch
+                        .connect_wrap(bertha::util::Nothing::<()>::default())
+                        .await
+                        .wrap_err("encr-mode no-neg connector")?;
+                    Ok(ProjectLeft::new(TlsConnAddr::Request, cn))
+                }
+            };
+
+            if no_negotiation {
+                rpcbench::client_ping(addr, noneg_fncl, pp, iters, reqs_per_iter).await?
+            } else {
+                rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
+            }
         }
         _ => {
             bail!("Bad option set");
         }
     };
 
-    tracing::info!("done");
+    info!("done");
     if let Some(ref path) = out_file {
-        tracing::debug!("writing latencies file");
-        let mut f = std::fs::File::create(path).wrap_err(eyre!("Create file: {:?}", path))?;
-        writeln!(&mut f, "Elapsed_us,Total_us,Server_us")?;
-        for (time, t, s) in durs.iter() {
-            writeln!(&mut f, "{},{},{}", time.as_micros(), t, s)?;
-        }
+        rpcbench::write_durs(path, durs)?;
 
-        tracing::debug!("writing trace file");
+        debug!("writing trace file");
         let (downcaster, d) = timing_downcaster.unwrap();
         let path = path.with_extension("trace");
-        let mut f = std::fs::File::create(path)?;
-        let timing = downcaster.downcast(&d).expect("downcast timing layer");
-        timing.force_synchronize();
-        // these values are in nanoseconds
-        timing.with_histograms(|hs| {
-            for (span_group, hs) in hs {
-                for (event_group, h) in hs {
-                    writeln!(
-                        &mut f,
-                        "{} {}:{} (ns:min,p25,p50,p75,p95): {} {} {} {} {} {} {}",
-                        per_iter,
-                        span_group,
-                        event_group,
-                        h.min(),
-                        h.value_at_quantile(0.25),
-                        h.value_at_quantile(0.5),
-                        h.value_at_quantile(0.75),
-                        h.value_at_quantile(0.95),
-                        h.max(),
-                        h.len(),
-                    )
-                    .expect("write to trace file");
-                }
-            }
-        });
+        rpcbench::write_tracing(&path, downcaster, &d, &per_iter.to_string())?;
     }
     Ok(())
 }
