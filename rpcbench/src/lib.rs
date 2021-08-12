@@ -276,7 +276,7 @@ async fn do_one_ping(
     cn.send(msg.into())
         .instrument(tracing::trace_span!("req", ?iter))
         .await
-        .wrap_err("ping send")?;
+        .wrap_err(eyre!("ping send #{:?},{:?}", iter, which))?;
     trace!(?iter, ?which, "send done");
     let response = match cn
         .recv()
