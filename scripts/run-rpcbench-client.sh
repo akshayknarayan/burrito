@@ -13,7 +13,8 @@ if [[ $6 != "none" ]]; then
     sudo docker cp $6 rpcbench-cli:/gt
 fi
 
-RLOG="info"
+#RLOG="info"
+RLOG="info,rpcbench=trace,bertha=trace,tls-tunnel=trace,burrito-localname-ctl=trace"
 
 # 1 = outdir, 2 = addr, 3 = i, 4 = reqs-per-iter, 5 = outfile, 6 = encr, 7 = burrito-root
 if [[ $2 =~ ":" ]]; then 

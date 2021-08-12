@@ -25,7 +25,7 @@ def start_server(srv_addr, srv_port, ghostunnel, burrito_root, n):
     agenda.subtask(f"encr arg: {ghostunnel}")
     agenda.subtask(f"bertha arg: {burrito_root}")
     agenda.subtask(f"neg arg: {n}")
-    neg = '' if n else '--no-negotiation'
+    neg = '' if n != 'off' else '--no-negotiation'
     sp = srv_addr.split(":")
     srv_addr = sp[0]
     encr_arg = f"{ghostunnel}" if ghostunnel is not None else "none"
@@ -59,7 +59,7 @@ def start_server(srv_addr, srv_port, ghostunnel, burrito_root, n):
 
 def start_server_unix(neg_arg):
     agenda.task("local rpcbench-server unix")
-    neg = '' if neg_arg  else '--no-negotiation'
+    neg = '' if neg_arg != 'off' else '--no-negotiation'
     cmd = f"./scripts/start-rpcbench-unix-server.sh ./target/release {neg} &"
     agenda.subtask("running launch script")
     sh.run(cmd, shell=True)
@@ -72,7 +72,7 @@ def exp(srv_addr, mode, args, n):
         exp_addr = sp[1]
     else:
         exp_addr = srv_addr
-    neg = '' if n  else '--no-negotiation'
+    neg = f'--negotiation={n}'
     encr_arg = f"{args.ghostunnel}" if args.ghostunnel and 'rel' not in mode else "none"
     burrito_root_arg = f"--burrito-root=/burrito" if args.burrito_root and 'fp' in mode else "none"
     if '127.0.0.1' == exp_addr:
@@ -106,7 +106,7 @@ def exp(srv_addr, mode, args, n):
     sh.run(cmd, shell=True)
 
 def exp_unix(args, n):
-    neg = '' if n else '--no-negotiation'
+    neg = f'--negotiation={n}'
     outfile_arg = f"local-mode:rel-ux-msgs:{args.reqs}-perconn:{args.perconn}-neg:{n}"
     cmd = f"./scripts/run-rpcbench-unix-client.sh \
         {args.outdir} \
@@ -122,7 +122,7 @@ parser.add_argument('--outdir', type=str, required=True)
 parser.add_argument('--server', type=str, action='append', required=True)
 parser.add_argument('--server-port', type=int, required=True)
 parser.add_argument('--ghostunnel', type=str)
-neg_opts = ['true', 'false']
+neg_opts = ['off', 'one', 'zero']
 parser.add_argument('--negotiate', type=str, action='append', choices=neg_opts + ['all'])
 parser.add_argument('--reqs', type=int, required=True)
 parser.add_argument('--perconn', type=int, required=True)
@@ -136,8 +136,6 @@ if 'all' in args.mode:
 
 if 'all' in args.negotiate:
     args.negotiate = neg_opts
-
-args.negotiate = [True if n == 'true' else False for n in args.negotiate]
 
 os.makedirs(args.outdir, exist_ok = True)
 

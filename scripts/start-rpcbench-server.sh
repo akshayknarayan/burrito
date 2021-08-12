@@ -11,7 +11,7 @@ sudo docker cp $1/bincode-pingserver rpcbench-srv:/server
 if [[ $3 != "none" ]]; then
   sudo docker cp $3 rpcbench-srv:/gt
   # RUST_LOG=debug,tls_tunnel=trace ./target/release/bincode-pingserver -p 4242 --encr-ghostunnel-root ~/ghostunnel
-  sudo docker exec -e RUST_LOG=info rpcbench-srv /server -p=$2 -o /server.trace --encr-ghostunnel-root=/gt $4  "${@:5}"
+  sudo docker exec -e RUST_LOG=info,rpcbench=trace,bertha=trace,tls-tunnel=trace,burrito-localname-ctl=trace rpcbench-srv /server -p=$2 -o /server.trace --encr-ghostunnel-root=/gt $4  "${@:5}"
 else
-  sudo docker exec -e RUST_LOG=info rpcbench-srv /server -p=$2 -o /server.trace $4 "${@:5}"
+  sudo docker exec -e RUST_LOG=info,rpcbench=trace,bertha=trace,tls-tunnel=trace,burrito-localname-ctl=trace rpcbench-srv /server -p=$2 -o /server.trace $4 "${@:5}"
 fi
