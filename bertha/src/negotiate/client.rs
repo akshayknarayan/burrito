@@ -62,8 +62,13 @@ impl<A: Serialize + DeserializeOwned + Clone + Debug + Eq + Hash + Send + Sync +
     where
         C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
         S: Apply + Clone + Send + 'static,
-        <S as Apply>::Applied:
-            Chunnel<CheckZeroRttNegotiationReply<C>> + GetOffers + Clone + Debug + Send + 'static,
+        <S as Apply>::Applied: Chunnel<CheckZeroRttNegotiationReply<C>>
+            + GetOffers
+            + NegotiatePicked
+            + Clone
+            + Debug
+            + Send
+            + 'static,
         <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection: Send,
         <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Error:
             Into<Report> + Send + Sync + 'static,
@@ -88,8 +93,13 @@ impl<A: Serialize + DeserializeOwned + Clone + Debug + Eq + Hash + Send + Sync +
     where
         C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
         S: Apply + Pick + GetOffers + Clone + Debug + Send + 'static,
-        <S as Apply>::Applied:
-            Chunnel<CheckZeroRttNegotiationReply<C>> + GetOffers + Clone + Debug + Send + 'static,
+        <S as Apply>::Applied: Chunnel<CheckZeroRttNegotiationReply<C>>
+            + GetOffers
+            + NegotiatePicked
+            + Clone
+            + Debug
+            + Send
+            + 'static,
         <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection: Send,
         <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Error:
             Into<Report> + Send + Sync + 'static,
@@ -213,7 +223,13 @@ pub fn negotiate_client_fixed_stack<C, A, S>(
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     A: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static,
-    S: Chunnel<CheckZeroRttNegotiationReply<C>> + GetOffers + Clone + Debug + Send + 'static,
+    S: Chunnel<CheckZeroRttNegotiationReply<C>>
+        + GetOffers
+        + NegotiatePicked
+        + Clone
+        + Debug
+        + Send
+        + 'static,
     <S as Chunnel<CheckZeroRttNegotiationReply<C>>>::Error: Into<Report> + Send + Sync + 'static,
 {
     async move {
@@ -228,6 +244,13 @@ where
 
             nonce
         };
+
+        let picked = NegotiateMsg::ServerNonce {
+            addr: bincode::serialize(&addr)?,
+            picked: nonce.clone(),
+        };
+        let inform_picked_nonce_buf = bincode::serialize(&picked)?;
+        stack.call_negotiate_picked(&inform_picked_nonce_buf).await;
 
         let msg = NegotiateMsg::ClientNonce(nonce);
         let buf = bincode::serialize(&msg)?;
@@ -261,8 +284,13 @@ pub fn negotiate_client_nonce<C, A, S>(
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     S: Apply + Clone + Send + 'static,
-    <S as Apply>::Applied:
-        Chunnel<CheckZeroRttNegotiationReply<C>> + GetOffers + Clone + Debug + Send + 'static,
+    <S as Apply>::Applied: Chunnel<CheckZeroRttNegotiationReply<C>>
+        + GetOffers
+        + NegotiatePicked
+        + Clone
+        + Debug
+        + Send
+        + 'static,
     <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Connection: Send,
     <<S as Apply>::Applied as Chunnel<CheckZeroRttNegotiationReply<C>>>::Error:
         Into<Report> + Send + Sync + 'static,
