@@ -245,16 +245,16 @@ where
             nonce
         };
 
+        let msg = NegotiateMsg::ClientNonce(nonce.clone());
+        let buf = bincode::serialize(&msg)?;
+        cn.send((addr.clone(), buf)).await?;
+
         let picked = NegotiateMsg::ServerNonce {
             addr: bincode::serialize(&addr)?,
-            picked: nonce.clone(),
+            picked: nonce,
         };
         let inform_picked_nonce_buf = bincode::serialize(&picked)?;
         stack.call_negotiate_picked(&inform_picked_nonce_buf).await;
-
-        let msg = NegotiateMsg::ClientNonce(nonce);
-        let buf = bincode::serialize(&msg)?;
-        cn.send((addr, buf)).await?;
 
         Ok(stack
             .connect_wrap(CheckZeroRttNegotiationReply::from(cn))
