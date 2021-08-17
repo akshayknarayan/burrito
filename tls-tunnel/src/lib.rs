@@ -123,7 +123,7 @@ where
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                         if let Err(e) = tokio::net::TcpStream::connect(try_conn_addr).await {
-                            if start.elapsed() > std::time::Duration::from_millis(1000) {
+                            if start.elapsed() > std::time::Duration::from_secs(10) {
                                 let ctx = eyre!(
                                     "can't connect to {:?} after {:?} tries ({:?})",
                                     try_conn_addr,
@@ -134,6 +134,7 @@ where
                             } else {
                                 tries += 1;
                                 trace!(addr = ?&try_conn_addr, ?tries, err = %format!("{:#}", e), "failed connection");
+                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                             }
                         } else { break; }
                     }
@@ -170,7 +171,7 @@ where
                         match UnixStream::connect(&cli_unix).await {
                             Ok(uc) => break uc,
                             Err(e) => {
-                                if start.elapsed() > std::time::Duration::from_millis(1000) {
+                                if start.elapsed() > std::time::Duration::from_secs(1) {
                                     let ctx = eyre!(
                                         "can't connect unix socket to {:?} after {:?} tries ({:?})",
                                         cli_unix,
@@ -187,11 +188,13 @@ where
                         }
                     };
 
+                    debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to local");
+
                     let start = std::time::Instant::now();
                     let mut tries = 0usize;
                     loop {
                         if let Err(e) = tokio::net::TcpStream::connect(rem).await {
-                            if start.elapsed() > std::time::Duration::from_millis(1000) {
+                            if start.elapsed() > std::time::Duration::from_secs(20) {
                                 let ctx = eyre!(
                                     "can't connect to {:?} after {:?} tries ({:?})",
                                     rem,
@@ -202,11 +205,12 @@ where
                             } else {
                                 tries += 1;
                                 trace!(addr = ?&rem, ?tries, err = %format!("{:#}", e), "failed connection");
+                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                             }
                         } else { break}
                     };
 
-                    debug!(tunnel_entry = ?&cli_unix, elapsed = ?start.elapsed(), "connected to remote");
+                    debug!(tunnel_target = ?&rem, elapsed = ?start.elapsed(), "connected to remote");
                     Ok((uc, gt))
                 }
             )

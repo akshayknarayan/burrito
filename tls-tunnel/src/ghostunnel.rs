@@ -5,12 +5,19 @@ use std::path::Path;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::oneshot;
-use tracing::{debug, trace};
+use tracing::{debug, debug_span, trace};
+use tracing_futures::Instrument;
 
 #[derive(Debug)]
 pub struct GhostTunnel {
     pub(crate) process_handle: Child,
     is_up: Option<oneshot::Receiver<Result<(), Report>>>,
+}
+
+impl Drop for GhostTunnel {
+    fn drop(&mut self) {
+        debug!("dropping ghostunnel prcess");
+    }
 }
 
 impl GhostTunnel {
@@ -55,7 +62,10 @@ impl GhostTunnel {
             .spawn()
             .wrap_err("spawn ghostunnel server process")?;
         let (s, r) = oneshot::channel();
-        tokio::spawn(read_stderr(child.stderr.take().unwrap(), s));
+        tokio::spawn(
+            read_stderr(child.stderr.take().unwrap(), s)
+                .instrument(debug_span!("server ghostunnel stderr")),
+        );
         Ok(Self {
             process_handle: child,
             is_up: Some(r),
@@ -89,7 +99,10 @@ impl GhostTunnel {
             .spawn()
             .wrap_err("spawn ghostunnel client process")?;
         let (s, r) = oneshot::channel();
-        tokio::spawn(read_stderr(child.stderr.take().unwrap(), s));
+        tokio::spawn(
+            read_stderr(child.stderr.take().unwrap(), s)
+                .instrument(debug_span!("client ghostunnel stderr")),
+        );
         Ok(Self {
             process_handle: child,
             is_up: Some(r),
