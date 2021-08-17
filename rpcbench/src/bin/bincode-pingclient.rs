@@ -135,7 +135,7 @@ async fn main() -> Result<(), Report> {
 
     let per_iter = opt.reqs_per_iter;
     let out_file = opt.out_file.clone();
-    let durs = match (opt, enc) {
+    let data = match (opt, enc) {
         (
             Opt {
                 unix_addr: Some(addr),
@@ -625,7 +625,7 @@ async fn main() -> Result<(), Report> {
 
     info!("done");
     if let Some(ref path) = out_file {
-        rpcbench::write_durs(path, durs)?;
+        rpcbench::write_durs(path, data)?;
 
         debug!("writing trace file");
         let (downcaster, d) = timing_downcaster.unwrap();

@@ -8,6 +8,7 @@ use color_eyre::eyre::{bail, eyre, Report};
 use futures_util::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::convert::TryInto;
+use std::fmt::Debug;
 use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
@@ -226,6 +227,38 @@ impl Server {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConnData {
+    conn_idx: usize,
+    exp_time: Duration,
+    conn_time: Duration,
+    total_time: Duration,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Datapoint {
+    conn_idx: usize,
+    req_idx: usize,
+    exp_time: Duration,
+    rtt: i64,
+    srv_time: i64,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Data {
+    conns: Vec<ConnData>,
+    reqs: Vec<Datapoint>,
+}
+
+impl Data {
+    fn with_capacity(conns: usize, per_iter: usize) -> Self {
+        Self {
+            conns: Vec::with_capacity(conns),
+            reqs: Vec::with_capacity(conns * per_iter),
+        }
+    }
+}
+
 #[instrument(skip(addr, connector, msg), err)]
 pub async fn client_ping<A, C, F, S>(
     addr: A,
@@ -233,37 +266,52 @@ pub async fn client_ping<A, C, F, S>(
     msg: PingParams,
     iters: usize,
     reqs_per_iter: usize,
-) -> Result<Vec<(Duration, i64, i64)>, Report>
+) -> Result<Data, Report>
 where
     A: Clone,
     C: Fn(A) -> F,
     F: Future<Output = Result<S, Report>>,
     S: ChunnelConnection<Data = Msg> + Send + 'static,
 {
+    let mut data = Data::with_capacity(iters, reqs_per_iter);
     let start = std::time::Instant::now();
-    let mut durs = vec![];
     for i in 0..iters {
         trace!(iter = i, "start_loop");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let then = std::time::Instant::now();
+        let connstart = start.elapsed();
         let st = connector(addr.clone())
             .instrument(tracing::trace_span!("connector", iter = i))
             .await
             .wrap_err("could not connect")?;
+        let conntime = then.elapsed();
         trace!(iter = i, "connected");
         for j in 0..reqs_per_iter {
+            let reqtime = start.elapsed();
             trace!(iter = i, which = j, "ping_start");
             let (tot, srv) = do_one_ping(&st, msg.clone(), i, j).await?;
             trace!(iter = i, which = j, "ping_end");
-            durs.push((start.elapsed(), tot, srv));
+            data.reqs.push(Datapoint {
+                conn_idx: i,
+                req_idx: j,
+                exp_time: reqtime,
+                rtt: tot,
+                srv_time: srv,
+            });
         }
 
-        let elap: i64 = then.elapsed().as_micros().try_into()?;
-        trace!(iter = i, overall_time = elap, "end_loop");
+        let elap = then.elapsed();
+        trace!(iter = i, overall_time = ?elap, "end_loop");
+        data.conns.push(ConnData {
+            conn_idx: i,
+            exp_time: connstart,
+            conn_time: conntime,
+            total_time: elap,
+        });
     }
 
-    dump_durs(&durs);
-    Ok(durs)
+    dump_durs(&data);
+    Ok(data)
 }
 
 async fn do_one_ping(
@@ -274,13 +322,13 @@ async fn do_one_ping(
 ) -> Result<(i64, i64), Report> {
     let then = std::time::Instant::now();
     cn.send(msg.into())
-        .instrument(tracing::trace_span!("req", ?iter))
+        .instrument(tracing::trace_span!("req", ?iter, ?which))
         .await
         .wrap_err(eyre!("ping send #{:?},{:?}", iter, which))?;
     trace!(?iter, ?which, "send done");
     let response = match cn
         .recv()
-        .instrument(tracing::trace_span!("resp", ?iter))
+        .instrument(tracing::trace_span!("resp", ?iter, ?which))
         .await
         .wrap_err("pong recv")?
     {
@@ -300,12 +348,42 @@ fn gen_poisson_duration(amt: f64) -> Result<std::time::Duration, Report> {
     Ok(std::time::Duration::from_micros(pois.sample(&mut rng)))
 }
 
-pub fn write_durs(path: &std::path::Path, durs: Vec<(Duration, i64, i64)>) -> Result<(), Report> {
+pub fn write_durs(path: &std::path::Path, data: Data) -> Result<(), Report> {
     debug!("writing latencies file");
     let mut f = std::fs::File::create(path).wrap_err(eyre!("Create file: {:?}", path))?;
-    writeln!(&mut f, "Elapsed_us,Total_us,Server_us")?;
-    for (time, t, s) in durs.iter() {
-        writeln!(&mut f, "{},{},{}", time.as_micros(), t, s)?;
+    writeln!(
+        &mut f,
+        "Conn_idx,Conn_time_us,Req_idx,Elapsed_us,Total_us,Server_us"
+    )?;
+
+    for ConnData {
+        conn_idx: idx,
+        conn_time,
+        ..
+    } in data.conns
+    {
+        for Datapoint {
+            req_idx,
+            exp_time,
+            rtt,
+            srv_time,
+            ..
+        } in data
+            .reqs
+            .iter()
+            .filter(|Datapoint { conn_idx, .. }| *conn_idx == idx)
+        {
+            writeln!(
+                &mut f,
+                "{},{},{},{},{},{}",
+                idx,
+                conn_time.as_micros(),
+                req_idx,
+                exp_time.as_micros(),
+                rtt,
+                srv_time,
+            )?;
+        }
     }
 
     Ok(())
@@ -390,18 +468,31 @@ impl EncryptOpt {
     }
 }
 
-fn dump_durs(durs: &[(Duration, i64, i64)]) {
-    let mut just_durs: Vec<_> = durs.iter().map(|(_, x, _)| x).collect();
+fn dump_durs(data: &Data) {
+    let mut just_durs: Vec<_> = data.reqs.iter().map(|Datapoint { rtt, .. }| rtt).collect();
     just_durs.sort();
     let len = just_durs.len() as f64;
     let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
-    let quantiles: Vec<_> = quantile_idxs
+    let req_quantiles: Vec<_> = quantile_idxs
         .iter()
         .map(|q| (len * q) as usize)
         .map(|i| just_durs[i])
         .collect();
-    info!(?quantiles, "done");
-    println!("quantiles: {:?}", quantiles);
+    let mut conn_durs: Vec<_> = data
+        .conns
+        .iter()
+        .map(|ConnData { conn_time, .. }| conn_time)
+        .collect();
+    conn_durs.sort();
+    let len = conn_durs.len() as f64;
+    let conn_quantiles: Vec<_> = quantile_idxs
+        .iter()
+        .map(|q| (len * q) as usize)
+        .map(|i| conn_durs[i])
+        .collect();
+    info!(?conn_quantiles, ?req_quantiles, "done");
+    println!("conn quantiles: {:?}", conn_quantiles);
+    println!("req quantiles: {:?}", req_quantiles);
 }
 
 #[cfg(test)]
