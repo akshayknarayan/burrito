@@ -564,14 +564,17 @@ async fn main() -> Result<(), Report> {
                         enc.cert_dir_path(),
                     )
                     .connect(addr);
-                    let mut ch = CxList::from(SerializeChunnelProject::default()).wrap(tls);
+                    let ch = CxList::from(SerializeChunnelProject::default()).wrap(tls);
                     let nonce = ch.offers().next().unwrap();
-                    let nonce_buf = bincode::serialize(&nonce)?;
-                    ch.call_negotiate_picked(&nonce_buf).await;
-                    let cn = ch
-                        .connect_wrap(bertha::util::Nothing::<()>::default())
-                        .await
-                        .wrap_err("encr-mode no-neg connector")?;
+
+                    let cn = bertha::negotiate::negotiate_client_nonce(
+                        ch,
+                        UdpSkChunnel.connect(()).await?,
+                        nonce,
+                        addr,
+                    )
+                    .await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     Ok(ProjectLeft::new(TlsConnAddr::Request, cn))
                 }
             };
