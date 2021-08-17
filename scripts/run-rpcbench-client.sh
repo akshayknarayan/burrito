@@ -7,14 +7,13 @@ mkdir -p /tmp/burrito
 sudo docker rm -f rpcbench-cli || true
 sudo docker run --mount type=bind,source=/tmp/burrito/,target=/burrito -it --name rpcbench-cli -d ubuntu:20.04 /bin/bash
 sudo docker cp ./target/release/bincode-pingclient rpcbench-cli:/client
-# RUST_LOG=debug ./target/release/bincode-pingclient -i=3 --reqs-per-iter=2 -w=imm --addr 127.0.0.1:4242 --encr-ghostunnel-root ~/ghostunnel
 
 if [[ $6 != "none" ]]; then
     sudo docker cp $6 rpcbench-cli:/gt
 fi
 
-#RLOG="info"
-RLOG="info,rpcbench=trace,bertha=trace,tls-tunnel=trace,burrito-localname-ctl=trace"
+RLOG="info"
+#RLOG="info,rpcbench=trace,bertha=trace,tls_tunnel=trace,burrito_localname_ctl=trace"
 
 # 1 = outdir, 2 = addr, 3 = i, 4 = reqs-per-iter, 5 = outfile, 6 = encr, 7 = burrito-root
 if [[ $2 =~ ":" ]]; then 
