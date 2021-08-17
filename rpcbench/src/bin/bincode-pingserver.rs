@@ -1,14 +1,12 @@
 use bertha::{
     bincode::SerializeChunnelProject,
-    negotiate::{GetOffers, NegotiatePicked},
     negotiate_server,
     udp::UdpReqChunnel,
     uds::{UnixReqChunnel, UnixSkChunnel},
-    Chunnel, ChunnelListener, CxList,
+    ChunnelListener, CxList,
 };
 use burrito_localname_ctl::LocalNameChunnel;
 use color_eyre::eyre::{bail, Report};
-use futures_util::stream::TryStreamExt;
 use rpcbench::EncryptOpt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -27,9 +25,6 @@ struct Opt {
     port: Option<u16>,
     #[structopt(long)]
     burrito_root: Option<PathBuf>,
-
-    #[structopt(long)]
-    no_negotiation: bool,
 
     #[structopt(long, default_value = "/tmp")]
     encr_unix_root: PathBuf,
@@ -61,17 +56,6 @@ async fn unix(srv: rpcbench::Server, addr: PathBuf) -> Result<(), Report> {
 }
 
 #[tracing::instrument(skip(srv))]
-async fn unix_raw(srv: rpcbench::Server, addr: PathBuf) -> Result<(), Report> {
-    info!(?addr, "Serving unix-only mode");
-    let st = UnixReqChunnel.listen(addr).await?;
-    let st = st.and_then(|cn| {
-        let mut ch = SerializeChunnelProject::default();
-        async move { Ok(ch.connect_wrap(cn).await?) }
-    });
-    srv.serve(st, true).await
-}
-
-#[tracing::instrument(skip(srv))]
 async fn udp(srv: rpcbench::Server, port: u16, enc: Option<EncryptOpt>) -> Result<(), Report> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     info!(?port, encrypt = enc.is_some(), "Serving udp mode");
@@ -93,38 +77,6 @@ async fn udp(srv: rpcbench::Server, port: u16, enc: Option<EncryptOpt>) -> Resul
         .await?;
         srv.serve(st, true).await
     }
-}
-
-#[tracing::instrument(skip(srv))]
-async fn udp_raw(srv: rpcbench::Server, port: u16, enc: Option<EncryptOpt>) -> Result<(), Report> {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-    info!(?port, encrypt = enc.is_some(), "Serving udp raw mode");
-    if let Some(enc) = enc {
-        let tls =
-            TLSChunnel::<TlsConnAddr>::new(enc.unix_root(), enc.bin_path(), enc.cert_dir_path())
-                .listen(addr);
-        let mut ch = CxList::from(SerializeChunnelProject::default()).wrap(tls);
-        let nonce = ch.offers().next().unwrap();
-        let nonce_buf = bincode::serialize(&nonce)?;
-        ch.call_negotiate_picked(&nonce_buf).await;
-        let cn = ch
-            .connect_wrap(bertha::util::Nothing::<()>::default())
-            .await;
-        srv.serve(
-            futures_util::stream::once(futures_util::future::ready(cn)),
-            false,
-        )
-        .await?;
-    } else {
-        let st = UdpReqChunnel::default().listen(addr).await?;
-        let st = st.and_then(|cn| async move {
-            let mut ch = CxList::from(SerializeChunnelProject::default());
-            ch.connect_wrap(cn).await
-        });
-        srv.serve(st, false).await?;
-    }
-
-    Ok(())
 }
 
 #[tracing::instrument(skip(srv))]
@@ -174,65 +126,6 @@ async fn burrito(
     }
 }
 
-#[tracing::instrument(skip(srv))]
-async fn burrito_raw(
-    srv: rpcbench::Server,
-    port: u16,
-    root: PathBuf,
-    enc: Option<EncryptOpt>,
-) -> Result<(), Report> {
-    use tls_tunnel::TlsConnAddr;
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-
-    if let Some(enc) = enc {
-        let lch = LocalNameChunnel::<_, _, (SocketAddr, TlsConnAddr)>::new(
-            root.clone(),
-            Some((addr, TlsConnAddr::Request)),
-            UnixSkChunnel::with_root(root.clone()),
-            bertha::CxNil,
-        )
-        .await?;
-        let tls = TLSChunnel::<(SocketAddr, TlsConnAddr)>::new(
-            enc.unix_root(),
-            enc.bin_path(),
-            enc.cert_dir_path(),
-        )
-        .listen(addr);
-        let mut stack = CxList::from(SerializeChunnelProject::default())
-            .wrap(lch)
-            .wrap(tls);
-        let nonce = stack.offers().next().unwrap();
-        let nonce_buf = bincode::serialize(&nonce)?;
-        stack.call_negotiate_picked(&nonce_buf).await;
-        let cn = stack
-            .connect_wrap(bertha::util::Nothing::<()>::default())
-            .await;
-        info!(?port, ?root, "Serving localname mode with encryption");
-        srv.serve(
-            futures_util::stream::once(futures_util::future::ready(cn)),
-            false,
-        )
-        .await
-    } else {
-        let lch = LocalNameChunnel::<_, _, SocketAddr>::new(
-            root.clone(),
-            Some(addr),
-            UnixSkChunnel::with_root(root.clone()),
-            bertha::CxNil,
-        )
-        .await?;
-        let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
-
-        info!(?port, ?root, "Serving localname mode without encryption");
-        let st = UdpReqChunnel.listen(addr).await?;
-        let st = st.and_then(|cn| {
-            let mut ch = stack.clone();
-            async move { ch.connect_wrap(cn).await }
-        });
-        srv.serve(st, true).await
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Report> {
     color_eyre::install().unwrap();
@@ -272,37 +165,19 @@ async fn main() -> Result<(), Report> {
     let mut srv = rpcbench::Server::default();
     srv.set_trace_collection_trigger(trigger_trace_rewrite);
 
-    if !opt.no_negotiation {
-        if let Some(path) = opt.unix_addr {
-            return unix(srv, path).await;
-        }
-
-        if opt.port.is_none() {
-            bail!("Must specify port if not using unix address");
-        }
-
-        let encrypt = EncryptOpt::from(&opt);
-        let port = opt.port.unwrap();
-        if let Some(root) = opt.burrito_root {
-            return burrito(srv, port, root, encrypt).await;
-        }
-
-        udp(srv, port, encrypt).await
-    } else {
-        if let Some(path) = opt.unix_addr {
-            return unix_raw(srv, path).await;
-        }
-
-        if opt.port.is_none() {
-            bail!("Must specify port if not using unix address");
-        }
-
-        let encrypt = EncryptOpt::from(&opt);
-        let port = opt.port.unwrap();
-        if let Some(root) = opt.burrito_root {
-            return burrito_raw(srv, port, root, encrypt).await;
-        }
-
-        udp_raw(srv, port, encrypt).await
+    if let Some(path) = opt.unix_addr {
+        return unix(srv, path).await;
     }
+
+    if opt.port.is_none() {
+        bail!("Must specify port if not using unix address");
+    }
+
+    let encrypt = EncryptOpt::from(&opt);
+    let port = opt.port.unwrap();
+    if let Some(root) = opt.burrito_root {
+        return burrito(srv, port, root, encrypt).await;
+    }
+
+    udp(srv, port, encrypt).await
 }
