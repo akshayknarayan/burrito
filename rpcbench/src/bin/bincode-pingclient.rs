@@ -1,12 +1,6 @@
 use bertha::{
-    bincode::SerializeChunnelProject,
-    either::Either,
-    negotiate::{GetOffers, NegotiatePicked},
-    negotiate_client,
-    udp::UdpSkChunnel,
-    uds::UnixSkChunnel,
-    util::ProjectLeft,
-    Chunnel, ChunnelConnector, ClientNegotiator, CxList,
+    bincode::SerializeChunnelProject, either::Either, negotiate_client, udp::UdpSkChunnel,
+    uds::UnixSkChunnel, util::ProjectLeft, ChunnelConnector, ClientNegotiator, CxList,
 };
 use burrito_localname_ctl::LocalNameChunnel;
 use color_eyre::eyre::{bail, Report, WrapErr};
@@ -27,14 +21,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 enum NegotiationMode {
     OneRtt,
     ZeroRtt,
-    Off,
 }
 
 impl std::str::FromStr for NegotiationMode {
     type Err = Report;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
-            "false" | "off" => NegotiationMode::Off,
+            "false" | "off" => bail!("No-negotiation removed"),
             "true" | "one" => NegotiationMode::OneRtt,
             "zero" => NegotiationMode::ZeroRtt,
             s => bail!(
@@ -94,6 +87,16 @@ async fn main() -> Result<(), Report> {
         let timing_layer = tracing_timing::Builder::default()
             .no_span_recursion()
             .span_close_events()
+            .spans(|s: &tracing::span::Attributes| {
+                let mut val = s.metadata().name().to_owned();
+                let mut f = |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    if field.name() == "which" {
+                        val.push_str(&format!(" which={:?}", value));
+                    };
+                };
+                s.record(&mut f);
+                val
+            })
             .events(|e: &tracing::Event| {
                 let mut val = String::new();
                 let mut f = |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
@@ -167,20 +170,6 @@ async fn main() -> Result<(), Report> {
                 }
             };
 
-            let noneg_ctr = |addr: PathBuf| {
-                let br = burrito_root.clone();
-                async move {
-                    let u = if let Some(r) = br {
-                        UnixSkChunnel::with_root(r).connect(()).await?
-                    } else {
-                        UnixSkChunnel::default().connect(()).await?
-                    };
-                    let mut ch = SerializeChunnelProject::default();
-                    let cn = ch.connect_wrap(u).await?;
-                    Ok(ProjectLeft::new(addr, cn))
-                }
-            };
-
             let did_first_round: Arc<AtomicBool> = Default::default();
             let cl_neg = Arc::new(Mutex::new(ClientNegotiator::default()));
             let zerortt_ctr = |addr: PathBuf| {
@@ -208,9 +197,6 @@ async fn main() -> Result<(), Report> {
             };
 
             match negotiation {
-                NegotiationMode::Off => {
-                    rpcbench::client_ping(addr, noneg_ctr, pp, iters, reqs_per_iter).await?
-                }
                 NegotiationMode::OneRtt => {
                     rpcbench::client_ping(addr, ctr, pp, iters, reqs_per_iter).await?
                 }
@@ -245,21 +231,7 @@ async fn main() -> Result<(), Report> {
                     Ok(ProjectLeft::new(Either::Left(addr), cn))
                 }
             };
-            let noneg_fncl = |addr| {
-                let r = root.clone();
-                async move {
-                    let lch = LocalNameChunnel::<_, _, SocketAddr>::new(
-                        r.clone(),
-                        None,
-                        UnixSkChunnel::with_root(r),
-                        bertha::CxNil,
-                    )
-                    .await?;
-                    let mut stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
-                    let cn = stack.connect_wrap(UdpSkChunnel.connect(()).await?).await?;
-                    Ok(ProjectLeft::new(Either::Left(addr), cn))
-                }
-            };
+
             let did_first_round: Arc<AtomicBool> = Default::default();
             let cl_neg = Arc::new(Mutex::new(ClientNegotiator::default()));
             let zerortt_fncl = |addr| {
@@ -300,9 +272,6 @@ async fn main() -> Result<(), Report> {
             );
 
             match negotiation {
-                NegotiationMode::Off => {
-                    rpcbench::client_ping(addr, noneg_fncl, pp, iters, reqs_per_iter).await?
-                }
                 NegotiationMode::OneRtt => {
                     rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
                 }
@@ -348,36 +317,7 @@ async fn main() -> Result<(), Report> {
                     Ok(ProjectLeft::new(Either::Left((addr, x)), cn))
                 }
             };
-            let noneg_fncl = |(addr, x)| {
-                let enc = enc.clone();
-                let r = root.clone();
-                async move {
-                    let lch = LocalNameChunnel::new(
-                        r.clone(),
-                        None,
-                        UnixSkChunnel::with_root(r),
-                        bertha::CxNil,
-                    )
-                    .await?;
-                    let tls = TLSChunnel::<(SocketAddr, TlsConnAddr)>::new(
-                        enc.unix_root(),
-                        enc.bin_path(),
-                        enc.cert_dir_path(),
-                    )
-                    .connect(addr);
-                    let mut stack = CxList::from(SerializeChunnelProject::default())
-                        .wrap(lch)
-                        .wrap(tls);
-                    let nonce = stack.offers().next().unwrap();
-                    let nonce_buf = bincode::serialize(&nonce)?;
-                    stack.call_negotiate_picked(&nonce_buf).await;
-                    let cn = stack
-                        .connect_wrap(UdpSkChunnel.connect(()).await?)
-                        .await
-                        .wrap_err("burrito-mode no-neg connector")?;
-                    Ok(ProjectLeft::new(Either::Left((addr, x)), cn))
-                }
-            };
+
             let did_first_round: Arc<AtomicBool> = Default::default();
             let cl_neg = Arc::new(Mutex::new(ClientNegotiator::default()));
             let zerortt_fncl = |(addr, x)| {
@@ -429,16 +369,6 @@ async fn main() -> Result<(), Report> {
             );
 
             match negotiation {
-                NegotiationMode::Off => {
-                    rpcbench::client_ping(
-                        (addr, TlsConnAddr::Request),
-                        noneg_fncl,
-                        pp,
-                        iters,
-                        reqs_per_iter,
-                    )
-                    .await?
-                }
                 NegotiationMode::OneRtt => {
                     rpcbench::client_ping(
                         (addr, TlsConnAddr::Request),
@@ -483,11 +413,7 @@ async fn main() -> Result<(), Report> {
                 .await?;
                 Ok(ProjectLeft::new(addr, cn))
             };
-            let noneg_fncl = |addr| async move {
-                let mut ch = SerializeChunnelProject::default();
-                let cn = ch.connect_wrap(UdpSkChunnel.connect(()).await?).await?;
-                Ok(ProjectLeft::new(addr, cn))
-            };
+
             let did_first_round: Arc<AtomicBool> = Default::default();
             let cl_neg = Arc::new(Mutex::new(ClientNegotiator::default()));
             let zerortt_fncl = |addr| {
@@ -512,9 +438,6 @@ async fn main() -> Result<(), Report> {
             };
 
             match negotiation {
-                NegotiationMode::Off => {
-                    rpcbench::client_ping(addr, noneg_fncl, pp, iters, reqs_per_iter).await?
-                }
                 NegotiationMode::OneRtt => {
                     rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
                 }
@@ -555,30 +478,6 @@ async fn main() -> Result<(), Report> {
                 }
             };
 
-            let noneg_fncl = |addr| {
-                let enc = enc.clone();
-                async move {
-                    let tls = TLSChunnel::<TlsConnAddr>::new(
-                        enc.unix_root(),
-                        enc.bin_path(),
-                        enc.cert_dir_path(),
-                    )
-                    .connect(addr);
-                    let ch = CxList::from(SerializeChunnelProject::default()).wrap(tls);
-                    let nonce = ch.offers().next().unwrap();
-
-                    let cn = bertha::negotiate::negotiate_client_nonce(
-                        ch,
-                        UdpSkChunnel.connect(()).await?,
-                        nonce,
-                        addr,
-                    )
-                    .await?;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    Ok(ProjectLeft::new(TlsConnAddr::Request, cn))
-                }
-            };
-
             let did_first_round: Arc<AtomicBool> = Default::default();
             let cl_neg = Arc::new(Mutex::new(ClientNegotiator::default()));
             let zerortt_fncl = |addr| {
@@ -610,9 +509,6 @@ async fn main() -> Result<(), Report> {
             };
 
             match negotiation {
-                NegotiationMode::Off => {
-                    rpcbench::client_ping(addr, noneg_fncl, pp, iters, reqs_per_iter).await?
-                }
                 NegotiationMode::OneRtt => {
                     rpcbench::client_ping(addr, fncl, pp, iters, reqs_per_iter).await?
                 }
