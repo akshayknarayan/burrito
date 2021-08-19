@@ -2,6 +2,7 @@
 
 members = [
     "bertha",
+    "batcher",
     "burrito-localname-ctl",
     "burrito-shard-ctl",
     "kvstore",
