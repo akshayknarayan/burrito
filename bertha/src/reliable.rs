@@ -411,6 +411,16 @@ where
                         }
                         _ = tokio::time::sleep(to) => {
                             let (ref addr, ref pkt) = segment;
+                            {
+                                let mut st = state.get_mut(&flow_id).expect("conn not found");
+                                let seq = pkt.payload.as_ref().unwrap().0;
+                                if !st.inflight.contains_key(&seq) {
+                                trace!("received ack while retransmitting");
+                                    st.retx_ctrs.saturating_record(retx_ctr);
+                                    return Ok::<_, eyre::Report>(());
+                                }
+                            }
+
                             retx_ctr += 1;
                             to_ms *= to_ms;
                             trace!(?addr, ?pkt, ?retx_ctr, ?to, "retransmitting");
@@ -420,8 +430,13 @@ where
                             // send_time is the time since the last transmission
                             let mut st = state.get_mut(&flow_id).expect("conn not found");
                             let seq = pkt.payload.as_ref().unwrap().0;
-                            let (_, _, ref mut send_time) = st.inflight.get_mut(&seq).expect("pkt state not found");
-                            *send_time = Instant::now();
+                            if let Some((_, _, ref mut send_time)) = st.inflight.get_mut(&seq) {
+                                *send_time = Instant::now();
+                            } else {
+                                st.retx_ctrs.saturating_record(retx_ctr);
+                                trace!("received ack while retransmitting");
+                                return Ok::<_, eyre::Report>(());
+                            }
                         }
                     );
                 }
