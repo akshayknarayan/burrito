@@ -207,6 +207,8 @@ pub async fn single_shard(
                 Ok(None) => unreachable!(),
             };
 
+            //let cn = batcher::Batcher::new(cn);
+
             let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let store = store.clone();
             // TODO deduplicate possible spurious retxs by req id

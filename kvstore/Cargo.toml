@@ -12,6 +12,7 @@ ebpf = ["burrito-shard-ctl/ebpf"]
 
 [dependencies]
 bertha = { path = "../bertha" }
+batcher = { path = "../batcher" }
 burrito-shard-ctl = { path = "../burrito-shard-ctl" }
 color-eyre = "0.5"
 futures-util = "0.3"

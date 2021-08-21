@@ -27,7 +27,7 @@ impl<C, D> Batcher<C, D> {
             bus_boarding_join: Default::default(),
             curr_pending: Default::default(),
             pending_recvd: Default::default(),
-            recv_batch_size: 10,
+            recv_batch_size: 1,
         }
     }
 }

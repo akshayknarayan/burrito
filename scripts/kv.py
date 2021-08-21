@@ -231,7 +231,7 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     with_ebpf = "ebpf" if ebpf else "noebpf"
-    ok = conn.run(f"RUST_LOG=info,bertha=debug,kvstore=debug ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --log --trace-time={outf}.trace",
+    ok = conn.run(f"RUST_LOG=info,kvstore=debug ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --log --trace-time={outf}.trace",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -239,7 +239,8 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
             stderr=f"{outf}.err",
             )
     check(ok, "spawn server", conn.addr)
-    time.sleep(2)
+    agenda.subtask("wait for kvserver check")
+    time.sleep(8)
     conn.check_proc(f"kvserver-{with_ebpf}", f"{outf}.err")
 
 def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile):
@@ -258,7 +259,7 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile)
 
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
-    agenda.subtask(f"client starting, timeout {timeout}")
+    agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
     ok = conn.run(f"RUST_LOG=info,ycsb=debug ./target/release/ycsb \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
@@ -447,8 +448,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
         agenda.subtask(f"adding experiment info for {c.addr}")
         try:
             awk_files(0)
-        except:
-            agenda.subfailure(f"At least one file missing")
+        except Exception as e:
+            agenda.subfailure(f"At least one file missing: {e}")
             return False
 
     agenda.task("done")

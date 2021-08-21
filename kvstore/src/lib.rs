@@ -10,7 +10,7 @@ mod server;
 #[cfg(feature = "bin")]
 pub mod bin;
 
-pub use client::KvClient;
+pub use client::{KvClient, KvClientBuilder};
 pub use msg::Msg;
 pub use server::{serve, serve_lb, single_shard};
 
