@@ -4,10 +4,12 @@ from fabric import Connection
 import agenda
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import toml
 
 class ConnectionWrapper(Connection):
     def __init__(self, addr, user=None, port=None):
@@ -162,17 +164,12 @@ def check(ok, msg, addr, allowed=[]):
         sys.exit(1)
 
 def check_machine(ip):
-    if len(ip) == 3:
-        host, alt, addr = ip
-    elif len(ip) == 2:
-        host, addr = ip
-        alt = host
-    elif len(ip) == 1:
-        host = ip
-        addr = ip
-        alt = host
-    else:
+    if 'exp' not in ip:
         raise Exception(f"Malformed ips: {ip}")
+
+    addr = ip['exp']
+    host = ip['access'] if 'access' in ip else addr
+    alt = ip['alt'] if 'alt' in ip else host
 
     conn = ConnectionWrapper(host)
     if not conn.file_exists("~/burrito"):
@@ -222,7 +219,7 @@ def get_timeout(wrkfile, interarrival_us):
         total_time_s = num_reqs * interarrival_us / 1e6
         return max(int(total_time_s * 2), 180)
 
-def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
+def start_server(conn, redis_addr, outf, shards=1, ebpf=False, server_batch="none"):
     conn.run("sudo pkill -9 kvserver-ebpf")
     conn.run("sudo pkill -9 kvserver-noebpf")
     conn.run("sudo pkill -9 iokerneld")
@@ -231,7 +228,7 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     with_ebpf = "ebpf" if ebpf else "noebpf"
-    ok = conn.run(f"RUST_LOG=info,kvstore=debug ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --log --trace-time={outf}.trace",
+    ok = conn.run(f"RUST_LOG=info,kvstore=debug ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --batch-mode={server_batch} --log --trace-time={outf}.trace",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -243,7 +240,7 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False):
     time.sleep(8)
     conn.check_proc(f"kvserver-{with_ebpf}", f"{outf}.err")
 
-def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile):
+def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, batch, shardtype, outf, wrkfile):
     conn.run("sudo pkill -9 iokerneld")
 
     timeout = get_timeout(wrkfile, interarrival)
@@ -257,6 +254,9 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile)
     else:
         raise f"unknown shardtype {shardtype}"
 
+    batch_arg = f'--max-send-batching={batch}' if batch != 0 else ''
+    poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
+
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
@@ -265,8 +265,10 @@ def run_client(conn, server, redis_addr, interarrival, shardtype, outf, wrkfile)
             --redis-addr={redis_addr} \
             -i {interarrival} \
             --accesses {wrkfile} \
-            --out-file={outf}0.data1 \
+            --out-file={outf}0.data \
             -s host.config \
+            {batch_arg} \
+            {poisson_arg} \
             {shard_arg} \
             --logging --tracing --skip-loads",
         wd="~/burrito",
@@ -313,7 +315,7 @@ def run_loads(conn, server, redis_addr, outf, wrkfile):
                 wd="~/burrito",
                 stdout=f"{outf}-loads.out",
                 stderr=f"{outf}-loads.err",
-                timeout=15,
+                timeout=30,
                 )
         except:
             agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
@@ -326,10 +328,34 @@ def run_loads(conn, server, redis_addr, outf, wrkfile):
             agenda.subtask(f"loads client done: {time.time() - loads_start} s")
             break
 
-def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrkload, overwrite):
+def do_exp(iter_num,
+    outdir=None,
+    machines=None,
+    num_shards=None,
+    shardtype=None,
+    ops_per_sec=None,
+    client_batch=None,
+    server_batch=None,
+    poisson_arrivals=None,
+    wrkload=None,
+    overwrite=None
+):
+    assert(
+        outdir is not None and
+        machines is not None and
+        num_shards is not None and
+        shardtype is not None and
+        ops_per_sec is not None and
+        client_batch is not None and
+        server_batch is not None and
+        poisson_arrivals is not None and
+        wrkload is not None and
+        overwrite is not None
+    )
+
     wrkname = wrkload.split("/")[-1].split(".")[0]
-    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkname}-{iter_num}-kvserver"
-    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-{wrkname}-{iter_num}-client"
+    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-clientbatch={client_batch}-server_batch={server_batch}-{wrkname}-{iter_num}-kvserver"
+    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch={client_batch}-server_batch={server_batch}-{wrkname}-{iter_num}-client"
 
     for m in machines:
         if m.local:
@@ -339,7 +365,7 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
     if not overwrite and os.path.exists(f"{outf}0-{machines[1].addr}.data"):
-        agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
+        agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, client_batch = {client_batch}, server_batch = {server_batch}, load = {ops_per_sec} ops/s")
         return True
     else:
         agenda.task(f"running: {outf}0-{machines[1].addr}.data")
@@ -357,12 +383,12 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
     redis_addr = start_redis(machines[0])
     time.sleep(5)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {server_addr}, num_shards = {num_shards}, shardtype = {shardtype}, workload = {wrkname}, iter = {iter_num}, load = {ops_per_sec}, ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
+    agenda.task(f"starting: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, client_batch = {client_batch}, server_batch = {server_batch}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
     redis_port = redis_addr.split(":")[-1]
-    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, shards=num_shards, ebpf=False)
+    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, shards=num_shards, ebpf=False, server_batch=server_batch)
     time.sleep(5)
     # prime the server with loads
     agenda.task("doing loads")
@@ -370,8 +396,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
     try:
         machines[1].get(f"{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
         machines[1].get(f"{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
-    except:
-        agenda.subfailure("Could not get file from loads client")
+    except Exception as e:
+        agenda.subfailure(f"Could not get file from loads client: {e}")
 
     # others are clients
     agenda.task("starting clients")
@@ -380,6 +406,8 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
             server_addr,
             redis_addr,
             interarrival_us,
+            poisson_arrivals,
+            client_batch,
             shardtype,
             outf,
             wrkload
@@ -409,10 +437,10 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
             agenda.subtask(f"Use get_local: {c.host}")
             fn = get_local
 
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
+        agenda.subtask(f"getting {outf}{num}-{c.addr}.data")
         fn(
-            f"burrito/{outf}{num}.err",
-            local=f"{outf}{num}-{c.addr}.err",
+            f"burrito/{outf}{num}.data",
+            local=f"{outf}{num}-{c.addr}.data",
             preserve_mode=False,
         )
         agenda.subtask(f"getting {outf}{num}-{c.addr}.out")
@@ -421,16 +449,16 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
             local=f"{outf}{num}-{c.addr}.out",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.data1")
-        fn(
-            f"burrito/{outf}{num}.data1",
-            local=f"{outf}{num}-{c.addr}.data1",
-            preserve_mode=False,
-        )
         agenda.subtask(f"getting {outf}{num}-{c.addr}.trace")
         fn(
             f"burrito/{outf}{num}.trace",
             local=f"{outf}{num}-{c.addr}.trace",
+            preserve_mode=False,
+        )
+        agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
+        fn(
+            f"burrito/{outf}{num}.err",
+            local=f"{outf}{num}-{c.addr}.err",
             preserve_mode=False,
         )
 
@@ -441,58 +469,62 @@ def do_exp(outdir, machines, num_shards, shardtype, ops_per_sec, iter_num, wrklo
         except Exception as e:
             agenda.subfailure(f"At least one file missing for {c}: {e}")
 
-    def awk_files(num):
-        subprocess.run(f"awk '{{if (!hdr) {{hdr=$1; print \"ShardType NumShards Wrkload Ops \"$0;}} else {{print \"{shardtype} {num_shards} {wrkload} {ops_per_sec} \"$0}} }}' {outf}{num}-{c.addr}.data1 > {outf}{num}-{c.addr}.data", shell=True, check=True)
-
-    for c in machines[1:]:
-        agenda.subtask(f"adding experiment info for {c.addr}")
-        try:
-            awk_files(0)
-        except Exception as e:
-            agenda.subfailure(f"At least one file missing: {e}")
-            return False
-
     agenda.task("done")
     return True
 
 
+### Sample config
+### [machines]
+### server = { access = "127.0.0.1", alt = "192.168.1.2", exp = "10.1.1.2" }
+### clients = [
+###     { access = "192.168.1.5", exp = "10.1.1.5" },
+###     { access = "192.168.1.6", exp = "10.1.1.6" },
+###     { access = "192.168.1.7", exp = "10.1.1.7" },
+###     { access = "192.168.1.8", exp = "10.1.1.8" },
+###     { access = "192.168.1.9", exp = "10.1.1.9" },
+### ]
+###
+### [exp]
+### wrk = ["~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"]
+### load = [10000, 20000, 40000, 60000, 80000, 100000]
+### shardtype = ["client"]
+### shards = [6]
+### batching = [0, 16, 64, 256]
+###
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--outdir', type=str, required=True)
-    parser.add_argument('--load', type=int, action='append', required=True)
-    parser.add_argument('--server', type=str, required=True)
-    parser.add_argument('--client', type=str, action='append', required=True)
-    parser.add_argument('--shards', type=int, action='append', required=True)
-    parser.add_argument('--shardtype', type=str, action='append', required=True)
-    parser.add_argument('--wrk', type=str, action='append', required=True)
     parser.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
+    agenda.task(f"reading cfg {args.config}")
+    cfg = toml.load(args.config)
+    print(cfg)
 
     outdir = args.outdir
-    ips = [args.server] + args.client
 
-    if len(args.client) < 1:
+    if len(cfg['machines']['clients']) < 1:
         agenda.failure("Need more machines")
         sys.exit(1)
 
-    ops_per_sec = args.load
-    if args.shards is None:
+    ops_per_sec = cfg['exp']['load']
+    if cfg['exp']['shards'] is None:
         agenda.failure("Need shards arg")
         sys.exit(1)
 
-    for t in args.wrk:
+    for t in cfg['exp']['wrk']:
         if not t.endswith(".access") or '-' not in t:
             agenda.failure(f"Workload file should be <name>-<concurrency>.access, got {t}")
             sys.exit(1)
 
-    for t in args.shardtype:
+    for t in cfg['exp']['shardtype']:
         if t not in ['client', 'server', 'basicclient']: # basicclient is a subset of server
             agenda.failure(f"Unknown shardtype {t}")
             sys.exit(1)
 
     agenda.task(f"Checking for connection vs experiment ip")
-    ips = [i.split(":") if len(i.split(":")) >= 2 else i for i in ips]
-
+    ips = [cfg['machines']['server']] + cfg['machines']['clients']
     agenda.task(f"connecting to {ips}")
     machines, commits = zip(*[check_machine(ip) for ip in ips])
     # check all the commits are equal
@@ -518,19 +550,27 @@ if __name__ == '__main__':
         sys.exit(1)
     agenda.task("...done building burrito")
 
-    for w in args.wrk:
-        for s in args.shards:
-            for t in args.shardtype:
+    # copy config file to outdir
+    shutil.copy2(args.config, args.outdir)
+
+    for w in cfg['exp']['wrk']:
+        for s in cfg['exp']['shards']:
+            for t in cfg['exp']['shardtype']:
                 for o in ops_per_sec:
-                    do_exp(outdir, machines, s, t, o, 0, w, args.overwrite)
+                    for cb in cfg['exp']['client-batching']:
+                        for sb in cfg['exp']['server-batching']:
+                            for p in cfg['exp']['poisson-arrivals']:
+                                do_exp(0,
+                                    outdir=outdir,
+                                    machines=machines,
+                                    num_shards=s,
+                                    shardtype=t,
+                                    ops_per_sec=o,
+                                    client_batch=cb,
+                                    server_batch=sb,
+                                    poisson_arrivals=p,
+                                    wrkload=w,
+                                    overwrite=args.overwrite
+                                )
 
     agenda.task("done")
-
-    # could do the aggregation here, but we do it in jupyter anyway
-    #subprocess.run(f"rm -f {outdir}/*.data1", shell=True)
-    #subprocess.run(f"rm -f {outdir}/*.data2", shell=True)
-    #subprocess.run(f"cat ./{outdir}/*client*.data | awk '{{if (!hdr) {{hdr=$0; print $0;}} else if (hdr != $0) {{print $0}};}}' > {outdir}/exp.data", shell=True)
-    #subprocess.run(f"awk '{{print $1,$2,$3,$4}}' {outdir}/exp.data | uniq > {outdir}/exp-scaling.data1", shell=True)
-    #subprocess.run(f"python3 scripts/exp_max.py < {outdir}/exp-scaling.data1 > {outdir}/exp-scaling.data", shell=True)
-    #agenda.task("plotting")
-    #subprocess.run(f"./scripts/kv.R {outdir}/exp.data {outdir}/exp.pdf", shell=True)

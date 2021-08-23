@@ -1,0 +1,18 @@
+[machines]
+server = { access = "127.0.0.1", alt = "192.168.1.2", exp = "10.1.1.2" }
+clients = [
+    { access = "192.168.1.5", exp = "10.1.1.5" },
+    { access = "192.168.1.6", exp = "10.1.1.6" },
+    { access = "192.168.1.7", exp = "10.1.1.7" },
+    { access = "192.168.1.8", exp = "10.1.1.8" },
+    { access = "192.168.1.9", exp = "10.1.1.9" },
+]
+
+[exp]
+wrk = ["./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"]
+load = [10000, 20000, 40000, 60000, 80000, 100000, 120000]
+poisson-arrivals = [true, false]
+shardtype = ["client"]
+shards = [6]
+client-batching = [0, 16, 64]
+server-batching = ["none", "auto", "applevel:16", "applevel:64"]
