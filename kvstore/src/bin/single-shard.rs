@@ -14,6 +14,9 @@ struct Opt {
     #[structopt(short, long)]
     internal_addr: Option<SocketAddr>,
 
+    #[structopt(short, long, default_value = "none")]
+    batch_mode: kvstore::BatchMode,
+
     #[structopt(short, long)]
     shenango_cfg: std::path::PathBuf,
 
@@ -42,6 +45,7 @@ async fn main() -> Result<(), Report> {
         listener,
         true,
         None,
+        opt.batch_mode,
     )
     .await;
     Ok(())

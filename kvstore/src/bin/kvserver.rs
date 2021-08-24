@@ -20,6 +20,9 @@ struct Opt {
     #[structopt(short, long)]
     shenango_cfg: Option<std::path::PathBuf>,
 
+    #[structopt(short, long, default_value = "none")]
+    batch_mode: kvstore::BatchMode,
+
     #[structopt(short, long)]
     num_shards: u16,
 
@@ -59,6 +62,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         opt.port,
         opt.num_shards,
         None,
+        opt.batch_mode,
     )
     .instrument(info_span!("server"))
     .await
@@ -81,6 +85,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         opt.port,
         opt.num_shards,
         None,
+        opt.batch_mode,
     )
     .instrument(info_span!("server"))
     .await
