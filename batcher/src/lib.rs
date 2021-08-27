@@ -12,7 +12,8 @@ pub struct Batcher<C, D> {
     // send side
     bus_left_notify_arrival: Arc<Mutex<Option<mpsc::Sender<()>>>>,
     bus_boarding_join: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    curr_pending: Arc<Mutex<PendingSend<D>>>,
+    curr_pending: Arc<Mutex<(PendingSend<D>, hdrhistogram::Histogram<u64>)>>,
+    max_batch_size: usize,
 
     // recv side
     pending_recvd: Arc<Mutex<VecDeque<D>>>,
@@ -25,10 +26,39 @@ impl<C, D> Batcher<C, D> {
             inner: Arc::new(inner),
             bus_left_notify_arrival: Default::default(),
             bus_boarding_join: Default::default(),
-            curr_pending: Default::default(),
+            curr_pending: Arc::new(Mutex::new((
+                Default::default(),
+                hdrhistogram::Histogram::new_with_max(512, 2).unwrap(),
+            ))),
+            max_batch_size: 16,
             pending_recvd: Default::default(),
             recv_batch_size: 1,
         }
+    }
+
+    pub fn set_max_batch_size(&mut self, max_batch_size: usize) -> &mut Self {
+        self.max_batch_size = max_batch_size;
+        self
+    }
+
+    pub fn set_recv_batch_size(&mut self, size: usize) -> &mut Self {
+        self.recv_batch_size = size;
+        self
+    }
+}
+
+impl<C, D> Drop for Batcher<C, D> {
+    fn drop(&mut self) {
+        let (_, ref h) = *self.curr_pending.lock().unwrap();
+        tracing::info!(
+            p5 = h.value_at_quantile(0.05),
+            p25 = h.value_at_quantile(0.25),
+            p50 = h.value_at_quantile(0.5),
+            p75 = h.value_at_quantile(0.75),
+            p95 = h.value_at_quantile(0.95),
+            cnt = h.len(),
+            "send_batch_size",
+        );
     }
 }
 
@@ -45,6 +75,7 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
         let pending = Arc::clone(&self.curr_pending);
+        let max_batch_size = self.max_batch_size;
 
         // there is an ongoing send. this will fire when it finishes.
         // only one waiter should wait on this: whoever takes it first and starts a new batch.
@@ -62,13 +93,48 @@ where
             // 2. a. if we're starting a new bus (Some case), fill in bus_boarding_join
             //    b. if we're not starting a new bus (None case), then join the existing bus.
             //    c. but, if there's no existing bus, then we are starting a new bus after all.
+            //    d. if the existing bus has reached capacity, send it and replace board_bus
             let bus_boarding = bus_boarding_join.lock().unwrap().clone();
             match (enroute_bus, bus_boarding) {
                 (None, Some(board_bus)) => {
-                    // b. case
-                    pending.lock().unwrap().push(data);
-                    trace!("wait for batch completion");
-                    board_bus.closed().await;
+                    // b. and d. cases
+                    let batch_closed = {
+                        let (ref mut h, ref mut record) = *pending.lock().unwrap();
+                        h.push(data);
+                        if h.size() >= max_batch_size {
+                            record.saturating_record(h.size() as _);
+                            Some(h.take())
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(send_now) = batch_closed {
+                        let (board_bus, mut this_bus_arrival) = mpsc::channel(1);
+                        // overwrite the existing board_bus waiter.
+                        {
+                            let mut arrival = bus_left_notify_arrival.lock().unwrap();
+                            *arrival = Some(board_bus);
+                        }
+
+                        trace!(?send_now, "sending");
+                        match send_now {
+                            PendingSend::Nil => unreachable!(),
+                            PendingSend::Single(d) => {
+                                inner.send(d).await?;
+                            }
+                            PendingSend::Batch(d) => {
+                                inner.send_batch(d).await?;
+                            }
+                        }
+
+                        trace!("sent");
+                        // signal completion.
+                        this_bus_arrival.close();
+                    } else {
+                        trace!("wait for batch completion");
+                        board_bus.closed().await;
+                    }
                     Ok(())
                 }
                 (enroute, _) => {
@@ -95,17 +161,19 @@ where
                     let send_now = {
                         let mut arrival = bus_left_notify_arrival.lock().unwrap();
                         let mut bus = bus_boarding_join.lock().unwrap();
-                        let mut s = pending.lock().unwrap();
+                        let (ref mut s, ref mut record) = *pending.lock().unwrap();
                         *arrival = bus.take();
                         s.push(data);
-                        s.take()
+                        let b = s.take();
+                        record.saturating_record(b.size() as _);
+                        b
                     };
 
                     trace!(?send_now, "sending");
 
                     // take whatever's ready to be sent now and send it.
                     match send_now {
-                        PendingSend::Nil => todo!(),
+                        PendingSend::Nil => unreachable!(),
                         PendingSend::Single(d) => {
                             inner.send(d).await?;
                         }
@@ -218,6 +286,14 @@ impl<D> PendingSend<D> {
                 b.push(data);
                 return true;
             }
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            PendingSend::Nil => 0,
+            PendingSend::Single(_) => 1,
+            PendingSend::Batch(ref b) => b.len(),
         }
     }
 }
