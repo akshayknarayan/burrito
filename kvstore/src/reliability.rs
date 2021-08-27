@@ -153,7 +153,7 @@ where
                         let recv_msg_id = resp.1.id();
                         // careful about blocking here, could deadlock
                         signal_recv.send(resp).await.map_err(|_| ()).expect("receiver won't hang up");
-                        let send_ch = if let Some(s) = sends.remove(&msg_id) {
+                        let send_ch = if let Some(s) = sends.remove(&recv_msg_id) {
                             s
                         } else { continue; };
 
@@ -168,6 +168,56 @@ where
                     }
                     _ = tokio::time::sleep(to) => {
                         inner.send(data.clone()).await?;
+                    }
+                );
+            }
+        })
+    }
+
+    fn send_batch<'cn, B>(
+        &'cn self,
+        data: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+        Self::Data: Send,
+        Self: Sync,
+    {
+        use futures_util::TryStreamExt;
+        Box::pin(async move {
+            let mut batch_pkts = Vec::new();
+            let batch_completions = futures_util::stream::FuturesUnordered::new();
+            for pkt in data {
+                let (s, r) = oneshot::channel();
+                let msg_id = pkt.1.id();
+                self.sends.insert(msg_id, s);
+                batch_pkts.push(pkt.clone());
+                batch_completions.push(r);
+                self.inner.send(pkt).await?;
+            }
+
+            let mut done = batch_completions.try_collect();
+            loop {
+                tokio::select!(
+                    resp = self.inner.recv() => {
+                        let resp = resp.wrap_err("kvreliability recv acks")?;
+                        let recv_msg_id = resp.1.id();
+                        // careful about blocking here, could deadlock
+                        self.signal_recv.send(resp).await.map_err(|_| ()).expect("receiver won't hang up");
+                        let send_ch = if let Some(s) = self.sends.remove(&recv_msg_id) {
+                            s
+                        } else { continue; };
+                        send_ch.1.send(()).map_err(|_| ()).expect("send done notification failed");
+                    }
+                    r = &mut done => {
+                        r?;
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(self.timeout) => {
+                        for p in batch_pkts.clone() {
+                            self.inner.send(p).await?;
+                        }
                     }
                 );
             }
