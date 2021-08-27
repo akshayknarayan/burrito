@@ -98,18 +98,24 @@ impl KvClientBuilder<true> {
     pub async fn new_basicclient(
         self,
         raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+        max_batch_size: usize,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         let cn = basic_client!(raw_cn, self.canonical_addr);
-        Ok(KvClient::new_from_cn(batcher::Batcher::new(cn)))
+        let mut b = batcher::Batcher::new(cn);
+        b.set_max_batch_size(max_batch_size);
+        Ok(KvClient::new_from_cn(b))
     }
 
     #[instrument(skip(raw_cn), err)]
     pub async fn new_nonshardclient(
         self,
         raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+        max_batch_size: usize,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         let cn = nonshard!(raw_cn, self.canonical_addr);
-        Ok(KvClient::new_from_cn(batcher::Batcher::new(cn)))
+        let mut b = batcher::Batcher::new(cn);
+        b.set_max_batch_size(max_batch_size);
+        Ok(KvClient::new_from_cn(b))
     }
 
     #[instrument(skip(raw_cn), err)]
@@ -117,9 +123,12 @@ impl KvClientBuilder<true> {
         self,
         raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         redis_addr: SocketAddr,
+        max_batch_size: usize,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         let cn = shardcl!(raw_cn, redis_addr, self.canonical_addr);
-        Ok(KvClient::new_from_cn(batcher::Batcher::new(cn)))
+        let mut b = batcher::Batcher::new(cn);
+        b.set_max_batch_size(max_batch_size);
+        Ok(KvClient::new_from_cn(b))
     }
 }
 

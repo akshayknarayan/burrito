@@ -9,7 +9,7 @@ use bertha::{
     ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers, Select,
 };
 use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
-use color_eyre::eyre::{Report, WrapErr};
+use color_eyre::eyre::{bail, Report, WrapErr};
 use futures_util::stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{atomic::AtomicUsize, Arc};
@@ -131,6 +131,130 @@ pub async fn serve_lb(
     unreachable!() // negotiate_server never returns None
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum BatchMode {
+    None,
+    Auto,
+    AppLevel(usize),
+}
+
+impl std::str::FromStr for BatchMode {
+    type Err = Report;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let sp: Vec<_> = s.split(":").collect();
+        Ok(match &sp[..] {
+            &["none"] => BatchMode::None,
+            &["auto"] => BatchMode::Auto,
+            &["applevel", x] => BatchMode::AppLevel(x.parse()?),
+            x => bail!("Unknown batching mode {:?}", x),
+        })
+    }
+}
+
+impl BatchMode {
+    async fn serve(
+        self,
+        cn: impl ChunnelConnection<Data = (SocketAddr, Msg)> + Send + Sync + 'static,
+        store: Store,
+        idx: usize,
+    ) {
+        macro_rules! nobatch {
+            ($cn: expr, $store: expr) => {{
+                let mut pending_sends = FuturesUnordered::new();
+                debug!("new");
+                loop {
+                    trace!("call recv");
+                    use futures_util::future::Either;
+                    let recv_val =
+                        match futures_util::future::select(pending_sends.next(), $cn.recv()).await {
+                            Either::Left((Some(Ok(_)), _)) => None,
+                            Either::Left((Some(Err(e)), _)) => {
+                                warn!(err = ?e, ?idx, "exiting on send error");
+                                break;
+                            }
+                            Either::Left((None, f)) => Some(f.await),
+                            Either::Right((inc, _)) => Some(inc),
+                        };
+
+                    match recv_val {
+                        Some(Ok((a, msg @ Msg { .. }))) => {
+                            trace!(msg = ?&msg, from=?&a, pending_sends = pending_sends.len(), "got msg");
+                            let rsp = $store.call(msg);
+                            let id = rsp.id;
+                            let send_fut = $cn.send((a, rsp));
+                            pending_sends.push(async move {
+                                send_fut.await?;
+                                trace!(msg_id = id, "sent response");
+                                Ok::<_, Report>(())
+                            });
+                        }
+                        Some(Err(e)) => {
+                            warn!(err = ?e, ?idx, "exiting on recv error");
+                            break;
+                        }
+                        None => (),
+                    }
+                }
+            }}
+        }
+
+        match self {
+            BatchMode::None => {
+                nobatch!(cn, store)
+            }
+            BatchMode::Auto => {
+                let cn = batcher::Batcher::new(cn);
+                nobatch!(cn, store)
+            }
+            BatchMode::AppLevel(batch_size) => {
+                let cn = batcher::Batcher::new(cn);
+                let mut pending_sends = FuturesUnordered::new();
+                debug!("new");
+                loop {
+                    trace!("call recv");
+                    use futures_util::future::Either;
+                    let recv_val = match futures_util::future::select(
+                        pending_sends.next(),
+                        cn.recv_batch(batch_size),
+                    )
+                    .await
+                    {
+                        Either::Left((Some(Ok(_)), _)) => None,
+                        Either::Left((Some(Err(e)), _)) => {
+                            warn!(err = ?e, ?idx, "exiting on send error");
+                            break;
+                        }
+                        Either::Left((None, f)) => Some(f.await),
+                        Either::Right((inc, _)) => Some(inc),
+                    };
+
+                    match recv_val {
+                        Some(Ok(msgs)) => {
+                            let resps: Vec<_> = msgs.into_iter().map(|(a, msg @ Msg { .. })| {
+                                trace!(msg = ?&msg, from=?&a, pending_sends = pending_sends.len(), "got msg");
+                                let rsp = store.call(msg);
+                                (a, rsp)
+                            }).collect();
+
+                            let send_fut = cn.send_batch(resps);
+                            pending_sends.push(async move {
+                                send_fut.await?;
+                                trace!("sent response");
+                                Ok::<_, Report>(())
+                            });
+                        }
+                        Some(Err(e)) => {
+                            warn!(err = ?e, ?idx, "exiting on recv error");
+                            break;
+                        }
+                        None => (),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Start and serve a single shard.
 ///
 /// `addr`: Public address to listen on
@@ -160,13 +284,17 @@ pub async fn single_shard(
         + 'static,
     need_address_embedding: bool,
     s: impl Into<Option<tokio::sync::oneshot::Sender<Vec<StackNonce>>>>,
+    batching: BatchMode,
 ) {
     let s = s.into();
     let internal_addr = internal_addr.unwrap_or(addr);
     info!(?addr, ?internal_addr, "listening");
 
-    async fn srv<C, Sc, Se>(st: Sc, s: Option<tokio::sync::oneshot::Sender<Vec<StackNonce>>>)
-    where
+    async fn srv<C, Sc, Se>(
+        st: Sc,
+        s: Option<tokio::sync::oneshot::Sender<Vec<StackNonce>>>,
+        batching: BatchMode,
+    ) where
         Sc: Stream<Item = Result<C, Se>> + Send + 'static,
         C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         Se: Into<Report> + Send + Sync + 'static,
@@ -207,49 +335,15 @@ pub async fn single_shard(
                 Ok(None) => unreachable!(),
             };
 
-            //let cn = batcher::Batcher::new(cn);
-
             let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let store = store.clone();
             // TODO deduplicate possible spurious retxs by req id
-            let mut pending_sends = FuturesUnordered::new();
 
-            tokio::spawn(async move {
-                debug!("new");
-                loop {
-                    trace!("call recv");
-                    use futures_util::future::Either;
-                    let recv_val = match futures_util::future::select(pending_sends.next(), cn.recv()).await {
-                        Either::Left((Some(Ok(_)), _)) => None,
-                        Either::Left((Some(Err(e)), _)) => {
-                            warn!(err = ?e, ?idx, "exiting on send error");
-                            break;
-                        }
-                        Either::Left((None, f)) => Some(f.await),
-                        Either::Right((inc, _)) => Some(inc),
-                    };
-
-                    match recv_val {
-                        Some(Ok((a, msg @ Msg {..}))) => {
-                            trace!(msg = ?&msg, from=?&a, pending_sends = pending_sends.len(), "got msg");
-                            let rsp = store.call(msg);
-                            let id = rsp.id;
-                            let send_fut = cn.send((a, rsp));
-                            pending_sends.push(async move {
-                                send_fut.await?;
-                                trace!(msg_id = id, "sent response");
-                                Ok::<_, Report>(())
-                            });
-                        }
-                        Some(Err(e)) => {
-                            warn!(err = ?e, ?idx, "exiting on recv error");
-                            break;
-                        }
-                        None => (),
-                    }
-                }
-            }
-            .instrument(debug_span!("shard_connection", idx = ?idx)));
+            tokio::spawn(
+                batching
+                    .serve(cn, store, idx)
+                    .instrument(debug_span!("shard_connection", idx = ?idx)),
+            );
         }
 
         unreachable!();
@@ -262,7 +356,7 @@ pub async fn single_shard(
             .await
             .map_err::<Report, _>(Into::into)
             .unwrap();
-        srv(st, s).await
+        srv(st, s, batching).await
     } else {
         let st = SelectListener::new(raw_listener, internal_srv)
             .separate_addresses()
@@ -270,7 +364,7 @@ pub async fn single_shard(
             .await
             .map_err::<Report, _>(Into::into)
             .unwrap();
-        srv(st, s).await
+        srv(st, s, batching).await
     }
 }
 
@@ -297,6 +391,7 @@ pub async fn serve(
     srv_port: u16,
     num_shards: u16,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
+    batching: BatchMode,
 ) -> Result<(), Report> {
     // 1. Define addr.
     let si = make_shardinfo(srv_ip, srv_port, num_shards);
@@ -309,7 +404,7 @@ pub async fn serve(
         let (s, r) = tokio::sync::oneshot::channel();
         let int_srv = internal_srv.clone();
         tokio::spawn(
-            single_shard(a, raw_listener.clone(), None, int_srv, false, s)
+            single_shard(a, raw_listener.clone(), None, int_srv, false, s, batching)
                 .instrument(debug_span!("shardsrv", addr = ?&a)),
         );
         rdy.push(r);

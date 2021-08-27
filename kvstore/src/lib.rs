@@ -12,7 +12,7 @@ pub mod bin;
 
 pub use client::{KvClient, KvClientBuilder};
 pub use msg::Msg;
-pub use server::{serve, serve_lb, single_shard};
+pub use server::{serve, serve_lb, single_shard, BatchMode};
 
 #[cfg(test)]
 mod tests {
