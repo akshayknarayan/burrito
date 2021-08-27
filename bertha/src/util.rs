@@ -13,7 +13,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::trace;
 
 pub trait MsgId {
@@ -186,14 +186,14 @@ where
         make_conn: MkConn,
     ) -> Pin<Box<dyn Stream<Item = Result<Conn, Report>> + Send + 'static>>
     where
-        MkConn: Fn(A, C, mpsc::UnboundedReceiver<(A, Vec<u8>)>) -> Conn + Send + 'static,
+        MkConn: Fn(A, C, flume::Receiver<(A, Vec<u8>)>) -> Conn + Send + 'static,
         Conn: ChunnelConnection,
     {
         let sk = self.0;
         Box::pin(futures_util::stream::try_unfold(
             (
                 sk,
-                AHashMap::<_, mpsc::UnboundedSender<(A, Vec<u8>)>>::new(),
+                AHashMap::<_, flume::Sender<(A, Vec<u8>)>>::new(),
                 make_conn,
             ),
             move |(sk, mut map, make_conn)| {
@@ -205,15 +205,15 @@ where
 
                         let mut done = None;
                         let c = map.entry(from.clone()).or_insert_with(|| {
-                            let (sch, rch) = mpsc::unbounded_channel();
+                            let (sch, rch) = flume::unbounded();
                             done = Some(make_conn(from.clone(), sk.clone(), rch));
                             sch
                         });
 
                         // the send fails only if the receiver stopped listening.
                         // so this becomes a new connection
-                        if let Err(mpsc::error::SendError(data)) = c.send((from.clone(), data)) {
-                            let (sch, rch) = mpsc::unbounded_channel();
+                        if let Err(flume::SendError(data)) = c.send((from.clone(), data)) {
+                            let (sch, rch) = flume::unbounded();
                             done = Some(make_conn(from.clone(), sk.clone(), rch));
                             // Send again because the previous one failed, so the message would
                             // otherwise be dropped. This won't block because it's an unbounded

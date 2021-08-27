@@ -17,9 +17,10 @@ bincode = "1"
 pin-project = "1"
 paste = "1"
 dashmap = "3"
-ahash = "0.5"
+ahash = "0.7"
 hdrhistogram = "7"
 base64 = "0.13"
+flume = "0.10"
 
 [dev-dependencies]
 lazy_static = "1.4"

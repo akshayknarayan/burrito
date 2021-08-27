@@ -164,11 +164,22 @@ pub trait ChunnelConnection {
         Self::Data: Send,
         Self: Sync,
     {
+        use futures_util::FutureExt;
         Box::pin(async move {
-            let mut recv_batch = Vec::with_capacity(batch_size);
-            for i in 0..batch_size {
-                recv_batch.push(self.recv().await?);
-                tracing::debug!(?i, "batch recv");
+            let mut recv_batch = vec![];
+            loop {
+                if let Some(m) = self.recv().now_or_never() {
+                    recv_batch.push(m?);
+                    tracing::debug!(batch_len = ?recv_batch.len(), "batch recv");
+                    if recv_batch.len() >= batch_size {
+                        break;
+                    }
+                } else if recv_batch.is_empty() {
+                    recv_batch.push(self.recv().await?);
+                    break;
+                } else {
+                    break;
+                }
             }
 
             Ok(recv_batch)

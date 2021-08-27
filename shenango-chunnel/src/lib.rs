@@ -2,18 +2,16 @@
 
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use crossbeam::channel;
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
 lazy_static::lazy_static! {
-static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<channel::Sender<NewConn>>>> =
+static ref SHENANGO_RUNTIME_SENDER: Arc<StdMutex<Option<flume::Sender<NewConn>>>> =
     Arc::new(StdMutex::new(None));
 }
 
@@ -25,12 +23,12 @@ struct Msg {
 enum NewConn {
     Listen {
         addr: SocketAddrV4,
-        incoming: mpsc::UnboundedSender<Msg>,
-        outgoing: channel::Receiver<Msg>,
+        incoming: flume::Sender<Msg>,
+        outgoing: flume::Receiver<Msg>,
     },
     Dial {
-        incoming: mpsc::UnboundedSender<Msg>,
-        outgoing: channel::Receiver<Msg>,
+        incoming: flume::Sender<Msg>,
+        outgoing: flume::Receiver<Msg>,
     },
 }
 
@@ -94,10 +92,10 @@ impl NewConn {
                 }) => {
                     sk.write_to(&data, a).wrap_err("shenango write_to").unwrap();
                 }
-                Err(crossbeam::channel::TryRecvError::Empty) => {
+                Err(flume::TryRecvError::Empty) => {
                     shenango::thread::thread_yield();
                 }
-                Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                Err(flume::TryRecvError::Disconnected) => {
                     debug!(sk=?laddr, "send thread exiting");
                     break;
                 }
@@ -108,7 +106,7 @@ impl NewConn {
 
 // everything here blocks.
 // On success, this won't return while the ShenangoUdpSkChunnel still lives.
-fn shenango_runtime_start(shenango_config: &Path) -> channel::Sender<NewConn> {
+fn shenango_runtime_start(shenango_config: &Path) -> flume::Sender<NewConn> {
     let mut rt_guard = SHENANGO_RUNTIME_SENDER
         .lock()
         .expect("Shenango runtime lock acquisition failure is critical");
@@ -116,7 +114,7 @@ fn shenango_runtime_start(shenango_config: &Path) -> channel::Sender<NewConn> {
         return s.clone();
     }
 
-    let (s, conns) = channel::bounded(0);
+    let (s, conns) = flume::bounded(0);
     rt_guard.replace(s.clone());
     let cfg = shenango_config.to_str().unwrap().to_owned();
     std::thread::spawn(move || {
@@ -125,10 +123,10 @@ fn shenango_runtime_start(shenango_config: &Path) -> channel::Sender<NewConn> {
                 Ok(conn) => {
                     conn.start();
                 }
-                Err(crossbeam::channel::TryRecvError::Empty) => {
+                Err(flume::TryRecvError::Empty) => {
                     shenango::thread::thread_yield();
                 }
-                Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                Err(flume::TryRecvError::Disconnected) => {
                     debug!("main thread exiting");
                     break;
                 }
@@ -142,7 +140,7 @@ fn shenango_runtime_start(shenango_config: &Path) -> channel::Sender<NewConn> {
 
 #[derive(Clone, Debug)]
 pub struct ShenangoUdpSkChunnel {
-    events: channel::Sender<NewConn>,
+    events: flume::Sender<NewConn>,
 }
 
 impl ShenangoUdpSkChunnel {
@@ -153,8 +151,8 @@ impl ShenangoUdpSkChunnel {
     }
 
     fn make_listen(&self, a: SocketAddrV4) -> Result<ShenangoUdpSk, Report> {
-        let (incoming_s, incoming_r) = mpsc::unbounded_channel();
-        let (outgoing_s, outgoing_r) = channel::unbounded();
+        let (incoming_s, incoming_r) = flume::unbounded();
+        let (outgoing_s, outgoing_r) = flume::unbounded();
         self.events.send(NewConn::Listen {
             addr: a,
             incoming: incoming_s,
@@ -164,8 +162,8 @@ impl ShenangoUdpSkChunnel {
     }
 
     fn make_dial(&self) -> Result<ShenangoUdpSk, Report> {
-        let (incoming_s, incoming_r) = mpsc::unbounded_channel();
-        let (outgoing_s, outgoing_r) = channel::unbounded();
+        let (incoming_s, incoming_r) = flume::unbounded();
+        let (outgoing_s, outgoing_r) = flume::unbounded();
         self.events.send(NewConn::Dial {
             incoming: incoming_s,
             outgoing: outgoing_r,
@@ -214,14 +212,10 @@ impl ChunnelConnector for ShenangoUdpSkChunnel {
     }
 }
 
-struct Recv {
-    r: mpsc::UnboundedReceiver<Msg>,
-}
-
 #[derive(Clone)]
 pub struct ShenangoUdpSk {
-    outgoing: channel::Sender<Msg>,
-    incoming: Arc<Mutex<Recv>>,
+    outgoing: flume::Sender<Msg>,
+    incoming: Arc<flume::Receiver<Msg>>,
 }
 
 impl std::fmt::Debug for ShenangoUdpSk {
@@ -231,10 +225,10 @@ impl std::fmt::Debug for ShenangoUdpSk {
 }
 
 impl ShenangoUdpSk {
-    fn new(inc: mpsc::UnboundedReceiver<Msg>, out: channel::Sender<Msg>) -> Self {
+    fn new(inc: flume::Receiver<Msg>, out: flume::Sender<Msg>) -> Self {
         Self {
-            incoming: Arc::new(Mutex::new(Recv { r: inc })),
             outgoing: out,
+            incoming: Arc::new(inc),
         }
     }
 }
@@ -264,8 +258,10 @@ impl ChunnelConnection for ShenangoUdpSk {
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let inc = Arc::clone(&self.incoming);
         Box::pin(async move {
-            let Recv { ref mut r } = *inc.lock().await;
-            let Msg { addr: a, buf: d } = r.recv().await.expect("shenango side will never drop");
+            let Msg { addr: a, buf: d } = inc
+                .recv_async()
+                .await
+                .expect("shenango side will never drop");
             Ok((SocketAddr::V4(a), d))
         })
     }
@@ -294,20 +290,10 @@ impl ChunnelListener for ShenangoUdpReqChunnel {
     }
 }
 
-struct StRecv {
-    r: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
-}
-
-impl std::fmt::Debug for StRecv {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StRecv").finish()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct UdpConn {
     resp_addr: SocketAddr,
-    recv: Arc<Mutex<StRecv>>,
+    recv: Arc<flume::Receiver<(SocketAddr, Vec<u8>)>>,
     send: ShenangoUdpSk,
 }
 
@@ -315,11 +301,11 @@ impl UdpConn {
     fn new(
         resp_addr: SocketAddr,
         send: ShenangoUdpSk,
-        recv: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+        recv: flume::Receiver<(SocketAddr, Vec<u8>)>,
     ) -> Self {
         UdpConn {
             resp_addr,
-            recv: Arc::new(Mutex::new(StRecv { r: recv })),
+            recv: Arc::new(recv),
             send,
         }
     }
@@ -344,12 +330,52 @@ impl ChunnelConnection for UdpConn {
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let recv = Arc::clone(&self.recv);
         Box::pin(async move {
-            let StRecv { ref mut r } = *recv.lock().await;
-            let (a, d) = r
-                .recv()
+            let (a, d) = recv
+                .recv_async()
                 .await
-                .ok_or_else(|| eyre!("Nothing more to receive"))?;
+                .wrap_err(eyre!("Nothing more to receive"))?;
             Ok((a, d))
         }) as _
+    }
+
+    fn recv_batch<'cn>(
+        &'cn self,
+        batch_size: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Self::Data>, Report>> + Send + 'cn>>
+    where
+        Self::Data: Send,
+        Self: Sync,
+    {
+        Box::pin(async move {
+            let mut this_batch = vec![];
+
+            // try to pull off as many messages as we can, up to `batch_size`.
+            loop {
+                match self.recv.try_recv() {
+                    Ok(d) => {
+                        this_batch.push(d);
+                        if this_batch.len() >= batch_size {
+                            break;
+                        }
+                    }
+                    Err(flume::TryRecvError::Empty) => {
+                        break;
+                    }
+                    Err(flume::TryRecvError::Disconnected) => {
+                        return Err(eyre!("Connection closed"));
+                    }
+                }
+            }
+
+            if this_batch.is_empty() {
+                Ok(vec![self
+                    .recv
+                    .recv_async()
+                    .await
+                    .wrap_err(eyre!("Nothing more to receive"))?])
+            } else {
+                Ok(this_batch)
+            }
+        })
     }
 }

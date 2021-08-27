@@ -8,7 +8,6 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
 use tracing::trace;
 
 /// UDP Chunnel connector.
@@ -146,19 +145,15 @@ impl ChunnelListener for UnixReqChunnel {
 #[derive(Debug, Clone)]
 pub struct UnixConn {
     resp_addr: PathBuf,
-    recv: Arc<Mutex<mpsc::UnboundedReceiver<(PathBuf, Vec<u8>)>>>,
+    recv: Arc<flume::Receiver<(PathBuf, Vec<u8>)>>,
     send: UnixSk,
 }
 
 impl UnixConn {
-    fn new(
-        resp_addr: PathBuf,
-        send: UnixSk,
-        recv: mpsc::UnboundedReceiver<(PathBuf, Vec<u8>)>,
-    ) -> Self {
+    fn new(resp_addr: PathBuf, send: UnixSk, recv: flume::Receiver<(PathBuf, Vec<u8>)>) -> Self {
         UnixConn {
             resp_addr,
-            recv: Arc::new(Mutex::new(recv)),
+            recv: Arc::new(recv),
             send,
         }
     }
@@ -183,8 +178,8 @@ impl ChunnelConnection for UnixConn {
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let r = Arc::clone(&self.recv);
         Box::pin(async move {
-            let d = r.lock().await.recv().await;
-            d.ok_or_else(|| eyre!("Nothing more to receive"))
+            let d = r.recv_async().await;
+            d.wrap_err(eyre!("Nothing more to receive"))
         }) as _
     }
 }

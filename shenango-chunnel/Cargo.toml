@@ -10,7 +10,7 @@ tracing = { version = "0.1" }
 tracing-futures = "0.2"
 color-eyre = "0.5"
 shenango = { path = "./caladan/bindings/rust" }
-crossbeam = "0.8"
+flume = "0.10"
 futures-util = "0.3"
 lazy_static = "1"
 tokio = { version = "1", features = ["sync"] }
