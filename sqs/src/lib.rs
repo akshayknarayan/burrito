@@ -12,11 +12,15 @@ use rusoto_sqs::{
     SendMessageBatchRequest, SendMessageBatchRequestEntry, SendMessageBatchResult,
     SendMessageRequest, SendMessageResult, Sqs,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{atomic::AtomicUsize, Arc};
-use tracing::{debug_span, instrument, trace};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex as StdMutex,
+};
+use tokio::sync::Mutex;
+use tracing::{debug_span, info, instrument, trace};
 use tracing_futures::Instrument;
 
 /// The underlying client type to access Sqs.
@@ -146,6 +150,7 @@ impl From<SqsChunnel> for OrderedSqsChunnel {
     fn from(mut inner: SqsChunnel) -> Self {
         let fifo_urls = inner
             .recv_queue_urls
+            .clone()
             .into_iter()
             .map(|mut s| {
                 if !s.ends_with(".fifo") {
@@ -185,6 +190,9 @@ impl OrderedSqsChunnel {
             inner: SqsChunnel {
                 sqs_client,
                 recv_queue_urls,
+                num_sqs_send_calls: Default::default(),
+                num_sqs_recv_calls: Default::default(),
+                num_sqs_del_calls: Default::default(),
             },
             send_ctr: Default::default(),
         })
@@ -211,9 +219,7 @@ impl ChunnelConnection for OrderedSqsChunnel {
         ): Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let sqs = self.inner.sqs_client.clone();
-        let ctr = self
-            .send_ctr
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ctr = self.send_ctr.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             //ensure!(
             //    queue_id.ends_with(".fifo"),
@@ -257,7 +263,17 @@ impl ChunnelConnection for OrderedSqsChunnel {
 }
 
 /// OrderedSqsChunnel but with send_batch and recv_batch impls.
-pub struct OrderedSqsChunnelBatch(pub OrderedSqsChunnel);
+pub struct OrderedSqsChunnelBatch(
+    pub OrderedSqsChunnel,
+    // saved recv_batch futures
+    Arc<Mutex<HashMap<String, FutWithString>>>,
+);
+
+impl OrderedSqsChunnelBatch {
+    pub fn new(inner: OrderedSqsChunnel) -> Self {
+        Self(inner, Default::default())
+    }
+}
 
 impl ChunnelConnection for OrderedSqsChunnelBatch {
     type Data = (SqsAddr, String);
@@ -365,13 +381,12 @@ impl ChunnelConnection for OrderedSqsChunnelBatch {
                 if let Some(qid) = batch_to_send {
                     // we filled a batch. send it and loop back for any other messages.
                     let msgs = pending_batches.remove(&qid).unwrap(); // for loop above guarantees presence
-                    let ctr = send_ctr.fetch_add(msgs.len(), std::sync::atomic::Ordering::SeqCst);
+                    let ctr = send_ctr.fetch_add(msgs.len(), Ordering::SeqCst);
                     send_batch(&sqs, qid, ctr, msgs).await?;
                 } else {
                     // send the residual batches and break.
                     for (qid, msgs) in pending_batches {
-                        let ctr =
-                            send_ctr.fetch_add(msgs.len(), std::sync::atomic::Ordering::SeqCst);
+                        let ctr = send_ctr.fetch_add(msgs.len(), Ordering::SeqCst);
                         send_batch(&sqs, qid, ctr, msgs).await?;
                     }
 
@@ -394,7 +409,15 @@ impl ChunnelConnection for OrderedSqsChunnelBatch {
         // first inner: OrderedSqsChunnel. second: SqsChunnel
         let sqs = self.0.inner.sqs_client.clone();
         let recv_queue_urls = self.0.inner.recv_queue_urls.clone();
-        Box::pin(do_recv_batch(sqs, recv_queue_urls, batch_size))
+        let recv_futs = Arc::clone(&self.1);
+        Box::pin(do_recv_batch(
+            sqs,
+            recv_queue_urls,
+            recv_futs,
+            batch_size,
+            Default::default(),
+            Default::default(),
+        ))
     }
 }
 
@@ -402,6 +425,9 @@ impl ChunnelConnection for OrderedSqsChunnelBatch {
 pub struct SqsChunnel {
     sqs_client: SqsClient,
     recv_queue_urls: Vec<String>,
+    num_sqs_send_calls: Arc<AtomicUsize>,
+    num_sqs_recv_calls: Arc<AtomicUsize>,
+    num_sqs_del_calls: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for SqsChunnel {
@@ -409,6 +435,15 @@ impl std::fmt::Debug for SqsChunnel {
         f.debug_struct("SqsChunnel")
             .field("recv_queue_urls", &self.recv_queue_urls)
             .finish()
+    }
+}
+
+impl Drop for SqsChunnel {
+    fn drop(&mut self) {
+        let sends = self.num_sqs_send_calls.load(Ordering::SeqCst);
+        let recvs = self.num_sqs_recv_calls.load(Ordering::SeqCst);
+        let dels = self.num_sqs_del_calls.load(Ordering::SeqCst);
+        info!(?sends, ?recvs, ?dels, "sqschunnel call counters");
     }
 }
 
@@ -420,6 +455,9 @@ impl SqsChunnel {
         SqsChunnel {
             sqs_client,
             recv_queue_urls: recv_queue_urls.into_iter().map(str::to_owned).collect(),
+            num_sqs_send_calls: Default::default(),
+            num_sqs_recv_calls: Default::default(),
+            num_sqs_del_calls: Default::default(),
         }
     }
 
@@ -438,6 +476,7 @@ impl ChunnelConnection for SqsChunnel {
         (SqsAddr { queue_id, group }, body): Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let sqs = self.sqs_client.clone();
+        let call_ctr = Arc::clone(&self.num_sqs_send_calls);
         Box::pin(async move {
             let attributes: HashMap<_, _> = group
                 .clone()
@@ -453,6 +492,7 @@ impl ChunnelConnection for SqsChunnel {
                     )
                 })
                 .collect();
+            call_ctr.fetch_add(1, Ordering::SeqCst);
             let SendMessageResult {
                 message_id,
                 sequence_number,
@@ -480,6 +520,8 @@ impl ChunnelConnection for SqsChunnel {
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let sqs = self.sqs_client.clone();
         let recv_queue_urls = self.recv_queue_urls.clone();
+        let recv_call_ctr = Arc::clone(&self.num_sqs_recv_calls);
+        let del_call_ctr = Arc::clone(&self.num_sqs_del_calls);
         // How to receive an SQS message:
         // 1. call receive_message on the queue
         // 2. call has some timeout. if we got no message, goto 1.
@@ -505,7 +547,9 @@ impl ChunnelConnection for SqsChunnel {
                             .map(|q_url| {
                                 let qu = q_url.to_string();
                                 let sqs = &sqs; // don't move sqs, we need to use it in the other concurrent reqs
+                                let recv_call_ctr = &recv_call_ctr;
                                 Box::pin(async move {
+                                    recv_call_ctr.fetch_add(1, Ordering::SeqCst);
                                     let resp = sqs
                                         .receive_message(ReceiveMessageRequest {
                                             max_number_of_messages: Some(1),
@@ -573,6 +617,7 @@ impl ChunnelConnection for SqsChunnel {
                 );
 
                 // delete the message that we got
+                del_call_ctr.fetch_add(1, Ordering::SeqCst);
                 sqs.delete_message(DeleteMessageRequest {
                     queue_url: queue_id.clone(),
                     receipt_handle: receipt_handle.unwrap(),
@@ -611,21 +656,111 @@ impl ChunnelConnection for SqsChunnel {
 }
 
 /// SqsChunnel but with send_batch and recv_batch impls.
-#[derive(Debug, Clone)]
-pub struct SqsChunnelBatch(pub SqsChunnel);
+#[derive(Clone)]
+pub struct SqsChunnelBatch {
+    inner: SqsChunnel,
+
+    pending_sends: Arc<StdMutex<HashMap<SqsAddr, (usize, Vec<(SqsAddr, String)>)>>>,
+    pending_recvs: Arc<StdMutex<VecDeque<(SqsAddr, String)>>>,
+
+    // saved recv_batch futures
+    batch_recv_futs: Arc<Mutex<HashMap<String, FutWithString>>>,
+}
+
+impl std::fmt::Debug for SqsChunnelBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqsChunnelBatch")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl SqsChunnelBatch {
+    pub fn new(inner: SqsChunnel) -> Self {
+        Self {
+            inner,
+            pending_sends: Default::default(),
+            batch_recv_futs: Default::default(),
+            pending_recvs: Default::default(),
+        }
+    }
+}
 
 impl ChunnelConnection for SqsChunnelBatch {
     type Data = (SqsAddr, String);
 
     fn send(
         &self,
-        d: Self::Data,
+        (q, data): Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.0.send(d)
+        enum BatchState {
+            Now(Vec<(SqsAddr, String)>),
+            Nagle(SqsAddr, usize),
+        }
+
+        let batch_state = {
+            let mut sends = self.pending_sends.lock().unwrap();
+            let (batch_ctr, batch) = sends.entry(q.clone()).or_default();
+            batch.push((q.clone(), data));
+            if batch.len() >= 10 {
+                *batch_ctr += 1;
+                let batch = std::mem::take(batch);
+                BatchState::Now(batch)
+            } else {
+                BatchState::Nagle(q, *batch_ctr)
+            }
+        };
+
+        let this = self.clone();
+        Box::pin(async move {
+            match batch_state {
+                BatchState::Now(batch) => {
+                    trace!(len = ?batch.len(), "batch send");
+                    return this.send_batch(batch).await;
+                }
+                BatchState::Nagle(q, batch_id) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+                    let batch = {
+                        let mut sends = this.pending_sends.lock().unwrap();
+                        let (batch_ctr, batch) = sends.get_mut(&q).unwrap();
+                        if *batch_ctr != batch_id {
+                            // this was already resolved
+                            return Ok(());
+                        } else if !batch.is_empty() {
+                            *batch_ctr += 1;
+                            std::mem::take(batch)
+                        } else {
+                            unreachable!()
+                        }
+                    };
+
+                    trace!(len = ?batch.len(), "post-nagle batch send");
+                    return this.send_batch(batch).await;
+                }
+            }
+        })
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        self.0.recv()
+        {
+            let mut rcvs = self.pending_recvs.lock().unwrap();
+            if let Some(r) = rcvs.pop_front() {
+                return Box::pin(futures_util::future::ready(Ok(r)));
+            }
+        }
+
+        let this = self.clone();
+        Box::pin(async move {
+            let batch = this.recv_batch(10).await?;
+            let ret = {
+                let mut rcvs = this.pending_recvs.lock().unwrap();
+                rcvs.extend(batch.into_iter());
+                rcvs.pop_front().unwrap()
+            };
+
+            Ok(ret)
+        })
     }
 
     // TODO advertise max batch size, in our case 10
@@ -646,6 +781,7 @@ impl ChunnelConnection for SqsChunnelBatch {
             sqs: &SqsClient,
             qid: String,
             msgs: Vec<(SqsAddr, String)>,
+            send_call_ctr: &Arc<AtomicUsize>,
         ) -> Result<(), Report> {
             let batch_request_entries = msgs
                 .into_iter()
@@ -673,6 +809,7 @@ impl ChunnelConnection for SqsChunnelBatch {
                     }
                 })
                 .collect();
+            send_call_ctr.fetch_add(1, Ordering::SeqCst);
             let SendMessageBatchResult { failed, successful } = sqs
                 .send_message_batch(SendMessageBatchRequest {
                     entries: batch_request_entries,
@@ -691,7 +828,8 @@ impl ChunnelConnection for SqsChunnelBatch {
             Ok(())
         }
 
-        let sqs = self.0.sqs_client.clone();
+        let sqs = self.inner.sqs_client.clone();
+        let send_call_ctr = Arc::clone(&self.inner.num_sqs_send_calls);
         Box::pin(async move {
             let mut pending_batches = HashMap::new();
             let mut data = data.into_iter();
@@ -721,11 +859,11 @@ impl ChunnelConnection for SqsChunnelBatch {
                 if let Some(qid) = batch_to_send {
                     // we filled a batch. send it and loop back for any other messages.
                     let msgs = pending_batches.remove(&qid).unwrap(); // for loop above guarantees presence
-                    send_batch(&sqs, qid, msgs).await?;
+                    send_batch(&sqs, qid, msgs, &send_call_ctr).await?;
                 } else {
                     // send the residual batches and break.
                     for (qid, msgs) in pending_batches {
-                        send_batch(&sqs, qid, msgs).await?;
+                        send_batch(&sqs, qid, msgs, &send_call_ctr).await?;
                     }
 
                     break;
@@ -744,35 +882,89 @@ impl ChunnelConnection for SqsChunnelBatch {
         Self::Data: Send,
         Self: Sync,
     {
-        let sqs = self.0.sqs_client.clone();
-        let recv_queue_urls = self.0.recv_queue_urls.clone();
+        let sqs = self.inner.sqs_client.clone();
+        let recv_queue_urls = self.inner.recv_queue_urls.clone();
+        let recv_futs = Arc::clone(&self.batch_recv_futs);
         let batch_size = std::cmp::min(batch_size, 10);
-        Box::pin(do_recv_batch(sqs, recv_queue_urls, batch_size))
+
+        let recv_call_ctr = Arc::clone(&self.inner.num_sqs_recv_calls);
+        let del_call_ctr = Arc::clone(&self.inner.num_sqs_del_calls);
+        Box::pin(do_recv_batch(
+            sqs,
+            recv_queue_urls,
+            recv_futs,
+            batch_size,
+            recv_call_ctr,
+            del_call_ctr,
+        ))
     }
 }
 
-#[instrument(skip(sqs), err, level = "debug")]
+struct FutWithString {
+    q: String,
+    f: Pin<
+        Box<dyn Future<Output = Result<(ReceiveMessageResult, String), Report>> + Send + 'static>,
+    >,
+}
+
+impl FutWithString {
+    fn key(&self) -> &str {
+        &self.q
+    }
+
+    fn new(
+        q: String,
+        f: Pin<
+            Box<
+                dyn Future<Output = Result<(ReceiveMessageResult, String), Report>>
+                    + Send
+                    + 'static,
+            >,
+        >,
+    ) -> Self {
+        Self { q, f }
+    }
+}
+
+use std::task::{Context, Poll};
+impl Future for FutWithString {
+    type Output = Result<(ReceiveMessageResult, String), Report>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::as_mut(&mut self.f).poll(cx)
+    }
+}
+
+#[instrument(skip(sqs, recv_futs), err, level = "debug")]
 async fn do_recv_batch(
     sqs: SqsClient,
     recv_queue_urls: Vec<String>,
+    recv_futs: Arc<Mutex<HashMap<String, FutWithString>>>,
     batch_size: usize,
+    recv_call_ctr: Arc<AtomicUsize>,
+    del_call_ctr: Arc<AtomicUsize>,
 ) -> Result<Vec<(SqsAddr, String)>, Report> {
+    trace!("called");
     tokio::pin!(sqs);
-    let mut futs = vec![];
+    let mut futs = recv_futs.lock().await;
+    trace!("locked");
     let (queue_id, mut msgs) = loop {
-        if futs.is_empty() {
-            futs = recv_queue_urls
-                .iter()
-                .map(|q_url| {
-                    let qu = q_url.to_string();
-                    let sqs = &sqs; // don't move sqs, we need to use it in the other concurrent reqs
+        // refill any futures we are missing.
+        for recv_q in &recv_queue_urls {
+            futs.entry(recv_q.clone()).or_insert_with_key(|q_url| {
+                let qu = q_url.to_string();
+                let sqs = sqs.clone();
+                let recv_call_ctr = Arc::clone(&recv_call_ctr);
+                FutWithString::new(
+                    qu.clone(),
                     Box::pin(async move {
+                        trace!(?qu, "receive_message future starting");
+                        recv_call_ctr.fetch_add(1, Ordering::SeqCst);
                         let resp = sqs
                             .receive_message(ReceiveMessageRequest {
                                 max_number_of_messages: Some(batch_size as _),
                                 queue_url: qu.clone(),
                                 visibility_timeout: Some(5),
-                                wait_time_seconds: Some(5),
+                                wait_time_seconds: Some(20),
                                 attribute_names: Some(vec![
                                     MESSAGE_GROUP_ID_ATTRIBUTE_NAME.to_owned()
                                 ]),
@@ -785,14 +977,17 @@ async fn do_recv_batch(
                             .wrap_err(eyre!("sqs.receive_message on {:?}", qu))?;
                         trace!(
                             messages = ?resp.messages.as_ref().map(Vec::len),
-                            "sqs receive_message future completed"
+                            "receive_message future completed"
                         );
                         Ok::<_, Report>((resp, qu))
-                    })
-                })
-                .collect();
+                    }),
+                )
+            });
         }
 
+        let f = futs.drain().map(|(_, v)| v);
+        trace!(num = ?f.len(), "executing");
+        // take all the futures out
         let (
             (
                 ReceiveMessageResult {
@@ -801,24 +996,26 @@ async fn do_recv_batch(
                 qid,
             ),
             leftover,
-        ) = futures_util::future::select_ok(futs).await?;
+        ) = futures_util::future::select_ok(f).await?;
+        // put the leftover futures back
+        futs.extend(leftover.into_iter().map(|f| (f.key().to_string(), f)));
+        trace!("returned");
 
         match recvd_message {
             None => {
                 // try again with the rest of the futs.
-                futs = leftover;
+                // the one that completed will get replenished above.
                 trace!("receive_message returned None");
                 continue;
             }
             Some(msg) if msg.is_empty() => {
                 // try again with the rest of the futs.
-                futs = leftover;
+                // the one that completed will get replenished above.
                 trace!("receive_message returned empty list");
                 continue;
             }
             Some(msgs) => {
-                // done. can drop leftover. if the leftover futures happen to successfully
-                // resolve, that is fine, we're not going to clear them from the queue.
+                // done for now.
                 trace!(
                     recvd_batch_size = msgs.len(),
                     "receive_message returned batch"
@@ -840,8 +1037,7 @@ async fn do_recv_batch(
             }
         })
         .collect();
-
-    // delete the message that we got
+    del_call_ctr.fetch_add(1, Ordering::SeqCst);
     let DeleteMessageBatchResult { failed, successful } = sqs
         .delete_message_batch(DeleteMessageBatchRequest {
             queue_url: queue_id.clone(),

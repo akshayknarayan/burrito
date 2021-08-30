@@ -70,6 +70,35 @@ pub async fn do_best_effort_exp<A: Clone + Debug + PartialEq + Send + Sync + 'st
     num_reqs: usize,
     inter_request_ms: u64,
     num_receivers: usize,
+) -> Result<(Vec<RecvdMsg>, Duration), Report>
+where
+    A: Clone + crate::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
+{
+    let cn = Arc::new(cn);
+    let send_cn = ProjectLeft::new(addr.clone(), Arc::clone(&cn));
+    let recv_cns = (0..num_receivers).map(move |_| Arc::clone(&cn));
+
+    let start = std::time::Instant::now();
+    let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, recv_cns, false));
+    send_reqs(
+        start,
+        num_reqs,
+        Duration::from_millis(inter_request_ms),
+        &[send_cn],
+    )
+    .await?;
+    let (msgs, elapsed) = receive_handle.await??;
+    let msgs = msgs.into_iter().map(|(_, m)| m).collect();
+    Ok((msgs, elapsed))
+}
+
+#[instrument(skip(cn, addr))]
+pub async fn do_best_effort_exp_batch<A: Clone + Debug + PartialEq + Send + Sync + 'static>(
+    cn: impl ChunnelConnection<Data = (A, Msg)> + Send + Sync + 'static,
+    addr: A,
+    num_reqs: usize,
+    inter_request_ms: u64,
+    num_receivers: usize,
     batch_size: usize,
 ) -> Result<(Vec<RecvdMsg>, Duration), Report>
 where
@@ -80,8 +109,10 @@ where
     let recv_cns = (0..num_receivers).map(move |_| Arc::clone(&cn));
 
     let start = std::time::Instant::now();
-    let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, batch_size, recv_cns, false));
-    send_reqs(
+    let receive_handle = tokio::spawn(receive_reqs_batch(
+        start, num_reqs, batch_size, recv_cns, false,
+    ));
+    send_reqs_batch(
         start,
         num_reqs,
         batch_size,
@@ -101,6 +132,51 @@ pub async fn do_atmostonce_exp<A>(
     num_reqs: usize,
     inter_request_ms: u64,
     num_receivers: usize,
+) -> Result<(Vec<RecvdMsg>, Duration), Report>
+where
+    A: Clone + crate::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
+{
+    let inter_request = Duration::from_millis(inter_request_ms);
+    let cn = Arc::new(cn);
+    let send_cn = Arc::clone(&cn);
+    let recv_cns = (0..num_receivers).map(move |_| Arc::clone(&cn));
+
+    let start = std::time::Instant::now();
+    let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, recv_cns, false));
+
+    // our local version of send_reqs, which uses a unique ordering key
+    debug!("starting sends");
+    let cn = send_cn;
+    for req_num in 0..num_reqs {
+        debug!(?req_num, "sending req");
+        let mut addr = addr.clone();
+        addr.set_group(req_num.to_string());
+        cn.send((
+            addr,
+            Msg {
+                send_time: start.elapsed(),
+                req_num,
+            },
+        ))
+        .await?;
+        if inter_request.as_nanos() > 0 {
+            tokio::time::sleep(inter_request).await;
+        }
+    }
+
+    debug!("finished sends");
+    let (msgs, elapsed) = receive_handle.await??;
+    let msgs = msgs.into_iter().map(|(_, m)| m).collect();
+    Ok((msgs, elapsed))
+}
+
+#[instrument(skip(cn, addr))]
+pub async fn do_atmostonce_exp_batch<A>(
+    cn: impl ChunnelConnection<Data = (A, Msg)> + Send + Sync + 'static,
+    addr: A,
+    num_reqs: usize,
+    inter_request_ms: u64,
+    num_receivers: usize,
     batch_size: usize,
 ) -> Result<(Vec<RecvdMsg>, Duration), Report>
 where
@@ -112,7 +188,9 @@ where
     let recv_cns = (0..num_receivers).map(move |_| Arc::clone(&cn));
 
     let start = std::time::Instant::now();
-    let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, batch_size, recv_cns, false));
+    let receive_handle = tokio::spawn(receive_reqs_batch(
+        start, num_reqs, batch_size, recv_cns, false,
+    ));
 
     // our local version of send_reqs, which uses a unique ordering key
     debug!("starting sends");
@@ -154,6 +232,46 @@ pub async fn do_ordered_groups_exp<A>(
     num_groups: usize,
     inter_request_ms: u64,
     num_receivers: usize,
+) -> Result<(Vec<RecvdMsg>, Duration), Report>
+where
+    A: Clone + crate::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
+{
+    let cn = Arc::new(cn);
+    let send_cns: Vec<_> = iter(0..num_groups)
+        .then(|i| {
+            let mut a = addr.clone();
+            let cn = &cn;
+            async move {
+                a.set_group(i.to_string());
+                Ok::<_, Report>(ProjectLeft::new(a, Arc::clone(cn)))
+            }
+        })
+        .try_collect()
+        .await?;
+    let recv_cns = (0..num_receivers).map(move |_| Arc::clone(&cn));
+
+    let start = std::time::Instant::now();
+    let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, recv_cns, true));
+    send_reqs(
+        start,
+        num_reqs,
+        Duration::from_millis(inter_request_ms),
+        &send_cns,
+    )
+    .await?;
+    let (msgs, elapsed) = receive_handle.await??;
+    let msgs = msgs.into_iter().map(|(_, m)| m).collect();
+    Ok((msgs, elapsed))
+}
+
+#[instrument(skip(cn, addr))]
+pub async fn do_ordered_groups_exp_batch<A>(
+    cn: impl ChunnelConnection<Data = (A, Msg)> + Send + Sync + 'static,
+    addr: A,
+    num_reqs: usize,
+    num_groups: usize,
+    inter_request_ms: u64,
+    num_receivers: usize,
     batch_size: usize,
 ) -> Result<(Vec<RecvdMsg>, Duration), Report>
 where
@@ -174,8 +292,10 @@ where
     let recv_cns = (0..num_receivers).map(move |_| Arc::clone(&cn));
 
     let start = std::time::Instant::now();
-    let receive_handle = tokio::spawn(receive_reqs(start, num_reqs, batch_size, recv_cns, true));
-    send_reqs(
+    let receive_handle = tokio::spawn(receive_reqs_batch(
+        start, num_reqs, batch_size, recv_cns, true,
+    ));
+    send_reqs_batch(
         start,
         num_reqs,
         batch_size,
@@ -217,6 +337,140 @@ impl RecvdMsg {
 async fn send_reqs(
     start: std::time::Instant,
     num_reqs: usize,
+    inter_request: Duration,
+    send_chunnels: &[impl ChunnelConnection<Data = Msg> + Sync],
+) -> Result<(), Report> {
+    use futures_util::stream::TryStreamExt;
+    debug!("starting sends");
+    let sends: futures_util::stream::FuturesOrdered<_> = (0..num_reqs)
+        .map(|req_num| {
+            let send_chunnels = &send_chunnels;
+            async move {
+                let wait_time = inter_request * (req_num as _);
+                if inter_request.as_nanos() > 0 {
+                    tokio::time::sleep(wait_time).await;
+                }
+
+                let curr_group = req_num % send_chunnels.len();
+                debug!(?curr_group, ?req_num, "sending request");
+                send_chunnels[curr_group]
+                    .send(Msg {
+                        send_time: start.elapsed(),
+                        req_num,
+                    })
+                    .await?;
+                Ok::<_, Report>(())
+            }
+        })
+        .collect();
+
+    sends.try_collect().await?;
+
+    debug!("finished sends");
+    Ok(())
+}
+
+/// Each of `receive_chunnels` corresponds to one ordering group. We receive on all until a total
+/// of `num_reqs` messages.
+#[instrument(skip(start, receive_chunnels))]
+async fn receive_reqs<A>(
+    start: std::time::Instant,
+    num_reqs: usize,
+    receive_chunnels: impl IntoIterator<Item = impl ChunnelConnection<Data = (A, Msg)> + Sync>,
+    check_ordering: bool,
+) -> Result<(Vec<(A, RecvdMsg)>, Duration), Report>
+where
+    A: Clone + crate::SetGroup + Hash + Debug + Eq + Send + Sync + 'static,
+{
+    let tot_rcvd = Arc::new(AtomicUsize::new(0));
+    let first_recv_time = Arc::new(AtomicU64::new(0));
+    let groups = futures_util::future::try_join_all(receive_chunnels.into_iter().enumerate().map(
+        |(i, rch)| {
+            let rcvd = Arc::clone(&tot_rcvd);
+            let first_time = Arc::clone(&first_recv_time);
+            let mut msgs = Vec::new();
+            let mut groups = HashMap::new();
+            async move {
+                let mut f = rch.recv();
+                loop {
+                    tokio::select!(
+                        r = &mut f => {
+                            let (a, msg) = r?;
+                            msgs.push((a.clone(), RecvdMsg::from_start(start, msg)));
+                            // fetch_add returns the old value, so we re-apply the +1 locally.
+                            let tot = rcvd.fetch_add(1, Ordering::SeqCst) + 1;
+                            debug!(num = ?msg.req_num, ?tot, local = ?msgs.len(), "got msg");
+                            if msgs.len() == 1 {
+                                let possible_first_time = start.elapsed();
+                                match first_time.compare_exchange(
+                                    0,
+                                    possible_first_time.as_micros() as u64,
+                                    Ordering::SeqCst,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(0) => {
+                                        debug!(recv_begin = ?&possible_first_time, "Receives started");
+                                    }
+                                    Ok(_) => unreachable!(),
+                                    Err(_) => (), // we're not the first.
+                                }
+                            }
+
+                            // check order
+                            if check_ordering {
+                                let old_num = groups.entry(a.clone()).or_insert(msg.req_num);
+                                if *old_num <= msg.req_num {
+                                    *old_num = msg.req_num;
+                                } else {
+                                    let on = *old_num;
+                                    //std::mem::drop(old_num);
+                                    return Err(eyre!(
+                                       "Group order semantics not met in group {:?}: {:?} > {:?}: {:?}", 
+                                       a, on, msg.req_num, groups
+                                    ));
+                                }
+                            }
+
+                            if tot >= num_reqs {
+                                return Ok::<_, Report>(msgs);
+                            }
+
+                            // get a new recv future.
+                            f = rch.recv();
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            // check tot
+                            let tot = rcvd.load(Ordering::SeqCst);
+                            if tot >= num_reqs {
+                                return Ok::<_, Report>(msgs);
+                            }
+
+                            debug!(?tot, local=?msgs.len(), "No recv for 100ms");
+                        }
+                    )
+                }
+            }
+            .instrument(info_span!("receive-reqs", num=?i))
+        }
+    ))
+    .await?;
+    let first_recv_time = Duration::from_micros(first_recv_time.load(Ordering::SeqCst));
+    let last_recv_time = start.elapsed();
+    Ok((
+        groups.into_iter().fold(vec![], |mut acc, x| {
+            acc.extend(x);
+            acc
+        }),
+        last_recv_time - first_recv_time,
+    ))
+}
+
+/// Each of the `send_chunnels` is an ordering group. Messages are distributed round-robin across
+/// groups.
+#[instrument(skip(send_chunnels, start))]
+async fn send_reqs_batch(
+    start: std::time::Instant,
+    num_reqs: usize,
     batch_size: usize,
     inter_request: Duration,
     send_chunnels: &[impl ChunnelConnection<Data = Msg> + Sync],
@@ -246,7 +500,7 @@ async fn send_reqs(
 /// Each of `receive_chunnels` corresponds to one ordering group. We receive on all until a total
 /// of `num_reqs` messages.
 #[instrument(skip(start, receive_chunnels))]
-async fn receive_reqs<A>(
+async fn receive_reqs_batch<A>(
     start: std::time::Instant,
     num_reqs: usize,
     batch_size: usize,

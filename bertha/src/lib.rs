@@ -7,6 +7,7 @@ use color_eyre::eyre;
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
+use std::task::Poll;
 
 mod and_then_concurrent;
 pub mod atmostonce;
@@ -146,10 +147,7 @@ pub trait ChunnelConnection {
         Self: Sync,
     {
         Box::pin(async move {
-            for d in data {
-                self.send(d).await?;
-            }
-
+            futures_util::future::try_join_all(data.into_iter().map(|d| self.send(d))).await?;
             Ok(())
         })
     }
@@ -164,21 +162,25 @@ pub trait ChunnelConnection {
         Self::Data: Send,
         Self: Sync,
     {
-        use futures_util::FutureExt;
         Box::pin(async move {
             let mut recv_batch = vec![];
             loop {
-                if let Some(m) = self.recv().now_or_never() {
-                    recv_batch.push(m?);
-                    tracing::debug!(batch_len = ?recv_batch.len(), "batch recv");
-                    if recv_batch.len() >= batch_size {
+                let mut f = self.recv();
+                match futures_util::poll!(&mut f) {
+                    Poll::Ready(m) => {
+                        recv_batch.push(m?);
+                        tracing::debug!(batch_len = ?recv_batch.len(), "batch recv");
+                        if recv_batch.len() >= batch_size {
+                            break;
+                        }
+                    }
+                    Poll::Pending if recv_batch.is_empty() => {
+                        recv_batch.push(f.await?);
                         break;
                     }
-                } else if recv_batch.is_empty() {
-                    recv_batch.push(self.recv().await?);
-                    break;
-                } else {
-                    break;
+                    Poll::Pending => {
+                        break;
+                    }
                 }
             }
 

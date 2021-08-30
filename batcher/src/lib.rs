@@ -199,8 +199,7 @@ where
         Box::pin(async move {
             {
                 let mut pg = pending.lock().unwrap();
-                let res = pg.pop_front();
-                if let Some(d) = res {
+                if let Some(d) = pg.pop_front() {
                     return Ok(d);
                 }
             }

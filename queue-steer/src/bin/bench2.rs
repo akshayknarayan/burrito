@@ -9,10 +9,14 @@ use bertha::{
     bincode::{Base64Chunnel, SerializeChunnelProject},
     Chunnel, CxList,
 };
-use color_eyre::{eyre::eyre, Report};
+use color_eyre::{
+    eyre::{bail, eyre},
+    Report,
+};
 use gcp_pubsub::{PubSubAddr, PubSubChunnel};
 use queue_steer::bin_help::{
-    do_atmostonce_exp, do_best_effort_exp, do_ordered_groups_exp, dump_results, Mode, RecvdMsg,
+    do_atmostonce_exp, do_atmostonce_exp_batch, do_best_effort_exp, do_best_effort_exp_batch,
+    do_ordered_groups_exp, do_ordered_groups_exp_batch, dump_results, Mode, RecvdMsg,
 };
 use queue_steer::{
     AtMostOnce, AzQueueChunnelWrap, BatchSqsChunnelWrap, GcpPubSubWrap, KafkaChunnelWrap, Ordered,
@@ -28,6 +32,26 @@ use tracing::{debug, info};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
+#[derive(Debug, Clone, Copy)]
+enum BatchMode {
+    None,
+    Auto,
+    AppLevel(usize),
+}
+
+impl std::str::FromStr for BatchMode {
+    type Err = Report;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let sp: Vec<_> = s.split(":").collect();
+        Ok(match &sp[..] {
+            &["none"] => BatchMode::None,
+            &["auto"] => BatchMode::Auto,
+            &["applevel", x] => BatchMode::AppLevel(x.parse()?),
+            x => bail!("Unknown batching mode {:?}", x),
+        })
+    }
+}
+
 #[derive(Clone, Debug, StructOpt)]
 struct Opt {
     #[structopt(short, long)]
@@ -41,19 +65,19 @@ struct Opt {
     #[structopt(short = "r", long)]
     num_receivers: usize,
     #[structopt(long)]
-    batch_size: usize,
-    #[structopt(long)]
-    batch_opt: bool, // a flag, if given the value is true, which is with the API optimization
+    batch_mode: BatchMode,
     #[structopt(long)]
     service_mode: bool, // client-side or service-side impl. it is a flag, so if not provided its value is false, which is client mode.
     #[structopt(short, long)]
     out_file: std::path::PathBuf,
+    #[structopt(long)]
+    iter: usize,
 
     #[structopt(subcommand)]
     provider: Provider,
 }
 
-#[derive(Debug, Clone, StructOpt)]
+#[derive(Clone, StructOpt)]
 pub enum Provider {
     Aws {
         #[structopt(long)]
@@ -79,6 +103,17 @@ pub enum Provider {
     },
 }
 
+impl std::fmt::Debug for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Aws { .. } => f.debug_struct("Aws").finish(),
+            Self::Azure { .. } => f.debug_struct("Azure").finish(),
+            Self::Gcp { .. } => f.debug_struct("Gcp").finish(),
+            Self::Kafka { addr } => f.debug_struct("Kafka").field("addr", addr).finish(),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Report> {
     color_eyre::install()?;
@@ -93,21 +128,20 @@ async fn main() -> Result<(), Report> {
         mode,
         num_reqs,
         num_receivers,
-        batch_size,
-        batch_opt,
+        batch_mode,
         inter_request_ms,
         service_mode,
         out_file,
         queue,
         provider,
+        iter,
     } = Opt::from_args();
     let prov = provider.provider().to_owned();
     info!(
         ?mode,
         ?num_reqs,
         ?inter_request_ms,
-        ?batch_size,
-        ?batch_opt,
+        ?batch_mode,
         ?service_mode,
         ?provider,
         "starting"
@@ -117,11 +151,11 @@ async fn main() -> Result<(), Report> {
             queue,
             mode,
             service_mode,
-            batch_opt,
+            batch_mode,
             num_reqs,
             inter_request_ms,
             num_receivers,
-            batch_size,
+            iter,
         )
         .await?;
 
@@ -163,17 +197,19 @@ impl Provider {
         }
     }
 
-    pub async fn run_exp(
+    #[tracing::instrument(skip(queue))]
+    async fn run_exp(
         self,
         queue: Option<String>,
         mode: Mode,
         service_mode: bool,
-        batch_opt: bool,
+        batch_mode: BatchMode,
         num_reqs: usize,
         inter_request_ms: u64,
         num_receivers: usize,
-        batch_size: usize,
+        iter: usize,
     ) -> Result<(Vec<RecvdMsg>, Duration), Report> {
+        debug!(?iter, "start");
         if !service_mode && num_receivers != 1 {
             return Err(eyre!("Cannot have > 1 receiver with client mode"));
         }
@@ -194,7 +230,7 @@ impl Provider {
         });
 
         macro_rules! do_exp_service {
-            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr, $batch_size: expr) => {{
+            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr) => {{
                 use bertha::util::NeverCn;
                 match mode {
                     Mode::BestEffort => {
@@ -212,7 +248,6 @@ impl Provider {
                             $num_reqs,
                             $inter_request_ms,
                             $num_receivers,
-                            $batch_size,
                         )
                         .await?
                     }
@@ -230,7 +265,6 @@ impl Provider {
                             n,
                             $inter_request_ms,
                             $num_receivers,
-                            $batch_size,
                         )
                         .await?
                     }
@@ -239,7 +273,7 @@ impl Provider {
         }
 
         macro_rules! do_exp {
-            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr, $batch_size: expr) => {{
+            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr) => {{
                 use bertha::util::NeverCn;
                 match mode {
                     Mode::BestEffort => {
@@ -248,6 +282,63 @@ impl Provider {
                             .wrap($cn);
                         let ch = stack.connect_wrap(NeverCn::default()).await?;
                         do_best_effort_exp(
+                            ch,
+                            $addr.clone(),
+                            $num_reqs,
+                            $inter_request_ms,
+                            $num_receivers,
+                        )
+                        .await?
+                    }
+                    Mode::Ordered { num_groups: None } => {
+                        // at most once.
+                        let mut stack = CxList::from(AtMostOnce::default())
+                            .wrap(SerializeChunnelProject::default())
+                            .wrap(Base64Chunnel::default())
+                            .wrap($cn);
+                        let ch = stack.connect_wrap(NeverCn::default()).await?;
+                        do_atmostonce_exp(
+                            ch,
+                            $addr.clone(),
+                            $num_reqs,
+                            $inter_request_ms,
+                            $num_receivers,
+                        )
+                        .await?
+                    }
+                    Mode::Ordered {
+                        num_groups: Some(n),
+                    } => {
+                        // ordered, with potentially many groups
+                        let mut stack = CxList::from(Ordered::default())
+                            .wrap(SerializeChunnelProject::default())
+                            .wrap(Base64Chunnel::default())
+                            .wrap($cn);
+                        let ch = stack.connect_wrap(NeverCn::default()).await?;
+                        do_ordered_groups_exp(
+                            ch,
+                            $addr.clone(),
+                            $num_reqs,
+                            n,
+                            $inter_request_ms,
+                            $num_receivers,
+                        )
+                        .await?
+                    }
+                }
+            }};
+        }
+
+        macro_rules! do_exp_batch {
+            ($mode: expr, $cn: expr, $addr: expr, $num_reqs: expr, $inter_request_ms: expr, $num_receivers: expr, $batch_size: expr) => {{
+                use bertha::util::NeverCn;
+                match mode {
+                    Mode::BestEffort => {
+                        let mut stack = CxList::from(SerializeChunnelProject::default())
+                            .wrap(Base64Chunnel::default())
+                            .wrap($cn);
+                        let ch = stack.connect_wrap(NeverCn::default()).await?;
+                        do_best_effort_exp_batch(
                             ch,
                             $addr.clone(),
                             $num_reqs,
@@ -264,7 +355,7 @@ impl Provider {
                             .wrap(Base64Chunnel::default())
                             .wrap($cn);
                         let ch = stack.connect_wrap(NeverCn::default()).await?;
-                        do_atmostonce_exp(
+                        do_atmostonce_exp_batch(
                             ch,
                             $addr.clone(),
                             $num_reqs,
@@ -283,7 +374,7 @@ impl Provider {
                             .wrap(Base64Chunnel::default())
                             .wrap($cn);
                         let ch = stack.connect_wrap(NeverCn::default()).await?;
-                        do_ordered_groups_exp(
+                        do_ordered_groups_exp_batch(
                             ch,
                             $addr.clone(),
                             $num_reqs,
@@ -326,46 +417,106 @@ impl Provider {
                     group: None,
                 };
 
-                let (msgs, elapsed) = if batch_opt {
-                    let cn: BatchSqsChunnelWrap =
-                        SqsChunnelBatch(SqsChunnel::new(sqs_client, once(queue.as_str()))).into();
-                    if service_mode {
-                        todo!()
-                    } else {
-                        do_exp!(
-                            mode,
-                            cn,
-                            addr,
-                            num_reqs,
-                            inter_request_ms,
-                            num_receivers,
-                            batch_size
-                        )
+                let (msgs, elapsed) = match batch_mode {
+                    BatchMode::AppLevel(batch_size) => {
+                        let cn: BatchSqsChunnelWrap =
+                            SqsChunnelBatch::new(SqsChunnel::new(sqs_client, once(queue.as_str())))
+                                .into();
+                        if service_mode {
+                            todo!()
+                        } else {
+                            do_exp_batch!(
+                                mode,
+                                cn,
+                                addr,
+                                num_reqs,
+                                inter_request_ms,
+                                num_receivers,
+                                batch_size
+                            )
+                        }
                     }
-                } else {
-                    let cn: SqsChunnelWrap =
-                        SqsChunnel::new(sqs_client, once(queue.as_str())).into();
-                    if service_mode {
-                        let cn: OrderedSqsChunnelWrap = cn.into();
-                        do_exp_service!(
-                            mode,
-                            cn,
-                            addr,
-                            num_reqs,
-                            inter_request_ms,
-                            num_receivers,
-                            batch_size
-                        )
-                    } else {
-                        do_exp!(
-                            mode,
-                            cn,
-                            addr,
-                            num_reqs,
-                            inter_request_ms,
-                            num_receivers,
-                            batch_size
-                        )
+                    BatchMode::Auto => {
+                        let cn: BatchSqsChunnelWrap =
+                            SqsChunnelBatch::new(SqsChunnel::new(sqs_client, once(queue.as_str())))
+                                .into();
+                        if service_mode {
+                            todo!()
+                        } else {
+                            use bertha::util::NeverCn;
+                            match mode {
+                                Mode::BestEffort => {
+                                    let mut stack =
+                                        CxList::from(SerializeChunnelProject::default())
+                                            .wrap(Base64Chunnel::default())
+                                            .wrap(cn);
+                                    let ch = stack.connect_wrap(NeverCn::default()).await?;
+                                    let ch = batcher::Batcher::new(ch);
+                                    do_best_effort_exp(
+                                        ch,
+                                        addr.clone(),
+                                        num_reqs,
+                                        inter_request_ms,
+                                        num_receivers,
+                                    )
+                                    .await?
+                                }
+                                Mode::Ordered { num_groups: None } => {
+                                    // at most once.
+                                    let mut stack = CxList::from(AtMostOnce::default())
+                                        .wrap(SerializeChunnelProject::default())
+                                        .wrap(Base64Chunnel::default())
+                                        .wrap(cn);
+                                    let ch = stack.connect_wrap(NeverCn::default()).await?;
+                                    let ch = batcher::Batcher::new(ch);
+                                    do_atmostonce_exp(
+                                        ch,
+                                        addr.clone(),
+                                        num_reqs,
+                                        inter_request_ms,
+                                        num_receivers,
+                                    )
+                                    .await?
+                                }
+                                Mode::Ordered {
+                                    num_groups: Some(n),
+                                } => {
+                                    // ordered, with potentially many groups
+                                    let mut stack = CxList::from(Ordered::default())
+                                        .wrap(SerializeChunnelProject::default())
+                                        .wrap(Base64Chunnel::default())
+                                        .wrap(cn);
+                                    let ch = stack.connect_wrap(NeverCn::default()).await?;
+                                    let ch = batcher::Batcher::new(ch);
+                                    do_ordered_groups_exp(
+                                        ch,
+                                        addr.clone(),
+                                        num_reqs,
+                                        n,
+                                        inter_request_ms,
+                                        num_receivers,
+                                    )
+                                    .await?
+                                }
+                            }
+                        }
+                    }
+                    BatchMode::None => {
+                        let cn: SqsChunnelWrap =
+                            SqsChunnel::new(sqs_client, once(queue.as_str())).into();
+                        if service_mode {
+                            let cn: OrderedSqsChunnelWrap = cn.into();
+                            do_exp_service!(
+                                mode,
+                                cn,
+                                addr,
+                                num_reqs,
+                                inter_request_ms,
+                                num_receivers
+                            )
+                        } else {
+                            do_exp!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
+                        }
                     }
                 };
 
@@ -401,15 +552,8 @@ impl Provider {
                     AzStorageQueueChunnel::new(az_client, once(queue.as_str())).into();
                 let cn = CxList::from(FakeSetGroup::default()).wrap(cn);
                 let addr: FakeSetGroupAddr = queue.into();
-                let (msgs, elapsed) = do_exp!(
-                    mode,
-                    cn,
-                    addr,
-                    num_reqs,
-                    inter_request_ms,
-                    num_receivers,
-                    batch_size
-                );
+                let (msgs, elapsed) =
+                    do_exp!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers);
                 if let Some(gen) = generated {
                     gen.cleanup().await?;
                 }
@@ -418,7 +562,7 @@ impl Provider {
             Kafka { addr } => {
                 kafka::make_topic(&addr, &queue).await?;
                 info!(?queue, ?addr, "Kafka queue");
-                let ch = kafka::KafkaChunnel::new_with_batch_size(&addr, batch_size)?;
+                let ch = kafka::KafkaChunnel::new(&addr)?;
                 ch.listen(&[&queue])?;
                 let cn: KafkaChunnelWrap = ch.into();
                 let c_addr = kafka::KafkaAddr {
@@ -427,25 +571,9 @@ impl Provider {
                 };
 
                 let (msgs, elapsed) = if service_mode {
-                    do_exp_service!(
-                        mode,
-                        cn,
-                        c_addr,
-                        num_reqs,
-                        inter_request_ms,
-                        num_receivers,
-                        1
-                    )
+                    do_exp_service!(mode, cn, c_addr, num_reqs, inter_request_ms, num_receivers)
                 } else {
-                    do_exp!(
-                        mode,
-                        cn,
-                        c_addr,
-                        num_reqs,
-                        inter_request_ms,
-                        num_receivers,
-                        1
-                    )
+                    do_exp!(mode, cn, c_addr, num_reqs, inter_request_ms, num_receivers)
                 };
 
                 kafka::delete_topic(&addr, &queue).await?;
@@ -480,25 +608,9 @@ impl Provider {
                     .into();
                 let (msgs, elapsed) = if service_mode {
                     let cn = OrderedGcpPubSubWrap::convert(cn).await?;
-                    do_exp_service!(
-                        mode,
-                        cn,
-                        addr,
-                        num_reqs,
-                        inter_request_ms,
-                        num_receivers,
-                        batch_size
-                    )
+                    do_exp_service!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
                 } else {
-                    do_exp!(
-                        mode,
-                        cn,
-                        addr,
-                        num_reqs,
-                        inter_request_ms,
-                        num_receivers,
-                        batch_size
-                    )
+                    do_exp!(mode, cn, addr, num_reqs, inter_request_ms, num_receivers)
                 };
 
                 if let Some(gen) = generated {
