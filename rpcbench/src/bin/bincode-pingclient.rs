@@ -160,12 +160,8 @@ async fn main() -> Result<(), Report> {
                     } else {
                         UnixSkChunnel::default().connect(()).await?
                     };
-                    let cn = negotiate_client(
-                        CxList::from(SerializeChunnelProject::default()),
-                        u,
-                        addr.clone(),
-                    )
-                    .await?;
+                    let cn = negotiate_client(SerializeChunnelProject::default(), u, addr.clone())
+                        .await?;
                     Ok(ProjectLeft::new(addr, cn))
                 }
             };
@@ -406,7 +402,7 @@ async fn main() -> Result<(), Report> {
             info!(?addr, encrypt = "no", "UDP mode");
             let fncl = |addr| async move {
                 let cn = negotiate_client(
-                    CxList::from(SerializeChunnelProject::default()),
+                    SerializeChunnelProject::default(),
                     UdpSkChunnel.connect(()).await?,
                     addr,
                 )

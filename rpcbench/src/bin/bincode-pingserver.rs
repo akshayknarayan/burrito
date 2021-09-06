@@ -48,7 +48,7 @@ impl rpcbench::AsEncryptOpt for Opt {
 async fn unix(srv: rpcbench::Server, addr: PathBuf) -> Result<(), Report> {
     info!(?addr, "Serving unix-only mode");
     let st = negotiate_server(
-        CxList::from(SerializeChunnelProject::default()),
+        SerializeChunnelProject::default(),
         UnixReqChunnel.listen(addr).await?,
     )
     .await?;
