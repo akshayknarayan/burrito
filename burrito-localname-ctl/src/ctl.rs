@@ -201,11 +201,11 @@ fn get_addr() -> String {
 #[cfg(test)]
 mod test {
     use crate::LocalNameChunnel;
-    use crate::Report;
     use bertha::{
         either::Either, negotiate_client, negotiate_server, udp::UdpSkChunnel, uds::UnixSkChunnel,
         util::Nothing, ChunnelConnection, ChunnelConnector, ChunnelListener,
     };
+    use color_eyre::eyre::Report;
     use futures_util::stream::TryStreamExt;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -252,7 +252,7 @@ mod test {
             .unwrap();
 
         let addr = "127.0.0.1:17052".parse().unwrap();
-        let root = PathBuf::from("./tmp-test-with_ctl/");
+        let root = PathBuf::from("./tmp-test-with-ctl/");
         test_util::reset_root_dir(&root);
 
         rt.block_on(

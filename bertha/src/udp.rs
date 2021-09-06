@@ -79,6 +79,10 @@ impl<A> UdpSk<A> {
             _phantom: Default::default(),
         }
     }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, Report> {
+        Ok(self.sk.local_addr()?)
+    }
 }
 
 impl<A> ChunnelConnection for UdpSk<A>
