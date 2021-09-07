@@ -5,7 +5,7 @@ use bertha::{
     uds::{UnixReqChunnel, UnixSkChunnel},
     ChunnelListener, CxList,
 };
-use burrito_localname_ctl::LocalNameChunnel;
+use burrito_localname_ctl::MicroserviceChunnel;
 use color_eyre::eyre::{bail, Report};
 use rpcbench::EncryptOpt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -90,9 +90,9 @@ async fn burrito(
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
 
     if let Some(enc) = enc {
-        let lch = LocalNameChunnel::<_, _, (SocketAddr, TlsConnAddr)>::new(
+        let lch = MicroserviceChunnel::<_, _, (SocketAddr, TlsConnAddr)>::server(
             root.clone(),
-            Some((addr, TlsConnAddr::Request)),
+            (addr, TlsConnAddr::Request),
             UnixSkChunnel::with_root(root.clone()),
             bertha::CxNil,
         )
@@ -111,9 +111,9 @@ async fn burrito(
         let st = negotiate_server(stack, UdpReqChunnel.listen(addr).await?).await?;
         srv.serve(st, true).await
     } else {
-        let lch = LocalNameChunnel::<_, _, SocketAddr>::new(
+        let lch = MicroserviceChunnel::<_, _, SocketAddr>::server(
             root.clone(),
-            Some(addr),
+            addr,
             UnixSkChunnel::with_root(root.clone()),
             bertha::CxNil,
         )
