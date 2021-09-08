@@ -5,8 +5,9 @@ set -x
 
 mkdir -p /tmp/burrito
 sudo docker rm -f rpcbench-cli || true
-sudo docker run --mount type=bind,source=/tmp/burrito/,target=/burrito -it --name rpcbench-cli -d ubuntu:20.04 /bin/bash
+sudo docker run --privileged --mount type=bind,source=/tmp/burrito/,target=/burrito -it --name rpcbench-cli -d ubuntu:20.04 /bin/bash
 sudo docker cp ./target/release/bincode-pingclient rpcbench-cli:/client
+sudo docker exec rpcbench-cli /bin/bash -c "apt update && apt install -y linux-tools-common linux-tools-`uname -r`"
 
 if [[ $6 != "none" ]]; then
     sudo docker cp $6 rpcbench-cli:/gt
@@ -43,8 +44,7 @@ else
     container_ip=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rpcbench-srv)
     if [[ $6 != "none" ]]; then
         if [[ $7 != "none"  ]]; then
-            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
-                --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $7 $8
+            sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli bash -c "perf record -o \"/$5-client.perf\" /client --addr $container_ip:$2 -w=imm $3 $4 -o=\"/$5.data\" --encr-ghostunnel-root=/gt $7 $8"
         else
             sudo docker exec -e RUST_LOG=$RLOG rpcbench-cli /client \
                 --addr $container_ip:$2 -w=imm $3 $4 -o="/$5.data" --encr-ghostunnel-root=/gt $8
@@ -64,6 +64,7 @@ else
 fi
 sudo docker cp rpcbench-cli:/"$5.data" $1/"$5.data"
 sudo docker cp rpcbench-cli:/"$5.trace" $1/"$5.trace"
+sudo docker cp rpcbench-cli:/"$5-client.perf" $1/"$5-client.perf"
 
 sudo docker rm -f rpcbench-cli
 ps aux | grep burrito-localname | awk '{print $2}' | xargs sudo kill -9
