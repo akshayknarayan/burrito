@@ -12,7 +12,7 @@ def start_localnamectl(srv_addr, burrito_root):
     sp = srv_addr.split(":")
     srv_addr = sp[0]
     if burrito_root is not None:
-        cmd = f"sudo RUST_LOG=debug ./target/release/burrito-localname -f &"
+        cmd = f"RUST_LOG=warn ./target/release/burrito-localname -f &"
         if srv_addr == "127.0.0.1":
             agenda.task("starting localname-ctl")
             sh.run(cmd, shell=True)
@@ -29,7 +29,7 @@ def start_server(srv_addr, srv_port, ghostunnel, burrito_root, n):
     sp = srv_addr.split(":")
     srv_addr = sp[0]
     encr_arg = f"{ghostunnel}" if ghostunnel is not None else "none"
-    burrito_root_arg = f"--burrito-root=/burrito" if burrito_root is not None else ""
+    burrito_root_arg = f"--burrito-root=/tmp/burrito" if burrito_root is not None else ""
     if srv_addr == '127.0.0.1':
         agenda.task("local rpcbench-server")
         cmd = f"./scripts/start-rpcbench-server.sh \
@@ -74,7 +74,7 @@ def exp(srv_addr, mode, args, n):
         exp_addr = srv_addr
     neg = f'--negotiation={n}'
     encr_arg = f"{args.ghostunnel}" if args.ghostunnel and 'rel' not in mode else "none"
-    burrito_root_arg = f"--burrito-root=/burrito" if args.burrito_root and 'fp' in mode else "none"
+    burrito_root_arg = f"--burrito-root=/tmp/burrito" if args.burrito_root and 'fp' in mode else "none"
     if '127.0.0.1' == exp_addr:
         is_local = 'local'
     elif '10.1' in exp_addr:
