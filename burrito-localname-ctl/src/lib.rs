@@ -32,3 +32,6 @@ pub use runtime_fastpath::*;
 
 mod static_fastpath;
 pub use static_fastpath::*;
+
+mod fused_tls_fastpath;
+pub use fused_tls_fastpath::*;

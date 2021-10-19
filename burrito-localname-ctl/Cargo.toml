@@ -10,6 +10,7 @@ ctl = ["tokio/rt-multi-thread", "tokio-stream", "tokio-stream", "ctrlc", "struct
 
 [dependencies]
 bertha = { path = "../bertha" }
+tls-tunnel = { path = "../tls-tunnel" }
 bincode = "1"
 tracing = "0.1"
 color-eyre = "0.5"

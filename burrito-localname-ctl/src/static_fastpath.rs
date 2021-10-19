@@ -4,6 +4,7 @@ use color_eyre::eyre::{eyre, Report};
 use futures_util::{future::ready, stream::StreamExt};
 use std::fmt::Debug;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,13 +12,13 @@ use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
 #[derive(Clone, Copy, Debug)]
-enum Side<A> {
+pub(crate) enum Side<A> {
     Server(A),
     Client { local_addr: A, remote_addr: A },
 }
 
 impl<A> Side<A> {
-    fn register_addr(&self) -> &A {
+    pub(crate) fn register_addr(&self) -> &A {
         match self {
             Side::Server(a) => a,
             Side::Client { local_addr, .. } => local_addr,
@@ -29,6 +30,7 @@ impl<A> Side<A> {
 pub struct MicroserviceChunnel<Lch, Lr, Ag> {
     cl: Option<Arc<Mutex<client::LocalNameClient>>>,
     local_addr: Option<PathBuf>,
+    peer_global_addr: Option<SocketAddr>,
     side: Side<Ag>,
     local_raw: Lr,
     local_chunnel: Lch,
@@ -39,6 +41,35 @@ impl<Lch, Lr, Ag> Negotiate for MicroserviceChunnel<Lch, Lr, Ag> {
 
     fn guid() -> u64 {
         0xb3fa08967e518987
+    }
+
+    fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        let msg: bertha::negotiate::NegotiateMsg = match bincode::deserialize(nonce) {
+            Err(e) => {
+                debug!(err = ?e, "nonce deserialize failed");
+                return Box::pin(futures_util::future::ready(()));
+            }
+            Ok(m) => m,
+        };
+
+        let addr = match msg {
+            bertha::negotiate::NegotiateMsg::ServerNonce { addr, .. } => addr,
+            _ => {
+                debug!("malformed nonce");
+                return Box::pin(futures_util::future::ready(()));
+            }
+        };
+
+        match bincode::deserialize(&addr) {
+            Ok(skaddr) => {
+                self.peer_global_addr = Some(skaddr);
+            }
+            Err(e) => {
+                debug!(err = ?e, "socketaddr deserialize failed");
+            }
+        }
+
+        return Box::pin(futures_util::future::ready(()));
     }
 }
 
@@ -101,6 +132,7 @@ where
         Ok(Self {
             cl: cl.map(Mutex::new).map(Arc::new).ok(),
             local_addr,
+            peer_global_addr: None,
             side,
             local_raw,
             local_chunnel,
@@ -112,7 +144,7 @@ impl<A, Gc, Lr, LrCn, LrErr, Lrd, Lch, Lcn, LchErr, D> Chunnel<Gc>
     for MicroserviceChunnel<Lch, Lr, A>
 where
     Gc: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
-    A: GetSockAddr + Clone + PartialEq + Debug + Send + Sync + 'static,
+    A: GetSockAddr + From<SocketAddr> + Clone + PartialEq + Debug + Send + Sync + 'static,
     D: Send + Sync + 'static,
     // Raw local connections. Lrd, local raw data, is probably Vec<u8> (e.g. for Lctr = UDS), but
     // don't assume this.
@@ -138,39 +170,48 @@ where
                 let local_self_addr = self.local_addr.clone();
                 let mut local_raw = self.local_raw.clone();
                 let mut local_chunnel = self.local_chunnel.clone();
+                let peer_global_addr = self.peer_global_addr.clone();
                 Box::pin(async move {
                     let mut cl_g = cl.lock().await;
-                    match side {
-                        Side::Client { remote_addr: a, .. } | Side::Server(a) => {
-                            match cl_g.query(a.as_sk_addr()).await? {
-                                None => Ok(MicroserviceCn::Global(inner)),
-                                Some(local_peer_addr) => {
-                                    let local_raw_cn = local_raw
-                                        .listen(local_self_addr.unwrap())
-                                        .await
-                                        .map_err(Into::into)?
-                                        .next()
-                                        .await
-                                        .unwrap()
-                                        .map_err(Into::into)?;
-                                    let local_cn = local_chunnel
-                                        .connect_wrap(local_raw_cn)
-                                        .await
-                                        .map_err(Into::into)?;
-                                    trace!(?local_peer_addr, global_addr = ?&a, "using local connection");
-                                    Ok(MicroserviceCn::Local {
-                                        cn: local_cn,
-                                        local_addr: local_peer_addr,
-                                        global_addr: a,
-                                    })
-                                }
-                            }
+                    let a: A = match side {
+                        Side::Client { remote_addr: a, .. } => a,
+                        Side::Server(_) => peer_global_addr
+                            .ok_or_else(|| eyre!("no peer client address set"))?
+                            .into(),
+                    };
+
+                    match cl_g.query(a.as_sk_addr()).await? {
+                        None => {
+                            trace!(global_addr = ?&a, "using global connection");
+                            Ok(MicroserviceCn::Global(inner))
+                        }
+                        Some(local_peer_addr) => {
+                            trace!(?local_peer_addr, global_addr = ?&a, "getting local connection");
+                            let local_raw_cn = local_raw
+                                .listen(local_self_addr.unwrap())
+                                .await
+                                .map_err(Into::into)?
+                                .next()
+                                .await
+                                .unwrap()
+                                .map_err(Into::into)?;
+                            let local_cn = local_chunnel
+                                .connect_wrap(local_raw_cn)
+                                .await
+                                .map_err(Into::into)?;
+                            trace!(?local_peer_addr, global_addr = ?&a, "using local connection");
+                            Ok(MicroserviceCn::Local {
+                                cn: local_cn,
+                                local_addr: local_peer_addr,
+                                global_addr: a,
+                            })
                         }
                     }
                 })
             }
             None => {
                 // if we couldn't connect to localname-ctl, it's all global anyway.
+                trace!("no localname-ctl, using global connection");
                 Box::pin(ready(Ok(MicroserviceCn::Global(inner))))
             }
         }

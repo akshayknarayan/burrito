@@ -170,13 +170,8 @@ impl BurritoNet {
         listen_addr: PathBuf,
     ) -> Result<(), String> {
         let mut tbl = self.name_table.write().await;
-        if tbl.contains_key(&service_addr) {
-            Err(format!("Service address {} already in use", &service_addr,))
-        } else if tbl.insert(service_addr, listen_addr).is_none() {
-            Ok(())
-        } else {
-            unreachable!()
-        }
+        tbl.insert(service_addr, listen_addr);
+        Ok(())
     }
 
     async fn query(&self, dst_addr: &SocketAddr) -> Result<Option<PathBuf>, String> {

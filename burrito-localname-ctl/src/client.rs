@@ -37,7 +37,7 @@ impl LocalNameClient {
         if name.ip().is_unspecified() {
             let addrs = pnet::datalink::interfaces()
                 .into_iter()
-                .filter(|i| i.is_up() && !i.is_loopback() && !i.ips.is_empty())
+                .filter(|i| i.is_up() && !i.ips.is_empty())
                 .flat_map(|i| {
                     i.ips.into_iter().map(|a| {
                         let mut addr = name;
