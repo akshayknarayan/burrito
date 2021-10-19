@@ -9,7 +9,8 @@ use futures_util::future::{ready, Ready};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, trace, trace_span};
+use tracing_futures::Instrument;
 
 #[derive(Debug, Clone)]
 pub struct SerializeChunnelProject<D> {
@@ -108,23 +109,30 @@ where
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
-        Box::pin(async move {
-            let buf = bincode::serialize(&data.1).wrap_err("serialize failed")?;
-            inner.send((data.0, buf)).await
-        })
+        Box::pin(
+            async move {
+                let buf = bincode::serialize(&data.1).wrap_err("serialize failed")?;
+                inner.send((data.0, buf)).await
+            }
+            .instrument(trace_span!("bincode_send")),
+        )
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let inner = Arc::clone(&self.inner);
-        Box::pin(async move {
-            let (a, buf) = inner.recv().await?;
-            let data = bincode::deserialize(&buf[..]).wrap_err(eyre!(
-                "deserialize failed: {:?} -> {:?}",
-                buf,
-                std::any::type_name::<D>()
-            ))?;
-            Ok((a, data))
-        })
+        Box::pin(
+            async move {
+                let (a, buf) = inner.recv().await?;
+                trace!("recvd");
+                let data = bincode::deserialize(&buf[..]).wrap_err(eyre!(
+                    "deserialize failed: {:?} -> {:?}",
+                    buf,
+                    std::any::type_name::<D>()
+                ))?;
+                Ok((a, data))
+            }
+            .instrument(trace_span!("bincode_recv")),
+        )
     }
 }
 
