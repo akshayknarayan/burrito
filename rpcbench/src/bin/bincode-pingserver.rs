@@ -5,9 +5,9 @@ use bertha::{
     uds::{UnixReqChunnel, UnixSkChunnel},
     ChunnelListener, CxList,
 };
-use burrito_localname_ctl::MicroserviceChunnel;
-use color_eyre::eyre::{bail, Report};
-use rpcbench::EncryptOpt;
+use burrito_localname_ctl::{MicroserviceChunnel, MicroserviceTLSChunnel};
+use color_eyre::eyre::{bail, eyre, Report, WrapErr};
+use rpcbench::{EncryptOpt, TlsWrapAddr};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -90,22 +90,18 @@ async fn burrito(
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
 
     if let Some(enc) = enc {
-        let lch = MicroserviceChunnel::<_, _, (SocketAddr, TlsConnAddr)>::server(
+        let tls =
+            TLSChunnel::<TlsWrapAddr>::new(enc.unix_root(), enc.bin_path(), enc.cert_dir_path())
+                .listen(addr);
+        let lch = MicroserviceTLSChunnel::<_, _, TlsWrapAddr>::server(
+            tls,
             root.clone(),
-            (addr, TlsConnAddr::Request),
+            (addr, TlsConnAddr::Request).into(),
             UnixSkChunnel::with_root(root.clone()),
             bertha::CxNil,
         )
         .await?;
-        let tls = TLSChunnel::<(SocketAddr, TlsConnAddr)>::new(
-            enc.unix_root(),
-            enc.bin_path(),
-            enc.cert_dir_path(),
-        )
-        .listen(addr);
-        let stack = CxList::from(SerializeChunnelProject::default())
-            .wrap(lch)
-            .wrap(tls);
+        let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
 
         info!(?port, ?root, "Serving localname mode with encryption");
         let st = negotiate_server(stack, UdpReqChunnel.listen(addr).await?).await?;
@@ -140,7 +136,6 @@ async fn main() -> Result<(), Report> {
         let subscriber = subscriber
             .with(timing_layer)
             .with(tracing_subscriber::EnvFilter::from_default_env())
-            //.with(tracing_subscriber::fmt::layer())
             .with(ErrorLayer::default());
         let d = tracing::Dispatch::new(subscriber);
         d.clone().init();
@@ -148,7 +143,9 @@ async fn main() -> Result<(), Report> {
         let (s, mut r) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(_) = r.recv().await {
-                rpcbench::write_tracing(&path, timing_downcaster, &d, "").expect("write tracing");
+                rpcbench::write_tracing(&path, timing_downcaster, &d, "")
+                    .wrap_err(eyre!("write to {:?}", path))
+                    .expect("write tracing");
             }
         });
         Some(s)

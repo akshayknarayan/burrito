@@ -2,17 +2,18 @@ use bertha::{
     bincode::SerializeChunnelProject, either::Either, negotiate_client, udp::UdpSkChunnel,
     uds::UnixSkChunnel, util::ProjectLeft, ChunnelConnector, ClientNegotiator, CxList,
 };
-use burrito_localname_ctl::{EitherAddr, MicroserviceChunnel};
+use burrito_localname_ctl::{EitherAddr, MicroserviceChunnel, MicroserviceTLSChunnel};
 use color_eyre::eyre::{bail, Report, WrapErr};
-use rpcbench::EncryptOpt;
+use rpcbench::{EncryptOpt, TlsWrapAddr};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use structopt::StructOpt;
 use tls_tunnel::{TLSChunnel, TlsConnAddr};
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -114,7 +115,6 @@ async fn main() -> Result<(), Report> {
         let subscriber = subscriber
             .with(timing_layer)
             .with(tracing_subscriber::EnvFilter::from_default_env())
-            //.with(tracing_subscriber::fmt::layer())
             .with(ErrorLayer::default());
         let d = tracing::Dispatch::new(subscriber);
         d.clone().init();
@@ -179,7 +179,7 @@ async fn main() -> Result<(), Report> {
                         UnixSkChunnel::default().connect(()).await?
                     };
 
-                    let mut cl_neg = cl_neg.lock().unwrap();
+                    let mut cl_neg = cl_neg.lock().await;
                     let stack = SerializeChunnelProject::default();
                     if !did_first_round.load(Ordering::SeqCst) {
                         let cn = cl_neg.negotiate_fetch_nonce(stack, u, addr.clone()).await?;
@@ -247,7 +247,7 @@ async fn main() -> Result<(), Report> {
                     )
                     .await?;
                     let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
-                    let mut cl_neg = cl_neg.lock().unwrap();
+                    let mut cl_neg = cl_neg.lock().await;
 
                     if !did_first_round.load(Ordering::SeqCst) {
                         let cn = cl_neg.negotiate_fetch_nonce(stack, sk, addr).await?;
@@ -295,27 +295,26 @@ async fn main() -> Result<(), Report> {
                 let r = root.clone();
                 async move {
                     let sk = UdpSkChunnel.connect(()).await?;
-                    let lch = MicroserviceChunnel::<_, _, (SocketAddr, TlsConnAddr)>::client(
-                        r.clone(),
-                        (addr, TlsConnAddr::Request),
-                        (sk.local_addr()?, TlsConnAddr::Request),
-                        UnixSkChunnel::with_root(r),
-                        bertha::CxNil,
-                    )
-                    .await?;
-                    let tls = TLSChunnel::<(SocketAddr, TlsConnAddr)>::new(
+                    let tls = TLSChunnel::<TlsWrapAddr>::new(
                         enc.unix_root(),
                         enc.bin_path(),
                         enc.cert_dir_path(),
                     )
                     .connect(addr);
-                    let stack = CxList::from(SerializeChunnelProject::default())
-                        .wrap(lch)
-                        .wrap(tls);
+                    let lch = MicroserviceTLSChunnel::<_, _, TlsWrapAddr>::client(
+                        tls,
+                        r.clone(),
+                        (addr, TlsConnAddr::Request).into(),
+                        (sk.local_addr()?, TlsConnAddr::Request).into(),
+                        UnixSkChunnel::with_root(r),
+                        bertha::CxNil,
+                    )
+                    .await?;
+                    let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
                     let cn = negotiate_client(stack, sk, addr)
                         .await
                         .wrap_err("burrito-mode yes-neg connector")?;
-                    Ok(ProjectLeft::new(EitherAddr::Global((addr, x)), cn))
+                    Ok(ProjectLeft::new(EitherAddr::Global((addr, x).into()), cn))
                 }
             };
 
@@ -328,24 +327,23 @@ async fn main() -> Result<(), Report> {
                 let r = root.clone();
                 async move {
                     let sk = UdpSkChunnel.connect(()).await?;
-                    let lch = MicroserviceChunnel::<_, _, (SocketAddr, TlsConnAddr)>::client(
-                        r.clone(),
-                        (addr, TlsConnAddr::Request),
-                        (sk.local_addr()?, TlsConnAddr::Request),
-                        UnixSkChunnel::with_root(r),
-                        bertha::CxNil,
-                    )
-                    .await?;
-                    let tls = TLSChunnel::<(SocketAddr, TlsConnAddr)>::new(
+                    let tls = TLSChunnel::<TlsWrapAddr>::new(
                         enc.unix_root(),
                         enc.bin_path(),
                         enc.cert_dir_path(),
                     )
                     .connect(addr);
-                    let stack = CxList::from(SerializeChunnelProject::default())
-                        .wrap(lch)
-                        .wrap(tls);
-                    let mut cl_neg = cl_neg.lock().unwrap();
+                    let lch = MicroserviceTLSChunnel::<_, _, TlsWrapAddr>::client(
+                        tls,
+                        r.clone(),
+                        (addr, TlsConnAddr::Request).into(),
+                        (sk.local_addr()?, TlsConnAddr::Request).into(),
+                        UnixSkChunnel::with_root(r),
+                        bertha::CxNil,
+                    )
+                    .await?;
+                    let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
+                    let mut cl_neg = cl_neg.lock().await;
 
                     if !did_first_round.load(Ordering::SeqCst) {
                         let cn = cl_neg
@@ -354,13 +352,13 @@ async fn main() -> Result<(), Report> {
                             .wrap_err("burrito-mode first-round yes-neg connector")?;
                         did_first_round.store(true, Ordering::SeqCst);
                         Ok(ProjectLeft::new(
-                            EitherAddr::Global((addr, x)),
+                            EitherAddr::Global((addr, x).into()),
                             Either::Left(cn),
                         ))
                     } else {
                         let cn = cl_neg.negotiate_zero_rtt(stack, sk, addr).await?;
                         Ok(ProjectLeft::new(
-                            EitherAddr::Global((addr, x)),
+                            EitherAddr::Global((addr, x).into()),
                             Either::Right(cn),
                         ))
                     }
@@ -378,7 +376,7 @@ async fn main() -> Result<(), Report> {
             match negotiation {
                 NegotiationMode::OneRtt => {
                     rpcbench::client_ping(
-                        (addr, TlsConnAddr::Request),
+                        (addr, TlsConnAddr::Request).into(),
                         fncl,
                         pp,
                         iters,
@@ -388,7 +386,7 @@ async fn main() -> Result<(), Report> {
                 }
                 NegotiationMode::ZeroRtt => {
                     rpcbench::client_ping(
-                        (addr, TlsConnAddr::Request),
+                        (addr, TlsConnAddr::Request).into(),
                         zerortt_fncl,
                         pp,
                         iters,
@@ -428,7 +426,7 @@ async fn main() -> Result<(), Report> {
                 let cl_neg = Arc::clone(&cl_neg);
                 async move {
                     let stack = SerializeChunnelProject::default();
-                    let mut cl_neg = cl_neg.lock().unwrap();
+                    let mut cl_neg = cl_neg.lock().await;
                     if !did_first_round.load(Ordering::SeqCst) {
                         let cn = cl_neg
                             .negotiate_fetch_nonce(stack, UdpSkChunnel.connect(()).await?, addr)
@@ -499,7 +497,7 @@ async fn main() -> Result<(), Report> {
                     )
                     .connect(addr);
                     let stack = CxList::from(SerializeChunnelProject::default()).wrap(tls);
-                    let mut cl_neg = cl_neg.lock().unwrap();
+                    let mut cl_neg = cl_neg.lock().await;
                     if !did_first_round.load(Ordering::SeqCst) {
                         let cn = cl_neg
                             .negotiate_fetch_nonce(stack, UdpSkChunnel.connect(()).await?, addr)

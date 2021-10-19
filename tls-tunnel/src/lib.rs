@@ -381,6 +381,12 @@ pub enum TlsConnAddr {
     Response(usize),
 }
 
+impl Default for TlsConnAddr {
+    fn default() -> Self {
+        Self::Request
+    }
+}
+
 impl<A> ChunnelConnection for TlsConn<A>
 where
     A: GetTlsConnAddr,

@@ -11,10 +11,12 @@ use std::convert::TryInto;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::Duration;
+use tls_tunnel::TlsConnAddr;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, debug_span, info, instrument, trace, trace_span};
 use tracing_futures::Instrument;
@@ -230,9 +232,7 @@ impl Server {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConnData {
     conn_idx: usize,
-    exp_time: Duration,
     conn_time: Duration,
-    total_time: Duration,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -279,7 +279,6 @@ where
         trace!(iter = i, "start_loop");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let then = std::time::Instant::now();
-        let connstart = start.elapsed();
         let st = connector(addr.clone())
             .instrument(tracing::trace_span!("connector", iter = i))
             .await
@@ -304,9 +303,7 @@ where
         trace!(iter = i, overall_time = ?elap, "end_loop");
         data.conns.push(ConnData {
             conn_idx: i,
-            exp_time: connstart,
             conn_time: conntime,
-            total_time: elap,
         });
     }
 
@@ -321,10 +318,27 @@ async fn do_one_ping(
     which: usize,
 ) -> Result<(i64, i64), Report> {
     let then = std::time::Instant::now();
-    cn.send(msg.into())
-        .instrument(tracing::trace_span!("req", ?iter, ?which))
-        .await
-        .wrap_err(eyre!("ping send #{:?},{:?}", iter, which))?;
+    let mut ctr = 0;
+    let msg: Msg = msg.into();
+    loop {
+        match cn
+            .send(msg.clone())
+            .instrument(tracing::trace_span!("req", ?iter, ?which))
+            .await
+            .wrap_err(eyre!("ping send #{:?},{:?}", iter, which))
+        {
+            Ok(_) => break,
+            Err(e) => {
+                if ctr > 5 {
+                    return Err(e).wrap_err(eyre!("attempt #{:?}", ctr));
+                }
+
+                trace!(err = %format!("{:#?}", e), "send failed, retry");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        ctr += 1;
+    }
     trace!(?iter, ?which, "send done");
     let response = match cn
         .recv()
@@ -493,6 +507,33 @@ fn dump_durs(data: &Data) {
     info!(?conn_quantiles, ?req_quantiles, "done");
     println!("conn quantiles: {:?}", conn_quantiles);
     println!("req quantiles: {:?}", req_quantiles);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TlsWrapAddr(SocketAddr, TlsConnAddr);
+
+impl From<(SocketAddr, TlsConnAddr)> for TlsWrapAddr {
+    fn from((s, t): (SocketAddr, TlsConnAddr)) -> TlsWrapAddr {
+        Self(s, t)
+    }
+}
+
+impl burrito_localname_ctl::GetSockAddr for TlsWrapAddr {
+    fn as_sk_addr(&self) -> SocketAddr {
+        self.0
+    }
+}
+
+impl tls_tunnel::GetTlsConnAddr for TlsWrapAddr {
+    fn as_tlsconn_addr(&self) -> TlsConnAddr {
+        self.1
+    }
+}
+
+impl From<SocketAddr> for TlsWrapAddr {
+    fn from(s: SocketAddr) -> Self {
+        Self(s, Default::default())
+    }
 }
 
 #[cfg(test)]

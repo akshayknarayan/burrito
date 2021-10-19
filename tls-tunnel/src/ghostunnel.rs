@@ -10,7 +10,7 @@ use tracing_futures::Instrument;
 
 #[derive(Debug)]
 pub struct GhostTunnel {
-    pub(crate) process_handle: Child,
+    _process_handle: Child,
     is_up: Option<oneshot::Receiver<Result<(), Report>>>,
 }
 
@@ -67,7 +67,7 @@ impl GhostTunnel {
                 .instrument(debug_span!("server ghostunnel stderr")),
         );
         Ok(Self {
-            process_handle: child,
+            _process_handle: child,
             is_up: Some(r),
         })
     }
@@ -104,7 +104,7 @@ impl GhostTunnel {
                 .instrument(debug_span!("client ghostunnel stderr")),
         );
         Ok(Self {
-            process_handle: child,
+            _process_handle: child,
             is_up: Some(r),
         })
     }
