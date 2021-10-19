@@ -8,7 +8,8 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::trace;
+use tracing::{trace, trace_span};
+use tracing_futures::Instrument;
 
 /// UDP Chunnel connector.
 ///
@@ -42,6 +43,7 @@ impl ChunnelListener for UnixSkChunnel {
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
+            std::fs::remove_file(a.as_path()).unwrap_or_else(|_| ());
             let sk = tokio::net::UnixDatagram::bind(a)?;
             Ok(
                 Box::pin(futures_util::stream::once(futures_util::future::ready(Ok(
@@ -94,31 +96,37 @@ impl ChunnelConnection for UnixSk {
         data: Self::Data,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         let sk = Arc::clone(&self.sk);
-        Box::pin(async move {
-            let (addr, data) = data;
-            trace!(to = ?&addr, "send");
-            sk.send_to(&data, &addr)
-                .await
-                .wrap_err(eyre!("unixsk send to address: {:?}", &addr))?;
-            Ok(())
-        })
+        Box::pin(
+            async move {
+                let (addr, data) = data;
+                trace!(to = ?&addr, "send");
+                sk.send_to(&data, &addr)
+                    .await
+                    .wrap_err(eyre!("unixsk send to address: {:?}", &addr))?;
+                Ok(())
+            }
+            .instrument(trace_span!("uds_send")),
+        )
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
         let mut buf = [0u8; 1024];
         let sk = Arc::clone(&self.sk);
 
-        Box::pin(async move {
-            let (len, from) = sk.recv_from(&mut buf).await?;
-            trace!(from = ?&from, "recv");
-            let data = buf[0..len].to_vec();
-            Ok((
-                from.as_pathname()
-                    .ok_or_else(|| eyre!("received from unnamed socket"))?
-                    .to_path_buf(),
-                data,
-            ))
-        })
+        Box::pin(
+            async move {
+                let (len, from) = sk.recv_from(&mut buf).await?;
+                trace!(from = ?&from, "recv");
+                let data = buf[0..len].to_vec();
+                Ok((
+                    from.as_pathname()
+                        .ok_or_else(|| eyre!("received from unnamed socket"))?
+                        .to_path_buf(),
+                    data,
+                ))
+            }
+            .instrument(trace_span!("uds_recv")),
+        )
     }
 }
 
