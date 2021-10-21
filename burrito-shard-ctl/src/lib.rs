@@ -323,6 +323,7 @@ where
         let shards_inner_stack = self.shards_inner_stack.clone();
         Box::pin(
             async move {
+                let _ = &addr;
                 let num_shards = addr.shard_addrs.len();
 
                 // connect to shards
@@ -486,6 +487,7 @@ where
         let shards_inner_stack = self.inner.shards_inner_stack.clone();
         Box::pin(
             async move {
+                let _ = &addr;
                 let num_shards = addr.shard_addrs.len();
 
                 // negotiate with shards
@@ -799,7 +801,10 @@ where
         // figure out which shard to send to.
         let shard_idx = (self.shard_fn)(&data.1);
         let a = self.shard_addrs[shard_idx].clone();
-        Box::pin(async move { inner.send((a, data.1)).await })
+        Box::pin(async move {
+            let _ = &data;
+            inner.send((a, data.1)).await
+        })
     }
 
     fn recv(
