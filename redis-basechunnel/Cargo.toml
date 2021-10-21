@@ -2,7 +2,7 @@
 name = "redis-basechunnel"
 version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 # cargo version as of 0.20.1 has a bug. Patch with this fork until https://github.com/mitsuhiko/redis-rs/pull/486 is merged and there's a release with that fix.

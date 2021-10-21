@@ -2,7 +2,7 @@
 name = "bertha"
 version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }

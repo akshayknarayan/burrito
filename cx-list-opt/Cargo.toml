@@ -2,7 +2,7 @@
 name = "cx-list-opt"
 version = "0.1.0"
 authors = ["Akshay Narayan <akshayn@mit.edu>"]
-edition = "2018"
+edition = "2021"
 
 [lib]
 proc-macro = true
