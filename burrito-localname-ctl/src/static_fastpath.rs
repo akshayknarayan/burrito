@@ -402,7 +402,7 @@ mod test {
             .build()
             .unwrap();
 
-        let addr: SocketAddr = "127.0.0.1:12571".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:13571".parse().unwrap();
         const ROOT: &'static str = "./tmp-test-burrito-root";
 
         rt.block_on(
