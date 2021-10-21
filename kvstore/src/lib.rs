@@ -16,7 +16,7 @@ pub use server::{serve, serve_lb, single_shard, BatchMode};
 
 #[cfg(test)]
 mod tests {
-    use super::{serve, serve_lb, single_shard, KvClient};
+    use super::{serve, serve_lb, single_shard, KvClient, KvClientBuilder};
     use bertha::{
         udp::{UdpReqChunnel, UdpSkChunnel},
         ChunnelConnector,
@@ -81,6 +81,7 @@ mod tests {
                         srv_port,
                         2,
                         s,
+                        crate::BatchMode::None,
                     )
                     .instrument(info_span!("server")),
                 );
@@ -90,7 +91,8 @@ mod tests {
                 async {
                     info!("make client");
                     let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
-                    let client = KvClient::new_basicclient(raw_cn, srv_addr.parse()?)
+                    let client = KvClientBuilder::new(srv_addr.parse()?)
+                        .new_basicclient(raw_cn)
                         .instrument(info_span!("make kvclient"))
                         .await
                         .wrap_err("make basic KvClient")?;
@@ -103,11 +105,11 @@ mod tests {
                 async {
                     info!("make shardclient");
                     let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
-                    let client =
-                        KvClient::new_shardclient(raw_cn, redis_sk_addr, srv_addr.parse()?)
-                            .instrument(info_span!("make shard kvclient"))
-                            .await
-                            .wrap_err("make shard KvClient")?;
+                    let client = KvClientBuilder::new(srv_addr.parse()?)
+                        .new_shardclient(raw_cn, redis_sk_addr)
+                        .instrument(info_span!("make shard kvclient"))
+                        .await
+                        .wrap_err("make shard KvClient")?;
                     putget(client, ("bazzzzzz".into(), "quxxxxx".into())).await?;
                     Ok::<_, Report>(())
                 }
@@ -166,6 +168,7 @@ mod tests {
                             UdpReqChunnel::default(),
                             true,
                             s,
+                            crate::BatchMode::None,
                         )
                         .instrument(info_span!("shard", addr = ?sa)),
                     );
@@ -199,7 +202,8 @@ mod tests {
                     let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
                     // TODO only works with new_nonshardclient, not basicclient
                     // for some reason the message is getting echoed.
-                    let client = KvClient::new_nonshardclient(raw_cn, srv_addr)
+                    let client = KvClientBuilder::new(srv_addr)
+                        .new_nonshardclient(raw_cn)
                         .instrument(info_span!("make kvclient"))
                         .await
                         .wrap_err("make basic KvClient")?;
