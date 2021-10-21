@@ -588,7 +588,7 @@ mod test {
             let stack = CxList::from(SerializeChunnelProject::default()).wrap(lch);
             info!("Serving localname mode");
             let st = negotiate_server(stack, UdpReqChunnel.listen(addr).await?).await?;
-            srv.serve(st).await
+            srv.serve(st, false).await
         }
 
         rt.block_on(
