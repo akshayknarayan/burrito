@@ -144,7 +144,7 @@ where
             // capabilities. So if we didn't touch it, then invalid.
             client
                 .iter()
-                .all(|(guid, of)| of.sidedness.is_some() || touched.get(&guid).is_some())
+                .all(|(guid, of)| of.sidedness.is_some() || touched.get(guid).is_some())
                 && touched.iter().all(|t| {
                     // for all the things we did touch, the impls should match.
                     let of = server.get(t).unwrap();

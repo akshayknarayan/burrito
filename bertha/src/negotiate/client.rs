@@ -256,10 +256,10 @@ where
         let inform_picked_nonce_buf = bincode::serialize(&picked)?;
         stack.call_negotiate_picked(&inform_picked_nonce_buf).await;
 
-        Ok(stack
+        stack
             .connect_wrap(CheckZeroRttNegotiationReply::from(cn))
             .await
-            .map_err(Into::into)?)
+            .map_err(Into::into)
     }
 }
 

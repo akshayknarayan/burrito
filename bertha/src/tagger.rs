@@ -134,7 +134,7 @@ where
 /// `OrderedChunnelProj` takes in Data segments and tags them for use with `(A, (u32, D))` Chunnels.
 ///
 /// It returns data segments in the order they were sent.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct OrderedChunnelProj {
     pub hole_thresh: Option<usize>,
 }
@@ -143,12 +143,6 @@ impl OrderedChunnelProj {
     pub fn ordering_threshold(&mut self, thresh: usize) -> &mut Self {
         self.hole_thresh = Some(thresh);
         self
-    }
-}
-
-impl Default for OrderedChunnelProj {
-    fn default() -> Self {
-        Self { hole_thresh: None }
     }
 }
 

@@ -183,12 +183,12 @@ pub enum SelectPolicy {
 
 impl SelectPolicy {
     fn eval(&self, num_participants: usize) -> bool {
-        match self {
-            &SelectPolicy::Gt {
+        match *self {
+            SelectPolicy::Gt {
                 participant_threshold,
                 ..
             } if num_participants > participant_threshold => true,
-            &SelectPolicy::Lt {
+            SelectPolicy::Lt {
                 participant_threshold,
                 ..
             } if num_participants < participant_threshold => true,
@@ -197,10 +197,8 @@ impl SelectPolicy {
     }
 
     fn pref(&self) -> Either<(), ()> {
-        match self {
-            &SelectPolicy::Gt { preference, .. } | &SelectPolicy::Lt { preference, .. } => {
-                preference
-            }
+        match *self {
+            SelectPolicy::Gt { preference, .. } | SelectPolicy::Lt { preference, .. } => preference,
         }
     }
 }

@@ -90,17 +90,9 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ReliabilityChunnel {
     inner: ReliabilityProjChunnel,
-}
-
-impl Default for ReliabilityChunnel {
-    fn default() -> Self {
-        Self {
-            inner: Default::default(),
-        }
-    }
 }
 
 impl Negotiate for ReliabilityChunnel {

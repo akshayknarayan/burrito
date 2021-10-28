@@ -284,7 +284,7 @@ fn stack_pair_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, Offer>) 
         // sidedness
         if let Some(univ) = &offer.sidedness {
             let mut joint = offer.available.clone();
-            if let Some(srv_offer) = server.get(&guid) {
+            if let Some(srv_offer) = server.get(guid) {
                 joint.extend(srv_offer.available.clone());
             }
 
@@ -293,7 +293,7 @@ fn stack_pair_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, Offer>) 
             }
         } else {
             // two-sided, they must be equal
-            if let Some(srv_offer) = server.get(&guid) {
+            if let Some(srv_offer) = server.get(guid) {
                 if offer.impl_guid != srv_offer.impl_guid
                     || !have_all(&offer.available, &srv_offer.available)
                     || !have_all(&srv_offer.available, &offer.available)
@@ -361,7 +361,7 @@ where
             .into_iter()
             .find(|option| {
                 option.0.iter().all(|(cap_guid, offer)| {
-                    if let Some(picked_offer) = picked.get(&cap_guid) {
+                    if let Some(picked_offer) = picked.get(cap_guid) {
                         picked_offer.available == offer.available
                     } else {
                         false

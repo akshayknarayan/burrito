@@ -43,7 +43,7 @@ impl ChunnelListener for UnixSkChunnel {
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
-            std::fs::remove_file(a.as_path()).unwrap_or_else(|_| ());
+            std::fs::remove_file(a.as_path()).unwrap_or(());
             let sk = tokio::net::UnixDatagram::bind(a)?;
             Ok(
                 Box::pin(futures_util::stream::once(futures_util::future::ready(Ok(
