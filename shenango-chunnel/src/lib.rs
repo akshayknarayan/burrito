@@ -74,10 +74,10 @@ impl NewConn {
                     .read_from(&mut buf)
                     .wrap_err("shenango read_from")
                     .unwrap();
-                if let Err(_) = incoming.send(Msg {
+                if incoming.send(Msg {
                     addr: from_addr,
                     buf: buf[..read_len].to_vec(),
-                }) {
+                }).is_err() {
                     warn!(sk=?laddr, "Incoming channel dropped, recv thread exiting");
                     break;
                 }
@@ -183,15 +183,9 @@ impl ChunnelListener for ShenangoUdpSkChunnel {
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
         use SocketAddr::*;
         match addr {
-            V4(a) => Box::pin(futures_util::future::ready(self.make_listen(a).and_then(
-                |sk| {
-                    Ok(
-                        Box::pin(futures_util::stream::once(futures_util::future::ready(Ok(
+            V4(a) => Box::pin(futures_util::future::ready(self.make_listen(a).map(|sk| Box::pin(futures_util::stream::once(futures_util::future::ready(Ok(
                             sk,
-                        )))) as _,
-                    )
-                },
-            ))),
+                        )))) as _))),
             V6(a) => Box::pin(futures_util::future::ready(Err(eyre!(
                 "Only IPv4 is supported: {:?}",
                 a
