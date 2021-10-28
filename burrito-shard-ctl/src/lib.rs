@@ -144,7 +144,7 @@ where
                 .wrap_err("Connecting to redis")?,
         ));
 
-        let internal_addr = internal_addr.unwrap_or(addr.shard_addrs.clone());
+        let internal_addr = internal_addr.unwrap_or_else(|| addr.shard_addrs.clone());
         if internal_addr.len() != addr.shard_addrs.len() {
             return Err(eyre!(
                 "Shard addresses mismatched between internal and external: {:?} != {:?}",
