@@ -376,7 +376,7 @@ async fn main() -> Result<(), Report> {
             match negotiation {
                 NegotiationMode::OneRtt => {
                     rpcbench::client_ping(
-                        (addr, TlsConnAddr::Request).into(),
+                        (addr, TlsConnAddr::Request),
                         fncl,
                         pp,
                         iters,
@@ -386,7 +386,7 @@ async fn main() -> Result<(), Report> {
                 }
                 NegotiationMode::ZeroRtt => {
                     rpcbench::client_ping(
-                        (addr, TlsConnAddr::Request).into(),
+                        (addr, TlsConnAddr::Request),
                         zerortt_fncl,
                         pp,
                         iters,

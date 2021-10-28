@@ -459,14 +459,10 @@ pub struct EncryptOpt {
 
 impl EncryptOpt {
     pub fn from(o: &impl AsEncryptOpt) -> Option<Self> {
-        if let Some(ref gt) = o.gt_root() {
-            Some(EncryptOpt {
+        o.gt_root().as_ref().map(|gt| EncryptOpt {
                 ghostunnel_root: gt.clone(),
-                unix_root: o.unix_root().clone(),
+                unix_root: o.unix_root(),
             })
-        } else {
-            None
-        }
     }
 
     pub fn unix_root(&self) -> PathBuf {

@@ -142,7 +142,7 @@ async fn main() -> Result<(), Report> {
         // sends on s trigger rewrites on r.
         let (s, mut r) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Some(_) = r.recv().await {
+            while r.recv().await.is_some() {
                 rpcbench::write_tracing(&path, timing_downcaster, &d, "")
                     .wrap_err(eyre!("write to {:?}", path))
                     .expect("write tracing");
