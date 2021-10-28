@@ -7,7 +7,6 @@ edition = "2021"
 [dependencies]
 bertha = { path = "../bertha" }
 burrito-localname-ctl = { path = "../burrito-localname-ctl", features = ["ctl"] }
-kvstore = { path = "../kvstore" }
 tls-tunnel = { path = "../tls-tunnel" }
 serde = "1"
 bincode = "1"

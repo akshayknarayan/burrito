@@ -14,7 +14,6 @@ flume = "0.10"
 futures-util = "0.3"
 lazy_static = "1"
 tokio = { version = "1", features = ["sync"] }
-quanta = "0.7"
 hdrhistogram = "7"
 
 [dev-dependencies]
@@ -23,5 +22,4 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 tracing-subscriber = "0.2"
 tracing-error = "0.1"
 serde = { version = "1", features = ["derive"] }
-structopt = "0.3"
 bincode = "1"

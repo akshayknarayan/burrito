@@ -12,5 +12,3 @@ proc-macro2 = "1"
 nom = "6"
 syn = { version = "1", features = ["full", "extra-traits", "parsing", "printing"] }
 quote = "1"
-serde = "1"
-bincode = "1"
