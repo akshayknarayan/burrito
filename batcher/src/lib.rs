@@ -262,15 +262,14 @@ impl<D> std::fmt::Debug for PendingSend<D> {
 
 impl<D> PendingSend<D> {
     fn take(&mut self) -> Self {
-        let s = std::mem::take(self);
-        s
+        std::mem::take(self)
     }
 
     fn push(&mut self, data: D) -> bool {
         match self {
             PendingSend::Nil => {
                 *self = PendingSend::Single(data);
-                return false;
+                false
             }
             PendingSend::Single(_) => {
                 let s = std::mem::replace(self, PendingSend::Nil);
@@ -279,11 +278,11 @@ impl<D> PendingSend<D> {
                     _ => unreachable!(),
                 };
                 *self = PendingSend::Batch(vec![d, data]);
-                return true;
+                true
             }
             PendingSend::Batch(ref mut b) => {
                 b.push(data);
-                return true;
+                true
             }
         }
     }
