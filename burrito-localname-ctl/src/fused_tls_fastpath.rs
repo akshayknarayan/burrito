@@ -64,19 +64,13 @@ where
         let mut tls = self.tls.clone();
         let res = self.local_peer_addr.clone();
         Box::pin(async move {
-            match cl {
-                Some(ref c) => {
-                    let mut cl_g = c.lock().await;
-                    match cl_g.query(skaddr).await.ok().flatten() {
-                        Some(l) => {
-                            let mut r = res.lock().unwrap();
-                            *r = Some((l, skaddr.into()));
-                            return;
-                        }
-                        None => {}
-                    }
+            if let Some(ref c) = cl {
+                let mut cl_g = c.lock().await;
+                if let Some(l) = cl_g.query(skaddr).await.ok().flatten() {
+                    let mut r = res.lock().unwrap();
+                    *r = Some((l, skaddr.into()));
+                    return;
                 }
-                None => {}
             }
 
             {

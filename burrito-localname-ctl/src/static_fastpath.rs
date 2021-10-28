@@ -69,7 +69,7 @@ impl<Lch, Lr, Ag> Negotiate for MicroserviceChunnel<Lch, Lr, Ag> {
             }
         }
 
-        return Box::pin(futures_util::future::ready(()));
+        Box::pin(futures_util::future::ready(()))
     }
 }
 
@@ -170,7 +170,7 @@ where
                 let local_self_addr = self.local_addr.clone();
                 let mut local_raw = self.local_raw.clone();
                 let mut local_chunnel = self.local_chunnel.clone();
-                let peer_global_addr = self.peer_global_addr.clone();
+                let peer_global_addr = self.peer_global_addr;
                 Box::pin(async move {
                     let mut cl_g = cl.lock().await;
                     let a: A = match side {
@@ -319,12 +319,10 @@ mod test {
         negotiate_client, negotiate_server, udp::UdpSkChunnel, uds::UnixSkChunnel, util::Nothing,
         ChunnelConnection, ChunnelConnector, ChunnelListener,
     };
-    use color_eyre::eyre::Report;
     use futures_util::stream::TryStreamExt;
     use std::net::SocketAddr;
-    use tracing::{info, info_span};
+    use tracing::info;
     use tracing_error::ErrorLayer;
-    use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[test]

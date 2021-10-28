@@ -301,7 +301,7 @@ async fn query_ctl<A>(
                 },
             );
 
-            rev_addr_map.lock().unwrap().insert(laddr.clone(), addr);
+            rev_addr_map.lock().unwrap().insert(laddr, addr);
         }
         Ok(None) => insert_antihit(skaddr, addr_cache),
         Err(e) => {
