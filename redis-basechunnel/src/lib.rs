@@ -194,11 +194,13 @@ impl RendezvousBackend for RedisBase {
                         .zcard(&addr_ctr)
                         .query_async(&mut self.redis_conn)
                         .await?;
-                    let staged_val = staged_val.ok_or(eyre!(
-                        "KV store polluted: new round {:?} but staged_val key {:?} empty",
-                        round_ctr,
-                        &staged_key
-                    ))?;
+                    let staged_val = staged_val.ok_or_else(|| {
+                        eyre!(
+                            "KV store polluted: new round {:?} but staged_val key {:?} empty",
+                            round_ctr,
+                            &staged_key
+                        )
+                    })?;
                     ensure!(
                         !staged_val.is_empty(),
                         "KV store polluted: new round {:?} but staged_val key {:?} empty",
