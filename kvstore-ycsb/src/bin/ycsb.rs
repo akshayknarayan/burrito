@@ -127,7 +127,7 @@ fn main() -> Result<(), Report> {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let d = tracing::Dispatch::new(subscriber);
-        d.clone().init();
+        d.init();
         color_eyre::install()?;
         None
     } else {
@@ -248,60 +248,34 @@ fn main() -> Result<(), Report> {
                     .await?,
                 )
             }
-        } else {
-            if !opt.use_clientsharding {
-                if !opt.use_basicclient {
-                    let mut access_by_client = HashMap::default();
-                    info!(mode = "nonshardclient", "make clients");
-                    for (cid, ops) in group_by_client(accesses).into_iter() {
-                        let client = KvClientBuilder::new(opt.addr)
-                            .new_nonshardclient(ctr.clone().connect(()).await.map_err(Into::into)?)
-                            .instrument(info_span!("make kvclient", client_id = ?cid))
-                            .await
-                            .wrap_err("make KvClient")?;
-                        access_by_client.insert(cid, (client, ops));
-                    }
-                    let num_clients = access_by_client.len();
-                    (
-                        num_clients,
-                        do_requests(
-                            access_by_client,
-                            opt.interarrival_client_micros as _,
-                            opt.poisson_arrivals,
-                        )
-                        .await?,
-                    )
-                } else {
-                    let mut access_by_client = HashMap::default();
-                    info!(mode = "basicclient", "make clients");
-                    for (cid, ops) in group_by_client(accesses).into_iter() {
-                        let client = KvClientBuilder::new(opt.addr)
-                            .new_basicclient(ctr.clone().connect(()).await.map_err(Into::into)?)
-                            .instrument(info_span!("make kvclient", client_id = ?cid))
-                            .await
-                            .wrap_err("make KvClient")?;
-                        access_by_client.insert(cid, (client, ops));
-                    }
-                    let num_clients = access_by_client.len();
-                    (
-                        num_clients,
-                        do_requests(
-                            access_by_client,
-                            opt.interarrival_client_micros as _,
-                            opt.poisson_arrivals,
-                        )
-                        .await?,
-                    )
-                }
-            } else {
+        } else if !opt.use_clientsharding {
+            if !opt.use_basicclient {
                 let mut access_by_client = HashMap::default();
-                info!(mode = "shardclient", "make clients");
+                info!(mode = "nonshardclient", "make clients");
                 for (cid, ops) in group_by_client(accesses).into_iter() {
                     let client = KvClientBuilder::new(opt.addr)
-                        .new_shardclient(
-                            ctr.clone().connect(()).await.map_err(Into::into)?,
-                            opt.redis_addr,
-                        )
+                        .new_nonshardclient(ctr.clone().connect(()).await.map_err(Into::into)?)
+                        .instrument(info_span!("make kvclient", client_id = ?cid))
+                        .await
+                        .wrap_err("make KvClient")?;
+                    access_by_client.insert(cid, (client, ops));
+                }
+                let num_clients = access_by_client.len();
+                (
+                    num_clients,
+                    do_requests(
+                        access_by_client,
+                        opt.interarrival_client_micros as _,
+                        opt.poisson_arrivals,
+                    )
+                    .await?,
+                )
+            } else {
+                let mut access_by_client = HashMap::default();
+                info!(mode = "basicclient", "make clients");
+                for (cid, ops) in group_by_client(accesses).into_iter() {
+                    let client = KvClientBuilder::new(opt.addr)
+                        .new_basicclient(ctr.clone().connect(()).await.map_err(Into::into)?)
                         .instrument(info_span!("make kvclient", client_id = ?cid))
                         .await
                         .wrap_err("make KvClient")?;
@@ -318,6 +292,30 @@ fn main() -> Result<(), Report> {
                     .await?,
                 )
             }
+        } else {
+            let mut access_by_client = HashMap::default();
+            info!(mode = "shardclient", "make clients");
+            for (cid, ops) in group_by_client(accesses).into_iter() {
+                let client = KvClientBuilder::new(opt.addr)
+                    .new_shardclient(
+                        ctr.clone().connect(()).await.map_err(Into::into)?,
+                        opt.redis_addr,
+                    )
+                    .instrument(info_span!("make kvclient", client_id = ?cid))
+                    .await
+                    .wrap_err("make KvClient")?;
+                access_by_client.insert(cid, (client, ops));
+            }
+            let num_clients = access_by_client.len();
+            (
+                num_clients,
+                do_requests(
+                    access_by_client,
+                    opt.interarrival_client_micros as _,
+                    opt.poisson_arrivals,
+                )
+                .await?,
+            )
         };
 
         // done
@@ -338,7 +336,7 @@ fn main() -> Result<(), Report> {
             let timing = td.downcast(&d).expect("downcast timing layer");
             let fname = of.with_extension("trace");
             let mut f = std::fs::File::create(&fname).unwrap();
-            dump_tracing(&timing, &mut f)?;
+            dump_tracing(timing, &mut f)?;
         }
     }
 
