@@ -231,7 +231,7 @@ impl ChunnelConnection for OrderedSqsChunnel {
 
             // message_deduplication_id is optional if cloud-side "content-based deduplication" is
             // enabled, but required if it is not.
-            let dedup_id = get_dedup(ctr, &body[..].as_bytes());
+            let dedup_id = get_dedup(ctr, body[..].as_bytes());
             let SendMessageResult {
                 sequence_number,
                 message_id,
@@ -311,10 +311,10 @@ impl ChunnelConnection for OrderedSqsChunnelBatch {
                 .into_iter()
                 .enumerate()
                 .map(|(id, (SqsAddr { group, .. }, body))| {
-                    let dedup_id = get_dedup(ctr + id, &body[..].as_bytes());
+                    let dedup_id = get_dedup(ctr + id, body[..].as_bytes());
                     SendMessageBatchRequestEntry {
                         message_body: body,
-                        message_group_id: group.clone(),
+                        message_group_id: group,
                         message_deduplication_id: Some(dedup_id),
                         id: id.to_string(), // batch id
                         ..Default::default()
@@ -364,7 +364,7 @@ impl ChunnelConnection for OrderedSqsChunnelBatch {
 
                     let q_batch = pending_batches
                         .entry(queue_id.clone())
-                        .or_insert(Vec::with_capacity(10));
+                        .or_insert_with(|| Vec::with_capacity(10));
                     q_batch.push((
                         SqsAddr {
                             queue_id: queue_id.clone(),
@@ -788,7 +788,6 @@ impl ChunnelConnection for SqsChunnelBatch {
                 .enumerate()
                 .map(|(id, (SqsAddr { group, .. }, body))| {
                     let attributes: HashMap<_, _> = group
-                        .clone()
                         .into_iter()
                         .map(|g| {
                             (
@@ -842,7 +841,7 @@ impl ChunnelConnection for SqsChunnelBatch {
                 for (SqsAddr { queue_id, group }, body) in &mut data {
                     let q_batch = pending_batches
                         .entry(queue_id.clone())
-                        .or_insert(Vec::with_capacity(10));
+                        .or_insert_with(|| Vec::with_capacity(10));
                     q_batch.push((
                         SqsAddr {
                             queue_id: queue_id.clone(),
@@ -1152,12 +1151,12 @@ mod test {
                 let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
                 let sch = OrderedSqsChunnel::new(sqs_client, vec![])?;
 
-                const GROUP_A: &'static str = "A";
-                const A1: &'static str = "message A1";
-                const A2: &'static str = "message A2";
-                const GROUP_B: &'static str = "B";
-                const B1: &'static str = "message B1";
-                const B2: &'static str = "message B2";
+                const GROUP_A: &str = "A";
+                const A1: &str = "message A1";
+                const A2: &str = "message A2";
+                const GROUP_B: &str = "B";
+                const B1: &str = "message B1";
+                const B2: &str = "message B2";
 
                 let addr_a: SqsAddr = (queue_name.clone(), GROUP_A.to_string()).into();
                 let addr_b: SqsAddr = (queue_name.clone(), GROUP_B.to_string()).into();
@@ -1264,11 +1263,11 @@ mod test {
                 let sqs_client = SqsClient::new(rusoto_core::Region::UsEast1);
                 let sch = OrderedSqsChunnel::new(sqs_client, vec![])?;
 
-                const GROUP_A: &'static str = "A";
-                const A1: &'static str = "message A1";
-                const A2: &'static str = "message A2";
-                const A3: &'static str = "message A3";
-                const A4: &'static str = "message A4";
+                const GROUP_A: &str = "A";
+                const A1: &str = "message A1";
+                const A2: &str = "message A2";
+                const A3: &str = "message A3";
+                const A4: &str = "message A4";
 
                 let addr_a: SqsAddr = (queue_name.to_string(), GROUP_A.to_string()).into();
 
