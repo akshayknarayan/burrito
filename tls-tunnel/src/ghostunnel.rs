@@ -118,28 +118,24 @@ async fn read_stderr(stderr: ChildStderr, notify_up: oneshot::Sender<Result<(), 
     loop {
         match rd.read_line(&mut buf).await {
             Ok(x) if x == 0 => {
-                s.take().map(|n| {
-                    n.send(Err(eyre!("Ghostunnel child process EOF'ed stderr")))
-                        .unwrap()
-                });
+                if let Some(n) = s.take() { n.send(Err(eyre!("Ghostunnel child process EOF'ed stderr")))
+                        .unwrap() }
                 break;
             }
             Ok(_) => {
                 if buf.contains(SEARCH_FOR) {
                     debug!(?buf, "matched line");
-                    s.take().map(|n| n.send(Ok(())).unwrap());
+                    if let Some(n) = s.take() { n.send(Ok(())).unwrap() }
                 } else {
                     trace!(?buf, "read line");
                 }
             }
             Err(e) => {
                 let r: Report = e.into();
-                s.take().map(|n| {
-                    n.send(Err(
+                if let Some(n) = s.take() { n.send(Err(
                         r.wrap_err("Error reading Ghostunnel child process stderr")
                     ))
-                    .unwrap()
-                });
+                    .unwrap() }
                 break;
             }
         }

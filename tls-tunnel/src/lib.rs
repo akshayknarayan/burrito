@@ -192,23 +192,21 @@ where
 
                     let start = std::time::Instant::now();
                     let mut tries = 0usize;
-                    loop {
-                        if let Err(e) = tokio::net::TcpStream::connect(rem).await {
-                            if start.elapsed() > std::time::Duration::from_secs(20) {
-                                let ctx = eyre!(
-                                    "can't connect to {:?} after {:?} tries ({:?})",
-                                    rem,
-                                    tries,
-                                    start.elapsed(),
-                                );
-                                return Err(Report::from(e).wrap_err(ctx));
-                            } else {
-                                tries += 1;
-                                trace!(addr = ?&rem, ?tries, err = %format!("{:#}", e), "failed connection");
-                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                            }
-                        } else { break}
-                    };
+                    while let Err(e) = tokio::net::TcpStream::connect(rem).await {
+                        if start.elapsed() > std::time::Duration::from_secs(20) {
+                            let ctx = eyre!(
+                                "can't connect to {:?} after {:?} tries ({:?})",
+                                rem,
+                                tries,
+                                start.elapsed(),
+                            );
+                            return Err(Report::from(e).wrap_err(ctx));
+                        } else {
+                            tries += 1;
+                            trace!(addr = ?&rem, ?tries, err = %format!("{:#}", e), "failed connection");
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    }
 
                     debug!(tunnel_target = ?&rem, elapsed = ?start.elapsed(), "connected to remote");
                     Ok((uc, gt))
@@ -271,7 +269,7 @@ where
 
     // ingore the inner connection
     fn connect_wrap(&mut self, _: T) -> Self::Future {
-        let remote_skaddr = self.remote.clone();
+        let remote_skaddr = self.remote;
         let f = || {
             let mut scn_g = self.send_cn.lock().unwrap();
             let mut lcn_g = self.listen_cn.lock().unwrap();
@@ -456,8 +454,7 @@ where
                 .read_u64()
                 .await
                 .wrap_err("error receiving (hdr) from tls tunnel exit")?;
-            let mut buf = Vec::with_capacity(len as usize);
-            buf.resize(len as usize, 0);
+            let mut buf = vec![0; len as usize];
             sk.read_exact(&mut buf)
                 .await
                 .wrap_err("error receiving (body) from tls tunnel exit")?;
@@ -465,9 +462,9 @@ where
         }
 
         let remote_skaddr = self.remote_addr;
-        let sk = self.listen.as_ref().map(|c| Arc::clone(c));
+        let sk = self.listen.as_ref().map(Arc::clone);
         let conns = Arc::clone(&self.listen_conns);
-        let send_side = self.send.as_ref().map(|c| Arc::clone(c));
+        let send_side = self.send.as_ref().map(Arc::clone);
         Box::pin(
             async move {
                 let mut to_add: Option<UnixStream> = None;
