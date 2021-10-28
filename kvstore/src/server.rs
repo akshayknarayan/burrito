@@ -141,7 +141,7 @@ pub enum BatchMode {
 impl std::str::FromStr for BatchMode {
     type Err = Report;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let sp: Vec<_> = s.split(":").collect();
+        let sp: Vec<_> = s.split(':').collect();
         Ok(match &sp[..] {
             &["none"] => BatchMode::None,
             &["auto"] => BatchMode::Auto,
@@ -675,7 +675,7 @@ mod udp_to_shard {
                         let addr = Ipv4Addr::from(a);
                         let sa = SocketAddr::new(IpAddr::V4(addr), port);
                         d.splice(0..7, std::iter::empty());
-                        return Ok((sa, d));
+                        Ok((sa, d))
                     }
                     16 => {
                         if d.len() < 19 {
@@ -686,10 +686,10 @@ mod udp_to_shard {
                         a.copy_from_slice(&d[3..19]);
                         let sa = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(a)), port);
                         d.splice(0..19, std::iter::empty());
-                        return Ok((sa, d));
+                        Ok((sa, d))
                     }
                     _ => {
-                        return Err(eyre!("Bad payload, no address"));
+                        Err(eyre!("Bad payload, no address"))
                     }
                 }
             })

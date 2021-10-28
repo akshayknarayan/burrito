@@ -35,13 +35,13 @@ mod tests {
         info!("do put");
         match client.update(op.0.clone(), op.1.clone()).await? {
             None => {}
-            x => Err(eyre!("unexpected value from put {:?}", x))?,
+            x => return Err(eyre!("unexpected value from put {:?}", x)),
         }
 
         info!("do get");
         match client.get(op.0).await? {
             Some(x) if x == op.1 => {}
-            x => Err(eyre!("unexpected value from get {:?}", x))?,
+            x => return Err(eyre!("unexpected value from get {:?}", x)),
         }
 
         info!("client done");

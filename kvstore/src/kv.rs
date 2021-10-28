@@ -39,7 +39,7 @@ impl Store {
     pub fn call(&self, req: Msg) -> Msg {
         match req.op() {
             Op::Get => {
-                let val = self.get(req.key()).map(|x| x.to_owned());
+                let val = self.get(req.key());
                 req.resp(val)
             }
             Op::Put => {
