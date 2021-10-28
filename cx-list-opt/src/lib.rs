@@ -250,7 +250,7 @@ impl Stack {
                     exprs: &[Expr],
                     max_level: u8,
                 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
-                    if exprs.len() == 0 {
+                    if exprs.is_empty() {
                         panic!("need at least 1 list element");
                     }
                     if exprs.len() == 1 {
@@ -289,7 +289,7 @@ impl Stack {
                     }
                 }
 
-                recurse(&exprs, max_level)
+                recurse(exprs, max_level)
             }
             Stack::Select { left, right } => {
                 let (htypes, head_name) = left.get_type(max_level);
@@ -432,24 +432,22 @@ struct TraitComponents {
 
 impl TraitComponents {
     fn get(item: syn::ItemTrait) -> Self {
-        match item {
-            syn::ItemTrait {
-                ident: name, items, ..
-            } => {
-                let rt = items[0].clone();
-                let fm = items[1].clone();
-                match (rt, fm) {
-                    (syn::TraitItem::Type(ret_type), syn::TraitItem::Method(first_method)) => {
-                        TraitComponents {
-                            name,
-                            ret_type,
-                            func: first_method,
-                        }
-                    }
-                    _ => {
-                        panic!("Trait impl does not match macro");
-                    }
+        let syn::ItemTrait {
+            ident: name, items, ..
+        } = item;
+
+        let rt = items[0].clone();
+        let fm = items[1].clone();
+        match (rt, fm) {
+            (syn::TraitItem::Type(ret_type), syn::TraitItem::Method(first_method)) => {
+                TraitComponents {
+                    name,
+                    ret_type,
+                    func: first_method,
                 }
+            }
+            _ => {
+                panic!("Trait impl does not match macro");
             }
         }
     }
