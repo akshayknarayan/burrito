@@ -1,3 +1,11 @@
+use super::{Chunnel, ChunnelConnection};
+use color_eyre::eyre::Report;
+use futures_util::future::{ready, Ready};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex};
+use tracing::debug;
+
 // before splits:
 // CxList<A, CxList<B, CxList<C, CxNil>>>.connect(Base) -> CConn<BConn< AConn<Base>>>
 //
@@ -8,12 +16,12 @@
 //                                 ^---------------channel-----------------^
 // how?
 // - return only CConn<SplitCnBottom> to application in impl Chunnel
-// - SplitCn has the rest stuffed inside it (somehow?)
-// - SplitCn top is added to the other two to drive threads
+// - SplitCnBottom has its corresponding SplitCnTop stuffed inside and spawns it
 /// Split the Chunnel stack into two sub-stacks connected by a channel pair.
 ///
 /// The lower-level chunnel stack will be spawned off to run concurrently, and the higher-level one
 /// will be returned for either the application or to be split off again.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Split;
 
 impl Split {
@@ -181,4 +189,74 @@ where
 }
 
 #[cfg(test)]
-mod t {}
+mod t {
+    use super::Split;
+    use crate::chan_transport::Chan;
+    use crate::test::Serve;
+    use crate::{
+        bincode::SerializeChunnel, reliable::ReliabilityChunnel, tagger::OrderedChunnel, Chunnel,
+        ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
+    };
+    use futures_util::StreamExt;
+    use tracing::{debug, info};
+    use tracing_error::ErrorLayer;
+    use tracing_futures::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    #[test]
+    fn split_stack() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or(());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let msgs = vec![vec![0u8; 10], vec![1u8; 10], vec![2u8; 10]];
+
+        rt.block_on(
+            async move {
+                let (mut srv, mut cln) = Chan::default().split();
+                let mut stack = CxList::from(OrderedChunnel::default())
+                    .wrap(ReliabilityChunnel::default())
+                    .wrap(Split::default())
+                    .wrap(SerializeChunnel::default());
+
+                let rcv_st = srv.listen(()).await.unwrap();
+                let mut rcv_st = stack.serve(rcv_st).await.unwrap();
+                let rcv = rcv_st.next().await.unwrap().unwrap();
+
+                let cln = cln.connect(()).await.unwrap();
+                let snd = stack.connect_wrap(cln).await.unwrap();
+
+                // recv side
+                tokio::spawn(
+                    async move {
+                        info!("starting receiver");
+                        loop {
+                            let m = rcv.recv().await.unwrap();
+                            debug!(m = ?m, "rcvd");
+                        }
+                    }
+                    .instrument(tracing::info_span!("receiver")),
+                );
+
+                futures_util::future::join_all(msgs.into_iter().map(|m| {
+                    debug!(m = ?m, "sending");
+                    snd.send(m)
+                }))
+                .await
+                .into_iter()
+                .collect::<Result<(), _>>()
+                .unwrap();
+
+                info!("done");
+            }
+            .instrument(tracing::info_span!("split_stack")),
+        );
+    }
+}
