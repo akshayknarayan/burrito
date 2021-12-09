@@ -1,10 +1,12 @@
 //! Client side.
 
 use crate::msg::Msg;
+use crate::reliability::KvReliabilityChunnel;
 use bertha::{
     bincode::SerializeChunnelProject,
     negotiate::Select,
     reliable::ReliabilityProjChunnel,
+    split::Split,
     tagger::OrderedChunnelProj,
     util::ProjectLeft,
     util::{MsgIdMatcher, NeverCn, Nothing},
@@ -18,16 +20,24 @@ use tracing::{debug, debug_span, instrument, trace};
 use tracing_futures::Instrument;
 
 #[derive(Debug, Clone, Copy)]
-pub struct KvClientBuilder<const BATCH: bool> {
+pub struct KvClientBuilder<const BATCH: bool, const FRAG: bool> {
     canonical_addr: SocketAddr,
 }
 
-impl KvClientBuilder<false> {
+impl KvClientBuilder<false, false> {
     pub fn new(canonical_addr: SocketAddr) -> Self {
         KvClientBuilder { canonical_addr }
     }
+}
 
-    pub fn set_batching(self) -> KvClientBuilder<true> {
+impl<const B: bool, const F: bool> KvClientBuilder<B, F> {
+    pub fn set_batching(self) -> KvClientBuilder<true, F> {
+        KvClientBuilder {
+            canonical_addr: self.canonical_addr,
+        }
+    }
+
+    pub fn set_stack_fragmentation(self) -> KvClientBuilder<B, true> {
         KvClientBuilder {
             canonical_addr: self.canonical_addr,
         }
@@ -50,7 +60,6 @@ macro_rules! basic_client {
 
 macro_rules! nonshard {
     ($raw_cn: expr, $ca: expr) => {{
-        use crate::reliability::KvReliabilityChunnel;
         let stack = Select::from((
             CxList::from(OrderedChunnelProj::default())
                 .wrap(ReliabilityProjChunnel::default())
@@ -68,23 +77,14 @@ macro_rules! nonshard {
 }
 
 macro_rules! shardcl {
-    ($raw_cn: expr, $redis_addr: expr, $ca: expr) => {{
-        use crate::reliability::KvReliabilityChunnel;
+    ($raw_cn: expr, $redis_addr: expr, $ca: expr, $sel: expr) => {{
         let redis_addr = format!("redis://{}:{}", $redis_addr.ip(), $redis_addr.port());
         let cl = ClientShardChunnelClient::new($ca, &redis_addr).await?;
-        let sel = Select::from((
-            CxList::from(OrderedChunnelProj::default())
-                .wrap(ReliabilityProjChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
-            CxList::from(KvReliabilityChunnel::default()).wrap(SerializeChunnelProject::default()),
-        ))
-        .prefer_right();
         let stack = CxList::from(Select::from((
             cl,
             Nothing::<burrito_shard_ctl::ShardFns>::default(),
         )))
-        .wrap(sel);
-
+        .wrap($sel);
         debug!("negotiation");
         let cn = bertha::negotiate::negotiate_client(stack, $raw_cn, $ca)
             .instrument(debug_span!("client_negotiate"))
@@ -93,7 +93,15 @@ macro_rules! shardcl {
     }};
 }
 
-impl KvClientBuilder<true> {
+macro_rules! batch_wrap {
+    ($cn: expr, $max_batch_size: expr) => {{
+        let mut b = batcher::Batcher::new($cn);
+        b.set_max_batch_size($max_batch_size);
+        Ok(KvClient::new_from_cn(b))
+    }};
+}
+
+impl<const F: bool> KvClientBuilder<true, F> {
     #[instrument(skip(raw_cn), err)]
     pub async fn new_basicclient(
         self,
@@ -101,9 +109,7 @@ impl KvClientBuilder<true> {
         max_batch_size: usize,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         let cn = basic_client!(raw_cn, self.canonical_addr);
-        let mut b = batcher::Batcher::new(cn);
-        b.set_max_batch_size(max_batch_size);
-        Ok(KvClient::new_from_cn(b))
+        batch_wrap!(cn, max_batch_size)
     }
 
     #[instrument(skip(raw_cn), err)]
@@ -113,26 +119,11 @@ impl KvClientBuilder<true> {
         max_batch_size: usize,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
         let cn = nonshard!(raw_cn, self.canonical_addr);
-        let mut b = batcher::Batcher::new(cn);
-        b.set_max_batch_size(max_batch_size);
-        Ok(KvClient::new_from_cn(b))
-    }
-
-    #[instrument(skip(raw_cn), err)]
-    pub async fn new_shardclient(
-        self,
-        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
-        redis_addr: SocketAddr,
-        max_batch_size: usize,
-    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
-        let cn = shardcl!(raw_cn, redis_addr, self.canonical_addr);
-        let mut b = batcher::Batcher::new(cn);
-        b.set_max_batch_size(max_batch_size);
-        Ok(KvClient::new_from_cn(b))
+        batch_wrap!(cn, max_batch_size)
     }
 }
 
-impl KvClientBuilder<false> {
+impl<const F: bool> KvClientBuilder<false, F> {
     #[instrument(skip(raw_cn), err)]
     pub async fn new_basicclient(
         self,
@@ -150,14 +141,84 @@ impl KvClientBuilder<false> {
         let cn = nonshard!(raw_cn, self.canonical_addr);
         Ok(KvClient::new_from_cn(cn))
     }
+}
 
+macro_rules! stack_no_split {
+    () => {
+        Select::from((
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(KvReliabilityChunnel::default()).wrap(SerializeChunnelProject::default()),
+        ))
+        .prefer_right()
+    };
+}
+
+impl KvClientBuilder<true, false> {
+    #[instrument(skip(raw_cn), err)]
+    pub async fn new_shardclient(
+        self,
+        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+        redis_addr: SocketAddr,
+        max_batch_size: usize,
+    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
+        let sel = stack_no_split!();
+        let cn = shardcl!(raw_cn, redis_addr, self.canonical_addr, sel);
+        batch_wrap!(cn, max_batch_size)
+    }
+}
+
+impl KvClientBuilder<false, false> {
     #[instrument(skip(raw_cn), err)]
     pub async fn new_shardclient(
         self,
         raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         redis_addr: SocketAddr,
     ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
-        let cn = shardcl!(raw_cn, redis_addr, self.canonical_addr);
+        let sel = stack_no_split!();
+        let cn = shardcl!(raw_cn, redis_addr, self.canonical_addr, sel);
+        Ok(KvClient::new_from_cn(cn))
+    }
+}
+
+macro_rules! stack_with_split {
+    () => {
+        Select::from((
+            CxList::from(OrderedChunnelProj::default())
+                .wrap(ReliabilityProjChunnel::default())
+                .wrap(SerializeChunnelProject::default()),
+            CxList::from(KvReliabilityChunnel::default())
+                .wrap(Split::default())
+                .wrap(SerializeChunnelProject::default()),
+        ))
+        .prefer_right()
+    };
+}
+
+impl KvClientBuilder<true, true> {
+    #[instrument(skip(raw_cn), err)]
+    pub async fn new_shardclient(
+        self,
+        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+        redis_addr: SocketAddr,
+        max_batch_size: usize,
+    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
+        let sel = stack_with_split!();
+        let cn = shardcl!(raw_cn, redis_addr, self.canonical_addr, sel);
+        batch_wrap!(cn, max_batch_size)
+    }
+}
+
+impl KvClientBuilder<false, true> {
+    #[instrument(skip(raw_cn), err)]
+    pub async fn new_shardclient(
+        self,
+        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+        redis_addr: SocketAddr,
+    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
+        let sel = stack_with_split!();
+        let cn = shardcl!(raw_cn, redis_addr, self.canonical_addr, sel);
         Ok(KvClient::new_from_cn(cn))
     }
 }

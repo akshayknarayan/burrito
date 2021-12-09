@@ -5,12 +5,14 @@ use crate::msg::Msg;
 use crate::reliability::KvReliabilityServerChunnel;
 use bertha::{
     bincode::SerializeChunnelProject, chan_transport::RendezvousChannel, negotiate::StackNonce,
-    reliable::ReliabilityProjChunnel, select::SelectListener, tagger::OrderedChunnelProj,
-    ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, GetOffers, Select,
+    reliable::ReliabilityProjChunnel, select::SelectListener, split::Split,
+    tagger::OrderedChunnelProj, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
+    GetOffers, Select,
 };
 use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{bail, Report, WrapErr};
 use futures_util::stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt};
+use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{atomic::AtomicUsize, Arc};
 use tracing::{debug, debug_span, info, info_span, trace, warn};
@@ -283,6 +285,7 @@ pub async fn single_shard(
         + Sync
         + 'static,
     need_address_embedding: bool,
+    fragment_stack: bool,
     s: impl Into<Option<tokio::sync::oneshot::Sender<Vec<StackNonce>>>>,
     batching: BatchMode,
 ) {
@@ -290,63 +293,47 @@ pub async fn single_shard(
     let internal_addr = internal_addr.unwrap_or(addr);
     info!(?addr, ?internal_addr, "listening");
 
-    async fn srv<C, Sc, Se>(
-        st: Sc,
-        s: Option<tokio::sync::oneshot::Sender<Vec<StackNonce>>>,
-        batching: BatchMode,
-    ) where
-        Sc: Stream<Item = Result<C, Se>> + Send + 'static,
-        C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
-        Se: Into<Report> + Send + Sync + 'static,
-    {
-        let external = Select::from((
-            CxList::from(OrderedChunnelProj::default())
-                .wrap(ReliabilityProjChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
-            CxList::from(KvReliabilityServerChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
-        ))
-        .prefer_right();
-        let offers = external.clone().offers().collect();
-        let st = bertha::negotiate::negotiate_server(external, st)
-            .await
-            .unwrap();
-
-        if let Some(s) = s {
-            s.send(offers).unwrap();
-        }
-
-        // initialize the kv store.
-        let store = Store::default();
-        let idx = Arc::new(AtomicUsize::new(0));
-
-        tokio::pin!(st);
-        loop {
-            let cn = match st
-                .try_next()
-                .instrument(debug_span!("negotiate_server"))
+    macro_rules! serve_stack {
+        ($stack: expr, $st: expr) => {{
+            let offers = $stack.clone().offers().collect();
+            let st = bertha::negotiate::negotiate_server($stack, $st)
                 .await
-            {
-                Ok(Some(cn)) => cn,
-                Err(err) => {
-                    warn!(?err, "Could not accept connection");
-                    break;
-                }
-                Ok(None) => unreachable!(),
-            };
+                .unwrap();
 
-            let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let store = store.clone();
-            // TODO deduplicate possible spurious retxs by req id
+            if let Some(s) = s {
+                s.send(offers).unwrap();
+            }
 
-            tokio::spawn(
-                batching
-                    .serve(cn, store, idx)
-                    .instrument(debug_span!("shard_connection", idx = ?idx)),
-            );
-        }
+            // initialize the kv store.
+            let store = Store::default();
+            let idx = Arc::new(AtomicUsize::new(0));
 
-        unreachable!();
+            tokio::pin!(st);
+            loop {
+                let cn = match st
+                    .try_next()
+                    .instrument(debug_span!("negotiate_server"))
+                    .await
+                {
+                    Ok(Some(cn)) => cn,
+                    Err(err) => {
+                        warn!(?err, "Could not accept connection");
+                        break;
+                    }
+                    Ok(None) => unreachable!(),
+                };
+
+                let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let store = store.clone();
+                // TODO deduplicate possible spurious retxs by req id
+
+                tokio::spawn(
+                    batching
+                        .serve(cn, store, idx)
+                        .instrument(debug_span!("shard_connection", idx = ?idx)),
+                );
+            }
+        }}
     }
 
     if need_address_embedding {
@@ -356,7 +343,28 @@ pub async fn single_shard(
             .await
             .map_err::<Report, _>(Into::into)
             .unwrap();
-        srv(st, s, batching).await
+        if fragment_stack {
+            let external = Select::from((
+                CxList::from(OrderedChunnelProj::default())
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+                CxList::from(KvReliabilityServerChunnel::default())
+                    .wrap(Split::default())
+                    .wrap(SerializeChunnelProject::default()),
+            ))
+            .prefer_right();
+            serve_stack!(external, st)
+        } else {
+            let external = Select::from((
+                CxList::from(OrderedChunnelProj::default())
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+                CxList::from(KvReliabilityServerChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+            ))
+            .prefer_right();
+            serve_stack!(external, st)
+        }
     } else {
         let st = SelectListener::new(raw_listener, internal_srv)
             .separate_addresses()
@@ -364,8 +372,31 @@ pub async fn single_shard(
             .await
             .map_err::<Report, _>(Into::into)
             .unwrap();
-        srv(st, s, batching).await
+        if fragment_stack {
+            let external = Select::from((
+                CxList::from(OrderedChunnelProj::default())
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+                CxList::from(KvReliabilityServerChunnel::default())
+                    .wrap(Split::default())
+                    .wrap(SerializeChunnelProject::default()),
+            ))
+            .prefer_right();
+            serve_stack!(external, st)
+        } else {
+            let external = Select::from((
+                CxList::from(OrderedChunnelProj::default())
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+                CxList::from(KvReliabilityServerChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+            ))
+            .prefer_right();
+            serve_stack!(external, st)
+        }
     }
+
+    unreachable!()
 }
 
 /// Start and serve a `ShardCanonicalServer` and shards.
@@ -378,6 +409,8 @@ pub async fn single_shard(
 /// `num_shards`: Number of shards to start. Shard addresses are selected sequentially after
 /// `srv_port`, but this could change.
 /// `ready`: An optional notification for after setup and negotiation are done and before we start serving.
+/// `batching`: Which [`BatchMode`] to use.
+/// `fragment_stack`: Should the stack be split into concurrently executing fragments?
 pub async fn serve(
     mut raw_listener: impl ChunnelListener<
             Addr = SocketAddr,
@@ -392,6 +425,7 @@ pub async fn serve(
     num_shards: u16,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
     batching: BatchMode,
+    fragment_stack: bool,
 ) -> Result<(), Report> {
     // 1. Define addr.
     let si = make_shardinfo(srv_ip, srv_port, num_shards);
@@ -404,8 +438,17 @@ pub async fn serve(
         let (s, r) = tokio::sync::oneshot::channel();
         let int_srv = internal_srv.clone();
         tokio::spawn(
-            single_shard(a, raw_listener.clone(), None, int_srv, false, s, batching)
-                .instrument(debug_span!("shardsrv", addr = ?&a)),
+            single_shard(
+                a,
+                raw_listener.clone(),
+                None,
+                int_srv,
+                false,
+                fragment_stack,
+                s,
+                batching,
+            )
+            .instrument(debug_span!("shardsrv", addr = ?&a)),
         );
         rdy.push(r);
     }
@@ -424,6 +467,7 @@ pub async fn serve(
         redis_addr,
         offers.pop().unwrap(),
         ready,
+        fragment_stack,
     )
     .await
 }
@@ -441,88 +485,143 @@ async fn serve_canonical(
     redis_addr: SocketAddr,
     mut offer: Vec<StackNonce>,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
+    fragment_stack: bool,
 ) -> Result<(), Report> {
-    // 3. start canonical server
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
-    let shard_stack = CxList::from(
-        Select::from((
-            CxList::from(OrderedChunnelProj::default())
-                .wrap(ReliabilityProjChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
-            CxList::from(KvReliabilityServerChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
-        ))
-        .prefer_right(),
-    );
 
-    #[cfg(not(feature = "ebpf"))]
-    let cnsrv = burrito_shard_ctl::ShardCanonicalServer::new(
-        si.clone(),
-        None,
-        internal_cli,
-        shard_stack,
-        offer.pop().unwrap(),
-        &redis_addr,
-    )
-    .await
-    .wrap_err("Create ShardCanonicalServer")?;
+    macro_rules! serve_stack {
+        ($stack: expr) => {{
+            info!(shard_info = ?&si, "start canonical server");
+            let st = bertha::negotiate::negotiate_server($stack, st)
+                .instrument(info_span!("negotiate_server"))
+                .await
+                .wrap_err("negotiate_server")?;
 
-    #[cfg(feature = "ebpf")]
-    let cnsrv = burrito_shard_ctl::ShardCanonicalServerEbpf::new(
-        si.clone(),
-        None,
-        internal_cli,
-        shard_stack,
-        offer.pop().unwrap(),
-        &redis_addr,
-    )
-    .await
-    .wrap_err("Create ShardCanonicalServer")?;
-    let external = CxList::from(cnsrv).wrap(
-        Select::from((
-            CxList::from(OrderedChunnelProj::default())
-                .wrap(ReliabilityProjChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
-            CxList::from(KvReliabilityServerChunnel::default())
-                .wrap(SerializeChunnelProject::<Msg>::default()),
-        ))
-        .prefer_right(),
-    );
-    info!(shard_info = ?&si, "start canonical server");
-    let st = bertha::negotiate::negotiate_server(external, st)
-        .instrument(info_span!("negotiate_server"))
-        .await
-        .wrap_err("negotiate_server")?;
+            if let Some(ready) = ready.into() {
+                ready.send(()).unwrap_or_default();
+            }
 
-    if let Some(ready) = ready.into() {
-        ready.send(()).unwrap_or_default();
+            let mut ctr = 0usize;
+            tokio::pin!(st);
+            while let Some(r) = st
+                .try_next()
+                    .instrument(info_span!("negotiate_server"))
+                    .await?
+            {
+                tokio::spawn(async move {
+                    let ctr = ctr;
+                    loop {
+                        match r
+                            .recv() // ShardCanonicalServerConnection is recv-only
+                            .instrument(debug_span!("shard-canonical-server-connection", ?ctr))
+                            .await
+                            .wrap_err("kvstore/server: Error while processing requests")
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    warn!(err = ?e, ?ctr, "exiting");
+                                    break;
+                                }
+                            }
+                    }
+                });
+                ctr += 1;
+            }
+        }}
     }
 
-    let mut ctr = 0usize;
-    tokio::pin!(st);
-    while let Some(r) = st
-        .try_next()
-        .instrument(info_span!("negotiate_server"))
-        .await?
-    {
-        tokio::spawn(async move {
-            let ctr = ctr;
-            loop {
-                match r
-                    .recv() // ShardCanonicalServerConnection is recv-only
-                    .instrument(debug_span!("shard-canonical-server-connection", ?ctr))
-                    .await
-                    .wrap_err("kvstore/server: Error while processing requests")
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        warn!(err = ?e, ?ctr, "exiting");
-                        break;
-                    }
-                }
-            }
-        });
-        ctr += 1;
+    if fragment_stack {
+        let shard_stack = CxList::from(
+            Select::from((
+                CxList::from(OrderedChunnelProj::default())
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+                CxList::from(KvReliabilityServerChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+            ))
+            .prefer_right(),
+        );
+
+        #[cfg(not(feature = "ebpf"))]
+        let cnsrv = burrito_shard_ctl::ShardCanonicalServer::new(
+            si.clone(),
+            None,
+            internal_cli,
+            shard_stack,
+            offer.pop().unwrap(),
+            &redis_addr,
+        )
+        .await
+        .wrap_err("Create ShardCanonicalServer")?;
+
+        #[cfg(feature = "ebpf")]
+        let cnsrv = burrito_shard_ctl::ShardCanonicalServerEbpf::new(
+            si.clone(),
+            None,
+            internal_cli,
+            shard_stack,
+            offer.pop().unwrap(),
+            &redis_addr,
+        )
+        .await
+        .wrap_err("Create ShardCanonicalServer")?;
+        let external = CxList::from(cnsrv).wrap(
+            Select::from((
+                CxList::from(OrderedChunnelProj::default())
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+                CxList::from(KvReliabilityServerChunnel::default())
+                    .wrap(SerializeChunnelProject::<Msg>::default()),
+            ))
+            .prefer_right(),
+        );
+        serve_stack!(external);
+    } else {
+        let shard_stack = CxList::from(
+            Select::from((
+                CxList::from(OrderedChunnelProj::default())
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+                CxList::from(KvReliabilityServerChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+            ))
+            .prefer_right(),
+        );
+
+        #[cfg(not(feature = "ebpf"))]
+        let cnsrv = burrito_shard_ctl::ShardCanonicalServer::new(
+            si.clone(),
+            None,
+            internal_cli,
+            shard_stack,
+            offer.pop().unwrap(),
+            &redis_addr,
+        )
+        .await
+        .wrap_err("Create ShardCanonicalServer")?;
+
+        #[cfg(feature = "ebpf")]
+        let cnsrv = burrito_shard_ctl::ShardCanonicalServerEbpf::new(
+            si.clone(),
+            None,
+            internal_cli,
+            shard_stack,
+            offer.pop().unwrap(),
+            &redis_addr,
+        )
+        .await
+        .wrap_err("Create ShardCanonicalServer")?;
+        let external = CxList::from(cnsrv).wrap(
+            Select::from((
+                CxList::from(OrderedChunnelProj::default())
+                    .wrap(ReliabilityProjChunnel::default())
+                    .wrap(SerializeChunnelProject::default()),
+                CxList::from(KvReliabilityServerChunnel::default())
+                    .wrap(SerializeChunnelProject::<Msg>::default()),
+            ))
+            .prefer_right(),
+        );
+        serve_stack!(external);
     }
 
     unreachable!() // negotiate_server never returns None
@@ -688,9 +787,7 @@ mod udp_to_shard {
                         d.splice(0..19, std::iter::empty());
                         Ok((sa, d))
                     }
-                    _ => {
-                        Err(eyre!("Bad payload, no address"))
-                    }
+                    _ => Err(eyre!("Bad payload, no address")),
                 }
             })
         }

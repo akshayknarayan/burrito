@@ -27,6 +27,9 @@ struct Opt {
     num_shards: u16,
 
     #[structopt(short, long)]
+    fragment_stack: bool,
+
+    #[structopt(short, long)]
     log: bool,
 
     #[structopt(short, long)]
@@ -63,6 +66,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         opt.num_shards,
         None,
         opt.batch_mode,
+        opt.fragment_stack,
     )
     .instrument(info_span!("server"))
     .await
@@ -86,6 +90,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         opt.num_shards,
         None,
         opt.batch_mode,
+        opt.fragment_stack,
     )
     .instrument(info_span!("server"))
     .await
