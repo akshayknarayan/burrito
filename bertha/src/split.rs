@@ -1,17 +1,17 @@
-use super::{Chunnel, ChunnelConnection};
+use super::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::Report;
 use futures_util::future::{ready, Ready};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use tracing::debug;
+use tracing::{debug, warn};
 
 // before splits:
 // CxList<A, CxList<B, CxList<C, CxNil>>>.connect(Base) -> CConn<BConn< AConn<Base>>>
 //
 // with splits:
 // CxList<A, CxList<Split, CxList<B, CxList<Split, CxList<C, CxNil>>>>>.connect(Base)
-// -> [SplitCnTop<A<Base>>, SplitCnTop<BConn<SplitCnBottom>>, CConn<SplitCnBottom>] (3 threads)
+// -> [SplitCnTop<A<Base>>, SplitCnTop<BConn<SplitCnBottom>>, CConn<SplitCnBottom>] (3 fragments)
 //            ^----------channel--------------------^
 //                                 ^---------------channel-----------------^
 // how?
@@ -23,6 +23,14 @@ use tracing::debug;
 /// will be returned for either the application or to be split off again.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Split;
+
+impl Negotiate for Split {
+    type Capability = ();
+
+    fn guid() -> u64 {
+        0xd57da67aae24164b
+    }
+}
 
 impl Split {
     fn pair<S, D>(inner: S) -> SplitCnBottom<D, SplitCnTop<S, D>> {
@@ -80,6 +88,7 @@ where
             {
                 let mut chan_recv_fut = None;
                 let mut conn_recv_fut = None;
+                debug!(fragment = ?std::any::type_name::<InC>(), "starting stack fragment");
                 loop {
                     if chan_recv_fut.is_none() {
                         chan_recv_fut = Some(channel.recv.recv_async());
@@ -106,7 +115,7 @@ where
             }
 
             if let Err(err) = run(self.channel, self.cn).await {
-                tracing::warn!(?err, "SplitCnTop loop errored");
+                warn!(?err, fragment = ?std::any::type_name::<InC>(), "stack fragment errored");
                 Ok(())
             } else {
                 unreachable!()
@@ -194,11 +203,14 @@ mod t {
     use crate::chan_transport::Chan;
     use crate::test::Serve;
     use crate::{
-        bincode::SerializeChunnel, reliable::ReliabilityChunnel, tagger::OrderedChunnel, Chunnel,
-        ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
+        bincode::SerializeChunnel, bincode::SerializeChunnelProject, reliable::ReliabilityChunnel,
+        reliable::ReliabilityProjChunnel, tagger::OrderedChunnel, tagger::OrderedChunnelProj,
+        util::ProjectLeft, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     };
-    use futures_util::StreamExt;
-    use tracing::{debug, info};
+    use crate::{negotiate_client, negotiate_server};
+    use futures_util::{StreamExt, TryStreamExt};
+    use tokio::sync::mpsc;
+    use tracing::{debug, info, info_span};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -222,6 +234,7 @@ mod t {
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
                 let mut stack = CxList::from(OrderedChunnel::default())
+                    .wrap(Split::default())
                     .wrap(ReliabilityChunnel::default())
                     .wrap(Split::default())
                     .wrap(SerializeChunnel::default());
@@ -233,6 +246,8 @@ mod t {
                 let cln = cln.connect(()).await.unwrap();
                 let snd = stack.connect_wrap(cln).await.unwrap();
 
+                let (done_s, mut done_r) = mpsc::channel(3);
+
                 // recv side
                 tokio::spawn(
                     async move {
@@ -240,9 +255,10 @@ mod t {
                         loop {
                             let m = rcv.recv().await.unwrap();
                             debug!(m = ?m, "rcvd");
+                            done_s.send(()).await.unwrap();
                         }
                     }
-                    .instrument(tracing::info_span!("receiver")),
+                    .instrument(info_span!("receiver")),
                 );
 
                 futures_util::future::join_all(msgs.into_iter().map(|m| {
@@ -254,9 +270,83 @@ mod t {
                 .collect::<Result<(), _>>()
                 .unwrap();
 
+                done_r.recv().await.unwrap();
+                done_r.recv().await.unwrap();
+                done_r.recv().await.unwrap();
                 info!("done");
             }
-            .instrument(tracing::info_span!("split_stack")),
+            .instrument(info_span!("split_stack")),
+        );
+    }
+
+    #[test]
+    fn negotiate_split_stack_test() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        color_eyre::install().unwrap_or(());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let msgs = vec![vec![0u8; 10], vec![1u8; 10], vec![2u8; 10]];
+        let (mut srv, mut cln) = Chan::default().split();
+        let cli_stack = CxList::from(OrderedChunnelProj::default())
+            .wrap(Split::default())
+            .wrap(ReliabilityProjChunnel::default())
+            .wrap(Split::default())
+            .wrap(SerializeChunnelProject::default());
+        let srv_stack = cli_stack.clone();
+        let (done_s, mut done_r) = mpsc::channel(3);
+
+        rt.block_on(
+            async move {
+                // recv side
+                tokio::spawn(
+                    async move {
+                        let raw_rcv_st = srv.listen(()).await.unwrap();
+                        let rcv_st = negotiate_server(srv_stack, raw_rcv_st).await.unwrap();
+                        rcv_st
+                            .try_for_each_concurrent(None, |cn| {
+                                let done = done_s.clone();
+                                async move {
+                                    info!("starting receiver");
+                                    let cn = ProjectLeft::new((), cn);
+                                    loop {
+                                        let m = cn.recv().await?;
+                                        debug!(m = ?m, "rcvd");
+                                        done.send(()).await?;
+                                    }
+                                }
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    .instrument(info_span!("receiver")),
+                );
+
+                let raw_cli_cn = cln.connect(()).await.unwrap();
+                let snd = negotiate_client(cli_stack, raw_cli_cn, ()).await.unwrap();
+                let snd = ProjectLeft::new((), snd);
+
+                futures_util::future::join_all(msgs.into_iter().map(|m| {
+                    debug!(m = ?m, "sending");
+                    snd.send(m)
+                }))
+                .await
+                .into_iter()
+                .collect::<Result<(), _>>()
+                .unwrap();
+
+                done_r.recv().await.unwrap();
+                done_r.recv().await.unwrap();
+                done_r.recv().await.unwrap();
+                info!("done");
+            }
+            .instrument(info_span!("split_stack")),
         );
     }
 }
