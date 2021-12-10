@@ -42,6 +42,9 @@ struct Opt {
     #[structopt(long)]
     max_send_batching: Option<usize>,
 
+    #[structopt(long)]
+    fragment_stack: bool,
+
     #[structopt(short, long)]
     logging: bool,
 
@@ -166,156 +169,144 @@ fn main() -> Result<(), Report> {
             info!("skipping loads");
         }
 
+        macro_rules! run_exp {
+            ($client: expr) => {{
+                let mut access_by_client = HashMap::default();
+                for (cid, ops) in group_by_client(accesses).into_iter() {
+                    access_by_client.insert(
+                        cid,
+                        (($client)(cid).await.map_err::<Report, _>(Into::into)?, ops),
+                    );
+                }
+                let num_clients = access_by_client.len();
+                (
+                    num_clients,
+                    do_requests(
+                        access_by_client,
+                        opt.interarrival_client_micros as _,
+                        opt.poisson_arrivals,
+                    )
+                    .await?,
+                )
+            }};
+        }
+
         let (num_clients, (durs, remaining_inflight, time)) = if let Some(maxb) =
             opt.max_send_batching
         {
             if !opt.use_clientsharding {
                 if !opt.use_basicclient {
-                    let mut access_by_client = HashMap::default();
-                    info!(mode = "nonshardclient", "make clients");
-                    for (cid, ops) in group_by_client(accesses).into_iter() {
-                        let client = KvClientBuilder::new(opt.addr)
-                            .set_batching()
-                            .new_nonshardclient(
-                                ctr.clone().connect(()).await.map_err(Into::into)?,
-                                maxb,
+                    info!(mode = "nonshardclient", batching = ?maxb, "make clients");
+                    let make_client = |cid| {
+                        let ctr = &ctr;
+                        async move {
+                            Ok::<_, Report>(
+                                KvClientBuilder::new(opt.addr)
+                                    .set_batching()
+                                    .new_nonshardclient(
+                                        ctr.clone().connect(()).await.map_err(Into::into)?,
+                                        maxb,
+                                    )
+                                    .instrument(info_span!("make kvclient", client_id = ?cid))
+                                    .await
+                                    .wrap_err("make KvClient")?,
                             )
-                            .instrument(info_span!("make kvclient", client_id = ?cid))
-                            .await
-                            .wrap_err("make KvClient")?;
-                        access_by_client.insert(cid, (client, ops));
-                    }
-                    let num_clients = access_by_client.len();
-                    (
-                        num_clients,
-                        do_requests(
-                            access_by_client,
-                            opt.interarrival_client_micros as _,
-                            opt.poisson_arrivals,
-                        )
-                        .await?,
-                    )
+                        }
+                    };
+                    run_exp!(make_client)
                 } else {
-                    let mut access_by_client = HashMap::default();
-                    info!(mode = "basicclient", "make clients");
-                    for (cid, ops) in group_by_client(accesses).into_iter() {
-                        let client = KvClientBuilder::new(opt.addr)
-                            .set_batching()
-                            .new_basicclient(
-                                ctr.clone().connect(()).await.map_err(Into::into)?,
-                                maxb,
+                    info!(mode = "basicclient", batching = ?maxb, "make clients");
+                    let make_client = |cid| {
+                        let ctr = &ctr;
+                        async move {
+                            Ok::<_, Report>(
+                                KvClientBuilder::new(opt.addr)
+                                    .set_batching()
+                                    .new_basicclient(
+                                        ctr.clone().connect(()).await.map_err(Into::into)?,
+                                        maxb,
+                                    )
+                                    .instrument(info_span!("make kvclient", client_id = ?cid))
+                                    .await
+                                    .wrap_err("make KvClient")?,
                             )
-                            .instrument(info_span!("make kvclient", client_id = ?cid))
-                            .await
-                            .wrap_err("make KvClient")?;
-                        access_by_client.insert(cid, (client, ops));
-                    }
-                    let num_clients = access_by_client.len();
-                    (
-                        num_clients,
-                        do_requests(
-                            access_by_client,
-                            opt.interarrival_client_micros as _,
-                            opt.poisson_arrivals,
-                        )
-                        .await?,
-                    )
+                        }
+                    };
+                    run_exp!(make_client)
                 }
             } else {
-                let mut access_by_client = HashMap::default();
-                info!(mode = "shardclient", "make clients");
-                for (cid, ops) in group_by_client(accesses).into_iter() {
-                    let client = KvClientBuilder::new(opt.addr)
-                        .set_batching()
-                        .new_shardclient(
-                            ctr.clone().connect(()).await.map_err(Into::into)?,
-                            opt.redis_addr,
-                            maxb,
+                info!(mode = "shardclient", batching = ?maxb, "make clients");
+                let make_client = |cid| {
+                    let ctr = &ctr;
+                    async move {
+                        Ok::<_, Report>(
+                            KvClientBuilder::new(opt.addr)
+                                .set_batching()
+                                .new_shardclient(
+                                    ctr.clone().connect(()).await.map_err(Into::into)?,
+                                    opt.redis_addr,
+                                    maxb,
+                                )
+                                .instrument(info_span!("make kvclient", client_id = ?cid))
+                                .await
+                                .wrap_err("make KvClient")?,
                         )
-                        .instrument(info_span!("make kvclient", client_id = ?cid))
-                        .await
-                        .wrap_err("make KvClient")?;
-                    access_by_client.insert(cid, (client, ops));
-                }
-                let num_clients = access_by_client.len();
-                (
-                    num_clients,
-                    do_requests(
-                        access_by_client,
-                        opt.interarrival_client_micros as _,
-                        opt.poisson_arrivals,
-                    )
-                    .await?,
-                )
+                    }
+                };
+                run_exp!(make_client)
             }
         } else if !opt.use_clientsharding {
             if !opt.use_basicclient {
-                let mut access_by_client = HashMap::default();
-                info!(mode = "nonshardclient", "make clients");
-                for (cid, ops) in group_by_client(accesses).into_iter() {
-                    let client = KvClientBuilder::new(opt.addr)
-                        .new_nonshardclient(ctr.clone().connect(()).await.map_err(Into::into)?)
-                        .instrument(info_span!("make kvclient", client_id = ?cid))
-                        .await
-                        .wrap_err("make KvClient")?;
-                    access_by_client.insert(cid, (client, ops));
-                }
-                let num_clients = access_by_client.len();
-                (
-                    num_clients,
-                    do_requests(
-                        access_by_client,
-                        opt.interarrival_client_micros as _,
-                        opt.poisson_arrivals,
-                    )
-                    .await?,
-                )
+                info!(mode = "nonshardclient", batching = "no", "make clients");
+                let make_client = |cid| {
+                    let ctr = &ctr;
+                    async move {
+                        Ok::<_, Report>(
+                            KvClientBuilder::new(opt.addr)
+                                .new_nonshardclient(
+                                    ctr.clone().connect(()).await.map_err(Into::into)?,
+                                )
+                                .instrument(info_span!("make kvclient", client_id = ?cid))
+                                .await
+                                .wrap_err("make KvClient")?,
+                        )
+                    }
+                };
+                run_exp!(make_client)
             } else {
-                let mut access_by_client = HashMap::default();
-                info!(mode = "basicclient", "make clients");
-                for (cid, ops) in group_by_client(accesses).into_iter() {
-                    let client = KvClientBuilder::new(opt.addr)
-                        .new_basicclient(ctr.clone().connect(()).await.map_err(Into::into)?)
-                        .instrument(info_span!("make kvclient", client_id = ?cid))
-                        .await
-                        .wrap_err("make KvClient")?;
-                    access_by_client.insert(cid, (client, ops));
-                }
-                let num_clients = access_by_client.len();
-                (
-                    num_clients,
-                    do_requests(
-                        access_by_client,
-                        opt.interarrival_client_micros as _,
-                        opt.poisson_arrivals,
-                    )
-                    .await?,
-                )
+                info!(mode = "basicclient", batching = "no", "make clients");
+                let make_client = |cid| {
+                    let ctr = &ctr;
+                    async move {
+                        Ok::<_, Report>(
+                            KvClientBuilder::new(opt.addr)
+                                .new_basicclient(ctr.clone().connect(()).await.map_err(Into::into)?)
+                                .instrument(info_span!("make kvclient", client_id = ?cid))
+                                .await
+                                .wrap_err("make KvClient")?,
+                        )
+                    }
+                };
+                run_exp!(make_client)
             }
         } else {
-            let mut access_by_client = HashMap::default();
-            info!(mode = "shardclient", "make clients");
-            for (cid, ops) in group_by_client(accesses).into_iter() {
-                let client = KvClientBuilder::new(opt.addr)
-                    .new_shardclient(
-                        ctr.clone().connect(()).await.map_err(Into::into)?,
-                        opt.redis_addr,
+            info!(mode = "shardclient", batching = "no", "make clients");
+            let make_client = |cid| {
+                let ctr = &ctr;
+                async move {
+                    Ok::<_, Report>(
+                        KvClientBuilder::new(opt.addr)
+                            .new_shardclient(
+                                ctr.clone().connect(()).await.map_err(Into::into)?,
+                                opt.redis_addr,
+                            )
+                            .instrument(info_span!("make kvclient", client_id = ?cid))
+                            .await
+                            .wrap_err("make KvClient")?,
                     )
-                    .instrument(info_span!("make kvclient", client_id = ?cid))
-                    .await
-                    .wrap_err("make KvClient")?;
-                access_by_client.insert(cid, (client, ops));
-            }
-            let num_clients = access_by_client.len();
-            (
-                num_clients,
-                do_requests(
-                    access_by_client,
-                    opt.interarrival_client_micros as _,
-                    opt.poisson_arrivals,
-                )
-                .await?,
-            )
+                }
+            };
+            run_exp!(make_client)
         };
 
         // done
