@@ -235,25 +235,47 @@ fn main() -> Result<(), Report> {
                     run_exp!(make_client)
                 }
             } else {
-                info!(mode = "shardclient", batching = ?maxb, "make clients");
-                let make_client = |cid| {
-                    let ctr = &ctr;
-                    async move {
-                        Ok::<_, Report>(
-                            KvClientBuilder::new(opt.addr)
-                                .set_batching()
-                                .new_shardclient(
-                                    ctr.clone().connect(()).await.map_err(Into::into)?,
-                                    opt.redis_addr,
-                                    maxb,
-                                )
-                                .instrument(info_span!("make kvclient", client_id = ?cid))
-                                .await
-                                .wrap_err("make KvClient")?,
-                        )
-                    }
-                };
-                run_exp!(make_client)
+                info!(mode = "shardclient", batching = ?maxb, fragment_stack = ?opt.fragment_stack, "make clients");
+                if opt.fragment_stack {
+                    let make_client = |cid| {
+                        let ctr = &ctr;
+                        async move {
+                            Ok::<_, Report>(
+                                KvClientBuilder::new(opt.addr)
+                                    .set_batching()
+                                    .set_stack_fragmentation()
+                                    .new_shardclient(
+                                        ctr.clone().connect(()).await.map_err(Into::into)?,
+                                        opt.redis_addr,
+                                        maxb,
+                                    )
+                                    .instrument(info_span!("make kvclient", client_id = ?cid))
+                                    .await
+                                    .wrap_err("make KvClient")?,
+                            )
+                        }
+                    };
+                    run_exp!(make_client)
+                } else {
+                    let make_client = |cid| {
+                        let ctr = &ctr;
+                        async move {
+                            Ok::<_, Report>(
+                                KvClientBuilder::new(opt.addr)
+                                    .set_batching()
+                                    .new_shardclient(
+                                        ctr.clone().connect(()).await.map_err(Into::into)?,
+                                        opt.redis_addr,
+                                        maxb,
+                                    )
+                                    .instrument(info_span!("make kvclient", client_id = ?cid))
+                                    .await
+                                    .wrap_err("make KvClient")?,
+                            )
+                        }
+                    };
+                    run_exp!(make_client)
+                }
             }
         } else if !opt.use_clientsharding {
             if !opt.use_basicclient {
@@ -290,23 +312,43 @@ fn main() -> Result<(), Report> {
                 run_exp!(make_client)
             }
         } else {
-            info!(mode = "shardclient", batching = "no", "make clients");
-            let make_client = |cid| {
-                let ctr = &ctr;
-                async move {
-                    Ok::<_, Report>(
-                        KvClientBuilder::new(opt.addr)
-                            .new_shardclient(
-                                ctr.clone().connect(()).await.map_err(Into::into)?,
-                                opt.redis_addr,
-                            )
-                            .instrument(info_span!("make kvclient", client_id = ?cid))
-                            .await
-                            .wrap_err("make KvClient")?,
-                    )
-                }
-            };
-            run_exp!(make_client)
+            info!(mode = "shardclient", batching = "no", fragment_stack = ?opt.fragment_stack, "make clients");
+            if opt.fragment_stack {
+                let make_client = |cid| {
+                    let ctr = &ctr;
+                    async move {
+                        Ok::<_, Report>(
+                            KvClientBuilder::new(opt.addr)
+                            .set_stack_fragmentation()
+                                .new_shardclient(
+                                    ctr.clone().connect(()).await.map_err(Into::into)?,
+                                    opt.redis_addr,
+                                )
+                                .instrument(info_span!("make kvclient", client_id = ?cid))
+                                .await
+                                .wrap_err("make KvClient")?,
+                        )
+                    }
+                };
+                run_exp!(make_client)
+            } else {
+                let make_client = |cid| {
+                    let ctr = &ctr;
+                    async move {
+                        Ok::<_, Report>(
+                            KvClientBuilder::new(opt.addr)
+                                .new_shardclient(
+                                    ctr.clone().connect(()).await.map_err(Into::into)?,
+                                    opt.redis_addr,
+                                )
+                                .instrument(info_span!("make kvclient", client_id = ?cid))
+                                .await
+                                .wrap_err("make KvClient")?,
+                        )
+                    }
+                };
+                run_exp!(make_client)
+            }
         };
 
         // done
