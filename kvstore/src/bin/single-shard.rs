@@ -18,6 +18,9 @@ struct Opt {
     batch_mode: kvstore::BatchMode,
 
     #[structopt(short, long)]
+    fragment_stack: bool,
+
+    #[structopt(short, long)]
     shenango_cfg: std::path::PathBuf,
 
     #[structopt(short, long)]
@@ -44,6 +47,7 @@ async fn main() -> Result<(), Report> {
         opt.internal_addr,
         listener,
         true,
+        opt.fragment_stack,
         None,
         opt.batch_mode,
     )
