@@ -197,9 +197,9 @@ def write_shenango_config(conn):
 host_addr {conn.addr}
 host_netmask 255.255.255.0
 host_gateway 10.1.1.1
-runtime_kthreads 3
-runtime_spininng_kthreads 3
-    """
+runtime_kthreads 2
+runtime_spininng_kthreads 2
+runtime_guaranteed_kthreads 2"""
     from random import randint
     fname = randint(1,1000)
     fname = f"{fname}.config"
@@ -219,16 +219,16 @@ def get_timeout(wrkfile, interarrival_us):
         total_time_s = num_reqs * interarrival_us / 1e6
         return max(int(total_time_s * 2), 180)
 
-def start_server(conn, redis_addr, outf, shards=1, ebpf=False, server_batch="none"):
+def start_server(conn, redis_addr, outf, shards=1, ebpf=False, server_batch="none", stack_frag=False):
     conn.run("sudo pkill -9 kvserver-ebpf")
     conn.run("sudo pkill -9 kvserver-noebpf")
-    conn.run("sudo pkill -9 iokerneld")
+    conn.run("sudo pkill -INT iokerneld")
 
     write_shenango_config(conn)
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     with_ebpf = "ebpf" if ebpf else "noebpf"
-    ok = conn.run(f"RUST_LOG=info,kvstore=debug ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --batch-mode={server_batch} --log --trace-time={outf}.trace",
+    ok = conn.run(f"RUST_LOG=info,kvstore=debug,bertha=debug ./target/release/kvserver-{with_ebpf} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --batch-mode={server_batch} {'--fragment-stack' if stack_frag else ''} --log --trace-time={outf}.trace",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -240,8 +240,8 @@ def start_server(conn, redis_addr, outf, shards=1, ebpf=False, server_batch="non
     time.sleep(8)
     conn.check_proc(f"kvserver-{with_ebpf}", f"{outf}.err")
 
-def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, batch, shardtype, outf, wrkfile):
-    conn.run("sudo pkill -9 iokerneld")
+def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, batch, shardtype, stack_frag, outf, wrkfile):
+    conn.run("sudo pkill -INT iokerneld")
 
     timeout = get_timeout(wrkfile, interarrival)
     write_shenango_config(conn)
@@ -260,7 +260,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, batch, 
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info,ycsb=debug ./target/release/ycsb \
+    ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug ./target/release/ycsb \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
             -i {interarrival} \
@@ -270,6 +270,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, batch, 
             {batch_arg} \
             {poisson_arg} \
             {shard_arg} \
+            {'--fragment-stack' if stack_frag else ''} \
             --logging --tracing --skip-loads",
         wd="~/burrito",
         stdout=f"{outf}0.out",
@@ -277,7 +278,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, batch, 
         timeout=timeout,
         )
     check(ok, "client", conn.addr)
-    conn.run("sudo pkill -9 iokerneld")
+    conn.run("sudo pkill -INT iokerneld")
     agenda.subtask("client done")
 
 def start_redis(machine, use_sudo=False):
@@ -295,7 +296,7 @@ def start_redis(machine, use_sudo=False):
     return f"{machine.alt}:6379"
 
 def run_loads(conn, server, redis_addr, outf, wrkfile):
-    conn.run("sudo pkill -9 iokerneld")
+    conn.run("sudo pkill -INT iokerneld")
 
     write_shenango_config(conn)
     while True:
@@ -305,7 +306,7 @@ def run_loads(conn, server, redis_addr, outf, wrkfile):
         agenda.subtask(f"loads client starting")
         ok = None
         try:
-            ok = conn.run(f"RUST_LOG=info,ycsb=debug ./target/release/ycsb \
+            ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug ./target/release/ycsb \
                     --addr {server}:4242 \
                     --redis-addr={redis_addr} \
                     -i 1000 \
@@ -320,7 +321,7 @@ def run_loads(conn, server, redis_addr, outf, wrkfile):
         except:
             agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
         finally:
-            conn.run("sudo pkill -9 iokerneld")
+            conn.run("sudo pkill -INT iokerneld")
         if ok is None or ok.exited != 0:
             agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
             continue
@@ -337,6 +338,7 @@ def do_exp(iter_num,
     client_batch=None,
     server_batch=None,
     poisson_arrivals=None,
+    stack_frag=None,
     wrkload=None,
     overwrite=None
 ):
@@ -349,13 +351,14 @@ def do_exp(iter_num,
         client_batch is not None and
         server_batch is not None and
         poisson_arrivals is not None and
+        stack_frag is not None and
         wrkload is not None and
         overwrite is not None
     )
 
     wrkname = wrkload.split("/")[-1].split(".")[0]
-    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-clientbatch={client_batch}-server_batch={server_batch}-{wrkname}-{iter_num}-kvserver"
-    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch={client_batch}-server_batch={server_batch}-{wrkname}-{iter_num}-client"
+    server_prefix = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-clientbatch={client_batch}-server_batch={server_batch}-stackfrag={stack_frag}-{wrkname}-{iter_num}-kvserver"
+    outf = f"{outdir}/{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch={client_batch}-server_batch={server_batch}-stackfrag={stack_frag}-{wrkname}-{iter_num}-client"
 
     for m in machines:
         if m.local:
@@ -365,7 +368,7 @@ def do_exp(iter_num,
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
     if not overwrite and os.path.exists(f"{outf}0-{machines[1].addr}.data"):
-        agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, client_batch = {client_batch}, server_batch = {server_batch}, load = {ops_per_sec} ops/s")
+        agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, client_batch = {client_batch}, server_batch = {server_batch}, stack_fragmentation = {stack_frag}, load = {ops_per_sec} ops/s")
         return True
     else:
         agenda.task(f"running: {outf}0-{machines[1].addr}.data")
@@ -388,7 +391,7 @@ def do_exp(iter_num,
     # first one is the server, start the server
     agenda.subtask("starting server")
     redis_port = redis_addr.split(":")[-1]
-    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, shards=num_shards, ebpf=False, server_batch=server_batch)
+    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, shards=num_shards, ebpf=False, server_batch=server_batch, stack_frag=stack_frag)
     time.sleep(5)
     # prime the server with loads
     agenda.task("doing loads")
@@ -409,6 +412,7 @@ def do_exp(iter_num,
             poisson_arrivals,
             client_batch,
             shardtype,
+            stack_frag,
             outf,
             wrkload
         ),
@@ -421,7 +425,7 @@ def do_exp(iter_num,
     # kill the server
     machines[0].run("sudo pkill -9 kvserver-ebpf")
     machines[0].run("sudo pkill -9 kvserver-noebpf")
-    machines[0].run("sudo pkill -9 iokerneld")
+    machines[0].run("sudo pkill -INT iokerneld")
 
     for m in machines:
         m.run("rm ~/burrito/*.config")
@@ -437,10 +441,10 @@ def do_exp(iter_num,
             agenda.subtask(f"Use get_local: {c.host}")
             fn = get_local
 
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.data")
+        agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
         fn(
-            f"burrito/{outf}{num}.data",
-            local=f"{outf}{num}-{c.addr}.data",
+            f"burrito/{outf}{num}.err",
+            local=f"{outf}{num}-{c.addr}.err",
             preserve_mode=False,
         )
         agenda.subtask(f"getting {outf}{num}-{c.addr}.out")
@@ -449,16 +453,16 @@ def do_exp(iter_num,
             local=f"{outf}{num}-{c.addr}.out",
             preserve_mode=False,
         )
+        agenda.subtask(f"getting {outf}{num}-{c.addr}.data")
+        fn(
+            f"burrito/{outf}{num}.data",
+            local=f"{outf}{num}-{c.addr}.data",
+            preserve_mode=False,
+        )
         agenda.subtask(f"getting {outf}{num}-{c.addr}.trace")
         fn(
             f"burrito/{outf}{num}.trace",
             local=f"{outf}{num}-{c.addr}.trace",
-            preserve_mode=False,
-        )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
-        fn(
-            f"burrito/{outf}{num}.err",
-            local=f"{outf}{num}-{c.addr}.err",
             preserve_mode=False,
         )
 
@@ -553,24 +557,26 @@ if __name__ == '__main__':
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
 
-    for w in cfg['exp']['wrk']:
-        for s in cfg['exp']['shards']:
-            for t in cfg['exp']['shardtype']:
-                for o in ops_per_sec:
-                    for cb in cfg['exp']['client-batching']:
-                        for sb in cfg['exp']['server-batching']:
-                            for p in cfg['exp']['poisson-arrivals']:
-                                do_exp(0,
-                                    outdir=outdir,
-                                    machines=machines,
-                                    num_shards=s,
-                                    shardtype=t,
-                                    ops_per_sec=o,
-                                    client_batch=cb,
-                                    server_batch=sb,
-                                    poisson_arrivals=p,
-                                    wrkload=w,
-                                    overwrite=args.overwrite
-                                )
+    for frag in cfg['exp']['stack-fragmentation']:
+        for w in cfg['exp']['wrk']:
+            for s in cfg['exp']['shards']:
+                for t in cfg['exp']['shardtype']:
+                    for p in cfg['exp']['poisson-arrivals']:
+                        for o in ops_per_sec:
+                            for cb in cfg['exp']['client-batching']:
+                                for sb in cfg['exp']['server-batching']:
+                                    do_exp(0,
+                                        outdir=outdir,
+                                        machines=machines,
+                                        num_shards=s,
+                                        shardtype=t,
+                                        ops_per_sec=o,
+                                        client_batch=cb,
+                                        server_batch=sb,
+                                        poisson_arrivals=p,
+                                        stack_frag = frag,
+                                        wrkload=w,
+                                        overwrite=args.overwrite
+                                    )
 
     agenda.task("done")
