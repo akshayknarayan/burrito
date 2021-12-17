@@ -8,3 +8,6 @@
 [submodule "shenango-chunnel/caladan"]
 	path = shenango-chunnel/caladan
 	url = https://github.com/akshayknarayan/caladan
+[submodule "rdma-chunnel/io-queue-rdma"]
+	path = rdma-chunnel/io-queue-rdma
+	url = https://github.com/akshayknarayan/io-queue-rdma
