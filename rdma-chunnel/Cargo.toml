@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bertha = { path = "../bertha" }
+io-queue-rdma = { path = "./io-queue-rdma" }
+tracing = { version = "0.1" }
+tracing-futures = "0.2"
+color-eyre = "0.5"
+flume = "0.10"
+futures-util = "0.3"
+lazy_static = "1"
+nix = "0.21"
