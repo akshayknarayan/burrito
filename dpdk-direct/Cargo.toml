@@ -12,3 +12,11 @@ color-eyre = "0.5"
 flume = "0.10"
 futures-util = "0.3"
 lazy_static = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tracing-subscriber = "0.2"
+tracing-error = "0.1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+structopt = "0.3"
