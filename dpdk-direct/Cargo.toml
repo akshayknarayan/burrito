@@ -1,0 +1,14 @@
+[package]
+name = "dpdk-direct"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dpdk-wrapper = { path = "../../dpdk-wrapper" }
+bertha = { path = "../bertha" }
+tracing = "0.1"
+tracing-futures = "0.2"
+color-eyre = "0.5"
+flume = "0.10"
+futures-util = "0.3"
+lazy_static = "1"

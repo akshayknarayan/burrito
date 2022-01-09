@@ -8,3 +8,6 @@
 [submodule "shenango-chunnel/caladan"]
 	path = shenango-chunnel/caladan
 	url = https://github.com/akshayknarayan/caladan
+[submodule "dpdk-direct/dpdk-wrapper"]
+	path = dpdk-direct/dpdk-wrapper
+	url = https://github.com/akshayknarayan/dpdk-wrapper

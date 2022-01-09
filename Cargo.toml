@@ -9,6 +9,7 @@ members = [
     "kvstore-ycsb",
     "rpcbench",
     "shenango-chunnel",
+    "dpdk-direct",
     "test-util",
     "xdp-shard",
     "az-queues",
