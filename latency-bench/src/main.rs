@@ -2,9 +2,9 @@
 
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use dpdk_direct::DpdkUdpSkChunnel;
+use dpdk_direct::{DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use futures_util::stream::{StreamExt, TryStreamExt};
-use shenango_chunnel::ShenangoUdpSkChunnel;
+use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -48,7 +48,7 @@ impl std::str::FromStr for Mode {
 }
 
 impl Mode {
-    fn run<C>(self, sk: C, port: u16, client: Option<Ipv4Addr>) -> Result<(), Report>
+    async fn run_client<C>(self, sk: C, port: u16, ip: Ipv4Addr) -> Result<(), Report>
     where
         C: ChunnelListener<Addr = SocketAddr, Error = Report>
             + ChunnelConnector<Addr = (), Error = Report>,
@@ -58,37 +58,35 @@ impl Mode {
         <C as ChunnelConnector>::Connection:
             ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + 'static,
     {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()?;
+        let mut times = match self {
+            Mode::Echo => do_echo_client(sk, SocketAddrV4::new(ip, port))
+                .await
+                .unwrap(),
+            Mode::ConnEcho => do_conn_client(sk, SocketAddrV4::new(ip, port))
+                .await
+                .unwrap(),
+        };
+        let (p5, p25, p50, p75, p95) = percentiles_us(&mut times);
+        info!(?p5, ?p25, ?p50, ?p75, ?p95, "done");
+        println!(
+            "p5={:?}, p25={:?}, p50={:?}, p75={:?}, p95={:?}",
+            p5, p25, p50, p75, p95
+        );
+        std::process::exit(0);
+    }
 
-        rt.block_on(async move {
-            match client {
-                Some(ip) => {
-                    let mut times = match self {
-                        Mode::Echo => do_echo_client(sk, SocketAddrV4::new(ip, port))
-                            .await
-                            .unwrap(),
-                        Mode::ConnEcho => do_conn_client(sk, SocketAddrV4::new(ip, port))
-                            .await
-                            .unwrap(),
-                    };
-                    let (p5, p25, p50, p75, p95) = percentiles_us(&mut times);
-                    info!(?p5, ?p25, ?p50, ?p75, ?p95, "done");
-                    println!(
-                        "p5={:?}, p25={:?}, p50={:?}, p75={:?}, p95={:?}",
-                        p5, p25, p50, p75, p95
-                    );
-                    std::process::exit(0);
-                }
-                None => match self {
-                    Mode::Echo => do_echo_server(sk, port).await.unwrap(),
-                    Mode::ConnEcho => do_conn_server(sk, port).await.unwrap(),
-                },
-            }
-        });
-        Ok(())
+    async fn run_server<C>(self, sk: C, port: u16) -> Result<(), Report>
+    where
+        C: ChunnelListener<Addr = SocketAddr, Error = Report>,
+        <C as ChunnelListener>::Stream: Unpin,
+        <C as ChunnelListener>::Connection:
+            ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + 'static,
+    {
+        match self {
+            Mode::Echo => do_echo_server(sk, port).await?,
+            Mode::ConnEcho => do_conn_server(sk, port).await?,
+        }
+        unreachable!()
     }
 }
 
@@ -126,17 +124,52 @@ fn main() -> Result<(), Report> {
         backend,
     } = Opt::from_args();
 
-    match backend {
-        Backend::Dpdk => {
-            let ch = DpdkUdpSkChunnel::new(cfg)?;
-            mode.run(ch, port, client)?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async move {
+        if let Some(ip) = client {
+            match backend {
+                Backend::Dpdk => {
+                    let ch = DpdkUdpSkChunnel::new(cfg)?;
+                    mode.run_client(ch, port, ip).await?;
+                }
+                Backend::Shenango => {
+                    let ch = ShenangoUdpSkChunnel::new(&cfg);
+                    mode.run_client(ch, port, ip).await?;
+                }
+            }
+        } else {
+            match backend {
+                Backend::Dpdk => match mode {
+                    Mode::Echo => {
+                        let ch = DpdkUdpSkChunnel::new(cfg)?;
+                        mode.run_server(ch, port).await?;
+                    }
+                    Mode::ConnEcho => {
+                        let ch = DpdkUdpSkChunnel::new(cfg)?;
+                        let ch = DpdkUdpReqChunnel(ch);
+                        mode.run_server(ch, port).await?;
+                    }
+                },
+                Backend::Shenango => match mode {
+                    Mode::Echo => {
+                        let ch = ShenangoUdpSkChunnel::new(&cfg);
+                        mode.run_server(ch, port).await?;
+                    }
+                    Mode::ConnEcho => {
+                        let ch = ShenangoUdpSkChunnel::new(&cfg);
+                        let ch = ShenangoUdpReqChunnel(ch);
+                        mode.run_server(ch, port).await?;
+                    }
+                },
+            }
         }
-        Backend::Shenango => {
-            let ch = ShenangoUdpSkChunnel::new(&cfg);
-            mode.run(ch, port, client)?;
-        }
-    }
-    Ok(())
+
+        Ok::<_, Report>(())
+    })
 }
 
 #[tracing::instrument(err, skip(ch))]
