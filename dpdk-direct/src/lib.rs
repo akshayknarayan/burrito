@@ -2,7 +2,7 @@
 
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use dpdk_wrapper::{DpdkConn, DpdkIoKernel, DpdkIoKernelHandle};
+use dpdk_wrapper::{BoundDpdkConn, DpdkConn, DpdkIoKernel, DpdkIoKernelHandle};
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -126,5 +126,66 @@ impl ChunnelConnection for DpdkUdpSk {
             let (a, d) = fut.await?;
             Ok((SocketAddr::V4(a), d))
         })
+    }
+}
+
+pub struct BoundDpdkUdpSk(BoundDpdkConn);
+
+impl std::fmt::Debug for BoundDpdkUdpSk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundDpdkUdpSk").finish()
+    }
+}
+
+impl ChunnelConnection for BoundDpdkUdpSk {
+    type Data = (SocketAddr, Vec<u8>);
+
+    fn send(
+        &self,
+        data: Self::Data,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+        use SocketAddr::*;
+        match data {
+            (V4(addr), d) => {
+                let fut = self.0.send_async(addr, d);
+                Box::pin(fut)
+            }
+            (V6(a), _) => Box::pin(futures_util::future::ready(Err(eyre!(
+                "Only IPv4 is supported: {:?}",
+                a
+            )))),
+        }
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+        let fut = self.0.recv_async();
+        Box::pin(async move {
+            let (a, d) = fut.await?;
+            Ok((SocketAddr::V4(a), d))
+        })
+    }
+}
+
+pub struct DpdkUdpReqChunnel(pub DpdkUdpSkChunnel);
+impl ChunnelListener for DpdkUdpReqChunnel {
+    type Addr = SocketAddr;
+    type Connection = BoundDpdkUdpSk;
+    type Future = futures_util::future::Ready<Result<Self::Stream, Self::Error>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Report;
+
+    fn listen(&mut self, addr: Self::Addr) -> Self::Future {
+        use futures_util::stream::StreamExt;
+        use SocketAddr::*;
+        match addr {
+            V4(a) => {
+                let sk = self.0.handle.accept(a.port());
+                futures_util::future::ready(
+                    sk.map(|s| Box::pin(s.into_stream().map(BoundDpdkUdpSk).map(Ok)) as _),
+                )
+            }
+            V6(a) => futures_util::future::ready(Err(eyre!("Only IPv4 is supported: {:?}", a))),
+        }
     }
 }
