@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-dpdk-wrapper = { path = "../../dpdk-wrapper" }
 bertha = { path = "../bertha" }
+dpdk-wrapper = { path = "./dpdk-wrapper" }
 tracing = "0.1"
 tracing-futures = "0.2"
 color-eyre = "0.5"
