@@ -1,0 +1,18 @@
+[package]
+name = "latency-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bertha = { path = "../bertha" }
+dpdk-direct = { path = "../dpdk-direct" }
+shenango-chunnel = { path = "../shenango-chunnel" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+color-eyre = "0.5"
+tracing = "0.1"
+tracing-subscriber = "0.2"
+tracing-error = "0.1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+structopt = "0.3"
+futures-util = "0.3"

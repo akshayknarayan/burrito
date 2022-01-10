@@ -21,6 +21,7 @@ members = [
     "redis-basechunnel",
     "tls-tunnel",
     "negotiation-bench",
+    "latency-bench",
     "cx-list-opt",
     "cx-list-opt-test",
 ]
