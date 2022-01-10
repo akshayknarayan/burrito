@@ -1,8 +1,12 @@
 //! Shenango-powered UDP chunnel.
 
+use ahash::AHashMap as HashMap;
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use futures_util::stream::Stream;
+use futures_util::{
+    future::{ready, Ready},
+    stream::Stream,
+};
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
@@ -21,6 +25,12 @@ struct Msg {
 }
 
 enum NewConn {
+    Accept {
+        addr: SocketAddrV4,
+        outgoing_s: flume::Sender<Msg>,
+        outgoing_r: flume::Receiver<Msg>,
+        conns: flume::Sender<ShenangoUdpSk>,
+    },
     Listen {
         addr: SocketAddrV4,
         incoming: flume::Sender<Msg>,
@@ -31,11 +41,100 @@ enum NewConn {
         outgoing: flume::Receiver<Msg>,
     },
 }
+enum IncomingCh {
+    Msg(flume::Sender<Msg>),
+    Conn {
+        outgoing: flume::Sender<Msg>,
+        conns: flume::Sender<ShenangoUdpSk>,
+    },
+}
+
+impl IncomingCh {
+    fn recv_loop(self, laddr: SocketAddrV4, rsk: Arc<shenango::udp::UdpConnection>) {
+        match self {
+            Self::Msg(incoming) => {
+                // receive
+                let mut buf = [0u8; 1024];
+                loop {
+                    let (read_len, from_addr) = rsk
+                        .read_from(&mut buf)
+                        .wrap_err("shenango read_from")
+                        .unwrap();
+                    if incoming
+                        .send(Msg {
+                            addr: from_addr,
+                            buf: buf[..read_len].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        warn!(sk=?laddr, "Incoming channel dropped, recv thread exiting");
+                        break;
+                    }
+                }
+            }
+            Self::Conn { outgoing, conns } => {
+                let mut buf = [0u8; 1024];
+                let mut remotes = HashMap::default();
+                loop {
+                    let (read_len, from_addr) = rsk
+                        .read_from(&mut buf)
+                        .wrap_err("shenango read_from")
+                        .unwrap();
+
+                    let mut new_conn_res = Ok(());
+                    let msg_sender = remotes.entry(from_addr).or_insert_with(|| {
+                        let (cn_s, cn_r) = flume::bounded(16);
+                        new_conn_res = conns.send(ShenangoUdpSk {
+                            outgoing: outgoing.clone(),
+                            incoming: cn_r,
+                        });
+                        cn_s
+                    });
+                    new_conn_res.unwrap();
+
+                    if let Err(send_err) = msg_sender.send(Msg {
+                        addr: from_addr,
+                        buf: buf[..read_len].to_vec(),
+                    }) {
+                        remotes.remove(&from_addr).unwrap();
+                        debug!(sk=?laddr, ?from_addr, "Incoming channel dropped, resetting port");
+                        let (cn_s, cn_r) = flume::bounded(16);
+                        conns
+                            .send(ShenangoUdpSk {
+                                outgoing: outgoing.clone(),
+                                incoming: cn_r,
+                            })
+                            .unwrap();
+                        cn_s.send(send_err.into_inner()).unwrap(); // cannot fail since we just made cn_r
+                        remotes.insert(from_addr, cn_s);
+                    }
+                }
+            }
+        }
+    }
+}
 
 impl NewConn {
     fn start(self) {
         use NewConn::*;
         let (sk, incoming, outgoing) = match self {
+            Accept {
+                addr,
+                conns,
+                outgoing_s,
+                outgoing_r,
+            } => (
+                Arc::new(
+                    shenango::udp::UdpConnection::listen(addr)
+                        .wrap_err("Failed to make shenango udp socket")
+                        .expect("make udp conn"),
+                ),
+                IncomingCh::Conn {
+                    outgoing: outgoing_s,
+                    conns,
+                },
+                outgoing_r,
+            ),
             Listen {
                 addr,
                 incoming,
@@ -46,7 +145,7 @@ impl NewConn {
                         .wrap_err("Failed to make shenango udp socket")
                         .expect("make udp conn"),
                 ),
-                incoming,
+                IncomingCh::Msg(incoming),
                 outgoing,
             ),
             Dial { incoming, outgoing } => {
@@ -57,31 +156,17 @@ impl NewConn {
                             .wrap_err("Failed to make shenango udp socket")
                             .expect("make udp conn"),
                     ),
-                    incoming,
+                    IncomingCh::Msg(incoming),
                     outgoing,
                 )
             }
         };
 
         let laddr = sk.local_addr();
-
         let rsk = Arc::clone(&sk);
-        // receive
+
         shenango::thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            loop {
-                let (read_len, from_addr) = rsk
-                    .read_from(&mut buf)
-                    .wrap_err("shenango read_from")
-                    .unwrap();
-                if incoming.send(Msg {
-                    addr: from_addr,
-                    buf: buf[..read_len].to_vec(),
-                }).is_err() {
-                    warn!(sk=?laddr, "Incoming channel dropped, recv thread exiting");
-                    break;
-                }
-            }
+            incoming.recv_loop(laddr, rsk);
         });
 
         // send
@@ -150,6 +235,18 @@ impl ShenangoUdpSkChunnel {
         Self { events: s }
     }
 
+    fn make_accept(&self, a: SocketAddrV4) -> Result<flume::Receiver<ShenangoUdpSk>, Report> {
+        let (conns_s, conns_r) = flume::unbounded();
+        let (outgoing_s, outgoing_r) = flume::unbounded();
+        self.events.send(NewConn::Accept {
+            addr: a,
+            outgoing_r,
+            outgoing_s,
+            conns: conns_s,
+        })?;
+        Ok(conns_r)
+    }
+
     fn make_listen(&self, a: SocketAddrV4) -> Result<ShenangoUdpSk, Report> {
         let (incoming_s, incoming_r) = flume::unbounded();
         let (outgoing_s, outgoing_r) = flume::unbounded();
@@ -183,13 +280,12 @@ impl ChunnelListener for ShenangoUdpSkChunnel {
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
         use SocketAddr::*;
         match addr {
-            V4(a) => Box::pin(futures_util::future::ready(self.make_listen(a).map(|sk| Box::pin(futures_util::stream::once(futures_util::future::ready(Ok(
-                            sk,
-                        )))) as _))),
-            V6(a) => Box::pin(futures_util::future::ready(Err(eyre!(
-                "Only IPv4 is supported: {:?}",
-                a
-            )))),
+            V4(a) => {
+                Box::pin(ready(self.make_listen(a).map(|sk| {
+                    Box::pin(futures_util::stream::once(ready(Ok(sk)))) as _
+                })))
+            }
+            V6(a) => Box::pin(ready(Err(eyre!("Only IPv4 is supported: {:?}", a)))),
         }
     }
 }
@@ -202,14 +298,14 @@ impl ChunnelConnector for ShenangoUdpSkChunnel {
     type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
-        Box::pin(futures_util::future::ready(self.make_dial()))
+        Box::pin(ready(self.make_dial()))
     }
 }
 
 #[derive(Clone)]
 pub struct ShenangoUdpSk {
     outgoing: flume::Sender<Msg>,
-    incoming: Arc<flume::Receiver<Msg>>,
+    incoming: flume::Receiver<Msg>,
 }
 
 impl std::fmt::Debug for ShenangoUdpSk {
@@ -219,11 +315,8 @@ impl std::fmt::Debug for ShenangoUdpSk {
 }
 
 impl ShenangoUdpSk {
-    fn new(inc: flume::Receiver<Msg>, out: flume::Sender<Msg>) -> Self {
-        Self {
-            outgoing: out,
-            incoming: Arc::new(inc),
-        }
+    fn new(incoming: flume::Receiver<Msg>, outgoing: flume::Sender<Msg>) -> Self {
+        Self { outgoing, incoming }
     }
 }
 
@@ -240,17 +333,14 @@ impl ChunnelConnection for ShenangoUdpSk {
                 self.outgoing
                     .send(Msg { addr, buf: d })
                     .expect("shenango won't drop");
-                Box::pin(futures_util::future::ready(Ok(())))
+                Box::pin(ready(Ok(())))
             }
-            (V6(a), _) => Box::pin(futures_util::future::ready(Err(eyre!(
-                "Only IPv4 is supported: {:?}",
-                a
-            )))),
+            (V6(a), _) => Box::pin(ready(Err(eyre!("Only IPv4 is supported: {:?}", a)))),
         }
     }
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let inc = Arc::clone(&self.incoming);
+        let inc = self.incoming.clone();
         Box::pin(async move {
             let Msg { addr: a, buf: d } = inc
                 .recv_async()
@@ -266,110 +356,21 @@ pub struct ShenangoUdpReqChunnel(pub ShenangoUdpSkChunnel);
 
 impl ChunnelListener for ShenangoUdpReqChunnel {
     type Addr = SocketAddr;
-    type Connection = UdpConn;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Connection = ShenangoUdpSk;
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Report;
 
-    fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        let sk = self.0.listen(a);
-        Box::pin(async move {
-            use futures_util::StreamExt;
-            // .listen() gives a Once<Ready<...>>, so the top level might error but after that
-            // unwraps are ok.
-            let sk = bertha::util::AddrSteer::new(sk.await?.next().await.unwrap().unwrap());
-            Ok(sk.steer(UdpConn::new))
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct UdpConn {
-    resp_addr: SocketAddr,
-    recv: Arc<flume::Receiver<(SocketAddr, Vec<u8>)>>,
-    send: ShenangoUdpSk,
-}
-
-impl UdpConn {
-    fn new(
-        resp_addr: SocketAddr,
-        send: ShenangoUdpSk,
-        recv: flume::Receiver<(SocketAddr, Vec<u8>)>,
-    ) -> Self {
-        UdpConn {
-            resp_addr,
-            recv: Arc::new(recv),
-            send,
+    fn listen(&mut self, addr: Self::Addr) -> Self::Future {
+        use SocketAddr::*;
+        match addr {
+            V4(a) => {
+                use futures_util::stream::StreamExt;
+                let st = self.0.make_accept(a);
+                ready(st.map(|s| Box::pin(s.into_stream().map(Ok)) as _))
+            }
+            V6(a) => ready(Err(eyre!("Only IPv4 is supported: {:?}", a))),
         }
-    }
-}
-
-impl ChunnelConnection for UdpConn {
-    type Data = (SocketAddr, Vec<u8>);
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let sk = self.send.clone();
-        let addr = self.resp_addr;
-        let (_, data) = data;
-        Box::pin(async move {
-            sk.send((addr, data)).await?;
-            Ok(())
-        })
-    }
-
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let recv = Arc::clone(&self.recv);
-        Box::pin(async move {
-            let (a, d) = recv
-                .recv_async()
-                .await
-                .wrap_err(eyre!("Nothing more to receive"))?;
-            Ok((a, d))
-        }) as _
-    }
-
-    fn recv_batch<'cn>(
-        &'cn self,
-        batch_size: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Self::Data>, Report>> + Send + 'cn>>
-    where
-        Self::Data: Send,
-        Self: Sync,
-    {
-        Box::pin(async move {
-            let mut this_batch = vec![];
-
-            // try to pull off as many messages as we can, up to `batch_size`.
-            loop {
-                match self.recv.try_recv() {
-                    Ok(d) => {
-                        this_batch.push(d);
-                        if this_batch.len() >= batch_size {
-                            break;
-                        }
-                    }
-                    Err(flume::TryRecvError::Empty) => {
-                        break;
-                    }
-                    Err(flume::TryRecvError::Disconnected) => {
-                        return Err(eyre!("Connection closed"));
-                    }
-                }
-            }
-
-            if this_batch.is_empty() {
-                Ok(vec![self
-                    .recv
-                    .recv_async()
-                    .await
-                    .wrap_err(eyre!("Nothing more to receive"))?])
-            } else {
-                Ok(this_batch)
-            }
-        })
     }
 }
