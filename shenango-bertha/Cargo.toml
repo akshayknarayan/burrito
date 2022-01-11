@@ -1,0 +1,10 @@
+[package]
+name = "shenango-bertha"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shenango = { path = "../shenango-chunnel/caladan/bindings/rust" }
+bertha = { path = "../bertha" }
+tracing = { version = "0.1" }
+color-eyre = "0.5"
