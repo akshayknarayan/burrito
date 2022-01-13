@@ -6,5 +6,9 @@ edition = "2021"
 [dependencies]
 shenango = { path = "../shenango-chunnel/caladan/bindings/rust" }
 bertha = { path = "../bertha" }
+burrito-shard-ctl = { path = "../burrito-shard-ctl" }
 tracing = { version = "0.1" }
 color-eyre = "0.5"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+dashmap = "3"
