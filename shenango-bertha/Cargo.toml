@@ -7,6 +7,7 @@ edition = "2021"
 shenango = { path = "../shenango-chunnel/caladan/bindings/rust" }
 bertha = { path = "../bertha" }
 burrito-shard-ctl = { path = "../burrito-shard-ctl" }
+kvstore = { path = "../kvstore" }
 tracing = { version = "0.1" }
 color-eyre = "0.5"
 serde = { version = "1", features = ["derive"] }

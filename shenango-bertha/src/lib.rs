@@ -1,6 +1,7 @@
 //! Bertha logic adapted to work inside a shenango runtime
 // we will only use the things needed for the kvstore application.
 
+use base_traits::ChunnelConnection;
 mod base_traits {
     use bertha::{CxList, CxNil};
     use color_eyre::eyre::Report;
@@ -47,11 +48,44 @@ mod base_traits {
         fn recv(&self) -> Result<Self::Data, Report>;
     }
 
-    pub trait ChunnelConnector {
-        type Addr;
-        type Connection;
-        type Error;
-        fn connect(&mut self, a: Self::Addr) -> Result<Self::Connection, Self::Error>;
+    use bertha::either::Either;
+    impl<A, B, D> ChunnelConnection for Either<A, B>
+    where
+        A: ChunnelConnection<Data = D>,
+        B: ChunnelConnection<Data = D>,
+    {
+        type Data = D;
+
+        fn send(&self, data: Self::Data) -> Result<(), Report> {
+            match self {
+                Either::Left(a) => a.send(data),
+                Either::Right(b) => b.send(data),
+            }
+        }
+
+        fn recv(&self) -> Result<Self::Data, Report> {
+            match self {
+                Either::Left(a) => a.recv(),
+                Either::Right(b) => b.recv(),
+            }
+        }
+    }
+
+    use std::net::SocketAddrV4;
+    pub struct Project<C>(pub SocketAddrV4, pub C);
+    impl<C, D> ChunnelConnection for Project<C>
+    where
+        C: ChunnelConnection<Data = (SocketAddrV4, D)>,
+    {
+        type Data = D;
+
+        fn send(&self, data: Self::Data) -> Result<(), Report> {
+            self.1.send((self.0, data))
+        }
+
+        fn recv(&self) -> Result<Self::Data, Report> {
+            Ok(self.1.recv()?.1)
+        }
     }
 }
 
@@ -61,8 +95,7 @@ mod udp {
     pub use shenango::udp::udp_accept;
     pub use shenango::udp::UdpConnection;
     use std::net::SocketAddrV4;
-    use std::rc::Rc;
-    use std::sync::{atomic::AtomicBool, Mutex};
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
     #[derive(Clone)]
     pub struct UdpChunnelConnection(pub UdpConnection);
@@ -83,12 +116,12 @@ mod udp {
         }
     }
 
-    pub struct InjectOne<C, D>(C, AtomicBool, Rc<Mutex<Option<D>>>);
+    pub struct InjectOne<C, D>(C, AtomicBool, Arc<Mutex<Option<D>>>);
 
     impl<C, D> InjectOne<C, D> {
-        pub fn new(inner: C) -> (Self, Rc<Mutex<Option<D>>>) {
+        pub fn new(inner: C) -> (Self, Arc<Mutex<Option<D>>>) {
             let mtx = Default::default();
-            (Self(inner, Default::default(), Rc::clone(&mtx)), mtx)
+            (Self(inner, Default::default(), Arc::clone(&mtx)), mtx)
         }
     }
 
@@ -107,18 +140,6 @@ mod udp {
                 let d = self.2.lock().unwrap().take().unwrap();
                 Ok(d)
             }
-        }
-    }
-
-    pub struct UdpConnector;
-    impl super::base_traits::ChunnelConnector for UdpConnector {
-        type Addr = SocketAddrV4;
-        type Connection = UdpChunnelConnection;
-        type Error = Report;
-
-        fn connect(&mut self, a: Self::Addr) -> Result<Self::Connection, Self::Error> {
-            let cn = UdpConnection::dial(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0), a)?;
-            Ok(UdpChunnelConnection(cn))
         }
     }
 }
@@ -198,6 +219,8 @@ mod negotiate {
         fn collect_ext_info(&self) -> HashMap<u64, Option<Vec<u8>>>;
         fn distribute_ext_info(&mut self, info: &mut HashMap<u64, Option<Vec<u8>>>);
     }
+
+    impl Negotiate for bertha::CxNil {}
 
     impl<N> NegotiatePicked for N
     where
@@ -1015,7 +1038,6 @@ pub use chunnels::{KvReliability, KvReliabilityChunnel, KvReliabilityServerChunn
 pub use chunnels::{SerializeChunnelProject, SerializeProject};
 mod chunnels {
     use super::base_traits::{Chunnel, ChunnelConnection};
-    use crate::negotiate::StackNonce;
     use color_eyre::eyre::{eyre, Report, WrapErr};
     use shenango::poll::PollWaiter;
     use shenango::sync::Mutex;
@@ -1301,9 +1323,6 @@ mod chunnels {
         }
     }
 
-    use super::base_traits::ChunnelConnector;
-    use super::negotiate::NegotiateMsg;
-
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     pub struct ShardInfo {
         pub canonical_addr: SocketAddrV4,
@@ -1311,16 +1330,11 @@ mod chunnels {
     }
 
     #[derive(Clone)]
-    pub struct ShardCanonicalServer<S, Ss, D> {
+    pub struct ShardCanonicalServer {
         addr: ShardInfo,
-        internal_addr: Vec<SocketAddrV4>,
-        shards_inner: S,
-        shards_inner_stack: Ss,
-        shards_extern_nonce: StackNonce,
-        _phantom: std::marker::PhantomData<D>,
     }
 
-    impl<S, Ss, D> std::fmt::Debug for ShardCanonicalServer<S, Ss, D> {
+    impl std::fmt::Debug for ShardCanonicalServer {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("ShardCanonicalServer")
                 .field("addr", &self.addr)
@@ -1328,42 +1342,14 @@ mod chunnels {
         }
     }
 
-    impl<S, Ss, D> ShardCanonicalServer<S, Ss, D> {
+    impl ShardCanonicalServer {
         /// Inner is a chunnel for the external connection.
-        /// Shards is a chunnel for an internal connection to the shards.
-        pub fn new(
-            addr: ShardInfo,
-            internal_addr: Option<Vec<SocketAddrV4>>,
-            shards_inner: S,
-            shards_inner_stack: Ss,
-            shards_extern_nonce: StackNonce,
-        ) -> Result<Self, Report> {
-            let internal_addr = internal_addr.unwrap_or_else(|| addr.shard_addrs.clone());
-            if internal_addr.len() != addr.shard_addrs.len() {
-                return Err(eyre!(
-                    "Shard addresses mismatched between internal and external: {:?} != {:?}",
-                    internal_addr,
-                    addr
-                ));
-            }
-
-            Ok(ShardCanonicalServer {
-                addr,
-                internal_addr,
-                shards_inner,
-                shards_inner_stack,
-                shards_extern_nonce,
-                _phantom: Default::default(),
-            })
+        pub fn new(addr: ShardInfo) -> Result<Self, Report> {
+            Ok(ShardCanonicalServer { addr })
         }
     }
 
-    impl<S, Ss, D> bertha::Negotiate for ShardCanonicalServer<S, Ss, D>
-    where
-        S: ChunnelConnector<Addr = SocketAddrV4> + Clone + Send + Sync + 'static,
-        <S as ChunnelConnector>::Error: Into<Report>,
-        S::Connection: ChunnelConnection<Data = (SocketAddrV4, Vec<u8>)> + Send + Sync + 'static,
-    {
+    impl bertha::Negotiate for ShardCanonicalServer {
         type Capability = ShardFns;
 
         fn guid() -> u64 {
@@ -1375,219 +1361,47 @@ mod chunnels {
         }
     }
 
-    impl<S, Ss, D> super::Negotiate for ShardCanonicalServer<S, Ss, D>
-    where
-        S: ChunnelConnector<Addr = SocketAddrV4> + Clone + Send + Sync + 'static,
-        <S as ChunnelConnector>::Error: Into<Report>,
-        S::Connection: ChunnelConnection<Data = (SocketAddrV4, Vec<u8>)> + Send + Sync + 'static,
-    {
-        fn picked_blocking(&mut self, nonce: &[u8]) {
-            let offer = self.shards_extern_nonce.clone();
-            let msg: NegotiateMsg = match bincode::deserialize(nonce) {
-                Err(e) => {
-                    warn!(err = ?e, "deserialize failed");
-                    return;
-                }
-                Ok(m) => m,
-            };
-
-            let msg = match msg {
-                NegotiateMsg::ServerNonce { addr, .. } => NegotiateMsg::ServerNonce {
-                    addr,
-                    picked: offer,
-                },
-                _ => {
-                    warn!("malformed nonce");
-                    return;
-                }
-            };
-
-            let buf = match bincode::serialize(&msg) {
-                Err(e) => {
-                    warn!(err = ?e, "serialize failed");
-                    return;
-                }
-                Ok(m) => m,
-            };
-
-            let wg = shenango::sync::WaitGroup::new();
-            for shard in &self.internal_addr {
-                let mut ctr = self.shards_inner.clone();
-                let shard = shard.clone();
-                let buf = buf.clone();
-                wg.add(1);
-                let wg = wg.clone();
-                shenango::thread::spawn(move || {
-                    let cn = match ctr.connect(shard.clone()) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let e = e.into();
-                            warn!(err = ?e, "failed making connection to shard");
-                            wg.done();
-                            return;
-                        }
-                    };
-
-                    if let Err(e) = cn.send((shard.clone(), buf.clone())) {
-                        warn!(err = ?e, "failed sending negotiation nonce to shard");
-
-                        wg.done();
-                        return;
-                    }
-
-                    trace!("wait for nonce ack");
-                    match cn.recv() {
-                        Ok((a, buf)) => match bincode::deserialize(&buf) {
-                            Ok(NegotiateMsg::ServerNonceAck) => {
-                                // TODO collect received addresses since we could receive acks from
-                                // any shard
-                                if a != shard.clone() {
-                                    warn!(addr = ?a, expected = ?shard.clone(), "received from unexpected address");
-                                }
-
-                                trace!("got nonce ack");
-                            }
-                            Ok(m) => {
-                                warn!(msg = ?m, shard = ?shard.clone(), "got unexpected response to nonce");
-                            }
-                            Err(e) => {
-                                warn!(err = ?e, shard = ?shard.clone(), "failed deserializing nonce ack");
-                            }
-                        },
-                        Err(e) => {
-                            warn!(err = ?e, shard = ?shard.clone(), "failed waiting for nonce ack");
-                        }
-                    }
-
-                    wg.done();
-                });
-            }
-
-            wg.wait();
-        }
-
+    impl super::Negotiate for ShardCanonicalServer {
         fn ext_info(&self) -> Option<Vec<u8>> {
             let shard_info_bytes = bincode::serialize(&self.addr).unwrap();
             Some(shard_info_bytes)
         }
     }
 
-    use super::udp::UdpChunnelConnection;
-    use bertha::negotiate::{Apply, GetOffers};
     use burrito_shard_ctl::Kv;
     const FNV1_64_INIT: u64 = 0xcbf29ce484222325u64;
     const FNV_64_PRIME: u64 = 0x100000001b3u64;
 
-    pub type NegotiatedConn<C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
-    impl<I, S, Ss, D, E> Chunnel<I> for ShardCanonicalServer<S, Ss, D>
+    impl<I, D> Chunnel<I> for ShardCanonicalServer
     where
         I: ChunnelConnection<Data = D> + Send + Sync + 'static,
-        S: ChunnelConnector<Addr = SocketAddrV4, Error = E, Connection = UdpChunnelConnection>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        Ss: Apply + GetOffers + Clone + Send + Sync + 'static,
-        <Ss as Apply>::Applied: Chunnel<UdpChunnelConnection>
-            + super::negotiate::NegotiatePicked
-            + Clone
-            + Debug
-            + Send
-            + 'static,
-        <<Ss as Apply>::Applied as Chunnel<UdpChunnelConnection>>::Connection:
-            ChunnelConnection<Data = D> + Send + Sync + 'static,
-        <<Ss as Apply>::Applied as Chunnel<UdpChunnelConnection>>::Error:
-            Into<Report> + Send + Sync + 'static,
         D: Kv + Send + Sync + 'static,
         <D as Kv>::Key: AsRef<str>,
-        E: Into<Report> + Send + Sync + 'static,
     {
-        type Connection =
-            ShardCanonicalServerConnection<I, NegotiatedConn<UdpChunnelConnection, Ss>, D>;
+        type Connection = ShardCanonicalServerConnection<I>;
         type Error = Report;
 
         fn connect_wrap(&mut self, conn: I) -> Result<Self::Connection, Self::Error> {
-            let addr = self.addr.clone();
-            let internal_addr = self.internal_addr.clone();
-            let shards_inner = self.shards_inner.clone();
-            let shards_inner_stack = self.shards_inner_stack.clone();
-            let num_shards = addr.shard_addrs.len();
-
-            // connect to shards
-            let conns: Vec<Arc<_>> = internal_addr
-                .into_iter()
-                .map(|a| {
-                    debug!(?a, "connecting to shard");
-                    let a = a;
-                    let cn = shards_inner
-                        .clone()
-                        .connect(a.clone())
-                        .map_err(Into::into)
-                        .wrap_err(eyre!("Could not connect to {}", a.clone()))?;
-                    let cn = super::negotiate_client(shards_inner_stack.clone(), cn, a.clone())
-                        .wrap_err("negotiate_client failed")?;
-                    Ok::<_, Report>(Arc::new(cn))
-                })
-                .collect::<Result<_, Report>>()?;
-            trace!("connected to shards");
-
-            // serve canonical address
+            // this fake version does not forward, so don't bother with shard connections etc.
             Ok(ShardCanonicalServerConnection {
                 inner: Arc::new(conn),
-                shard_conns: conns,
-                shard_fn: Arc::new(move |d: &D| {
-                    let mut hash = FNV1_64_INIT;
-                    for b in d.key().as_ref().as_bytes()[0..4].iter() {
-                        hash ^= *b as u64;
-                        hash = u64::wrapping_mul(hash, FNV_64_PRIME);
-                    }
-
-                    hash as usize % num_shards
-                }),
             })
         }
     }
 
-    pub struct ShardCanonicalServerConnection<C, S, D> {
+    pub struct ShardCanonicalServerConnection<C> {
         inner: Arc<C>,
-        shard_conns: Vec<Arc<S>>,
-        shard_fn: Arc<dyn Fn(&D) -> usize + Send + Sync + 'static>,
     }
 
-    impl<C, S, D> ChunnelConnection for ShardCanonicalServerConnection<C, S, D>
+    impl<C> ChunnelConnection for ShardCanonicalServerConnection<C>
     where
-        C: ChunnelConnection<Data = D> + Send + Sync + 'static,
-        S: ChunnelConnection<Data = D> + Send + Sync + 'static,
-        D: Send + Sync + 'static,
+        C: ChunnelConnection + Send + Sync + 'static,
     {
         type Data = ();
 
         fn recv(&self) -> Result<Self::Data, Report> {
-            // received a packet on the canonical_addr.
-            // need to
-            // 1. evaluate the hash fn
-            // 2. forward to the right shard,
-            //    preserving the src addr so the response goes back to the client
-
-            // 0. receive the packet.
-            let data = self.inner.recv()?;
+            let _d = self.inner.recv()?;
             trace!("got request");
-
-            // 1. evaluate the hash fn to determine where to forward to.
-            let shard_idx = (self.shard_fn)(&data);
-            let conn = &self.shard_conns[shard_idx];
-            trace!(shard_idx, "checked shard");
-
-            // 2. Forward to the shard.
-            // TODO this assumes no reordering.
-            conn.send(data).wrap_err("Forward to shard")?;
-            trace!(shard_idx, "wait for shard response");
-
-            // 3. Get response from the shard, and send back to client.
-            let resp = conn.recv().wrap_err("Receive from shard")?;
-            trace!(shard_idx, "got shard response");
-            self.inner.send(resp)?;
-            trace!(shard_idx, "send response");
             Ok(())
         }
 
@@ -1639,23 +1453,6 @@ mod chunnels {
 
     impl super::Negotiate for ClientShardChunnelClient {
         fn ext_info_callback(&mut self, info: Vec<u8>) {
-            //let redis_conn = Arc::clone(&self.redis_listen_connection);
-            //trace!("query redis");
-            //// query redis for si
-            //let si = redis_util::redis_query(&a, redis_conn.lock().await)
-            //    .await
-            //    .wrap_err("redis query failed")?;
-            //
-            //    self.shard_info = Some(si);
-            //let addrs = match si {
-            //    None => vec![a.into()],
-            //    Some(si) => {
-            //        let mut addrs = vec![si.canonical_addr.into()];
-            //        addrs.extend(si.shard_addrs.into_iter().map(Into::into));
-            //        addrs
-            //    }
-            //};
-
             let si: ShardInfo = match bincode::deserialize(&info) {
                 Ok(si) => si,
                 Err(e) => {
@@ -1681,13 +1478,6 @@ mod chunnels {
         type Connection = ClientShardClientConnection<D, I>;
         type Error = Report;
 
-        // implementing this is tricky - we have been given one connection with some semantics,
-        // but we need n connections, to each shard.
-        // 1. ignore the connection (to the canonical_addr) to establish our own, to the shards.
-        // 2. force the connection to have (addr, data) semantics, so we can do routing without
-        //    establishing our own connections
-        //
-        //  -> pick #2
         fn connect_wrap(&mut self, inner: I) -> Result<Self::Connection, Self::Error> {
             let addrs = self
                 .shard_info
@@ -1755,6 +1545,267 @@ mod chunnels {
         fn recv(&self) -> Result<Self::Data, Report> {
             let p = self.inner.recv()?;
             Ok(p)
+        }
+    }
+}
+
+pub use crate::kvstore::{serve, single_shard};
+pub use crate::kvstore::{KvClient, KvClientBuilder};
+mod kvstore {
+    use super::ChunnelConnection;
+    use super::{KvReliabilityChunnel, KvReliabilityServerChunnel, SerializeChunnelProject};
+    use bertha::CxList;
+    use color_eyre::eyre::{eyre, Report, WrapErr};
+    use kvstore::kv::Store;
+    use std::net::SocketAddrV4;
+    use std::sync::{atomic::AtomicUsize, Arc};
+    use tracing::{debug, info, trace, warn};
+
+    pub fn single_shard(addr: SocketAddrV4) {
+        info!(?addr, "listening");
+
+        let external = CxList::from(KvReliabilityServerChunnel::default())
+            .wrap(SerializeChunnelProject::default());
+
+        // initialize the kv store.
+        let store = Store::default();
+        let idx = Arc::new(AtomicUsize::new(0));
+
+        super::negotiate_server(external, addr, move |cn| {
+            let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let store = store.clone();
+            debug!(?idx, "new");
+
+            loop {
+                let (a, msg) = match cn.recv() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!(?e, "recv failed");
+                        break;
+                    }
+                };
+                trace!(msg = ?&msg, from=?&a, "got msg");
+                let rsp = store.call(msg);
+                if let Err(e) = cn.send((a, rsp)) {
+                    warn!(?e, "send failed");
+                    break;
+                }
+            }
+        })
+        .unwrap();
+    }
+
+    /// Start and serve a `ShardCanonicalServer` and shards.
+    ///
+    /// `srv_addr`: Local addr to serve on.
+    /// `num_shards`: Number of shards to start. Shard addresses are selected sequentially after
+    /// `srv_port`, but this could change.
+    pub fn serve(srv_addr: SocketAddrV4, num_shards: u16) -> Result<(), Report> {
+        // 1. Define addr.
+        let si = make_shardinfo(srv_addr, num_shards);
+
+        // 2. start shard serv
+        for a in si.clone().shard_addrs {
+            info!(addr = ?&a, "start shard");
+            shenango::thread::spawn(move || single_shard(a));
+        }
+
+        serve_canonical(si)
+    }
+
+    use super::chunnels::ShardInfo;
+    fn serve_canonical(si: ShardInfo) -> Result<(), Report> {
+        let cnsrv = super::chunnels::ShardCanonicalServer::new(si.clone())
+            .wrap_err("Create ShardCanonicalServer")?;
+        let external = CxList::from(cnsrv)
+            .wrap(KvReliabilityServerChunnel::default())
+            .wrap(SerializeChunnelProject::<kvstore::Msg>::default());
+        info!(shard_info = ?&si, "start canonical server");
+
+        super::negotiate_server(external, si.canonical_addr, move |cn| {
+            loop {
+                match cn
+                    .recv() // ShardCanonicalServerConnection is recv-only
+                    .wrap_err("kvstore/server: Error while processing requests")
+                {
+                    Ok(()) => {
+                        warn!("got request at canonical server");
+                    }
+                    Err(e) => {
+                        warn!(err = ?e, "exiting");
+                        break;
+                    }
+                }
+            }
+        })
+        .unwrap();
+        unreachable!() // negotiate_server never returns None
+    }
+
+    fn make_shardinfo(srv_addr: SocketAddrV4, num_shards: u16) -> ShardInfo {
+        let shard_addrs = (1..=num_shards)
+            .map(|i| SocketAddrV4::new(*srv_addr.ip(), srv_addr.port() + i))
+            .collect();
+        ShardInfo {
+            canonical_addr: srv_addr,
+            shard_addrs,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct KvClientBuilder {
+        canonical_addr: SocketAddrV4,
+    }
+
+    impl KvClientBuilder {
+        pub fn new(canonical_addr: SocketAddrV4) -> Self {
+            KvClientBuilder { canonical_addr }
+        }
+    }
+
+    use super::ClientShardChunnelClient;
+    use crate::udp::{UdpChunnelConnection, UdpConnection};
+
+    impl KvClientBuilder {
+        pub fn new_shardclient(
+            self,
+        ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report>
+        {
+            let cl = ClientShardChunnelClient::new(self.canonical_addr)?;
+            let stack = CxList::from(cl)
+                .wrap(KvReliabilityChunnel::default())
+                .wrap(SerializeChunnelProject::default());
+            let raw = UdpChunnelConnection(UdpConnection::dial(
+                SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+                self.canonical_addr,
+            )?);
+            debug!("negotiation");
+            let cn = super::negotiate::negotiate_client(stack, raw, self.canonical_addr)?;
+            let cn = super::base_traits::Project(self.canonical_addr, cn);
+            Ok(KvClient::new_from_cn(cn))
+        }
+    }
+
+    pub struct KvClient<C>(MsgIdMatcher<C, Msg>);
+
+    impl<C: ChunnelConnection> Clone for KvClient<C> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
+
+    impl KvClient<()> {
+        fn new_from_cn<C: ChunnelConnection<Data = Msg> + Send + Sync + 'static>(
+            inner: C,
+        ) -> KvClient<C> {
+            KvClient(MsgIdMatcher::new(inner))
+        }
+    }
+
+    use kvstore::Msg;
+
+    impl<C> KvClient<C>
+    where
+        C: ChunnelConnection<Data = Msg> + Send + Sync + 'static,
+    {
+        fn do_req(&self, req: Msg) -> Result<Option<String>, Report> {
+            let cn = &self.0;
+            let id = req.id();
+            trace!("sending");
+            cn.send_msg(req).wrap_err("Error sending request")?;
+            let rsp = cn.recv_msg(id).wrap_err("Error awaiting response")?;
+            trace!("received");
+            if rsp.id() != id {
+                return Err(eyre!(
+                    "Msg id mismatch, check for reordering: {} != {}",
+                    rsp.id(),
+                    id
+                ));
+            }
+
+            Ok(rsp.into_kv().1)
+        }
+    }
+
+    impl<C> KvClient<C>
+    where
+        C: ChunnelConnection<Data = Msg> + Send + Sync + 'static,
+    {
+        pub fn update(&self, key: String, val: String) -> Result<Option<String>, Report> {
+            let req = Msg::put_req(key, val);
+            self.do_req(req)
+        }
+
+        pub fn get(&self, key: String) -> Result<Option<String>, Report> {
+            let req = Msg::get_req(key);
+            self.do_req(req)
+        }
+    }
+
+    pub struct MsgIdMatcher<C, D> {
+        inner: Arc<C>,
+        inflight: Arc<DashMap<usize, D>>,
+    }
+
+    impl<C: ChunnelConnection, D> Clone for MsgIdMatcher<C, D> {
+        fn clone(&self) -> Self {
+            Self {
+                inner: Arc::clone(&self.inner),
+                inflight: Arc::clone(&self.inflight),
+            }
+        }
+    }
+
+    use dashmap::DashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    impl<C, D> MsgIdMatcher<C, D>
+    where
+        C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+        D: bertha::util::MsgId + Send + Sync + 'static,
+    {
+        pub fn new(inner: C) -> Self {
+            Self {
+                inner: Arc::new(inner),
+                inflight: Default::default(),
+            }
+        }
+
+        pub fn send_msg(&self, data: D) -> Result<(), Report> {
+            self.inner.send(data)
+        }
+
+        pub fn recv_msg(&self, msg_id: usize) -> Result<D, Report> {
+            let done = Arc::new(AtomicBool::default());
+            let inflight = Arc::clone(&self.inflight);
+            let d = Arc::clone(&done);
+            let done_jh = shenango::thread::spawn(move || {
+                while let None = inflight.get(&msg_id) {
+                    shenango::thread::thread_yield();
+                }
+
+                d.store(true, Ordering::SeqCst);
+                inflight.remove(&msg_id).unwrap().1
+            });
+
+            let inner = Arc::clone(&self.inner);
+            let inflight = Arc::clone(&self.inflight);
+            let d = Arc::clone(&done);
+            shenango::thread::spawn(move || {
+                while !d.load(Ordering::SeqCst) {
+                    match inner.recv() {
+                        Ok(r) => {
+                            inflight.insert(r.id(), r);
+                        }
+                        Err(e) => {
+                            warn!(?e, "recv errored");
+                            return;
+                        }
+                    }
+                }
+            });
+
+            Ok(done_jh.join().unwrap())
         }
     }
 }

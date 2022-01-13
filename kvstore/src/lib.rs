@@ -1,7 +1,7 @@
 //! Chunnel-enabled key-value protocol, server, and client.
 
 mod client;
-mod kv;
+pub mod kv;
 mod msg;
 mod opt;
 pub mod reliability;
