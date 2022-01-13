@@ -160,6 +160,11 @@ impl StackNonce {
     pub fn __from_inner(h: HashMap<u64, Offer>) -> StackNonce {
         StackNonce(h)
     }
+
+    #[doc(hidden)]
+    pub fn __into_inner(self) -> HashMap<u64, Offer> {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,10 +198,11 @@ mod pick;
 pub use pick::Pick;
 use pick::PickResult;
 mod apply;
+pub use apply::check_apply;
 pub use apply::Apply;
-use apply::ApplyResult;
+pub use apply::ApplyResult;
 mod server;
-use server::monomorphize;
+pub use server::monomorphize;
 pub use server::negotiate_server;
 mod client;
 pub use client::{

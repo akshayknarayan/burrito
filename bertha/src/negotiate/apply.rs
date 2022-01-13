@@ -7,10 +7,10 @@ use tracing::{debug, trace};
 
 #[derive(Debug, Clone)]
 pub struct ApplyResult<A> {
-    pub(crate) applied: A,
-    pub(crate) picked: StackNonce,
-    pub(crate) touched: HashSet<u64>,
-    pub(crate) score: usize,
+    pub applied: A,
+    pub picked: StackNonce,
+    pub touched: HashSet<u64>,
+    pub score: usize,
 }
 
 pub trait Apply {
@@ -90,10 +90,7 @@ where
     }
 }
 
-pub(crate) fn check_apply<T: Apply>(
-    t: T,
-    picked: StackNonce,
-) -> Result<ApplyResult<T::Applied>, Report> {
+pub fn check_apply<T: Apply>(t: T, picked: StackNonce) -> Result<ApplyResult<T::Applied>, Report> {
     let ar = t.apply(picked)?;
     let p = &ar.picked.0;
     trace!(checking = ?p, "checking apply");

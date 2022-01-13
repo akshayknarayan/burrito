@@ -329,7 +329,7 @@ pub(crate) fn compare_offers(
     valid_pairs
 }
 
-pub(crate) fn monomorphize<Srv, A>(
+pub fn monomorphize<Srv, A>(
     stack: Srv,
     client_offers: Vec<StackNonce>,
     from_addr: &A,
