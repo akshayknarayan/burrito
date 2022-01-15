@@ -1,10 +1,10 @@
 //! Bertha logic adapted to work inside a shenango runtime
 // we will only use the things needed for the kvstore application.
 
-use base_traits::ChunnelConnection;
+pub use base_traits::ChunnelConnection;
 mod base_traits {
     use bertha::{CxList, CxNil};
-    use color_eyre::eyre::Report;
+    use color_eyre::eyre::{Report, WrapErr};
 
     pub trait Chunnel<I> {
         type Connection: ChunnelConnection;
@@ -80,7 +80,7 @@ mod base_traits {
         type Data = D;
 
         fn send(&self, data: Self::Data) -> Result<(), Report> {
-            self.1.send((self.0, data))
+            self.1.send((self.0, data)).wrap_err("Project send")
         }
 
         fn recv(&self) -> Result<Self::Data, Report> {
@@ -91,20 +91,26 @@ mod base_traits {
 
 mod udp {
     use crate::base_traits::ChunnelConnection;
-    use color_eyre::eyre::Report;
+    use color_eyre::eyre::{Report, WrapErr};
     pub use shenango::udp::udp_accept;
     pub use shenango::udp::UdpConnection;
     use std::net::SocketAddrV4;
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
     #[derive(Clone)]
-    pub struct UdpChunnelConnection(pub UdpConnection);
+    pub struct UdpChunnelConnection(pub Arc<UdpConnection>);
+
+    impl UdpChunnelConnection {
+        pub fn new(cn: UdpConnection) -> Self {
+            Self(Arc::new(cn))
+        }
+    }
 
     impl ChunnelConnection for UdpChunnelConnection {
         type Data = (SocketAddrV4, Vec<u8>);
         /// Send a message
         fn send(&self, (addr, buf): Self::Data) -> Result<(), Report> {
-            self.0.write_to(&buf, addr)?;
+            self.0.write_to(&buf, addr).wrap_err("udp send")?;
             Ok(())
         }
         /// Retrieve next incoming message.
@@ -149,6 +155,7 @@ pub use negotiate::{negotiate_server, Negotiate};
 mod negotiate {
     use crate::base_traits::{Chunnel, ChunnelConnection};
     use crate::udp::{self, InjectOne, UdpChunnelConnection};
+    use bertha::CapabilitySet;
     use bertha::{
         negotiate::{monomorphize, Apply, ApplyResult, GetOffers, Pick},
         CxList, DataEither, Either,
@@ -205,6 +212,25 @@ mod negotiate {
         ServerNonceAck,
     }
 
+    impl From<bertha::NegotiateMsg> for NegotiateMsg {
+        fn from(f: bertha::NegotiateMsg) -> Self {
+            match f {
+                bertha::NegotiateMsg::ServerNonceAck => NegotiateMsg::ServerNonceAck,
+                bertha::NegotiateMsg::ClientOffer(v) => {
+                    NegotiateMsg::ClientOffer(v.into_iter().map(Into::into).collect())
+                }
+                bertha::NegotiateMsg::ClientNonce(s) => NegotiateMsg::ClientNonce(s.into()),
+                bertha::NegotiateMsg::ServerNonce { addr, picked } => NegotiateMsg::ServerNonce {
+                    addr,
+                    picked: picked.into(),
+                },
+                bertha::NegotiateMsg::ServerReply(r) => {
+                    NegotiateMsg::ServerReply(r.map(|r| r.into_iter().map(Into::into).collect()))
+                }
+            }
+        }
+    }
+
     pub trait Negotiate: bertha::Negotiate {
         fn picked_blocking(&mut self, _nonce: &[u8]) {}
         fn ext_info(&self) -> Option<Vec<u8>> {
@@ -222,20 +248,21 @@ mod negotiate {
 
     impl Negotiate for bertha::CxNil {}
 
-    impl<N> NegotiatePicked for N
+    impl<N, C> NegotiatePicked for N
     where
-        N: Negotiate,
+        N: Negotiate<Capability = C>,
+        C: CapabilitySet,
     {
         fn call_negotiate_picked(&mut self, nonce: &[u8]) {
             self.picked_blocking(nonce)
         }
 
         fn collect_ext_info(&self) -> HashMap<u64, Option<Vec<u8>>> {
-            std::iter::once((N::guid(), self.ext_info())).collect()
+            std::iter::once((C::guid(), self.ext_info())).collect()
         }
 
         fn distribute_ext_info(&mut self, info: &mut HashMap<u64, Option<Vec<u8>>>) {
-            if let Some(Some(i)) = info.remove(&N::guid()) {
+            if let Some(Some(i)) = info.remove(&C::guid()) {
                 self.ext_info_callback(i);
             }
         }
@@ -389,9 +416,9 @@ mod negotiate {
         <<Srv as Apply>::Applied as Chunnel<ApplyInput>>::Error:
             Into<Report> + Send + Sync + 'static,
     {
-        debug!("new connection");
+        debug!(local = ?cn.local_addr(), remote = ?cn.remote_addr(), "new connection");
         let a = cn.remote_addr();
-        let cn = UdpChunnelConnection(cn);
+        let cn = UdpChunnelConnection::new(cn);
         loop {
             trace!("listening for potential negotiation pkt");
             let (_, buf) = cn.recv()?;
@@ -465,6 +492,8 @@ mod negotiate {
                         &a,
                     ) {
                         Ok((mut new_stack, nonce, picked_offers)) => {
+                            // bertha::NegotiateMsg to crate::NegotiateMsg (with extinfo)
+                            let nonce: NegotiateMsg = nonce.into();
                             let nonce_buf = bincode::serialize(&nonce)
                                 .wrap_err("Failed to serialize (addr, chosen_stack) nonce")?;
 
@@ -546,11 +575,11 @@ mod negotiate {
     }
 
     fn process_nonces_connection(
-        cn: impl ChunnelConnection<Data = (SocketAddrV4, Vec<u8>)>,
+        cn: UdpChunnelConnection,
         pending_negotiated_connections: Arc<Mutex<HashMap<SocketAddrV4, StackNonce>>>,
     ) -> Result<(), Report> {
         loop {
-            trace!("call recv()");
+            trace!(local = ?cn.0.local_addr(), remote = ?cn.0.remote_addr(), "call recv()");
             let (a, buf): (_, Vec<u8>) = cn.recv().wrap_err("conn recv")?;
             let negotiate_msg: NegotiateMsg =
                 bincode::deserialize(&buf).wrap_err("offer deserialize failed")?;
@@ -1113,7 +1142,7 @@ mod chunnels {
 
         fn recv(&self) -> Result<Self::Data, Report> {
             let (a, buf) = self.inner.recv()?;
-            trace!("recvd");
+            trace!("serialize recvd");
             let data = bincode::deserialize(&buf[..]).wrap_err(eyre!(
                 "deserialize failed: {:?} -> {:?}",
                 buf,
@@ -1206,7 +1235,7 @@ mod chunnels {
     pub struct KvReliability<C, A, D> {
         inner: Arc<C>,
         timeout: Duration,
-        sends: Arc<dashmap::DashSet<usize>>,
+        sends: Arc<dashmap::DashMap<usize, Mutex<()>>>,
         recvs: Arc<Mutex<Vec<(A, D)>>>,
     }
 
@@ -1238,14 +1267,18 @@ mod chunnels {
             }
 
             let msg_id = data.1.id();
-            let to = self.timeout;
-            self.sends.insert(msg_id);
+            let send_waiter = Mutex::new(());
+            // unlock this when the send finishes.
+            // use manual locking because we don't want to have to keep the mutex guard and its
+            // self-referential lifetime around.
+            unsafe { send_waiter.lock_manual() };
+            self.sends.insert(msg_id, send_waiter.clone());
 
             // blocks, but will finish fast.
             self.inner.send(data.clone())?;
 
             // there are 3 tasks. when this function returns, all 3 of them *must* exit (or have
-            // already exited) shortly afterwards.
+            // already exited) shortly after we return.
             let mut poll = PollWaiter::new();
             // 1. wait for the send to finish. this is what lets us return
             let sendcomplete_trigger = poll.trigger(Box::new(PollBranch::Snd));
@@ -1254,15 +1287,10 @@ mod chunnels {
             // 3. handle receives and notify the corresponding senders.
             let recv_trigger = poll.trigger(Box::new(PollBranch::Rcv));
 
-            let sends = Arc::clone(&self.sends);
             shenango::thread::spawn(move || {
                 let _send = sendcomplete_trigger;
-                loop {
-                    match sends.get(&msg_id) {
-                        None => break,
-                        _ => shenango::thread::thread_yield(),
-                    }
-                }
+                send_waiter.lock();
+                trace!(?msg_id, "done in send");
             });
 
             let recv_cn = Arc::clone(&self.inner);
@@ -1271,19 +1299,29 @@ mod chunnels {
             let recv_jh = shenango::thread::spawn(move || {
                 let _recv = recv_trigger;
                 loop {
-                    let resp = recv_cn.recv().wrap_err("kvreliability recv acks")?;
-                    let recv_msg_id = resp.1.id();
+                    let recv_msg_id = {
+                        let mut rg = recvs.lock();
+                        let resp = recv_cn.recv().wrap_err("kvreliability recv acks")?;
+                        let recv_msg_id = resp.1.id();
 
-                    // signal recv
-                    recvs.lock().push(resp);
-                    sends.remove(&recv_msg_id);
+                        // signal recv
+                        rg.push(resp);
+                        recv_msg_id
+                    };
 
-                    if recv_msg_id == msg_id || sends.remove(&msg_id).is_none() {
+                    let sw = sends
+                        .remove(&recv_msg_id)
+                        .ok_or_else(|| eyre!("not found: {:?}", recv_msg_id))?
+                        .1;
+                    trace!(?msg_id, "done in recv");
+                    unsafe { sw.unlock_manual() };
+                    if recv_msg_id == msg_id || !sends.contains_key(&msg_id) {
                         return Ok(());
                     }
                 }
             });
 
+            let to = self.timeout;
             shenango::thread::spawn_detached(move || {
                 let _to = timeout_trigger;
                 shenango::sleep(to);
@@ -1291,23 +1329,21 @@ mod chunnels {
             });
 
             loop {
-                match *poll.wait() {
+                let v = poll.wait();
+                let v = *v;
+                match v {
                     PollBranch::Timeout => {
+                        trace!("kvreliability timeout");
+                        self.inner.send(data.clone())?;
                         let timeout_trigger = poll.trigger(Box::new(PollBranch::Timeout));
                         shenango::thread::spawn_detached(move || {
                             let _to = timeout_trigger;
                             shenango::sleep(to);
                             // drop sleep_trigger
                         });
-
-                        continue;
                     }
-                    PollBranch::Rcv => {
-                        return recv_jh.join().unwrap();
-                    }
-                    PollBranch::Snd => {
-                        return Ok(());
-                    }
+                    PollBranch::Rcv => return recv_jh.join().unwrap(),
+                    PollBranch::Snd => return Ok(()),
                 }
             }
         }
@@ -1361,7 +1397,97 @@ mod chunnels {
         }
     }
 
+    use super::negotiate::NegotiateMsg;
+    use super::udp::UdpChunnelConnection;
+    use shenango::udp::UdpConnection;
     impl super::Negotiate for ShardCanonicalServer {
+        fn picked_blocking(&mut self, nonce: &[u8]) {
+            let msg: NegotiateMsg = match bincode::deserialize(nonce) {
+                Err(e) => {
+                    warn!(err = ?e, "deserialize failed");
+                    return;
+                }
+                Ok(x @ NegotiateMsg::ServerNonce { .. }) => x,
+                Ok(_) => {
+                    warn!("malformed nonce");
+                    return;
+                }
+            };
+
+            //let offer = self.shards_extern_nonce.clone();
+            //let msg = match msg {
+            //    NegotiateMsg::ServerNonce { addr, .. } => NegotiateMsg::ServerNonce {
+            //        addr,
+            //        picked: offer,
+            //    },
+            //    _ => {
+            //        warn!("malformed nonce");
+            //        return;
+            //    }
+            //};
+
+            let buf = match bincode::serialize(&msg) {
+                Err(e) => {
+                    warn!(err = ?e, "serialize failed");
+                    return;
+                }
+                Ok(m) => m,
+            };
+
+            let wg = shenango::sync::WaitGroup::new();
+            for shard in &self.addr.shard_addrs {
+                let buf = buf.clone();
+                wg.add(1);
+                let wg = wg.clone();
+                let shard = *shard;
+                shenango::thread::spawn(move || {
+                    let cn = match UdpConnection::dial(
+                        SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+                        shard,
+                    ) {
+                        Ok(cn) => cn,
+                        Err(err) => {
+                            warn!(?err, ?shard, "could not connect to shard");
+                            return;
+                        }
+                    };
+
+                    let cn = UdpChunnelConnection::new(cn);
+                    if let Err(e) = cn.send((shard.clone(), buf.clone())) {
+                        warn!(err = ?e, "failed sending negotiation nonce to shard");
+                        wg.done();
+                        return;
+                    }
+
+                    trace!(remote = ?shard, "wait for nonce ack");
+                    match cn.recv() {
+                        Ok((a, buf)) => match bincode::deserialize(&buf) {
+                            Ok(NegotiateMsg::ServerNonceAck) => {
+                                if a != shard.clone() {
+                                    warn!(addr = ?a, expected = ?shard.clone(), "received from unexpected address");
+                                }
+
+                                trace!("got nonce ack");
+                            }
+                            Ok(m) => {
+                                warn!(msg = ?m, shard = ?shard.clone(), "got unexpected response to nonce");
+                            }
+                            Err(e) => {
+                                warn!(err = ?e, shard = ?shard.clone(), "failed deserializing nonce ack");
+                            }
+                        },
+                        Err(e) => {
+                            warn!(err = ?e, shard = ?shard.clone(), "failed waiting for nonce ack");
+                        }
+                    }
+
+                    wg.done();
+                });
+            }
+
+            wg.wait();
+        }
+
         fn ext_info(&self) -> Option<Vec<u8>> {
             let shard_info_bytes = bincode::serialize(&self.addr).unwrap();
             Some(shard_info_bytes)
@@ -1544,6 +1670,7 @@ mod chunnels {
 
         fn recv(&self) -> Result<Self::Data, Report> {
             let p = self.inner.recv()?;
+            trace!("shardcn recvd");
             Ok(p)
         }
     }
@@ -1675,10 +1802,10 @@ mod kvstore {
             let stack = CxList::from(cl)
                 .wrap(KvReliabilityChunnel::default())
                 .wrap(SerializeChunnelProject::default());
-            let raw = UdpChunnelConnection(UdpConnection::dial(
-                SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
-                self.canonical_addr,
-            )?);
+            let raw = UdpChunnelConnection::new(UdpConnection::listen(SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                0,
+            ))?);
             debug!("negotiation");
             let cn = super::negotiate::negotiate_client(stack, raw, self.canonical_addr)?;
             let cn = super::base_traits::Project(self.canonical_addr, cn);
@@ -1688,7 +1815,7 @@ mod kvstore {
 
     pub struct KvClient<C>(MsgIdMatcher<C, Msg>);
 
-    impl<C: ChunnelConnection> Clone for KvClient<C> {
+    impl<C> Clone for KvClient<C> {
         fn clone(&self) -> Self {
             Self(self.0.clone())
         }
@@ -1711,10 +1838,11 @@ mod kvstore {
         fn do_req(&self, req: Msg) -> Result<Option<String>, Report> {
             let cn = &self.0;
             let id = req.id();
-            trace!("sending");
+            trace!(?id, "sending");
             cn.send_msg(req).wrap_err("Error sending request")?;
+            trace!(?id, "sent");
             let rsp = cn.recv_msg(id).wrap_err("Error awaiting response")?;
-            trace!("received");
+            trace!(?id, "received");
             if rsp.id() != id {
                 return Err(eyre!(
                     "Msg id mismatch, check for reordering: {} != {}",
@@ -1747,7 +1875,7 @@ mod kvstore {
         inflight: Arc<DashMap<usize, D>>,
     }
 
-    impl<C: ChunnelConnection, D> Clone for MsgIdMatcher<C, D> {
+    impl<C, D> Clone for MsgIdMatcher<C, D> {
         fn clone(&self) -> Self {
             Self {
                 inner: Arc::clone(&self.inner),

@@ -1,0 +1,3 @@
+[build]
+# the ../../../ is target/(debug|release)/build
+rustflags = ["-C", "link-arg=-T../../../shenango-chunnel/caladan/base/base.ld"]
