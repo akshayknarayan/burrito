@@ -915,8 +915,8 @@ mod negotiate {
         let buf = bincode::serialize(&offer)?;
         loop {
             let mut poll = PollWaiter::new();
-            let sleep_trigger = poll.trigger(Box::new(Either::Left(())));
-            let send_trigger = poll.trigger(Box::new(Either::Right(())));
+            let send_trigger = poll.trigger(0);
+            let sleep_trigger = poll.trigger(1);
 
             shenango::thread::spawn_detached(move || {
                 let _sleep_trigger = sleep_trigger;
@@ -932,13 +932,16 @@ mod negotiate {
                 x // drop send_trigger
             });
 
-            match *poll.wait() {
-                Either::Right(_) => {
+            match poll.wait() {
+                0 => {
                     return work.join().unwrap();
                 }
-                Either::Left(_) => {
+                1 => {
                     debug!("negotiate offer timed out");
                     continue;
+                }
+                x => {
+                    warn!(?x, "invalid return value from wait");
                 }
             }
         }
@@ -1142,7 +1145,6 @@ mod chunnels {
 
         fn recv(&self) -> Result<Self::Data, Report> {
             let (a, buf) = self.inner.recv()?;
-            trace!("serialize recvd");
             let data = bincode::deserialize(&buf[..]).wrap_err(eyre!(
                 "deserialize failed: {:?} -> {:?}",
                 buf,
@@ -1260,11 +1262,9 @@ mod chunnels {
         type Data = (A, D);
 
         fn send(&self, data: Self::Data) -> Result<(), Report> {
-            enum PollBranch {
-                Timeout,
-                Snd,
-                Rcv,
-            }
+            const SND: u32 = 0;
+            const RCV: u32 = 1;
+            const TIMEOUT: u32 = 2;
 
             let msg_id = data.1.id();
             let send_waiter = Mutex::new(());
@@ -1281,16 +1281,15 @@ mod chunnels {
             // already exited) shortly after we return.
             let mut poll = PollWaiter::new();
             // 1. wait for the send to finish. this is what lets us return
-            let sendcomplete_trigger = poll.trigger(Box::new(PollBranch::Snd));
+            let sendcomplete_trigger = poll.trigger(SND);
             // 2. if a timeout happens, retransmit.
-            let timeout_trigger = poll.trigger(Box::new(PollBranch::Timeout));
+            let timeout_trigger = poll.trigger(TIMEOUT);
             // 3. handle receives and notify the corresponding senders.
-            let recv_trigger = poll.trigger(Box::new(PollBranch::Rcv));
+            let recv_trigger = poll.trigger(RCV);
 
             shenango::thread::spawn(move || {
                 let _send = sendcomplete_trigger;
                 send_waiter.lock();
-                trace!(?msg_id, "done in send");
             });
 
             let recv_cn = Arc::clone(&self.inner);
@@ -1313,7 +1312,6 @@ mod chunnels {
                         .remove(&recv_msg_id)
                         .ok_or_else(|| eyre!("not found: {:?}", recv_msg_id))?
                         .1;
-                    trace!(?msg_id, "done in recv");
                     unsafe { sw.unlock_manual() };
                     if recv_msg_id == msg_id || !sends.contains_key(&msg_id) {
                         return Ok(());
@@ -1330,20 +1328,23 @@ mod chunnels {
 
             loop {
                 let v = poll.wait();
-                let v = *v;
                 match v {
-                    PollBranch::Timeout => {
+                    TIMEOUT => {
                         trace!("kvreliability timeout");
                         self.inner.send(data.clone())?;
-                        let timeout_trigger = poll.trigger(Box::new(PollBranch::Timeout));
+                        let timeout_trigger = poll.trigger(TIMEOUT);
                         shenango::thread::spawn_detached(move || {
                             let _to = timeout_trigger;
                             shenango::sleep(to);
                             // drop sleep_trigger
                         });
                     }
-                    PollBranch::Rcv => return recv_jh.join().unwrap(),
-                    PollBranch::Snd => return Ok(()),
+                    RCV => return recv_jh.join().unwrap(),
+                    SND => return Ok(()),
+                    x => {
+                        warn!(?x, "invalid poll value");
+                        return Err(eyre!("invalid poll value {:?}", x));
+                    }
                 }
             }
         }
@@ -1669,9 +1670,7 @@ mod chunnels {
         }
 
         fn recv(&self) -> Result<Self::Data, Report> {
-            let p = self.inner.recv()?;
-            trace!("shardcn recvd");
-            Ok(p)
+            self.inner.recv()
         }
     }
 }
@@ -1872,7 +1871,7 @@ mod kvstore {
 
     pub struct MsgIdMatcher<C, D> {
         inner: Arc<C>,
-        inflight: Arc<DashMap<usize, D>>,
+        inflight: Arc<DashMap<usize, (Mutex<()>, Option<D>)>>,
     }
 
     impl<C, D> Clone for MsgIdMatcher<C, D> {
@@ -1885,6 +1884,7 @@ mod kvstore {
     }
 
     use dashmap::DashMap;
+    use shenango::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     impl<C, D> MsgIdMatcher<C, D>
@@ -1900,31 +1900,40 @@ mod kvstore {
         }
 
         pub fn send_msg(&self, data: D) -> Result<(), Report> {
+            let recv_waiter = Mutex::new(());
+            unsafe { recv_waiter.lock_manual() };
+            self.inflight.insert(data.id(), (recv_waiter.clone(), None));
             self.inner.send(data)
         }
 
         pub fn recv_msg(&self, msg_id: usize) -> Result<D, Report> {
-            let done = Arc::new(AtomicBool::default());
-            let inflight = Arc::clone(&self.inflight);
-            let d = Arc::clone(&done);
-            let done_jh = shenango::thread::spawn(move || {
-                while let None = inflight.get(&msg_id) {
-                    shenango::thread::thread_yield();
-                }
-
-                d.store(true, Ordering::SeqCst);
-                inflight.remove(&msg_id).unwrap().1
-            });
+            let done: Arc<AtomicBool> = Default::default();
+            let recv_waiter: Mutex<()> = {
+                let e = self
+                    .inflight
+                    .get(&msg_id)
+                    .ok_or_else(|| eyre!("msg id not found"))?;
+                let (ref m, _) = e.value();
+                m.clone()
+            };
 
             let inner = Arc::clone(&self.inner);
-            let inflight = Arc::clone(&self.inflight);
+            let infl = Arc::clone(&self.inflight);
             let d = Arc::clone(&done);
             shenango::thread::spawn(move || {
                 while !d.load(Ordering::SeqCst) {
                     match inner.recv() {
-                        Ok(r) => {
-                            inflight.insert(r.id(), r);
-                        }
+                        Ok(r) => match infl.get_mut(&r.id()) {
+                            Some(ref mut e) => {
+                                trace!(id = ?r.id(), "msg done");
+                                let (m, ref mut d) = e.value_mut();
+                                *d = Some(r);
+                                unsafe { m.unlock_manual() }; // wake up the other thread
+                            }
+                            None => {
+                                warn!(id = ?r.id(), "got unexpected message");
+                            }
+                        },
                         Err(e) => {
                             warn!(?e, "recv errored");
                             return;
@@ -1933,7 +1942,10 @@ mod kvstore {
                 }
             });
 
-            Ok(done_jh.join().unwrap())
+            trace!(?msg_id, "waiting");
+            recv_waiter.lock();
+            done.store(true, Ordering::SeqCst);
+            Ok(self.inflight.remove(&msg_id).unwrap().1 .1.unwrap())
         }
     }
 }

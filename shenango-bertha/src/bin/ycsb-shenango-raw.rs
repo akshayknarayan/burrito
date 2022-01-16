@@ -188,7 +188,6 @@ where
         }
     }
 
-    #[tracing::instrument(err, skip(cl, ops, interarrival, done))]
     fn req_loop(
         client_id: usize,
         cl: KvClient<impl ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static>,
@@ -218,25 +217,27 @@ where
                 let mut putter_g = paced_ops_putter.lock();
                 timer.wait();
                 putter_g.push_back(o);
-                trace!(num_pending_ops = ?putter_g.len(), "pushed op");
+                trace!(?client_id, num_pending_ops = ?putter_g.len(), "pushed op");
                 // drop putter_g, releasing the lock
             }
 
             done.store(true, Ordering::SeqCst);
+            debug!(?client_id, "ops done");
         });
 
         let concurrent_ops = WaitGroup::new();
         let durs = loop {
-            // get ops, but don't hold the lock.
             if done.load(Ordering::SeqCst) {
+                debug!(?client_id, "exiting");
                 break Ok::<_, Report>(durs);
             }
 
+            // get ops, but don't hold the lock.
             let now_ops: Vec<_> = paced_ops.lock().drain(..).collect();
             if now_ops.is_empty() {
                 shenango::thread::thread_yield();
             } else {
-                trace!(num_now_ops = ?now_ops.len(), "drained ops");
+                trace!(?client_id, num_now_ops = ?now_ops.len(), "drained ops");
                 concurrent_ops.add(now_ops.len() as _);
                 let op_batch: Vec<_> = now_ops
                     .into_iter()
@@ -252,6 +253,7 @@ where
                     .collect();
 
                 concurrent_ops.wait();
+                trace!(?client_id, "ops batch completed");
                 for o in op_batch {
                     durs.push(o.join().unwrap()?);
                 }
@@ -286,6 +288,7 @@ where
         .collect();
 
     wg.wait();
+    info!("requests done");
     let access_end = Duration::from_micros(shenango::microtime() - access_start);
     let mut all_durs = vec![];
     let mut remaining_inflight = 0;
