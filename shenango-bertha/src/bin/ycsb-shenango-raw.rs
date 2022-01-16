@@ -153,7 +153,7 @@ where
             //let mut rng = rand::thread_rng();
             if self.deficit > self.interarrival {
                 self.deficit -= self.interarrival;
-                trace!(deficit = ?self.deficit, "returning immediately from deficit");
+                //trace!(deficit = ?self.deficit, "returning immediately from deficit");
                 return;
             }
 
@@ -179,12 +179,12 @@ where
                 self.deficit += Duration::from_micros(elapsed - interarrival_us);
             }
 
-            trace!(
-                ?elapsed,
-                ?self.deficit,
-                sampled_wait_us = ?interarrival_us,
-                "waited"
-            );
+            //trace!(
+            //    ?elapsed,
+            //    ?self.deficit,
+            //    sampled_wait_us = ?interarrival_us,
+            //    "waited"
+            //);
         }
     }
 
@@ -197,10 +197,10 @@ where
     ) -> Result<(Vec<Duration>, usize), Report> {
         let mut durs = vec![];
         debug!(?client_id, "starting");
-        let paced_ops = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let paced_ops = Mutex::new(std::collections::VecDeque::new());
 
         // paced ops
-        let paced_ops_putter = Arc::clone(&paced_ops);
+        let paced_ops_putter = paced_ops.clone();
         let paced_ops_done = Arc::clone(&done);
         shenango::thread::spawn(move || {
             let done = paced_ops_done;
@@ -217,7 +217,7 @@ where
                 let mut putter_g = paced_ops_putter.lock();
                 timer.wait();
                 putter_g.push_back(o);
-                trace!(?client_id, num_pending_ops = ?putter_g.len(), "pushed op");
+                //trace!(?client_id, num_pending_ops = ?putter_g.len(), "pushed op");
                 // drop putter_g, releasing the lock
             }
 

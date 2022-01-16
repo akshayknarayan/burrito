@@ -92,10 +92,11 @@ mod base_traits {
 mod udp {
     use crate::base_traits::ChunnelConnection;
     use color_eyre::eyre::{Report, WrapErr};
+    use shenango::sync::Mutex;
     pub use shenango::udp::udp_accept;
     pub use shenango::udp::UdpConnection;
     use std::net::SocketAddrV4;
-    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+    use std::sync::{atomic::AtomicBool, Arc};
 
     #[derive(Clone)]
     pub struct UdpChunnelConnection(pub Arc<UdpConnection>);
@@ -122,12 +123,12 @@ mod udp {
         }
     }
 
-    pub struct InjectOne<C, D>(C, AtomicBool, Arc<Mutex<Option<D>>>);
+    pub struct InjectOne<C, D>(C, AtomicBool, Mutex<Option<D>>);
 
     impl<C, D> InjectOne<C, D> {
-        pub fn new(inner: C) -> (Self, Arc<Mutex<Option<D>>>) {
-            let mtx = Default::default();
-            (Self(inner, Default::default(), Arc::clone(&mtx)), mtx)
+        pub fn new(inner: C) -> (Self, Mutex<Option<D>>) {
+            let mtx: Mutex<Option<D>> = Mutex::new(None);
+            (Self(inner, Default::default(), mtx.clone()), mtx)
         }
     }
 
@@ -143,7 +144,7 @@ mod udp {
                 self.0.recv()
             } else {
                 self.1.store(true, std::sync::atomic::Ordering::SeqCst);
-                let d = self.2.lock().unwrap().take().unwrap();
+                let d = self.2.lock().take().unwrap();
                 Ok(d)
             }
         }
@@ -161,12 +162,13 @@ mod negotiate {
         CxList, DataEither, Either,
     };
     use color_eyre::eyre::{bail, eyre, Report, WrapErr};
+    use shenango::sync::Mutex;
     use std::collections::HashMap;
     use std::fmt::Debug;
     use std::net::SocketAddrV4;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     };
     use tracing::{debug, trace, warn};
 
@@ -374,11 +376,11 @@ mod negotiate {
             + Sync
             + 'static,
     {
-        let pending_negotiated_connections: Arc<Mutex<HashMap<SocketAddrV4, StackNonce>>> =
+        let pending_negotiated_connections: Mutex<HashMap<SocketAddrV4, StackNonce>> =
             Default::default();
         udp::udp_accept(listen_addr, move |cn| {
             let stack = stack.clone();
-            let pending_negotiated_connections = Arc::clone(&pending_negotiated_connections);
+            let pending_negotiated_connections = pending_negotiated_connections.clone();
             match negotiate_server_connection(cn, stack, pending_negotiated_connections) {
                 Ok(Some(cn)) => per_conn(cn),
                 _ => (),
@@ -392,7 +394,7 @@ mod negotiate {
     fn negotiate_server_connection<Srv>(
         cn: udp::UdpConnection,
         stack: Srv,
-        pending_negotiated_connections: Arc<Mutex<HashMap<SocketAddrV4, StackNonce>>>,
+        pending_negotiated_connections: Mutex<HashMap<SocketAddrV4, StackNonce>>,
     ) -> Result<
         Option<
             Either<
@@ -427,7 +429,7 @@ mod negotiate {
             // if `a` is in pending_negotiated_connections, this is a post-negotiation message and we
             // should return the applied connection.
             let opt_picked = {
-                let guard = pending_negotiated_connections.lock().unwrap();
+                let guard = pending_negotiated_connections.lock();
                 guard.get(&a).map(Clone::clone)
             };
 
@@ -441,7 +443,7 @@ mod negotiate {
                 let new_cn = stack.connect_wrap(cn).map_err(Into::into)?;
 
                 debug!(addr = ?&a, stack = ?&stack, "returning pre-negotiated connection");
-                *recirculate_mtx.lock().unwrap() = Some((a, buf));
+                *recirculate_mtx.lock() = Some((a, buf));
                 return Ok(Some(Either::Right(new_cn)));
             }
 
@@ -464,7 +466,6 @@ mod negotiate {
                     trace!(client_addr = ?&addr, nonce = ?&picked, "got nonce");
                     pending_negotiated_connections
                         .lock()
-                        .unwrap()
                         .insert(addr, picked.clone());
 
                     // send ack
@@ -474,7 +475,7 @@ mod negotiate {
 
                     // need to loop on this connection, processing nonces
                     if let Err(e) =
-                        process_nonces_connection(cn, Arc::clone(&pending_negotiated_connections))
+                        process_nonces_connection(cn, pending_negotiated_connections.clone())
                             .wrap_err("process_nonces_connection")
                     {
                         debug!(err = %format!("{:#}", e), "process_nonces_connection exited");
@@ -576,7 +577,7 @@ mod negotiate {
 
     fn process_nonces_connection(
         cn: UdpChunnelConnection,
-        pending_negotiated_connections: Arc<Mutex<HashMap<SocketAddrV4, StackNonce>>>,
+        pending_negotiated_connections: Mutex<HashMap<SocketAddrV4, StackNonce>>,
     ) -> Result<(), Report> {
         loop {
             trace!(local = ?cn.0.local_addr(), remote = ?cn.0.remote_addr(), "call recv()");
@@ -591,7 +592,6 @@ mod negotiate {
                     trace!(client_addr = ?&addr, nonce = ?&picked, "got nonce");
                     pending_negotiated_connections
                         .lock()
-                        .unwrap()
                         .insert(addr, picked.clone());
 
                     // send ack
@@ -1073,6 +1073,7 @@ mod chunnels {
     use color_eyre::eyre::{eyre, Report, WrapErr};
     use shenango::poll::PollWaiter;
     use shenango::sync::Mutex;
+    use shenango::WaitGroup;
     use std::fmt::Debug;
     use std::net::SocketAddrV4;
     use std::sync::Arc;
@@ -1233,12 +1234,16 @@ mod chunnels {
         }
     }
 
+    use shenango::sync::Condvar;
+    use std::collections::HashMap;
+
     #[derive(Clone)]
     pub struct KvReliability<C, A, D> {
         inner: Arc<C>,
         timeout: Duration,
-        sends: Arc<dashmap::DashMap<usize, Mutex<()>>>,
-        recvs: Arc<Mutex<Vec<(A, D)>>>,
+        sends: Mutex<HashMap<usize, WaitGroup>>,
+        recv_cv: Condvar,
+        recvs: Mutex<Vec<(A, D)>>,
     }
 
     impl<C, A, D> KvReliability<C, A, D> {
@@ -1247,6 +1252,7 @@ mod chunnels {
                 inner: Arc::new(inner),
                 timeout,
                 sends: Default::default(),
+                recv_cv: Condvar::new(),
                 recvs: Default::default(),
             }
         }
@@ -1267,12 +1273,13 @@ mod chunnels {
             const TIMEOUT: u32 = 2;
 
             let msg_id = data.1.id();
-            let send_waiter = Mutex::new(());
-            // unlock this when the send finishes.
-            // use manual locking because we don't want to have to keep the mutex guard and its
-            // self-referential lifetime around.
-            unsafe { send_waiter.lock_manual() };
-            self.sends.insert(msg_id, send_waiter.clone());
+            let send_waiter = WaitGroup::new();
+            // .done() this when the send finishes.
+            send_waiter.add(1);
+            {
+                let mut g = self.sends.lock();
+                g.insert(msg_id, send_waiter.clone());
+            }
 
             // blocks, but will finish fast.
             self.inner.send(data.clone())?;
@@ -1289,31 +1296,40 @@ mod chunnels {
 
             shenango::thread::spawn(move || {
                 let _send = sendcomplete_trigger;
-                send_waiter.lock();
+                send_waiter.wait();
             });
 
             let recv_cn = Arc::clone(&self.inner);
-            let recvs = Arc::clone(&self.recvs);
-            let sends = Arc::clone(&self.sends);
+            let recvs = self.recvs.clone();
+            let recv_cv = self.recv_cv.clone();
+            let sends = self.sends.clone();
             let recv_jh = shenango::thread::spawn(move || {
                 let _recv = recv_trigger;
                 loop {
                     let recv_msg_id = {
-                        let mut rg = recvs.lock();
                         let resp = recv_cn.recv().wrap_err("kvreliability recv acks")?;
                         let recv_msg_id = resp.1.id();
 
                         // signal recv
+                        trace!(?recv_msg_id, "lock recvs");
+                        let mut rg = recvs.lock();
                         rg.push(resp);
+                        recv_cv.signal();
+                        trace!(pending_recvs = ?rg.len(), ?recv_msg_id, "kvrel recvd");
                         recv_msg_id
                     };
 
-                    let sw = sends
-                        .remove(&recv_msg_id)
-                        .ok_or_else(|| eyre!("not found: {:?}", recv_msg_id))?
-                        .1;
-                    unsafe { sw.unlock_manual() };
-                    if recv_msg_id == msg_id || !sends.contains_key(&msg_id) {
+                    let (sw, done_already) = {
+                        let mut g = sends.lock();
+                        (
+                            g.remove(&recv_msg_id)
+                                .ok_or_else(|| eyre!("not found: {:?}", recv_msg_id))?,
+                            !g.contains_key(&msg_id),
+                        )
+                    };
+
+                    sw.done();
+                    if recv_msg_id == msg_id || done_already {
                         return Ok(());
                     }
                 }
@@ -1339,7 +1355,10 @@ mod chunnels {
                             // drop sleep_trigger
                         });
                     }
-                    RCV => return recv_jh.join().unwrap(),
+                    RCV => {
+                        trace!("kvrel recv returned");
+                        return recv_jh.join().unwrap();
+                    }
                     SND => return Ok(()),
                     x => {
                         warn!(?x, "invalid poll value");
@@ -1350,11 +1369,24 @@ mod chunnels {
         }
 
         fn recv(&self) -> Result<Self::Data, Report> {
-            loop {
-                if let Some(d) = self.recvs.lock().pop() {
-                    return Ok(d);
-                } else {
-                    shenango::thread::thread_yield();
+            let res = {
+                let mut g = self.recvs.lock();
+                g.pop()
+            };
+            if let Some(d) = res {
+                trace!(id = ?d.1.id(), "kvrel returning fast");
+                return Ok(d);
+            } else {
+                loop {
+                    let mut e = self.recv_cv.wait(&self.recvs);
+                    if let Some(d) = e.pop() {
+                        let remaining = e.len();
+                        let id = d.1.id();
+                        trace!(?id, ?remaining, "kvrel returning slow");
+                        return Ok(d);
+                    } else {
+                        shenango::thread::thread_yield();
+                    }
                 }
             }
         }
@@ -1682,10 +1714,13 @@ mod kvstore {
     use super::{KvReliabilityChunnel, KvReliabilityServerChunnel, SerializeChunnelProject};
     use bertha::CxList;
     use color_eyre::eyre::{eyre, Report, WrapErr};
-    use kvstore::kv::Store;
+    //use kvstore::kv::Store;
     use std::net::SocketAddrV4;
     use std::sync::{atomic::AtomicUsize, Arc};
     use tracing::{debug, info, trace, warn};
+
+    use kvstore::Op;
+    use std::collections::HashMap;
 
     pub fn single_shard(addr: SocketAddrV4) {
         info!(?addr, "listening");
@@ -1694,7 +1729,39 @@ mod kvstore {
             .wrap(SerializeChunnelProject::default());
 
         // initialize the kv store.
-        let store = Store::default();
+        //let store = Store::default();
+        fn get(this: &Mutex<HashMap<String, String>>, k: &str) -> Option<String> {
+            let g = this.lock();
+            g.get(k).map(Clone::clone)
+        }
+
+        fn put(
+            this: &Mutex<HashMap<String, String>>,
+            k: &str,
+            v: Option<String>,
+        ) -> Option<String> {
+            let mut g = this.lock();
+            if let Some(v) = v {
+                g.insert(k.to_string(), v)
+            } else {
+                g.remove(k)
+            }
+        }
+
+        fn call(this: &Mutex<HashMap<String, String>>, req: Msg) -> Msg {
+            match req.op() {
+                Op::Get => {
+                    let val = get(this, req.key());
+                    req.resp(val)
+                }
+                Op::Put => {
+                    let old = put(this, req.key(), req.val());
+                    req.resp(old)
+                }
+            }
+        }
+
+        let store: Mutex<HashMap<String, String>> = Default::default();
         let idx = Arc::new(AtomicUsize::new(0));
 
         super::negotiate_server(external, addr, move |cn| {
@@ -1710,8 +1777,8 @@ mod kvstore {
                         break;
                     }
                 };
-                trace!(msg = ?&msg, from=?&a, "got msg");
-                let rsp = store.call(msg);
+                //trace!(msg = ?&msg, from=?&a, "got msg");
+                let rsp = call(&store, msg);
                 if let Err(e) = cn.send((a, rsp)) {
                     warn!(?e, "send failed");
                     break;
@@ -1871,20 +1938,19 @@ mod kvstore {
 
     pub struct MsgIdMatcher<C, D> {
         inner: Arc<C>,
-        inflight: Arc<DashMap<usize, (Mutex<()>, Option<D>)>>,
+        inflight: Mutex<HashMap<usize, (WaitGroup, Option<D>)>>,
     }
 
     impl<C, D> Clone for MsgIdMatcher<C, D> {
         fn clone(&self) -> Self {
             Self {
                 inner: Arc::clone(&self.inner),
-                inflight: Arc::clone(&self.inflight),
+                inflight: self.inflight.clone(),
             }
         }
     }
 
-    use dashmap::DashMap;
-    use shenango::sync::Mutex;
+    use shenango::sync::{Mutex, WaitGroup};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     impl<C, D> MsgIdMatcher<C, D>
@@ -1895,43 +1961,53 @@ mod kvstore {
         pub fn new(inner: C) -> Self {
             Self {
                 inner: Arc::new(inner),
-                inflight: Default::default(),
+                inflight: Mutex::new(Default::default()),
             }
         }
 
         pub fn send_msg(&self, data: D) -> Result<(), Report> {
-            let recv_waiter = Mutex::new(());
-            unsafe { recv_waiter.lock_manual() };
-            self.inflight.insert(data.id(), (recv_waiter.clone(), None));
+            let recv_waiter = WaitGroup::new();
+            recv_waiter.add(1);
+            let old = self
+                .inflight
+                .lock()
+                .insert(data.id(), (recv_waiter.clone(), None));
+            assert!(old.is_none(), "double send");
             self.inner.send(data)
         }
 
         pub fn recv_msg(&self, msg_id: usize) -> Result<D, Report> {
             let done: Arc<AtomicBool> = Default::default();
-            let recv_waiter: Mutex<()> = {
-                let e = self
-                    .inflight
-                    .get(&msg_id)
-                    .ok_or_else(|| eyre!("msg id not found"))?;
-                let (ref m, _) = e.value();
+            let recv_waiter: WaitGroup = {
+                let g = self.inflight.lock();
+                let (ref m, _) = g.get(&msg_id).ok_or_else(|| eyre!("msg id not found"))?;
                 m.clone()
             };
 
             let inner = Arc::clone(&self.inner);
-            let infl = Arc::clone(&self.inflight);
+            let infl = self.inflight.clone();
             let d = Arc::clone(&done);
             shenango::thread::spawn(move || {
                 while !d.load(Ordering::SeqCst) {
-                    match inner.recv() {
-                        Ok(r) => match infl.get_mut(&r.id()) {
+                    trace!(local_id = ?msg_id, "calling recv");
+                    let r = inner.recv();
+                    trace!(local_id = ?msg_id, "recv returned");
+                    match r {
+                        Ok(r) => match infl.lock().get_mut(&r.id()) {
                             Some(ref mut e) => {
-                                trace!(id = ?r.id(), "msg done");
-                                let (m, ref mut d) = e.value_mut();
+                                let id = r.id();
+                                trace!(?id, local_id = ?msg_id, "msg done");
+                                let (m, ref mut d) = e;
+                                assert!(d.is_none(), "double recv");
                                 *d = Some(r);
-                                unsafe { m.unlock_manual() }; // wake up the other thread
+                                m.done(); // wake up the other thread
+                                if msg_id == id {
+                                    break;
+                                }
                             }
                             None => {
-                                warn!(id = ?r.id(), "got unexpected message");
+                                // probably a spurious retx.
+                                trace!(id = ?r.id(), local_id = ?msg_id, "got unexpected message");
                             }
                         },
                         Err(e) => {
@@ -1942,10 +2018,9 @@ mod kvstore {
                 }
             });
 
-            trace!(?msg_id, "waiting");
-            recv_waiter.lock();
+            recv_waiter.wait();
             done.store(true, Ordering::SeqCst);
-            Ok(self.inflight.remove(&msg_id).unwrap().1 .1.unwrap())
+            Ok(self.inflight.lock().remove(&msg_id).unwrap().1.unwrap())
         }
     }
 }
