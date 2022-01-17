@@ -21,14 +21,14 @@ rpcbench: ./target/release/bincode-pingclient ./target/release/bincode-pingserve
 #	cd kvstore && $(CARGO) build --release --features="bin,ebpf,use-shenango"
 #	rm -f ./target/release/kvserver-ebpf && cp ./target/release/kvserver ./target/release/kvserver-ebpf
 
-./shenango-chunnel/caladan/iokerneld: ./shenango-chunnel/caladan/Makefile
+./shenango-chunnel/caladan/iokerneld ./shenango-chunnel/caladan/libbase.a ./shenango-chunnel/caladan/libnet.a ./shenango-chunnel/caladan/libruntime.a: ./shenango-chunnel/caladan/Makefile
 	make -C ./shenango-chunnel/caladan
 
 ./target/release/kvserver-noebpf: $(FLS)
 	cd kvstore && $(CARGO) build --release --features="bin,use-shenango"
 	rm -f ./target/release/kvserver-noebpf && cp ./target/release/kvserver ./target/release/kvserver-noebpf
 
-./target/release/ycsb-shenango-raw ./target/release/kvserver-shenango-raw: $(FLS)
+./target/release/ycsb-shenango-raw ./target/release/kvserver-shenango-raw: $(FLS) ./shenango-chunnel/caladan/libbase.a ./shenango-chunnel/caladan/libnet.a ./shenango-chunnel/caladan/libruntime.a
 	cd shenango-bertha && $(CARGO) build --release
 
 ./target/release/bincode-pingclient ./target/release/bincode-pingserver: $(FLS)
