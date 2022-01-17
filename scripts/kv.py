@@ -150,9 +150,9 @@ def get_local(filename, local=None, preserve_mode=True):
     assert(local is not None)
     subprocess.run(f"mv {filename} {local}", shell=True)
 
-thread_ok = True
 
 def check(ok, msg, addr, allowed=[]):
+    nonlocal thread_ok
     # exit code 0 is always ok, allowed is in addition
     if ok.exited != 0 and ok.exited not in allowed:
         agenda.subfailure(f"{msg} on {addr}: {ok.exited} not in {allowed}")
@@ -494,8 +494,6 @@ def do_exp(iter_num,
 ### shardtype = ["client"]
 ### shards = [6]
 ### batching = [0, 16, 64, 256]
-###
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
