@@ -63,7 +63,7 @@ fn main() -> Result<(), Report> {
                 do_loads(&mut basic_client, loads).unwrap();
                 if opt.loads_only {
                     info!("doing only loads, done");
-                    sys::process::exit(0);
+                    std::process::exit(0);
                 }
             } else {
                 info!("skipping loads");
