@@ -33,13 +33,13 @@ runtime_guaranteed_kthreads 6"""
         subprocess.run(f"rm -f host.config && cp {fname} host.config", shell=True)
 
 def start_server(conn, outf, shards=1):
-    conn.run("sudo pkill -9 kvserver-shenango-raw")
+    conn.run("sudo pkill -9 kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
     write_shenango_config(conn)
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
-    ok = conn.run(f"./target/release/kvserver-shenango-raw --ip-addr {conn.addr} --port 4242 --num-shards {shards} -s host.config",
+    ok = conn.run(f"./target/release/kvserver-shenango-raw --addr {conn.addr}:4242 --num-shards {shards} --cfg host.config",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -49,7 +49,7 @@ def start_server(conn, outf, shards=1):
     check(ok, "spawn server", conn.addr)
     agenda.subtask("wait for kvserver check")
     time.sleep(8)
-    conn.check_proc(f"kvserver-shenango-raw", f"{outf}.err")
+    conn.check_proc(f"kvserver", f"{outf}.err")
 
 def run_client(conn, server, interarrival, poisson_arrivals, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
@@ -61,7 +61,7 @@ def run_client(conn, server, interarrival, poisson_arrivals, outf, wrkfile):
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info ./target/release/ycsb \
+    ok = conn.run(f"RUST_LOG=info ./target/release/ycsb-shenango-raw \
             --addr {server}:4242 \
             -i {interarrival} \
             --accesses {wrkfile} \
@@ -82,34 +82,37 @@ def run_loads(conn, server, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
     write_shenango_config(conn)
-    while True:
-        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
-        time.sleep(2)
-        loads_start = time.time()
-        agenda.subtask(f"loads client starting")
-        ok = None
-        try:
-            ok = conn.run(f"RUST_LOG=info ./target/release/ycsb \
-                    --addr {server}:4242 \
-                    -i 1000 \
-                    --accesses {wrkfile} \
-                    -s host.config \
-                    --loads-only",
-                wd="~/burrito",
-                stdout=f"{outf}-loads.out",
-                stderr=f"{outf}-loads.err",
-                timeout=30,
-                )
-        except:
-            agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
-        finally:
-            conn.run("sudo pkill -INT iokerneld")
-        if ok is None or ok.exited != 0:
-            agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
-            continue
-        else:
-            agenda.subtask(f"loads client done: {time.time() - loads_start} s")
-            break
+    #while True:
+    conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+    time.sleep(2)
+    loads_start = time.time()
+    agenda.subtask(f"loads client starting")
+    ok = None
+    try:
+        ok = conn.run(f"RUST_LOG=info ./target/release/ycsb-shenango-raw \
+                --addr {server}:4242 \
+                -i 1000 \
+                --accesses {wrkfile} \
+                -s host.config \
+                --loads-only",
+            wd="~/burrito",
+            stdout=f"{outf}-loads.out",
+            stderr=f"{outf}-loads.err",
+            timeout=30,
+            )
+        print(ok)
+    except Exception as e:
+        print(e)
+        agenda.subfailure(f"loads failed") #, retrying after {time.time() - loads_start} s")
+    finally:
+        conn.run("sudo pkill -INT iokerneld")
+    if ok is None or ok.exited != 0:
+        agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
+        sys.exit(1)
+        #continue
+    else:
+        agenda.subtask(f"loads client done: {time.time() - loads_start} s")
+        #break
 
 def do_exp(iter_num,
     outdir=None,
@@ -187,7 +190,7 @@ def do_exp(iter_num,
     agenda.task("all clients returned")
 
     # kill the server
-    machines[0].run("sudo pkill -9 kvserver-shenango-raw")
+    machines[0].run("sudo pkill -9 kvserver")
     machines[0].run("sudo pkill -INT iokerneld")
 
     for m in machines:
@@ -282,25 +285,29 @@ if __name__ == '__main__':
             sys.exit(1)
 
     # ban fancy features from this experiment
-    for t in cfg['exp']['stack-fragmentation']:
-        if t:
-            agenda.failure(f"Stack fragmentation unsupported")
-            sys.exit(1)
+    if 'stack-fragmentation' in cfg['exp']:
+        for t in cfg['exp']['stack-fragmentation']:
+            if t:
+                agenda.failure(f"Stack fragmentation unsupported")
+                sys.exit(1)
 
-    for t in cfg['exp']['shardtype']:
-        if t != 'client':
-            agenda.failure(f"Unsupported shardtype {t}")
-            sys.exit(1)
+    if 'shardtype' in cfg['exp']:
+        for t in cfg['exp']['shardtype']:
+            if t != 'client':
+                agenda.failure(f"Unsupported shardtype {t}")
+                sys.exit(1)
 
-    for t in cfg['exp']['client-batching']:
-        if t != 0:
-            agenda.failure(f"Unsupported batching {t}")
-            sys.exit(1)
+    if 'client-batching' in cfg['exp']:
+        for t in cfg['exp']['client-batching']:
+            if t != 0:
+                agenda.failure(f"Unsupported batching {t}")
+                sys.exit(1)
 
-    for t in cfg['exp']['client-batching']:
-        if t != 0:
-            agenda.failure(f"Unsupported batching {t}")
-            sys.exit(1)
+    if 'server-batching' in cfg['exp']:
+        for t in cfg['exp']['server-batching']:
+            if t != 0:
+                agenda.failure(f"Unsupported batching {t}")
+                sys.exit(1)
 
     agenda.task(f"Checking for connection vs experiment ip")
     ips = [cfg['machines']['server']] + cfg['machines']['clients']

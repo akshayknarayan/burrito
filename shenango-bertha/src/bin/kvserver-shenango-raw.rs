@@ -6,7 +6,7 @@ use tracing::info;
 #[derive(Debug, StructOpt)]
 #[structopt(name = "kvserver")]
 struct Opt {
-    #[structopt(short, long, default_value = "0.0.0.0")]
+    #[structopt(short, long, default_value = "0.0.0.0:5001")]
     addr: std::net::SocketAddrV4,
 
     #[structopt(short, long)]

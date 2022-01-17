@@ -152,7 +152,6 @@ def get_local(filename, local=None, preserve_mode=True):
 
 
 def check(ok, msg, addr, allowed=[]):
-    nonlocal thread_ok
     # exit code 0 is always ok, allowed is in addition
     if ok.exited != 0 and ok.exited not in allowed:
         agenda.subfailure(f"{msg} on {addr}: {ok.exited} not in {allowed}")
@@ -495,6 +494,8 @@ def do_exp(iter_num,
 ### shards = [6]
 ### batching = [0, 16, 64, 256]
 if __name__ == '__main__':
+    global thread_ok
+    thread_ok = True
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--outdir', type=str, required=True)
@@ -543,7 +544,6 @@ if __name__ == '__main__':
 
     # build
     agenda.task("building burrito...")
-    thread_ok = True
     setups = [threading.Thread(target=setup_machine, args=(m,outdir)) for m in machines]
     [t.start() for t in setups]
     [t.join() for t in setups]
