@@ -134,8 +134,8 @@ def do_exp(iter_num,
     )
 
     wrkname = wrkload.split("/")[-1].split(".")[0]
-    server_prefix = f"{outdir}/{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-clientbatch=0-server_batch=0-stackfrag=False-{wrkname}-{iter_num}-kvserver"
-    outf = f"{outdir}/{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch=0-server_batch=0-stackfrag=False-{wrkname}-{iter_num}-client"
+    server_prefix = f"{outdir}/shenango_rt-{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch=0-server_batch=none-stackfrag=False-{wrkname}-{iter_num}-kvserver"
+    outf = f"{outdir}/shenango_rt-{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch=0-server_batch=none-stackfrag=False-{wrkname}-{iter_num}-client"
 
     for m in machines:
         if m.local:

@@ -11,22 +11,30 @@ all: sharding rpcbench
 
 .PHONY: sharding rpcbench
 
-sharding: ./target/release/ycsb ./target/release/kvserver-noebpf ./target/release/kvserver-shenango-raw ./target/release/ycsb-shenango-raw ./shenango-chunnel/caladan/iokerneld
+sharding: ./target/release/ycsb ./target/release/kvserver-noebpf ./target/release/kvserver-shenango-raw ./target/release/ycsb-shenango-raw ./shenango-chunnel/caladan/iokerneld ./target/release/ycsb-kernel ./target/release/kvserver-kernel
 rpcbench: ./target/release/bincode-pingclient ./target/release/bincode-pingserver ./target/release/burrito-localname
 
 ./target/release/ycsb: $(FLS)
 	cd kvstore-ycsb && $(CARGO) build --release --features="use-shenango"
 
+./target/release/kvserver-noebpf: $(FLS)
+	cd kvstore && $(CARGO) build --release --features="bin,use-shenango"
+	rm -f ./target/release/kvserver-noebpf && cp ./target/release/kvserver ./target/release/kvserver-noebpf
+
 #./target/release/kvserver-ebpf: $(FLS)
 #	cd kvstore && $(CARGO) build --release --features="bin,ebpf,use-shenango"
 #	rm -f ./target/release/kvserver-ebpf && cp ./target/release/kvserver ./target/release/kvserver-ebpf
 
+./target/release/ycsb-kernel: $(FLS)
+	cd kvstore-ycsb && $(CARGO) build --release 
+	rm -f ./target/release/ycsb-kernel && cp ./target/release/ycsb ./target/release/ycsb-kernel
+
+./target/release/kvserver-kernel: $(FLS)
+	cd kvstore && $(CARGO) build --release --features="bin"
+	rm -f ./target/release/kvserver-kernel && cp ./target/release/kvserver ./target/release/kvserver-kernel
+
 ./shenango-chunnel/caladan/iokerneld ./shenango-chunnel/caladan/libbase.a ./shenango-chunnel/caladan/libnet.a ./shenango-chunnel/caladan/libruntime.a: ./shenango-chunnel/caladan/Makefile
 	make -C ./shenango-chunnel/caladan
-
-./target/release/kvserver-noebpf: $(FLS)
-	cd kvstore && $(CARGO) build --release --features="bin,use-shenango"
-	rm -f ./target/release/kvserver-noebpf && cp ./target/release/kvserver ./target/release/kvserver-noebpf
 
 ./target/release/ycsb-shenango-raw ./target/release/kvserver-shenango-raw: $(FLS) ./shenango-chunnel/caladan/libbase.a ./shenango-chunnel/caladan/libnet.a ./shenango-chunnel/caladan/libruntime.a
 	cd shenango-bertha && $(CARGO) build --release
