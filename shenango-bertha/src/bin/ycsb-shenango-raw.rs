@@ -96,6 +96,8 @@ fn main() -> Result<(), Report> {
                 opt.interarrival_client_micros,
                 opt.out_file,
             );
+
+            std::process::exit(0);
         },
     )
     .unwrap();

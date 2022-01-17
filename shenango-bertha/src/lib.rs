@@ -1259,6 +1259,7 @@ mod chunnels {
     }
 
     use bertha::util::MsgId;
+    use shenango::time::Timer;
     impl<A, D, C> ChunnelConnection for KvReliability<C, A, D>
     where
         C: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
@@ -1311,21 +1312,20 @@ mod chunnels {
                         let recv_msg_id = resp.1.id();
 
                         // signal recv
-                        trace!(?recv_msg_id, "lock recvs");
                         let mut rg = recvs.lock();
                         rg.push(resp);
                         recv_cv.signal();
-                        trace!(pending_recvs = ?rg.len(), ?recv_msg_id, "kvrel recvd");
                         recv_msg_id
                     };
 
                     let (sw, done_already) = {
                         let mut g = sends.lock();
-                        (
-                            g.remove(&recv_msg_id)
-                                .ok_or_else(|| eyre!("not found: {:?}", recv_msg_id))?,
-                            !g.contains_key(&msg_id),
-                        )
+                        let sw = g.remove(&recv_msg_id);
+                        if sw.is_none() {
+                            return Ok(());
+                        }
+
+                        (sw.unwrap(), !g.contains_key(&msg_id))
                     };
 
                     sw.done();
@@ -1336,9 +1336,11 @@ mod chunnels {
             });
 
             let to = self.timeout;
+            let mut sleeper = Timer::new();
+            let sl = sleeper.clone();
             shenango::thread::spawn_detached(move || {
                 let _to = timeout_trigger;
-                shenango::sleep(to);
+                sl.sleep(to);
                 // drop sleep_trigger
             });
 
@@ -1348,19 +1350,25 @@ mod chunnels {
                     TIMEOUT => {
                         trace!("kvreliability timeout");
                         self.inner.send(data.clone())?;
+                        sleeper = Timer::new();
+                        let sl = sleeper.clone();
                         let timeout_trigger = poll.trigger(TIMEOUT);
                         shenango::thread::spawn_detached(move || {
                             let _to = timeout_trigger;
-                            shenango::sleep(to);
+                            sl.sleep(to);
                             // drop sleep_trigger
                         });
                     }
                     RCV => {
-                        trace!("kvrel recv returned");
+                        sleeper.cancel();
                         return recv_jh.join().unwrap();
                     }
-                    SND => return Ok(()),
+                    SND => {
+                        sleeper.cancel();
+                        return Ok(());
+                    }
                     x => {
+                        sleeper.cancel();
                         warn!(?x, "invalid poll value");
                         return Err(eyre!("invalid poll value {:?}", x));
                     }
@@ -1374,15 +1382,11 @@ mod chunnels {
                 g.pop()
             };
             if let Some(d) = res {
-                trace!(id = ?d.1.id(), "kvrel returning fast");
                 return Ok(d);
             } else {
                 loop {
                     let mut e = self.recv_cv.wait(&self.recvs);
                     if let Some(d) = e.pop() {
-                        let remaining = e.len();
-                        let id = d.1.id();
-                        trace!(?id, ?remaining, "kvrel returning slow");
                         return Ok(d);
                     } else {
                         shenango::thread::thread_yield();
@@ -1714,13 +1718,13 @@ mod kvstore {
     use super::{KvReliabilityChunnel, KvReliabilityServerChunnel, SerializeChunnelProject};
     use bertha::CxList;
     use color_eyre::eyre::{eyre, Report, WrapErr};
-    //use kvstore::kv::Store;
     use std::net::SocketAddrV4;
     use std::sync::{atomic::AtomicUsize, Arc};
     use tracing::{debug, info, trace, warn};
 
-    use kvstore::Op;
-    use std::collections::HashMap;
+    use kvstore::kv::Store;
+    //use kvstore::Op;
+    //use std::collections::HashMap;
 
     pub fn single_shard(addr: SocketAddrV4) {
         info!(?addr, "listening");
@@ -1729,39 +1733,39 @@ mod kvstore {
             .wrap(SerializeChunnelProject::default());
 
         // initialize the kv store.
-        //let store = Store::default();
-        fn get(this: &Mutex<HashMap<String, String>>, k: &str) -> Option<String> {
-            let g = this.lock();
-            g.get(k).map(Clone::clone)
-        }
+        let store = Store::default();
+        //let store: Mutex<HashMap<String, String>> = Default::default();
+        //fn get(this: &Mutex<HashMap<String, String>>, k: &str) -> Option<String> {
+        //    let g = this.lock();
+        //    g.get(k).map(Clone::clone)
+        //}
 
-        fn put(
-            this: &Mutex<HashMap<String, String>>,
-            k: &str,
-            v: Option<String>,
-        ) -> Option<String> {
-            let mut g = this.lock();
-            if let Some(v) = v {
-                g.insert(k.to_string(), v)
-            } else {
-                g.remove(k)
-            }
-        }
+        //fn put(
+        //    this: &Mutex<HashMap<String, String>>,
+        //    k: &str,
+        //    v: Option<String>,
+        //) -> Option<String> {
+        //    let mut g = this.lock();
+        //    if let Some(v) = v {
+        //        g.insert(k.to_string(), v)
+        //    } else {
+        //        g.remove(k)
+        //    }
+        //}
 
-        fn call(this: &Mutex<HashMap<String, String>>, req: Msg) -> Msg {
-            match req.op() {
-                Op::Get => {
-                    let val = get(this, req.key());
-                    req.resp(val)
-                }
-                Op::Put => {
-                    let old = put(this, req.key(), req.val());
-                    req.resp(old)
-                }
-            }
-        }
+        //fn call(this: &Mutex<HashMap<String, String>>, req: Msg) -> Msg {
+        //    match req.op() {
+        //        Op::Get => {
+        //            let val = get(this, req.key());
+        //            req.resp(val)
+        //        }
+        //        Op::Put => {
+        //            let old = put(this, req.key(), req.val());
+        //            req.resp(old)
+        //        }
+        //    }
+        //}
 
-        let store: Mutex<HashMap<String, String>> = Default::default();
         let idx = Arc::new(AtomicUsize::new(0));
 
         super::negotiate_server(external, addr, move |cn| {
@@ -1777,8 +1781,11 @@ mod kvstore {
                         break;
                     }
                 };
+
                 //trace!(msg = ?&msg, from=?&a, "got msg");
-                let rsp = call(&store, msg);
+                let rsp = store.call(msg);
+                //let rsp = call(&store, msg);
+
                 if let Err(e) = cn.send((a, rsp)) {
                     warn!(?e, "send failed");
                     break;
@@ -1938,19 +1945,23 @@ mod kvstore {
 
     pub struct MsgIdMatcher<C, D> {
         inner: Arc<C>,
-        inflight: Mutex<HashMap<usize, (WaitGroup, Option<D>)>>,
+        //inflight: Mutex<HashMap<usize, (WaitGroup, Option<D>)>>,
+        inflight: Arc<DashMap<usize, (WaitGroup, Option<D>)>>,
     }
 
     impl<C, D> Clone for MsgIdMatcher<C, D> {
         fn clone(&self) -> Self {
             Self {
                 inner: Arc::clone(&self.inner),
-                inflight: self.inflight.clone(),
+                //inflight: self.inflight.clone(),
+                inflight: Arc::clone(&self.inflight),
             }
         }
     }
 
-    use shenango::sync::{Mutex, WaitGroup};
+    use dashmap::DashMap;
+    //use shenango::sync::{Mutex, WaitGroup};
+    use shenango::sync::WaitGroup;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     impl<C, D> MsgIdMatcher<C, D>
@@ -1961,17 +1972,19 @@ mod kvstore {
         pub fn new(inner: C) -> Self {
             Self {
                 inner: Arc::new(inner),
-                inflight: Mutex::new(Default::default()),
+                //inflight: Mutex::new(Default::default()),
+                inflight: Default::default(),
             }
         }
 
         pub fn send_msg(&self, data: D) -> Result<(), Report> {
             let recv_waiter = WaitGroup::new();
             recv_waiter.add(1);
-            let old = self
-                .inflight
-                .lock()
-                .insert(data.id(), (recv_waiter.clone(), None));
+            //let old = self
+            //    .inflight
+            //    .lock()
+            //    .insert(data.id(), (recv_waiter.clone(), None));
+            let old = self.inflight.insert(data.id(), (recv_waiter.clone(), None));
             assert!(old.is_none(), "double send");
             self.inner.send(data)
         }
@@ -1979,28 +1992,54 @@ mod kvstore {
         pub fn recv_msg(&self, msg_id: usize) -> Result<D, Report> {
             let done: Arc<AtomicBool> = Default::default();
             let recv_waiter: WaitGroup = {
-                let g = self.inflight.lock();
-                let (ref m, _) = g.get(&msg_id).ok_or_else(|| eyre!("msg id not found"))?;
+                //let g = self.inflight.lock();
+                //let (ref m, _) = g.get(&msg_id).ok_or_else(|| eyre!("msg id not found"))?;
+                let (ref m, _) = self
+                    .inflight
+                    .get(&msg_id)
+                    .ok_or_else(|| eyre!("msg id not found"))?
+                    .value();
                 m.clone()
             };
 
             let inner = Arc::clone(&self.inner);
-            let infl = self.inflight.clone();
+            //let infl = self.inflight.clone();
+            let infl = Arc::clone(&self.inflight);
             let d = Arc::clone(&done);
             shenango::thread::spawn(move || {
                 while !d.load(Ordering::SeqCst) {
-                    trace!(local_id = ?msg_id, "calling recv");
                     let r = inner.recv();
-                    trace!(local_id = ?msg_id, "recv returned");
                     match r {
-                        Ok(r) => match infl.lock().get_mut(&r.id()) {
+                        //Ok(r) => match infl.lock().get_mut(&r.id()) {
+                        //    Some(ref mut e) => {
+                        //        let (m, ref mut d) = e;
+                        //        if let Some(old_d) = d {
+                        //            assert!(old_d.id() == r.id(), "double recv mismatched");
+                        //        } else {
+                        //            *d = Some(r);
+                        //            m.done(); // wake up the other thread
+                        //        }
+
+                        //        if msg_id == id {
+                        //            break;
+                        //        }
+                        //    }
+                        //    None => {
+                        //        // probably a spurious retx.
+                        //        trace!(id = ?r.id(), local_id = ?msg_id, "got unexpected message");
+                        //    }
+                        //},
+                        Ok(r) => match infl.get_mut(&r.id()) {
                             Some(ref mut e) => {
                                 let id = r.id();
-                                trace!(?id, local_id = ?msg_id, "msg done");
-                                let (m, ref mut d) = e;
-                                assert!(d.is_none(), "double recv");
-                                *d = Some(r);
-                                m.done(); // wake up the other thread
+                                let (m, ref mut d) = e.value_mut();
+                                if let Some(old_d) = d {
+                                    assert!(old_d.id() == id, "double recv mismatched");
+                                } else {
+                                    *d = Some(r);
+                                    m.done(); // wake up the other thread
+                                }
+
                                 if msg_id == id {
                                     break;
                                 }
@@ -2020,7 +2059,8 @@ mod kvstore {
 
             recv_waiter.wait();
             done.store(true, Ordering::SeqCst);
-            Ok(self.inflight.lock().remove(&msg_id).unwrap().1.unwrap())
+            //Ok(self.inflight.lock().remove(&msg_id).unwrap().1.unwrap())
+            Ok(self.inflight.remove(&msg_id).unwrap().1 .1.unwrap())
         }
     }
 }
