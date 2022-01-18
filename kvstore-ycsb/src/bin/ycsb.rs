@@ -61,6 +61,9 @@ struct Opt {
     out_file: Option<PathBuf>,
 }
 
+#[cfg(all(feature = "use-shenango", feature = "use-dpdk-direct"))]
+compile_error!("Features \"use-shenango\" and \"use-dpdk-direct\" are incompatible");
+
 #[cfg(feature = "use-shenango")]
 fn get_raw_connector(
     path: Option<PathBuf>,
@@ -72,12 +75,30 @@ fn get_raw_connector(
         > + Clone,
     Report,
 > {
+    info!("using shenango feature");
     let path = path
         .ok_or_else(|| eyre!("If shenango feature is enabled, shenango_cfg must be specified"))?;
     Ok(shenango_chunnel::ShenangoUdpSkChunnel::new(&path))
 }
 
-#[cfg(not(feature = "use-shenango"))]
+#[cfg(feature = "use-dpdk-direct")]
+fn get_raw_connector(
+    path: Option<PathBuf>,
+) -> Result<
+    impl ChunnelConnector<
+            Addr = (),
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
+            Error = impl Into<Report> + Send + Sync + 'static,
+        > + Clone,
+    Report,
+> {
+    info!("using dpdk feature");
+    let path = path
+        .ok_or_else(|| eyre!("If shenango feature is enabled, shenango_cfg must be specified"))?;
+    Ok(dpdk_direct::DpdkUdpSkChunnel::new(&path)?)
+}
+
+#[cfg(all(not(feature = "use-shenango"), not(feature = "use-dpdk-direct")))]
 fn get_raw_connector(
     p: Option<PathBuf>,
 ) -> Result<
@@ -88,6 +109,7 @@ fn get_raw_connector(
         > + Clone,
     Report,
 > {
+    info!("using default feature");
     if p.is_some() {
         tracing::warn!(cfg_file = ?p, "Shenango is disabled, ignoring config");
     }

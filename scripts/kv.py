@@ -219,8 +219,7 @@ def get_timeout(wrkfile, interarrival_us):
         return max(int(total_time_s * 2), 180)
 
 def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, server_batch="none", stack_frag=False):
-    conn.run("sudo pkill -9 kvserver-shenango")
-    conn.run("sudo pkill -9 kvserver-kernel")
+    conn.run("sudo pkill -9 kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
     variant = None
@@ -230,6 +229,8 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
         variant = '-shenango'
     elif datapath == 'kernel':
         variant = '-kernel'
+    elif datapath == 'dpdk':
+        variant = '-dpdk'
 
     if variant is None:
         raise Exception(f"invalid datapath {datapath}")
@@ -250,9 +251,15 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
 def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapath, batch, shardtype, stack_frag, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
+    variant = None
     if datapath == 'shenango_channel':
         write_shenango_config(conn)
         conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+        variant = '-shenango'
+    elif datapath == 'kernel':
+        variant = '-kernel'
+    elif datapath == 'dpdk':
+        variant = '-dpdk'
 
     if shardtype == 'client':
         shard_arg = '--use-clientsharding'
@@ -265,7 +272,6 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
 
     batch_arg = f'--max-send-batching={batch}' if batch != 0 else ''
     poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
-    variant = '-kernel' if datapath == 'kernel' else '-shenango'
     timeout = get_timeout(wrkfile, interarrival)
 
     time.sleep(2)
@@ -308,10 +314,14 @@ def start_redis(machine, use_sudo=False):
 def run_loads(conn, server, datapath, redis_addr, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
-    variant = '-kernel' if datapath == 'kernel' else '-shenango'
-
+    variant = None
     if datapath == 'shenango_channel':
         write_shenango_config(conn)
+        variant = '-shenango'
+    elif datapath == 'kernel':
+        variant = '-kernel'
+    elif datapath == 'dpdk':
+        variant = '-dpdk'
 
     while True:
         if datapath == 'shenango_channel':
@@ -438,8 +448,7 @@ def do_exp(iter_num,
     agenda.task("all clients returned")
 
     # kill the server
-    machines[0].run("sudo pkill -9 kvserver-kernel")
-    machines[0].run("sudo pkill -9 kvserver-shenango")
+    machines[0].run("sudo pkill -9 kvserver")
     machines[0].run("sudo pkill -INT iokerneld")
 
     for m in machines:

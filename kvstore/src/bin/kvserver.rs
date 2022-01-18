@@ -5,6 +5,9 @@ use structopt::StructOpt;
 use tracing::{info, info_span};
 use tracing_futures::Instrument;
 
+#[cfg(all(feature = "use-shenango", feature = "use-dpdk-direct"))]
+compile_error!("Features \"use-shenango\" and \"use-dpdk-direct\" are incompatible");
+
 #[derive(Debug, StructOpt)]
 #[structopt(name = "kvserver")]
 struct Opt {
@@ -52,8 +55,9 @@ async fn main() -> Result<(), Report> {
     Ok(())
 }
 
-#[cfg(not(feature = "use-shenango"))]
+#[cfg(all(not(feature = "use-shenango"), not(feature = "use-dpdk-direct")))]
 async fn run_server(opt: Opt) -> Result<(), Report> {
+    info!("using default feature");
     if opt.shenango_cfg.is_some() {
         tracing::warn!(cfg_file = ?opt.shenango_cfg, "Shenango is disabled, ignoring config");
     }
@@ -74,6 +78,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
 
 #[cfg(feature = "use-shenango")]
 async fn run_server(opt: Opt) -> Result<(), Report> {
+    info!("using shenango feature");
     if opt.shenango_cfg.is_none() {
         return Err(eyre!(
             "If shenango feature is enabled, shenango_cfg must be specified"
@@ -82,6 +87,31 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
 
     let s = shenango_chunnel::ShenangoUdpSkChunnel::new(&opt.shenango_cfg.unwrap());
     let l = shenango_chunnel::ShenangoUdpReqChunnel(s);
+    serve(
+        l,
+        opt.redis_addr,
+        opt.ip_addr,
+        opt.port,
+        opt.num_shards,
+        None,
+        opt.batch_mode,
+        opt.fragment_stack,
+    )
+    .instrument(info_span!("server"))
+    .await
+}
+
+#[cfg(feature = "use-dpdk-direct")]
+async fn run_server(opt: Opt) -> Result<(), Report> {
+    info!("using dpdk feature");
+    if opt.shenango_cfg.is_none() {
+        return Err(eyre!(
+            "If use-dpdk-direct feature is enabled, shenango_cfg must be specified"
+        ));
+    }
+
+    let s = dpdk_direct::DpdkUdpSkChunnel::new(&opt.shenango_cfg.unwrap())?;
+    let l = dpdk_direct::DpdkUdpReqChunnel(s);
     serve(
         l,
         opt.redis_addr,

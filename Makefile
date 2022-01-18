@@ -22,6 +22,14 @@ rpcbench: ./target/release/bincode-pingclient ./target/release/bincode-pingserve
 	cd kvstore && $(CARGO) build --release --features="bin,use-shenango"
 	rm -f ./target/release/kvserver-shenango && cp ./target/release/kvserver ./target/release/kvserver-shenango
 
+./target/release/ycsb-dpdk: $(FLS)
+	cd kvstore-ycsb && $(CARGO) build --release  --features="use-dpdk-direct"
+	rm -f ./target/release/ycsb-dpdk && cp ./target/release/ycsb ./target/release/ycsb-dpdk
+
+./target/release/kvserver-dpdk: $(FLS)
+	cd kvstore && $(CARGO) build --release --features="bin,use-dpdk-direct"
+	rm -f ./target/release/kvserver-dpdk && cp ./target/release/kvserver ./target/release/kvserver-dpdk
+
 ./target/release/ycsb-kernel: $(FLS)
 	cd kvstore-ycsb && $(CARGO) build --release 
 	rm -f ./target/release/ycsb-kernel && cp ./target/release/ycsb ./target/release/ycsb-kernel
