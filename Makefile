@@ -18,13 +18,9 @@ rpcbench: ./target/release/bincode-pingclient ./target/release/bincode-pingserve
 	cd kvstore-ycsb && $(CARGO) build --release --features="use-shenango"
 	rm -f ./target/release/ycsb-shenango && cp ./target/release/ycsb ./target/release/ycsb-shenango
 
-./target/release/kvserver-noebpf: $(FLS)
+./target/release/kvserver-shenango: $(FLS)
 	cd kvstore && $(CARGO) build --release --features="bin,use-shenango"
-	rm -f ./target/release/kvserver-noebpf && cp ./target/release/kvserver ./target/release/kvserver-noebpf
-
-#./target/release/kvserver-ebpf: $(FLS)
-#	cd kvstore && $(CARGO) build --release --features="bin,ebpf,use-shenango"
-#	rm -f ./target/release/kvserver-ebpf && cp ./target/release/kvserver ./target/release/kvserver-ebpf
+	rm -f ./target/release/kvserver-shenango && cp ./target/release/kvserver ./target/release/kvserver-shenango
 
 ./target/release/ycsb-kernel: $(FLS)
 	cd kvstore-ycsb && $(CARGO) build --release 

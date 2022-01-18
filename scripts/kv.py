@@ -219,7 +219,7 @@ def get_timeout(wrkfile, interarrival_us):
         return max(int(total_time_s * 2), 180)
 
 def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, server_batch="none", stack_frag=False):
-    conn.run("sudo pkill -9 kvserver-noebpf")
+    conn.run("sudo pkill -9 kvserver-shenango")
     conn.run("sudo pkill -9 kvserver-kernel")
     conn.run("sudo pkill -INT iokerneld")
 
@@ -227,7 +227,7 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     if datapath == 'shenango_channel':
         write_shenango_config(conn)
         conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
-        variant = '-noebpf'
+        variant = '-shenango'
     elif datapath == 'kernel':
         variant = '-kernel'
 
@@ -439,7 +439,7 @@ def do_exp(iter_num,
 
     # kill the server
     machines[0].run("sudo pkill -9 kvserver-kernel")
-    machines[0].run("sudo pkill -9 kvserver-noebpf")
+    machines[0].run("sudo pkill -9 kvserver-shenango")
     machines[0].run("sudo pkill -INT iokerneld")
 
     for m in machines:
