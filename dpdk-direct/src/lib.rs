@@ -166,6 +166,7 @@ impl ChunnelConnection for BoundDpdkUdpSk {
     }
 }
 
+#[derive(Clone)]
 pub struct DpdkUdpReqChunnel(pub DpdkUdpSkChunnel);
 impl ChunnelListener for DpdkUdpReqChunnel {
     type Addr = SocketAddr;
