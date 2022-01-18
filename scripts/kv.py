@@ -265,7 +265,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
 
     batch_arg = f'--max-send-batching={batch}' if batch != 0 else ''
     poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
-    variant = '-kernel' if datapath == 'kernel' else ''
+    variant = '-kernel' if datapath == 'kernel' else '-shenango'
     timeout = get_timeout(wrkfile, interarrival)
 
     time.sleep(2)
@@ -308,7 +308,7 @@ def start_redis(machine, use_sudo=False):
 def run_loads(conn, server, datapath, redis_addr, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
-    variant = '-kernel' if datapath == 'kernel' else ''
+    variant = '-kernel' if datapath == 'kernel' else '-shenango'
 
     if datapath == 'shenango_channel':
         write_shenango_config(conn)

@@ -11,11 +11,12 @@ all: sharding rpcbench
 
 .PHONY: sharding rpcbench
 
-sharding: ./target/release/ycsb ./target/release/kvserver-noebpf ./target/release/kvserver-shenango-raw ./target/release/ycsb-shenango-raw ./shenango-chunnel/caladan/iokerneld ./target/release/ycsb-kernel ./target/release/kvserver-kernel
+sharding: ./target/release/ycsb-shenango ./target/release/kvserver-shenango ./target/release/kvserver-shenango-raw ./target/release/ycsb-shenango-raw ./shenango-chunnel/caladan/iokerneld ./target/release/ycsb-kernel ./target/release/kvserver-kernel
 rpcbench: ./target/release/bincode-pingclient ./target/release/bincode-pingserver ./target/release/burrito-localname
 
-./target/release/ycsb: $(FLS)
+./target/release/ycsb-shenango: $(FLS)
 	cd kvstore-ycsb && $(CARGO) build --release --features="use-shenango"
+	rm -f ./target/release/ycsb-shenango && cp ./target/release/ycsb ./target/release/ycsb-shenango
 
 ./target/release/kvserver-noebpf: $(FLS)
 	cd kvstore && $(CARGO) build --release --features="bin,use-shenango"

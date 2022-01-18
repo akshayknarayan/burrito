@@ -10,7 +10,8 @@ clients = [
 
 [exp]
 wrk = ["./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"]
-load = [10000, 20000, 40000, 60000, 80000, 100000, 120000]
+datapath = ['kernel', 'shenango_channel']
+load = [10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000, 180000, 200000]
 poisson-arrivals = [true]
 shardtype = ["client"]
 shards = [4]
