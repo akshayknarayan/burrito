@@ -191,6 +191,20 @@ def setup_machine(conn, outdir):
     check(ok, "build", conn.addr)
     return conn
 
+def write_cfg(conn, config):
+    from random import randint
+    fname = randint(1,1000)
+    fname = f"{fname}.config"
+    with open(f"{fname}", 'w') as f:
+        f.write(config)
+
+    agenda.subtask(f"{conn.addr} config file: {fname}")
+    if not conn.local:
+        agenda.subtask(f"{conn.addr} config file: {fname}")
+        conn.put(f"{fname}", "~/burrito/host.config")
+    else:
+        subprocess.run(f"rm -f host.config && cp {fname} host.config", shell=True)
+
 def write_shenango_config(conn):
     shenango_config = f"""
 host_addr {conn.addr}
@@ -199,24 +213,50 @@ host_gateway 10.1.1.1
 runtime_kthreads 2
 runtime_spininng_kthreads 2
 runtime_guaranteed_kthreads 2"""
-    from random import randint
-    fname = randint(1,1000)
-    fname = f"{fname}.config"
-    with open(f"{fname}", 'w') as f:
-        f.write(shenango_config)
+    write_cfg(conn, shenango_config)
 
-    agenda.subtask(f"{conn.addr} shenango config file: {fname}")
-    if not conn.local:
-        agenda.subtask(f"{conn.addr} shenango config file: {fname}")
-        conn.put(f"{fname}", "~/burrito/host.config")
-    else:
-        subprocess.run(f"rm -f host.config && cp {fname} host.config", shell=True)
+def write_dpdk_config(conn):
+    dpdk_config = f"""
+[dpdk]
+eal_init = ["-n", "4", "-l", "0", "--allow", "0000:08:00.0", "--proc-type=auto"]
+
+[net]
+ip = "{conn.addr}"
+
+  [[net.arp]]
+  ip = "10.1.1.2"
+  mac = "f4:52:14:76:98:10"
+
+  [[net.arp]]
+  ip = "10.1.1.5"
+  mac = "f4:52:14:76:98:30"
+
+  [[net.arp]]
+  ip = "10.1.1.6"
+  mac = "f4:52:14:76:98:a0"
+
+  [[net.arp]]
+  ip = "10.1.1.7"
+  mac = "f4:52:14:76:a4:40"
+
+  [[net.arp]]
+  ip = "10.1.1.8"
+  mac = "f4:52:14:76:a4:90"
+
+  [[net.arp]]
+  ip = "10.1.1.9"
+  mac = "f4:52:14:76:a4:70"
+"""
+    write_cfg(conn, dpdk_config)
+
 
 def get_timeout(wrkfile, interarrival_us):
     with open(wrkfile, 'r') as f:
         num_reqs = sum(1 for _ in f)
         total_time_s = num_reqs * interarrival_us / 1e6
         return max(int(total_time_s * 2), 180)
+
+dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
 
 def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, server_batch="none", stack_frag=False):
     conn.run("sudo pkill -9 kvserver")
@@ -230,13 +270,14 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     elif datapath == 'kernel':
         variant = '-kernel'
     elif datapath == 'dpdk':
+        write_dpdk_config(conn)
         variant = '-dpdk'
 
     if variant is None:
         raise Exception(f"invalid datapath {datapath}")
 
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=info,kvstore=debug,bertha=debug ./target/release/kvserver{variant} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --batch-mode={server_batch} {'--fragment-stack' if stack_frag else ''} --log --trace-time={outf}.trace",
+    ok = conn.run(f"RUST_LOG=info,kvstore=debug,bertha=debug {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/kvserver{variant} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --batch-mode={server_batch} {'--fragment-stack' if stack_frag else ''} --log --trace-time={outf}.trace",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -259,6 +300,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
     elif datapath == 'kernel':
         variant = '-kernel'
     elif datapath == 'dpdk':
+        write_dpdk_config(conn)
         variant = '-dpdk'
 
     if shardtype == 'client':
@@ -276,7 +318,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
 
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug ./target/release/ycsb{variant} \
+    ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/ycsb{variant} \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
             -i {interarrival} \
@@ -287,8 +329,9 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
             {poisson_arg} \
             {shard_arg} \
             {'--fragment-stack' if stack_frag else ''} \
-            --logging --tracing --skip-loads",
+            --logging --skip-loads",
         wd="~/burrito",
+        sudo='dpdk' in variant,
         stdout=f"{outf}0.out",
         stderr=f"{outf}0.err",
         timeout=timeout,
@@ -321,6 +364,7 @@ def run_loads(conn, server, datapath, redis_addr, outf, wrkfile):
     elif datapath == 'kernel':
         variant = '-kernel'
     elif datapath == 'dpdk':
+        write_dpdk_config(conn)
         variant = '-dpdk'
 
     while True:
@@ -332,14 +376,15 @@ def run_loads(conn, server, datapath, redis_addr, outf, wrkfile):
         agenda.subtask(f"loads client starting")
         ok = None
         try:
-            ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug ./target/release/ycsb{variant} \
+            ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/ycsb{variant} \
                     --addr {server}:4242 \
                     --redis-addr={redis_addr} \
                     -i 1000 \
                     --accesses {wrkfile} \
                     -s host.config \
-                    --logging --tracing --loads-only",
+                    --logging --loads-only",
                 wd="~/burrito",
+                sudo='dpdk' in variant,
                 stdout=f"{outf}-loads.out",
                 stderr=f"{outf}-loads.err",
                 timeout=30,
@@ -554,7 +599,7 @@ if __name__ == '__main__':
     if 'datapath' not in cfg['exp']:
         cfg['exp']['datapath'] = ['shenango_channel']
     for t in cfg['exp']['datapath']:
-        if t not in ['shenango_channel', 'kernel']:
+        if t not in ['shenango_channel', 'kernel', 'dpdk']:
             agenda.failure(f"Unknown datapath {t}")
             sys.exit(1)
 
