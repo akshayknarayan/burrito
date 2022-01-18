@@ -11,7 +11,7 @@ all: sharding rpcbench
 
 .PHONY: sharding rpcbench
 
-sharding: ./target/release/ycsb-shenango ./target/release/kvserver-shenango ./target/release/kvserver-shenango-raw ./target/release/ycsb-shenango-raw ./shenango-chunnel/caladan/iokerneld ./target/release/ycsb-kernel ./target/release/kvserver-kernel
+sharding: ./target/release/ycsb-shenango ./target/release/kvserver-shenango ./target/release/kvserver-shenango-raw ./target/release/ycsb-shenango-raw ./shenango-chunnel/caladan/iokerneld ./target/release/ycsb-kernel ./target/release/kvserver-kernel ./target/release/kvserver-dpdk ./target/release/ycsb-dpdk
 rpcbench: ./target/release/bincode-pingclient ./target/release/bincode-pingserver ./target/release/burrito-localname
 
 ./target/release/ycsb-shenango: $(FLS)
