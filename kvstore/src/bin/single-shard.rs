@@ -50,6 +50,7 @@ async fn main() -> Result<(), Report> {
         opt.fragment_stack,
         None,
         opt.batch_mode,
+        false,
     )
     .await;
     Ok(())

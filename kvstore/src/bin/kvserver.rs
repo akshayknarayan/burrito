@@ -33,6 +33,9 @@ struct Opt {
     fragment_stack: bool,
 
     #[structopt(short, long)]
+    skip_negotiation: bool,
+
+    #[structopt(short, long)]
     log: bool,
 
     #[structopt(short, long)]
@@ -71,6 +74,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         None,
         opt.batch_mode,
         opt.fragment_stack,
+        opt.skip_negotiation,
     )
     .instrument(info_span!("server"))
     .await
@@ -96,6 +100,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         None,
         opt.batch_mode,
         opt.fragment_stack,
+        opt.skip_negotiation,
     )
     .instrument(info_span!("server"))
     .await
@@ -121,6 +126,7 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         None,
         opt.batch_mode,
         opt.fragment_stack,
+        opt.skip_negotiation,
     )
     .instrument(info_span!("server"))
     .await

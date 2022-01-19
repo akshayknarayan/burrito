@@ -17,6 +17,7 @@ batcher = { path = "../batcher" }
 burrito-shard-ctl = { path = "../burrito-shard-ctl" }
 color-eyre = "0.5"
 futures-util = "0.3"
+and-then-concurrent = "0.1"
 dashmap = "3"
 rand = "0.7"
 serde  = { version = "1", features = ["derive"]}

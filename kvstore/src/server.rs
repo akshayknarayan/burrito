@@ -288,15 +288,16 @@ pub async fn single_shard(
     fragment_stack: bool,
     s: impl Into<Option<tokio::sync::oneshot::Sender<Vec<StackNonce>>>>,
     batching: BatchMode,
+    no_negotiation: bool,
 ) {
     let s = s.into();
     let internal_addr = internal_addr.unwrap_or(addr);
     info!(?addr, ?internal_addr, "listening");
 
     macro_rules! serve_stack {
-        ($stack: expr, $st: expr) => {{
+        ($st_make: path, $stack: expr, $st: expr) => {{
             let offers = $stack.clone().offers().collect();
-            let st = bertha::negotiate::negotiate_server($stack, $st)
+            let st = $st_make($stack, $st) // bertha::negotiate::negotiate_server
                 .await
                 .unwrap();
 
@@ -353,7 +354,7 @@ pub async fn single_shard(
                     .wrap(SerializeChunnelProject::default()),
             ))
             .prefer_right();
-            serve_stack!(external, st)
+            serve_stack!(bertha::negotiate::negotiate_server, external, st)
         } else {
             let external = Select::from((
                 CxList::from(OrderedChunnelProj::default())
@@ -363,7 +364,7 @@ pub async fn single_shard(
                     .wrap(SerializeChunnelProject::default()),
             ))
             .prefer_right();
-            serve_stack!(external, st)
+            serve_stack!(bertha::negotiate::negotiate_server, external, st)
         }
     } else {
         let st = SelectListener::new(raw_listener, internal_srv)
@@ -382,7 +383,10 @@ pub async fn single_shard(
                     .wrap(SerializeChunnelProject::default()),
             ))
             .prefer_right();
-            serve_stack!(external, st)
+            serve_stack!(bertha::negotiate::negotiate_server, external, st)
+        } else if no_negotiation {
+            let external = SerializeChunnelProject::default();
+            serve_stack!(make_cn, external, st)
         } else {
             let external = Select::from((
                 CxList::from(OrderedChunnelProj::default())
@@ -392,7 +396,7 @@ pub async fn single_shard(
                     .wrap(SerializeChunnelProject::default()),
             ))
             .prefer_right();
-            serve_stack!(external, st)
+            serve_stack!(bertha::negotiate::negotiate_server, external, st)
         }
     }
 
@@ -426,6 +430,7 @@ pub async fn serve(
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
     batching: BatchMode,
     fragment_stack: bool,
+    no_negotiation: bool,
 ) -> Result<(), Report> {
     // 1. Define addr.
     let si = make_shardinfo(srv_ip, srv_port, num_shards);
@@ -447,29 +452,35 @@ pub async fn serve(
                 fragment_stack,
                 s,
                 batching,
+                no_negotiation,
             )
             .instrument(debug_span!("shardsrv", addr = ?&a)),
         );
         rdy.push(r);
     }
 
-    let mut offers: Vec<Vec<StackNonce>> = rdy.try_collect().await.unwrap();
+    if no_negotiation {
+        info!("no negotiation: no serve_canonical needed");
+        futures_util::future::pending().await
+    } else {
+        let mut offers: Vec<Vec<StackNonce>> = rdy.try_collect().await.unwrap();
 
-    let st = raw_listener
-        .listen(si.canonical_addr)
+        let st = raw_listener
+            .listen(si.canonical_addr)
+            .await
+            .map_err(Into::into)
+            .wrap_err("Listen on raw_listener")?;
+        serve_canonical(
+            si,
+            st.map_err(Into::into),
+            internal_cli,
+            redis_addr,
+            offers.pop().unwrap(),
+            ready,
+            fragment_stack,
+        )
         .await
-        .map_err(Into::into)
-        .wrap_err("Listen on raw_listener")?;
-    serve_canonical(
-        si,
-        st.map_err(Into::into),
-        internal_cli,
-        redis_addr,
-        offers.pop().unwrap(),
-        ready,
-        fragment_stack,
-    )
-    .await
+    }
 }
 
 async fn serve_canonical(
@@ -490,9 +501,9 @@ async fn serve_canonical(
     let redis_addr = format!("redis://{}:{}", redis_addr.ip(), redis_addr.port());
 
     macro_rules! serve_stack {
-        ($stack: expr) => {{
+        ($negotiator: path, $stack: expr) => {{
             info!(shard_info = ?&si, "start canonical server");
-            let st = bertha::negotiate::negotiate_server($stack, st)
+            let st = $negotiator($stack, st) // bertha::negotiate::negotiate_server
                 .instrument(info_span!("negotiate_server"))
                 .await
                 .wrap_err("negotiate_server")?;
@@ -575,7 +586,7 @@ async fn serve_canonical(
             ))
             .prefer_right(),
         );
-        serve_stack!(external);
+        serve_stack!(bertha::negotiate::negotiate_server, external);
     } else {
         let shard_stack = CxList::from(
             Select::from((
@@ -621,10 +632,44 @@ async fn serve_canonical(
             ))
             .prefer_right(),
         );
-        serve_stack!(external);
+        serve_stack!(bertha::negotiate::negotiate_server, external);
     }
 
     unreachable!() // negotiate_server never returns None
+}
+
+use and_then_concurrent::TryStreamAndThenExt;
+use bertha::Chunnel;
+#[allow(clippy::manual_async_fn)] // we need the + 'static which async fn does not do.
+pub fn make_cn<Srv, Sc, Se, C>(
+    stack: Srv,
+    raw_cn_st: Sc,
+) -> impl std::future::Future<
+    Output = Result<
+        impl Stream<Item = Result<<Srv as Chunnel<C>>::Connection, Report>> + Send + 'static,
+        Report,
+    >,
+> + Send
+       + 'static
+where
+    Sc: Stream<Item = Result<C, Se>> + Send + 'static,
+    Se: Into<Report> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+    Srv: Chunnel<C> + Clone + Debug + Send + 'static,
+    <Srv as Chunnel<C>>::Connection: Send + Sync + 'static,
+    <Srv as Chunnel<C>>::Error: Into<Report> + Send + Sync + 'static,
+{
+    async move {
+        // 1. serve (A, Vec<u8>) connections.
+        let st = raw_cn_st.map_err(Into::into); // stream of incoming Vec<u8> conns.
+        Ok(st
+            .map_err(Into::into)
+            .and_then_concurrent(move |cn| {
+                let mut stack = stack.clone();
+                async move { Ok(Some(stack.connect_wrap(cn).await.map_err(Into::into)?)) }
+            })
+            .try_filter_map(|v| futures_util::future::ready(Ok(v))))
+    }
 }
 
 fn make_shardinfo(srv_ip: IpAddr, srv_port: u16, num_shards: u16) -> ShardInfo<SocketAddr> {

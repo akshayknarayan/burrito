@@ -223,6 +223,24 @@ impl KvClientBuilder<false, true> {
     }
 }
 
+impl<const T: bool, const B: bool> KvClientBuilder<T, B> {
+    #[instrument(skip(raw_cn), err)]
+    pub async fn new_fiat_client(
+        self,
+        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+        si: burrito_shard_ctl::ShardInfo<SocketAddr>,
+    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
+        use bertha::Chunnel;
+        let cl = burrito_shard_ctl::static_client::ClientShardChunnelClient::new(si);
+        let mut stack = CxList::from(cl)
+            .wrap(KvReliabilityChunnel::default())
+            .wrap(SerializeChunnelProject::default());
+        let cn = stack.connect_wrap(raw_cn).await?;
+        let cn = ProjectLeft::new(self.canonical_addr, cn);
+        Ok(KvClient::new_from_cn(cn))
+    }
+}
+
 /// Connect to a Kv service.
 pub struct KvClient<C: ChunnelConnection>(MsgIdMatcher<C, Msg>);
 
