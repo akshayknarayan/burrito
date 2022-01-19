@@ -62,9 +62,9 @@ fn main() -> Result<(), Report> {
         opt.shenango_config.to_str().unwrap().to_owned(),
         move || {
             if !opt.skip_loads {
-                if let Some(shards) = opt.skip_negotiation {
+                if let Some(ref shards) = opt.skip_negotiation {
                     info!(?shards, "skipping negotiation");
-                    let cl = KvClientBuilder::new(opt.addr)
+                    let mut cl = KvClientBuilder::new(opt.addr)
                         .new_fiat_client(
                             shards
                                 .iter()
@@ -90,7 +90,7 @@ fn main() -> Result<(), Report> {
             info!(mode = "shardclient", "make clients");
 
             let (durs, remaining_inflight, time, num_clients) =
-                if let Some(shards) = opt.skip_negotiation {
+                if let Some(ref shards) = opt.skip_negotiation {
                     info!(?shards, "skipping negotiation");
                     let mut access_by_client = HashMap::default();
                     for (cid, ops) in group_by_client(accesses).into_iter() {
