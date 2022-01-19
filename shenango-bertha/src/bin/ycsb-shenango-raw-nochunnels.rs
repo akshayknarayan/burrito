@@ -59,7 +59,7 @@ fn main() -> Result<(), Report> {
     info!(num_ops = ?accesses.len(), "done reading workload");
 
     let shard_addrs: Vec<_> = (0..opt.num_shards)
-        .map(|p| SocketAddrV4::new(*opt.addr.ip(), p))
+        .map(|p| SocketAddrV4::new(*opt.addr.ip(), opt.addr.port() + p + 1))
         .collect();
 
     shenango::runtime_init(
@@ -76,7 +76,11 @@ fn main() -> Result<(), Report> {
                 info!("skipping loads");
             }
 
-            info!(mode = "shardclient, no chunnels", "make clients");
+            info!(
+                mode = "shardclient, no chunnels",
+                ?shard_addrs,
+                "make clients"
+            );
 
             let mut access_by_client = HashMap::default();
             for (cid, ops) in group_by_client(accesses).into_iter() {
