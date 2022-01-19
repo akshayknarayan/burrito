@@ -2385,6 +2385,14 @@ mod no_chunnels {
         }
     }
 
+    impl Drop for RawKvClient {
+        fn drop(&mut self) {
+            for cn in self.inner {
+                cn.shutdown();
+            }
+        }
+    }
+
     fn shardfn(m: &Msg, num_shards: usize) -> usize {
         const FNV1_64_INIT: u64 = 0xcbf29ce484222325u64;
         const FNV_64_PRIME: u64 = 0x100000001b3u64;
