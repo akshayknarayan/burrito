@@ -19,6 +19,9 @@ struct Opt {
     #[structopt(long)]
     addr: SocketAddrV4,
 
+    #[structopt(long)]
+    skip_negotiation: Option<Vec<u16>>,
+
     #[structopt(short, long)]
     interarrival_client_micros: usize,
 
@@ -71,21 +74,47 @@ fn main() -> Result<(), Report> {
 
             info!(mode = "shardclient", "make clients");
 
-            let mut access_by_client = HashMap::default();
-            for (cid, ops) in group_by_client(accesses).into_iter() {
-                let cl = KvClientBuilder::new(opt.addr)
-                    .new_shardclient()
-                    .wrap_err("make KvClient")
+            let (durs, remaining_inflight, time, num_clients) =
+                if let Some(shards) = opt.skip_negotiation {
+                    let mut access_by_client = HashMap::default();
+                    for (cid, ops) in group_by_client(accesses).into_iter() {
+                        let cl = KvClientBuilder::new(opt.addr)
+                            .new_fiat_client(
+                                shards
+                                    .iter()
+                                    .map(|p| SocketAddrV4::new(*opt.addr.ip(), *p))
+                                    .collect(),
+                            )
+                            .wrap_err("make fiat KvClient")
+                            .unwrap();
+                        access_by_client.insert(cid, (cl, ops));
+                    }
+                    let num_clients = access_by_client.len();
+                    let (durs, remaining_inflight, time) = do_requests(
+                        access_by_client,
+                        opt.interarrival_client_micros as _,
+                        opt.poisson_arrivals,
+                    )
                     .unwrap();
-                access_by_client.insert(cid, (cl, ops));
-            }
-            let num_clients = access_by_client.len();
-            let (durs, remaining_inflight, time) = do_requests(
-                access_by_client,
-                opt.interarrival_client_micros as _,
-                opt.poisson_arrivals,
-            )
-            .unwrap();
+                    (durs, remaining_inflight, time, num_clients)
+                } else {
+                    let mut access_by_client = HashMap::default();
+                    for (cid, ops) in group_by_client(accesses).into_iter() {
+                        let cl = KvClientBuilder::new(opt.addr)
+                            .new_shardclient()
+                            .wrap_err("make KvClient")
+                            .unwrap();
+                        access_by_client.insert(cid, (cl, ops));
+                    }
+                    let num_clients = access_by_client.len();
+                    let (durs, remaining_inflight, time) = do_requests(
+                        access_by_client,
+                        opt.interarrival_client_micros as _,
+                        opt.poisson_arrivals,
+                    )
+                    .unwrap();
+                    (durs, remaining_inflight, time, num_clients)
+                };
 
             // done
             write_results(

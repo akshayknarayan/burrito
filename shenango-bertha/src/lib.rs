@@ -1598,6 +1598,13 @@ mod chunnels {
                 shard_info: None,
             })
         }
+
+        pub fn new_static(addr: SocketAddrV4, shard_info: Vec<SocketAddrV4>) -> Self {
+            ClientShardChunnelClient {
+                addr,
+                shard_info: Some(shard_info),
+            }
+        }
     }
 
     use burrito_shard_ctl::ShardFns;
@@ -1726,7 +1733,7 @@ mod kvstore {
     //use kvstore::Op;
     //use std::collections::HashMap;
 
-    pub fn single_shard(addr: SocketAddrV4) {
+    pub fn single_shard(addr: SocketAddrV4, skip_negotiation: bool) {
         info!(?addr, "listening");
 
         let external = CxList::from(KvReliabilityServerChunnel::default())
@@ -1765,14 +1772,41 @@ mod kvstore {
         //        }
         //    }
         //}
+        use crate::base_traits::Chunnel;
+        use crate::udp;
+        fn skip_neg<Srv, F>(
+            stack: Srv,
+            listen_addr: SocketAddrV4,
+            per_conn: F,
+        ) -> Result<(), Report>
+        where
+            Srv: Chunnel<UdpChunnelConnection> + Clone + Send + Sync + 'static,
+            <Srv as Chunnel<UdpChunnelConnection>>::Connection: Send + Sync + 'static,
+            <Srv as Chunnel<UdpChunnelConnection>>::Error: Into<Report> + Send + Sync + 'static,
+            F: Fn(<Srv as Chunnel<UdpChunnelConnection>>::Connection)
+                + Clone
+                + Send
+                + Sync
+                + 'static,
+        {
+            udp::udp_accept(listen_addr, move |cn| {
+                let mut stack = stack.clone();
+                per_conn(
+                    stack
+                        .connect_wrap(UdpChunnelConnection::new(cn))
+                        .map_err(Into::into)
+                        .unwrap(),
+                )
+            })?;
+            Ok(())
+        }
 
-        let idx = Arc::new(AtomicUsize::new(0));
-
-        super::negotiate_server(external, addr, move |cn| {
-            let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let store = store.clone();
+        fn perconn(
+            cn: impl ChunnelConnection<Data = (SocketAddrV4, Msg)>,
+            store: Store,
+            idx: usize,
+        ) {
             debug!(?idx, "new");
-
             loop {
                 let (a, msg) = match cn.recv() {
                     Ok(d) => d,
@@ -1791,8 +1825,24 @@ mod kvstore {
                     break;
                 }
             }
-        })
-        .unwrap();
+        }
+
+        let idx = Arc::new(AtomicUsize::new(0));
+        if skip_negotiation {
+            skip_neg(external, addr, move |cn| {
+                let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let store = store.clone();
+                perconn(cn, store, idx)
+            })
+            .unwrap();
+        } else {
+            super::negotiate_server(external, addr, move |cn| {
+                let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let store = store.clone();
+                perconn(cn, store, idx)
+            })
+            .unwrap();
+        }
     }
 
     /// Start and serve a `ShardCanonicalServer` and shards.
@@ -1800,17 +1850,25 @@ mod kvstore {
     /// `srv_addr`: Local addr to serve on.
     /// `num_shards`: Number of shards to start. Shard addresses are selected sequentially after
     /// `srv_port`, but this could change.
-    pub fn serve(srv_addr: SocketAddrV4, num_shards: u16) -> Result<(), Report> {
+    pub fn serve(
+        srv_addr: SocketAddrV4,
+        num_shards: u16,
+        skip_negotiation: bool,
+    ) -> Result<(), Report> {
         // 1. Define addr.
         let si = make_shardinfo(srv_addr, num_shards);
 
         // 2. start shard serv
         for a in si.clone().shard_addrs {
             info!(addr = ?&a, "start shard");
-            shenango::thread::spawn(move || single_shard(a));
+            shenango::thread::spawn(move || single_shard(a, skip_negotiation));
         }
 
-        serve_canonical(si)
+        if skip_negotiation {
+            Ok(())
+        } else {
+            serve_canonical(si)
+        }
     }
 
     use super::chunnels::ShardInfo;
@@ -1881,6 +1939,25 @@ mod kvstore {
             ))?);
             debug!("negotiation");
             let cn = super::negotiate::negotiate_client(stack, raw, self.canonical_addr)?;
+            let cn = super::base_traits::Project(self.canonical_addr, cn);
+            Ok(KvClient::new_from_cn(cn))
+        }
+
+        pub fn new_fiat_client(
+            self,
+            shards: Vec<SocketAddrV4>,
+        ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report>
+        {
+            let cl = ClientShardChunnelClient::new_static(self.canonical_addr, shards);
+            let mut stack = CxList::from(cl)
+                .wrap(KvReliabilityChunnel::default())
+                .wrap(SerializeChunnelProject::default());
+            let raw = UdpChunnelConnection::new(UdpConnection::listen(SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                0,
+            ))?);
+            use crate::base_traits::Chunnel;
+            let cn = stack.connect_wrap(raw)?;
             let cn = super::base_traits::Project(self.canonical_addr, cn);
             Ok(KvClient::new_from_cn(cn))
         }

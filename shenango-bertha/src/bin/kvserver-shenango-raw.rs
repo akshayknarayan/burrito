@@ -16,6 +16,9 @@ struct Opt {
     cfg: std::path::PathBuf,
 
     #[structopt(short, long)]
+    skip_negotiation: bool,
+
+    #[structopt(short, long)]
     log: bool,
 }
 
@@ -35,5 +38,5 @@ fn main() -> Result<(), Report> {
 }
 
 fn run_server(opt: Opt) -> Result<(), Report> {
-    serve(opt.addr, opt.num_shards)
+    serve(opt.addr, opt.num_shards, opt.skip_negotiation)
 }
