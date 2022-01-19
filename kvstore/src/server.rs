@@ -665,6 +665,7 @@ where
         Ok(st
             .map_err(Into::into)
             .and_then_concurrent(move |cn| {
+                debug!("make_cn: new cn");
                 let mut stack = stack.clone();
                 async move { Ok(Some(stack.connect_wrap(cn).await.map_err(Into::into)?)) }
             })

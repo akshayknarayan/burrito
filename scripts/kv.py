@@ -258,8 +258,8 @@ def get_timeout(wrkfile, interarrival_us):
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
 
-def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, server_batch="none", stack_frag=False):
-    conn.run("sudo pkill -9 kvserver")
+def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, server_batch="none", stack_frag=False, skip_negotiation=False):
+    conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
     variant = None
@@ -276,8 +276,10 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     if variant is None:
         raise Exception(f"invalid datapath {datapath}")
 
+    skip_neg = '--skip-negotiation' if skip_negotiation else ''
+
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=info,kvstore=debug,bertha=debug {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/kvserver{variant} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --batch-mode={server_batch} {'--fragment-stack' if stack_frag else ''} --log --trace-time={outf}.trace",
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/kvserver{variant} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --batch-mode={server_batch} {'--fragment-stack' if stack_frag else ''} {skip_neg} --log",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -289,7 +291,7 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     time.sleep(8)
     conn.check_proc(f"kvserver", f"{outf}.err")
 
-def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapath, batch, shardtype, stack_frag, outf, wrkfile):
+def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapath, batch, shardtype, stack_frag, skip_negotiation, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
     variant = None
@@ -312,13 +314,18 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
     else:
         raise f"unknown shardtype {shardtype}"
 
+    skip_neg = ''
+    while skip_negotiation > 0:
+        skip_neg += f' --skip-negotiation={4242 + skip_negotiation} '
+        skip_negotiation -= 1
+
     batch_arg = f'--max-send-batching={batch}' if batch != 0 else ''
     poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
     timeout = get_timeout(wrkfile, interarrival)
 
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/ycsb{variant} \
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/ycsb{variant} \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
             -i {interarrival} \
@@ -329,6 +336,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
             {poisson_arg} \
             {shard_arg} \
             {'--fragment-stack' if stack_frag else ''} \
+            {skip_neg} \
             --logging --skip-loads",
         wd="~/burrito",
         sudo='dpdk' in variant,
@@ -354,7 +362,7 @@ def start_redis(machine, use_sudo=False):
     agenda.subtask(f"Started redis on {machine.host}")
     return f"{machine.alt}:6379"
 
-def run_loads(conn, server, datapath, redis_addr, outf, wrkfile):
+def run_loads(conn, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0):
     conn.run("sudo pkill -INT iokerneld")
 
     variant = None
@@ -366,6 +374,11 @@ def run_loads(conn, server, datapath, redis_addr, outf, wrkfile):
     elif datapath == 'dpdk':
         write_dpdk_config(conn)
         variant = '-dpdk'
+
+    skip_neg = ''
+    while skip_negotiation > 0:
+        skip_neg += f' --skip-negotiation={4242 + skip_negotiation} '
+        skip_negotiation -= 1
 
     while True:
         if datapath == 'shenango_channel':
@@ -382,6 +395,7 @@ def run_loads(conn, server, datapath, redis_addr, outf, wrkfile):
                     -i 1000 \
                     --accesses {wrkfile} \
                     -s host.config \
+                    {skip_neg} \
                     --logging --loads-only",
                 wd="~/burrito",
                 sudo='dpdk' in variant,
@@ -411,6 +425,7 @@ def do_exp(iter_num,
     server_batch=None,
     poisson_arrivals=None,
     stack_frag=None,
+    skip_negotiation=None,
     wrkload=None,
     overwrite=None
 ):
@@ -425,13 +440,15 @@ def do_exp(iter_num,
         server_batch is not None and
         poisson_arrivals is not None and
         stack_frag is not None and
+        skip_negotiation is not None and
         wrkload is not None and
         overwrite is not None
     )
 
     wrkname = wrkload.split("/")[-1].split(".")[0]
-    server_prefix = f"{outdir}/{datapath}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch={client_batch}-server_batch={server_batch}-stackfrag={stack_frag}-{wrkname}-{iter_num}-kvserver"
-    outf = f"{outdir}/{datapath}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch={client_batch}-server_batch={server_batch}-stackfrag={stack_frag}-{wrkname}-{iter_num}-client"
+    noneg = '_noneg' if skip_negotiation else ''
+    server_prefix = f"{outdir}/{datapath}{noneg}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch={client_batch}-server_batch={server_batch}-stackfrag={stack_frag}-{wrkname}-{iter_num}-kvserver"
+    outf = f"{outdir}/{datapath}{noneg}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch={client_batch}-server_batch={server_batch}-stackfrag={stack_frag}-{wrkname}-{iter_num}-client"
 
     for m in machines:
         if m.local:
@@ -441,7 +458,7 @@ def do_exp(iter_num,
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
     if not overwrite and os.path.exists(f"{outf}0-{machines[1].addr}.data"):
-        agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, shardtype = {shardtype}, client_batch = {client_batch}, server_batch = {server_batch}, stack_fragmentation = {stack_frag}, load = {ops_per_sec} ops/s")
+        agenda.task(f"skipping: server = {machines[0].addr}, datapath = {datapath}, skip_negotiation = {skip_negotiation} num_shards = {num_shards}, shardtype = {shardtype}, client_batch = {client_batch}, server_batch = {server_batch}, stack_fragmentation = {stack_frag}, load = {ops_per_sec} ops/s")
         return True
     else:
         agenda.task(f"running: {outf}0-{machines[1].addr}.data")
@@ -460,11 +477,11 @@ def do_exp(iter_num,
     # first one is the server, start the server
     agenda.subtask("starting server")
     redis_port = redis_addr.split(":")[-1]
-    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, datapath=datapath, shards=num_shards, server_batch=server_batch, stack_frag=stack_frag)
+    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, datapath=datapath, shards=num_shards, server_batch=server_batch, stack_frag=stack_frag, skip_negotiation=skip_negotiation)
     time.sleep(5)
     # prime the server with loads
     agenda.task("doing loads")
-    run_loads(machines[1], server_addr, datapath, redis_addr, outf, wrkload)
+    run_loads(machines[1], server_addr, datapath, redis_addr, outf, wrkload, skip_negotiation=num_shards if skip_negotiation else 0)
     try:
         machines[1].get(f"{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
         machines[1].get(f"{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
@@ -483,6 +500,7 @@ def do_exp(iter_num,
             client_batch,
             shardtype,
             stack_frag,
+            num_shards if skip_negotiation else 0,
             outf,
             wrkload
         ),
@@ -493,7 +511,7 @@ def do_exp(iter_num,
     agenda.task("all clients returned")
 
     # kill the server
-    machines[0].run("sudo pkill -9 kvserver")
+    machines[0].run("sudo pkill -INT kvserver")
     machines[0].run("sudo pkill -INT iokerneld")
 
     for m in machines:
@@ -610,6 +628,13 @@ if __name__ == '__main__':
     if 'server-batching' not in cfg['exp']:
         cfg['exp']['server-batching'] = ['none']
 
+    if 'negotiation' not in cfg['exp']:
+        cfg['exp']['negotiation'] = [True]
+    for t in cfg['exp']['negotiation']:
+        if t not in [True,False]:
+            agenda.failure("Skip-negotiation must be bool")
+            sys.exit(1)
+
     agenda.task(f"Checking for connection vs experiment ip")
     ips = [cfg['machines']['server']] + cfg['machines']['clients']
     agenda.task(f"connecting to {ips}")
@@ -641,26 +666,28 @@ if __name__ == '__main__':
 
     for dp in cfg['exp']['datapath']:
         for frag in cfg['exp']['stack-fragmentation']:
-            for w in cfg['exp']['wrk']:
-                for s in cfg['exp']['shards']:
-                    for t in cfg['exp']['shardtype']:
-                        for p in cfg['exp']['poisson-arrivals']:
-                            for o in ops_per_sec:
-                                for cb in cfg['exp']['client-batching']:
-                                    for sb in cfg['exp']['server-batching']:
-                                        do_exp(0,
-                                            outdir=outdir,
-                                            machines=machines,
-                                            num_shards=s,
-                                            shardtype=t,
-                                            ops_per_sec=o,
-                                            datapath=dp,
-                                            client_batch=cb,
-                                            server_batch=sb,
-                                            poisson_arrivals=p,
-                                            stack_frag=frag,
-                                            wrkload=w,
-                                            overwrite=args.overwrite
-                                        )
+            for neg in cfg['exp']['negotiation']:
+                for w in cfg['exp']['wrk']:
+                    for s in cfg['exp']['shards']:
+                        for t in cfg['exp']['shardtype']:
+                            for p in cfg['exp']['poisson-arrivals']:
+                                for o in ops_per_sec:
+                                    for cb in cfg['exp']['client-batching']:
+                                        for sb in cfg['exp']['server-batching']:
+                                            do_exp(0,
+                                                outdir=outdir,
+                                                machines=machines,
+                                                num_shards=s,
+                                                shardtype=t,
+                                                ops_per_sec=o,
+                                                datapath=dp,
+                                                client_batch=cb,
+                                                server_batch=sb,
+                                                poisson_arrivals=p,
+                                                stack_frag=frag,
+                                                skip_negotiation=not neg,
+                                                wrkload=w,
+                                                overwrite=args.overwrite
+                                            )
 
     agenda.task("done")
