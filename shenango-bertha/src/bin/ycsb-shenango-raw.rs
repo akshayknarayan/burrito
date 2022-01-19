@@ -62,8 +62,23 @@ fn main() -> Result<(), Report> {
         opt.shenango_config.to_str().unwrap().to_owned(),
         move || {
             if !opt.skip_loads {
-                let mut basic_client = KvClientBuilder::new(opt.addr).new_shardclient().unwrap();
-                do_loads(&mut basic_client, loads).unwrap();
+                if let Some(shards) = opt.skip_negotiation {
+                    info!(?shards, "skipping negotiation");
+                    let cl = KvClientBuilder::new(opt.addr)
+                        .new_fiat_client(
+                            shards
+                                .iter()
+                                .map(|p| SocketAddrV4::new(*opt.addr.ip(), *p))
+                                .collect(),
+                        )
+                        .wrap_err("make fiat KvClient")
+                        .unwrap();
+                    do_loads(&mut cl, loads).unwrap();
+                } else {
+                    let mut basic_client =
+                        KvClientBuilder::new(opt.addr).new_shardclient().unwrap();
+                    do_loads(&mut basic_client, loads).unwrap();
+                }
                 if opt.loads_only {
                     info!("doing only loads, done");
                     std::process::exit(0);
@@ -76,6 +91,7 @@ fn main() -> Result<(), Report> {
 
             let (durs, remaining_inflight, time, num_clients) =
                 if let Some(shards) = opt.skip_negotiation {
+                    info!(?shards, "skipping negotiation");
                     let mut access_by_client = HashMap::default();
                     for (cid, ops) in group_by_client(accesses).into_iter() {
                         let cl = KvClientBuilder::new(opt.addr)
