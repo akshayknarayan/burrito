@@ -99,7 +99,7 @@ def run_loads(conn, server, outf, wrkfile, skip_negotiation=0):
     agenda.subtask(f"loads client starting")
     ok = None
     try:
-        ok = conn.run(f"RUST_LOG=info ./target/release/ycsb-shenango-raw \
+        ok = conn.run(f"RUST_LOG=info,shenango_bertha=debug ./target/release/ycsb-shenango-raw \
                 --addr {server}:4242 \
                 -i 1000 \
                 --accesses {wrkfile} \
