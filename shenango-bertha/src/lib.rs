@@ -2141,3 +2141,263 @@ mod kvstore {
         }
     }
 }
+
+pub use no_chunnels::RawKvClient;
+/// KV client and server with not just no negotiation, but no chunnels
+pub use no_chunnels::{single_shard_conns, single_shard_no_conns};
+mod no_chunnels {
+    use super::udp;
+    use color_eyre::eyre::{eyre, Report};
+    use kvstore::kv::Store;
+    use kvstore::Msg;
+    use shenango::udp::UdpConnection;
+    use shenango::{
+        poll::PollWaiter,
+        sync::{Mutex, WaitGroup},
+        time::Timer,
+    };
+    use std::collections::HashMap;
+    use std::net::SocketAddrV4;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    use tracing::{debug, info, trace, warn};
+
+    /// still process 5-tuples in separate threads.
+    /// the main savings here is no need for allocating Vecs for the messages.
+    pub fn single_shard_conns(addr: SocketAddrV4) {
+        info!(?addr, "listening");
+
+        // initialize the kv store.
+        let store = Store::default();
+
+        fn perconn(cn: UdpConnection, store: Store, idx: usize) -> Result<(), Report> {
+            let from = cn.remote_addr();
+            debug!(?idx, ?from, "new");
+            let mut buf = [0u8; 2048];
+            loop {
+                let len = cn.recv(&mut buf)?;
+                let msg: Msg = bincode::deserialize(&buf[..len])?;
+                let rsp = store.call(msg);
+
+                let sz = bincode::serialized_size(&rsp)? as usize;
+                bincode::serialize_into(&mut buf[..], &rsp)?;
+                if let Err(e) = cn.send(&buf[..sz]) {
+                    warn!(?e, "send failed");
+                    break Err(e.into());
+                }
+            }
+        }
+
+        let idx = Arc::new(AtomicUsize::new(0));
+        udp::udp_accept(addr, move |cn| {
+            let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let store = store.clone();
+            perconn(cn, store, idx).unwrap()
+        })
+        .unwrap()
+    }
+
+    /// additionally strip out connections (which bertha needs)
+    pub fn single_shard_no_conns(addr: SocketAddrV4) -> Result<(), Report> {
+        info!(?addr, "listening");
+
+        // initialize the kv store.
+        let store = Store::default();
+
+        let sk = UdpConnection::listen(addr)?;
+        let mut buf = [0u8; 2048];
+        loop {
+            let (len, from) = sk.read_from(&mut buf)?;
+            let msg: Msg = bincode::deserialize(&buf[..len])?;
+            let rsp = store.call(msg);
+
+            let sz = bincode::serialized_size(&rsp)? as usize;
+            bincode::serialize_into(&mut buf[..], &rsp)?;
+            if let Err(e) = sk.write_to(&buf[..sz], from) {
+                warn!(?e, "send failed");
+                break Err(e.into());
+            }
+        }
+    }
+
+    enum RecvState {
+        Inflight(WaitGroup),
+        Recvd(Msg),
+    }
+
+    impl RecvState {
+        fn take_put(&mut self, m: Msg) -> Option<WaitGroup> {
+            match self {
+                RecvState::Inflight(_) => {
+                    let wg = std::mem::replace(self, RecvState::Recvd(m));
+                    match wg {
+                        RecvState::Inflight(wg) => Some(wg),
+                        _ => unreachable!(),
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        fn done(self) -> Msg {
+            match self {
+                RecvState::Recvd(m) => m,
+                _ => panic!("called done on still-inflight msg"),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct RawKvClient {
+        inner: Vec<UdpConnection>,
+        inflight: Arc<Mutex<HashMap<usize, RecvState>>>,
+    }
+
+    impl RawKvClient {
+        pub fn new(shard_addrs: Vec<SocketAddrV4>) -> Self {
+            RawKvClient {
+                inner: shard_addrs
+                    .into_iter()
+                    .map(|sa| {
+                        UdpConnection::dial(
+                            SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+                            sa,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+                inflight: Default::default(),
+            }
+        }
+
+        pub fn update(&self, key: String, val: String) -> Result<Option<String>, Report> {
+            let req = Msg::put_req(key, val);
+            self.do_req(req)
+        }
+
+        pub fn get(&self, key: String) -> Result<Option<String>, Report> {
+            let req = Msg::get_req(key);
+            self.do_req(req)
+        }
+
+        fn do_req(&self, req: Msg) -> Result<Option<String>, Report> {
+            let shard = shardfn(&req, self.inner.len());
+            let cn = &self.inner[shard];
+            let msg_id = req.id();
+            let mut send_buf = [0u8; 2048];
+            let sz = bincode::serialized_size(&req)? as usize;
+            bincode::serialize_into(&mut send_buf[..sz], &req)?;
+
+            const SND: u32 = 0;
+            const RCV: u32 = 1;
+            const TIMEOUT: u32 = 2;
+
+            let send_waiter = WaitGroup::new();
+            // .done() this when the send finishes.
+            send_waiter.add(1);
+            {
+                let mut g = self.inflight.lock();
+                g.insert(msg_id, RecvState::Inflight(send_waiter.clone()));
+            }
+
+            let mut poll = PollWaiter::new();
+            let sendcomplete_trigger = poll.trigger(SND);
+            let recv_trigger = poll.trigger(RCV);
+
+            shenango::thread::spawn(move || {
+                let _send = sendcomplete_trigger;
+                send_waiter.wait();
+            });
+
+            let done: Arc<AtomicBool> = Default::default();
+            let recv_cn = cn.clone();
+            let infl = self.inflight.clone();
+            let d = done.clone();
+            let recv_jh = shenango::thread::spawn(move || {
+                let _recv = recv_trigger;
+                let done = d;
+                let mut buf = [0u8; 2048];
+                while !done.load(Ordering::SeqCst) {
+                    let len = recv_cn.recv(&mut buf)?;
+                    let msg: Msg = bincode::deserialize(&buf[..len])?;
+                    let recv_msg_id = msg.id();
+                    trace!(?recv_msg_id, "received");
+
+                    let mut g = infl.lock();
+                    match g.get_mut(&recv_msg_id) {
+                        None => {
+                            return Err(eyre!("unknown message"));
+                        }
+                        Some(ref mut r) => match r.take_put(msg) {
+                            Some(wg) => wg.done(),
+                            None => {
+                                warn!(?recv_msg_id, "duplicate msg");
+                            }
+                        },
+                    }
+                }
+
+                Ok(())
+            });
+
+            loop {
+                trace!(?msg_id, "sending");
+                cn.send(&send_buf[..sz])?;
+                let timeout_trigger = poll.trigger(TIMEOUT);
+                let sleeper = Timer::new();
+                let sl = sleeper.clone();
+                shenango::thread::spawn_detached(move || {
+                    let _to = timeout_trigger;
+                    sl.sleep(Duration::from_millis(50));
+                    // drop sleep_trigger
+                });
+
+                let v = poll.wait();
+                match v {
+                    TIMEOUT => continue,
+                    RCV => {
+                        sleeper.cancel();
+                        // an error happened
+                        return Err(recv_jh.join().unwrap().unwrap_err());
+                    }
+                    SND => {
+                        sleeper.cancel();
+                        let m = self.inflight.lock().remove(&msg_id).unwrap().done();
+                        if m.id() != msg_id {
+                            return Err(eyre!(
+                                "Msg id mismatch, check for reordering: {} != {}",
+                                m.id(),
+                                msg_id
+                            ));
+                        }
+                        return Ok(m.into_kv().1);
+                    }
+                    x => {
+                        sleeper.cancel();
+                        warn!(?x, "invalid poll value");
+                        return Err(eyre!("invalid poll value {:?}", x));
+                    }
+                }
+            }
+        }
+    }
+
+    fn shardfn(m: &Msg, num_shards: usize) -> usize {
+        const FNV1_64_INIT: u64 = 0xcbf29ce484222325u64;
+        const FNV_64_PRIME: u64 = 0x100000001b3u64;
+        if num_shards == 0 {
+            return 0;
+        }
+
+        let mut hash = FNV1_64_INIT;
+        for b in m.key().as_bytes()[0..4].iter() {
+            hash ^= *b as u64;
+            hash = u64::wrapping_mul(hash, FNV_64_PRIME);
+        }
+
+        (hash as usize % num_shards) + 1
+    }
+}
