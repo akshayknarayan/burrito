@@ -2387,7 +2387,7 @@ mod no_chunnels {
 
     impl Drop for RawKvClient {
         fn drop(&mut self) {
-            for cn in self.inner {
+            for cn in &self.inner {
                 cn.shutdown();
             }
         }
