@@ -2252,7 +2252,7 @@ mod no_chunnels {
 
     #[derive(Clone)]
     pub struct RawKvClient {
-        inner: Vec<UdpConnection>,
+        inner: Vec<Arc<UdpConnection>>,
         inflight: Arc<Mutex<HashMap<usize, RecvState>>>,
     }
 
@@ -2268,6 +2268,7 @@ mod no_chunnels {
                         )
                         .unwrap()
                     })
+                    .map(Arc::new)
                     .collect(),
                 inflight: Default::default(),
             }
@@ -2313,7 +2314,7 @@ mod no_chunnels {
             });
 
             let done: Arc<AtomicBool> = Default::default();
-            let recv_cn = cn.clone();
+            let recv_cn = Arc::clone(&cn);
             let infl = self.inflight.clone();
             let d = done.clone();
             let recv_jh = shenango::thread::spawn(move || {
@@ -2385,14 +2386,6 @@ mod no_chunnels {
         }
     }
 
-    impl Drop for RawKvClient {
-        fn drop(&mut self) {
-            for cn in &self.inner {
-                cn.shutdown();
-            }
-        }
-    }
-
     fn shardfn(m: &Msg, num_shards: usize) -> usize {
         const FNV1_64_INIT: u64 = 0xcbf29ce484222325u64;
         const FNV_64_PRIME: u64 = 0x100000001b3u64;
@@ -2406,6 +2399,6 @@ mod no_chunnels {
             hash = u64::wrapping_mul(hash, FNV_64_PRIME);
         }
 
-        (hash as usize % num_shards)
+        hash as usize % num_shards
     }
 }
