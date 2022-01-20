@@ -2406,6 +2406,6 @@ mod no_chunnels {
             hash = u64::wrapping_mul(hash, FNV_64_PRIME);
         }
 
-        (hash as usize % num_shards) + 1
+        (hash as usize % num_shards)
     }
 }
