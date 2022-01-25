@@ -23,6 +23,7 @@ members = [
     "tls-tunnel",
     "negotiation-bench",
     "latency-bench",
+    "throughput-bench",
     "cx-list-opt",
     "cx-list-opt-test",
 ]
