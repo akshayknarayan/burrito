@@ -16,7 +16,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
-use tracing::{debug, info, info_span, trace};
+use tracing::{info, info_span, trace};
 use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
@@ -43,9 +43,6 @@ struct Client {
 
     #[structopt(long)]
     download_size: usize,
-
-    #[structopt(long)]
-    duration_secs: u64,
 }
 
 #[derive(Debug, Clone, StructOpt)]
@@ -57,13 +54,14 @@ enum Mode {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum Msg {
     Request(usize, usize),
-    Response(usize, Vec<u8>),
+    ResponsePart(usize, Vec<u8>),
+    ResponseDone(usize),
 }
 
 impl bertha::util::MsgId for Msg {
     fn id(&self) -> usize {
         match self {
-            &Msg::Request(i, _) | &Msg::Response(i, _) => i,
+            &Msg::Request(i, _) | &Msg::ResponsePart(i, _) | &Msg::ResponseDone(i) => i,
         }
     }
 }
@@ -86,7 +84,18 @@ fn main() -> Result<(), Report> {
     rt.block_on(async move {
         if let Mode::Client(cl) = mode {
             let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk chunnel")?;
-            run_clients(ch, cl, port).await?;
+            let download_size = cl.download_size;
+            let num_clients = cl.num_clients;
+            let (tot_bytes, elapsed) = run_clients(ch, cl, port).await?;
+            let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
+            info!(?num_clients, ?download_size, rate_mbps=?(rate / 1e6), "finished");
+            println!(
+                "num_clients={:?},download_size={:?},elapsed_us={:?},rate_bps={:?}",
+                num_clients,
+                download_size,
+                elapsed.as_micros(),
+                rate
+            );
         } else {
             let ch = DpdkUdpSkChunnel::new(cfg)?;
             let ch = DpdkUdpReqChunnel(ch);
@@ -98,7 +107,7 @@ fn main() -> Result<(), Report> {
     Ok(())
 }
 
-async fn run_clients<C, Cn, E>(ctr: C, c: Client, port: u16) -> Result<usize, Report>
+async fn run_clients<C, Cn, E>(ctr: C, c: Client, port: u16) -> Result<(usize, Duration), Report>
 where
     C: ChunnelConnector<Addr = (), Connection = Cn, Error = E> + Clone + Send + Sync + 'static,
     Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
@@ -107,13 +116,10 @@ where
     let addr = SocketAddr::from(SocketAddrV4::new(c.addr, port));
 
     let start = Instant::now();
-    let end = start + Duration::from_secs(c.duration_secs);
-
     let clients: futures_util::stream::FuturesUnordered<_> = (0..c.num_clients)
         .map(|i| {
             tokio::spawn(
-                run_client(ctr.clone(), addr, c.download_size, end)
-                    .instrument(info_span!("client", ?i)),
+                run_client(ctr.clone(), addr, c.download_size).instrument(info_span!("client", ?i)),
             )
         })
         .collect();
@@ -122,14 +128,16 @@ where
         .try_collect()
         .await
         .wrap_err("failed running one or more clients")?;
-    joined.into_iter().sum()
+    let elapsed = start.elapsed();
+    let tot_bytes = joined.into_iter().sum::<Result<_, _>>()?;
+    info!(?tot_bytes, ?elapsed, "all clients done");
+    Ok((tot_bytes, elapsed))
 }
 
 async fn run_client<C, Cn, E /*F*/>(
     mut ctr: C,
     addr: SocketAddr,
     download_size: usize,
-    end_time: Instant,
 ) -> Result<usize, Report>
 where
     C: ChunnelConnector<Addr = (), Connection = Cn, Error = E> + Send + Sync + 'static,
@@ -145,34 +153,35 @@ where
     ))
     .prefer_right();
     let mut tot_bytes = 0;
-    let mut num_msgs = 0;
-    while Instant::now() < end_time {
-        debug!(?num_msgs, remaining = ?(end_time - Instant::now()), "starting iteration");
-        // 1. connect
-        let s = stack.clone();
-        let cn = ctr
-            .connect(())
-            .await
-            .map_err(Into::into)
-            .wrap_err("connector failed")?;
-        let cn = bertha::negotiate_client(s, cn, addr)
-            .await
-            .wrap_err("negotiation failed")?;
-        trace!(?num_msgs, "got connection");
+    let start = Instant::now();
 
-        // 2. get bytes
-        cn.send((addr, Msg::Request(num_msgs, download_size)))
-            .await?;
+    // 1. connect
+    let cn = ctr
+        .connect(())
+        .await
+        .map_err(Into::into)
+        .wrap_err("connector failed")?;
+    let cn = bertha::negotiate_client(stack, cn, addr)
+        .await
+        .wrap_err("negotiation failed")?;
+    trace!("got connection");
+
+    // 2. get bytes
+    cn.send((addr, Msg::Request(42, download_size))).await?;
+
+    loop {
         match cn.recv().await? {
-            (_, Msg::Response(id, payload)) if id == num_msgs => {
+            (_, Msg::ResponsePart(_, payload)) => {
                 tot_bytes += payload.len();
-                num_msgs += 1;
             }
-            (_, Msg::Response(id, _)) => bail!("msg id {:?} != {:?}", id, num_msgs),
-            _ => bail!("got request at client"),
+            (_, Msg::ResponseDone(_)) => {
+                break;
+            }
+            _ => bail!("Got request at client"),
         }
     }
 
+    info!(?tot_bytes, elapsed=?start.elapsed(), "done");
     Ok(tot_bytes)
 }
 
@@ -213,10 +222,16 @@ where
             let mut rng = rand::rngs::SmallRng::from_entropy();
             let (a, msg) = cn.recv().await?;
             match msg {
-                Msg::Request(id, resp_size) => {
-                    let mut buf = vec![0u8; resp_size];
-                    rng.fill(&mut buf[..]);
-                    cn.send((a, Msg::Response(id, buf))).await?;
+                Msg::Request(id, mut remaining) => {
+                    while remaining > 0 {
+                        let this_send_size = std::cmp::min(1480, remaining);
+                        let mut buf = vec![0u8; this_send_size];
+                        rng.fill(&mut buf[..]);
+                        cn.send((a, Msg::ResponsePart(id, buf))).await?;
+                        remaining -= this_send_size;
+                    }
+
+                    cn.send((a, Msg::ResponseDone(id))).await?;
                 }
                 _ => bail!("Got response at server"),
             }
