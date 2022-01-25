@@ -7,7 +7,7 @@ use bertha::{
     bincode::SerializeChunnelProject, reliable::ReliabilityProjChunnel, tagger::OrderedChunnelProj,
     ChunnelConnection, ChunnelConnector, ChunnelListener, CxList, Select,
 };
-use color_eyre::eyre::{bail, eyre, Report, WrapErr};
+use color_eyre::eyre::{bail, Report, WrapErr};
 use dpdk_direct::{DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use futures_util::stream::TryStreamExt;
 use kvstore::reliability::{KvReliabilityChunnel, KvReliabilityServerChunnel};
@@ -218,8 +218,10 @@ where
                     rng.fill(&mut buf[..]);
                     cn.send((a, Msg::Response(id, buf))).await?;
                 }
-                _ => break Err::<(), _>(eyre!("Got response at server")),
+                _ => bail!("Got response at server"),
             }
+
+            Ok(())
         });
     }
 
