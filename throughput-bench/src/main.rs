@@ -155,7 +155,8 @@ where
     //let stack = CxList::from(OrderedChunnelProj::default())
     //    .wrap(ReliabilityProjChunnel::default())
     //    .wrap(SerializeChunnelProject::default());
-    let stack = SerializeChunnelProject::default();
+    //let stack = SerializeChunnelProject::default();
+    let stack = bertha::util::Nothing::<()>::default();
     let mut tot_bytes = 0;
     let start = Instant::now();
 
@@ -171,19 +172,29 @@ where
     trace!("got connection");
 
     // 2. get bytes
-    cn.send((addr, Msg::Request(42, download_size))).await?;
-    trace!("waiting for response");
+    //cn.send((addr, Msg::Request(42, download_size))).await?;
+    //trace!("waiting for response");
 
+    //loop {
+    //    match cn.recv().await? {
+    //        (_, Msg::ResponsePart(_, payload)) => {
+    //            tot_bytes += payload.len();
+    //            trace!(?tot_bytes, "received part");
+    //        }
+    //        (_, Msg::ResponseDone(_)) => {
+    //            break;
+    //        }
+    //        _ => bail!("Got request at client"),
+    //    }
+    //}
+    cn.send((addr, (download_size as u64).to_le_bytes().to_vec()))
+        .await?;
     loop {
-        match cn.recv().await? {
-            (_, Msg::ResponsePart(_, payload)) => {
-                tot_bytes += payload.len();
-                trace!(?tot_bytes, "received part");
-            }
-            (_, Msg::ResponseDone(_)) => {
-                break;
-            }
-            _ => bail!("Got request at client"),
+        let (_, r) = cn.recv().await?;
+        tot_bytes += 1480;
+        trace!(?tot_bytes, "received part");
+        if r[0] == 1 {
+            break;
         }
     }
 
@@ -216,7 +227,8 @@ where
     //let stack = CxList::from(OrderedChunnelProj::default())
     //    .wrap(ReliabilityProjChunnel::default())
     //    .wrap(SerializeChunnelProject::default());
-    let stack = SerializeChunnelProject::default();
+    //let stack = SerializeChunnelProject::default();
+    let stack = bertha::util::Nothing::<()>::default();
     let st = bertha::negotiate::negotiate_server(stack, st)
         .instrument(info_span!("negotiate_server"))
         .await
@@ -231,25 +243,36 @@ where
         tokio::spawn(async move {
             //let mut rng = rand::rngs::SmallRng::from_entropy();
             let (a, msg) = cn.recv().await?;
-            match msg {
-                Msg::Request(id, mut remaining) => {
-                    info!(?id, ?remaining, "starting response");
-                    let start = Instant::now();
-                    while remaining > 0 {
-                        let this_send_size = std::cmp::min(1480, remaining);
-                        let buf = vec![0u8; this_send_size];
-                        //rng.fill(&mut buf[..]);
-                        cn.send((a, Msg::ResponsePart(id, buf))).await?;
-                        remaining -= this_send_size;
-                    }
-
-                    info!(?id, elapsed=?start.elapsed(), "finished response");
-                    cn.send((a, Msg::ResponseDone(id))).await?;
-                }
-                _ => bail!("Got response at server"),
+            let mut remaining = u64::from_le_bytes(msg[..8].try_into().unwrap());
+            while remaining > 0 {
+                let this_send_size = std::cmp::min(1480, remaining);
+                let buf = vec![0u8; this_send_size as usize];
+                //rng.fill(&mut buf[..]);
+                cn.send((a, buf)).await?;
+                remaining -= this_send_size;
             }
 
-            Ok(())
+            cn.send((a, vec![1u8])).await?;
+
+            //match msg {
+            //    Msg::Request(id, mut remaining) => {
+            //        info!(?id, ?remaining, "starting response");
+            //        let start = Instant::now();
+            //        while remaining > 0 {
+            //            let this_send_size = std::cmp::min(1480, remaining);
+            //            let buf = vec![0u8; this_send_size];
+            //            //rng.fill(&mut buf[..]);
+            //            cn.send((a, Msg::ResponsePart(id, buf))).await?;
+            //            remaining -= this_send_size;
+            //        }
+
+            //        info!(?id, elapsed=?start.elapsed(), "finished response");
+            //        cn.send((a, Msg::ResponseDone(id))).await?;
+            //    }
+            //    _ => bail!("Got response at server"),
+            //}
+
+            Ok::<_, Report>(())
         });
     }
 
