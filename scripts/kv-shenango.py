@@ -32,15 +32,20 @@ runtime_guaranteed_kthreads 6"""
     else:
         subprocess.run(f"rm -f host.config && cp {fname} host.config", shell=True)
 
-def start_server(conn, outf, shards=1, skip_negotiation=False):
-    conn.run("sudo pkill -9 kvserver")
+def start_server(conn, outf, shards=1, skip_negotiation=False, no_chunnels=False):
+    conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
     skip_neg = '--skip-negotiation' if skip_negotiation else ''
     write_shenango_config(conn)
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
-    ok = conn.run(f"./target/release/kvserver-shenango-raw --addr {conn.addr}:4242 --num-shards {shards} --cfg host.config {skip_neg}",
+    nochunnels = ''
+    if no_chunnels:
+        nochunnels = '-nochunnels'
+        skip_neg = ''
+
+    ok = conn.run(f"./target/release/kvserver-shenango-raw{nochunnels} --addr {conn.addr}:4242 --num-shards {shards} --cfg host.config {skip_neg}",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -52,27 +57,33 @@ def start_server(conn, outf, shards=1, skip_negotiation=False):
     time.sleep(8)
     conn.check_proc(f"kvserver", f"{outf}.err")
 
-def run_client(conn, server, interarrival, poisson_arrivals, skip_negotiation, outf, wrkfile):
+def run_client(conn, server, interarrival, poisson_arrivals, skip_negotiation, no_chunnels, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
     timeout = get_timeout(wrkfile, interarrival)
     write_shenango_config(conn)
-    poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
 
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
+    poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
+
     skip_neg = ''
-    while skip_negotiation > 0:
-        skip_neg += f' --skip-negotiation={4242 + skip_negotiation} '
-        skip_negotiation -= 1
+    nochunnels = ''
+    if no_chunnels is not None:
+        nochunnels = '-nochunnels'
+        shards_arg = f'--num-shards={no_chunnels}'
+    else:
+        while skip_negotiation > 0:
+            skip_neg += f' --skip-negotiation={4242 + skip_negotiation} '
+            skip_negotiation -= 1
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info ./target/release/ycsb-shenango-raw \
+    ok = conn.run(f"RUST_LOG=info ./target/release/ycsb-shenango-raw{nochunnels} \
             --addr {server}:4242 \
             -i {interarrival} \
             --accesses {wrkfile} \
             --out-file={outf}0.data \
             -s host.config \
-            {skip_neg} \
+            {shards_arg} {skip_neg} \
             {poisson_arg} \
             --skip-loads",
         wd="~/burrito",
@@ -84,7 +95,7 @@ def run_client(conn, server, interarrival, poisson_arrivals, skip_negotiation, o
     conn.run("sudo pkill -INT iokerneld")
     agenda.subtask("client done")
 
-def run_loads(conn, server, outf, wrkfile, skip_negotiation=0):
+def run_loads(conn, server, outf, wrkfile, skip_negotiation=0, no_chunnels=False):
     conn.run("sudo pkill -INT iokerneld")
 
     write_shenango_config(conn)
@@ -92,19 +103,25 @@ def run_loads(conn, server, outf, wrkfile, skip_negotiation=0):
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     skip_neg = ''
-    while skip_negotiation > 0:
-        skip_neg += f' --skip-negotiation={4242 + skip_negotiation} '
-        skip_negotiation -= 1
+    nochunnels = ''
+    shards_arg = ''
+    if no_chunnels:
+        nochunnels = '-nochunnels'
+        shards_arg = f'--num-shards={no_chunnels}'
+    else:
+        while skip_negotiation > 0:
+            skip_neg += f' --skip-negotiation={4242 + skip_negotiation} '
+            skip_negotiation -= 1
     loads_start = time.time()
     agenda.subtask(f"loads client starting")
     ok = None
     try:
-        ok = conn.run(f"RUST_LOG=info,shenango_bertha=debug ./target/release/ycsb-shenango-raw \
+        ok = conn.run(f"RUST_LOG=info,shenango_bertha=debug ./target/release/ycsb-shenango-raw{nochunnels} \
                 --addr {server}:4242 \
                 -i 1000 \
                 --accesses {wrkfile} \
                 -s host.config \
-                {skip_neg} \
+                {shards_arg} {skip_neg} \
                 --loads-only",
             wd="~/burrito",
             stdout=f"{outf}-loads.out",
@@ -132,6 +149,7 @@ def do_exp(iter_num,
     ops_per_sec=None,
     poisson_arrivals=None,
     skip_negotiation=None,
+    no_chunnels=None,
     wrkload=None,
     overwrite=None
 ):
@@ -142,12 +160,19 @@ def do_exp(iter_num,
         ops_per_sec is not None and
         poisson_arrivals is not None and
         skip_negotiation is not None and
+        no_chunnels is not None and
         wrkload is not None and
         overwrite is not None
     )
 
+    if no_chunnels and not skip_negotiation:
+        agenda.task(f"skipping: no_chunnels requires skip_negotiation server = {machines[0].addr}, num_shards = {num_shards}, skip_negotiation = {skip_negotiation}, no_chunnels = {no_chunnels} load = {ops_per_sec} ops/s")
+        return True
+
     wrkname = wrkload.split("/")[-1].split(".")[0]
     noneg = '_noneg' if skip_negotiation else ''
+    if no_chunnels:
+        noneg = '_nochunnels'
     server_prefix = f"{outdir}/shenango_rt{noneg}-{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch=0-server_batch=none-stackfrag=False-{wrkname}-{iter_num}-kvserver"
     outf = f"{outdir}/shenango_rt{noneg}-{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch=0-server_batch=none-stackfrag=False-{wrkname}-{iter_num}-client"
 
@@ -159,7 +184,7 @@ def do_exp(iter_num,
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
     if not overwrite and os.path.exists(f"{outf}0-{machines[1].addr}.data"):
-        agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, skip_negotiation = {skip_negotiation}, load = {ops_per_sec} ops/s")
+        agenda.task(f"skipping: server = {machines[0].addr}, num_shards = {num_shards}, skip_negotiation = {skip_negotiation}, no_chunnels = {no_chunnels} load = {ops_per_sec} ops/s")
         return True
     else:
         agenda.task(f"running: {outf}0-{machines[1].addr}.data")
@@ -172,15 +197,15 @@ def do_exp(iter_num,
 
     time.sleep(5)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {machines[0].addr}, num_shards = {num_shards}, skip_negotiation = {skip_negotiation}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
+    agenda.task(f"starting: server = {machines[0].addr}, num_shards = {num_shards}, skip_negotiation = {skip_negotiation}, no_chunnels = {no_chunnels}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    start_server(machines[0], server_prefix, shards=num_shards, skip_negotiation=skip_negotiation)
+    start_server(machines[0], server_prefix, shards=num_shards, skip_negotiation=skip_negotiation, no_chunnels=no_chunnels)
     time.sleep(5)
     # prime the server with loads
     agenda.task("doing loads")
-    run_loads(machines[1], server_addr, outf, wrkload, skip_negotiation=num_shards if skip_negotiation else 0)
+    run_loads(machines[1], server_addr, outf, wrkload, skip_negotiation=num_shards if skip_negotiation else 0, no_chunnels=num_shards if no_chunnels else 0)
     try:
         machines[1].get(f"{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
         machines[1].get(f"{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
@@ -195,6 +220,7 @@ def do_exp(iter_num,
             interarrival_us,
             poisson_arrivals,
             num_shards if skip_negotiation else 0,
+            num_shards if no_chunnels else None,
             outf,
             wrkload,
         ),
@@ -205,7 +231,7 @@ def do_exp(iter_num,
     agenda.task("all clients returned")
 
     # kill the server
-    machines[0].run("sudo pkill -9 kvserver")
+    machines[0].run("sudo pkill -INT kvserver")
     machines[0].run("sudo pkill -INT iokerneld")
 
     for m in machines:
@@ -306,29 +332,19 @@ if __name__ == '__main__':
             agenda.failure("Skip-negotiation must be bool")
             sys.exit(1)
 
-    # ban fancy features from this experiment
-    if 'stack-fragmentation' in cfg['exp']:
-        for t in cfg['exp']['stack-fragmentation']:
-            if t:
-                agenda.failure(f"Stack fragmentation unsupported")
-                sys.exit(1)
+    if 'no-chunnels' not in cfg['exp']:
+        agenda.subfailure('no-chunnels field not found')
+        cfg['exp']['no-chunnels'] = [False]
+    for t in cfg['exp']['no-chunnels']:
+        if t not in [True, False]:
+            agenda.failure("Disabling chunnels must be bool")
+            sys.exit(1)
 
+    # ban fancy features from this experiment
     if 'shardtype' in cfg['exp']:
         for t in cfg['exp']['shardtype']:
             if t != 'client':
                 agenda.failure(f"Unsupported shardtype {t}")
-                sys.exit(1)
-
-    if 'client-batching' in cfg['exp']:
-        for t in cfg['exp']['client-batching']:
-            if t != 0:
-                agenda.failure(f"Unsupported batching {t}")
-                sys.exit(1)
-
-    if 'server-batching' in cfg['exp']:
-        for t in cfg['exp']['server-batching']:
-            if t != 0:
-                agenda.failure(f"Unsupported batching {t}")
                 sys.exit(1)
 
     agenda.task(f"Checking for connection vs experiment ip")
@@ -362,19 +378,21 @@ if __name__ == '__main__':
     shutil.copy2(args.config, args.outdir)
 
     for neg in cfg['exp']['negotiation']:
-        for w in cfg['exp']['wrk']:
-            for s in cfg['exp']['shards']:
-                for p in cfg['exp']['poisson-arrivals']:
-                    for o in ops_per_sec:
-                        do_exp(0,
-                                outdir=outdir,
-                                machines=machines,
-                                num_shards=s,
-                                ops_per_sec=o,
-                                poisson_arrivals=p,
-                                wrkload=w,
-                                skip_negotiation=not neg,
-                                overwrite=args.overwrite
-                                )
+        for noch in cfg['exp']['no-chunnels']:
+            for w in cfg['exp']['wrk']:
+                for s in cfg['exp']['shards']:
+                    for p in cfg['exp']['poisson-arrivals']:
+                        for o in ops_per_sec:
+                            do_exp(0,
+                                    outdir=outdir,
+                                    machines=machines,
+                                    num_shards=s,
+                                    ops_per_sec=o,
+                                    poisson_arrivals=p,
+                                    wrkload=w,
+                                    skip_negotiation=not neg,
+                                    no_chunnels=noch,
+                                    overwrite=args.overwrite
+                                    )
 
     agenda.task("done")
