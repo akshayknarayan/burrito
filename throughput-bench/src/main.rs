@@ -16,7 +16,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
-use tracing::{info, info_span};
+use tracing::{debug, info, info_span, trace};
 use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
@@ -85,7 +85,7 @@ fn main() -> Result<(), Report> {
 
     rt.block_on(async move {
         if let Mode::Client(cl) = mode {
-            let ch = DpdkUdpSkChunnel::new(cfg)?;
+            let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk chunnel")?;
             run_clients(ch, cl, port).await?;
         } else {
             let ch = DpdkUdpSkChunnel::new(cfg)?;
@@ -110,10 +110,18 @@ where
     let end = start + Duration::from_secs(c.duration_secs);
 
     let clients: futures_util::stream::FuturesUnordered<_> = (0..c.num_clients)
-        .map(|_| tokio::spawn(run_client(ctr.clone(), addr, c.download_size, end)))
+        .map(|i| {
+            tokio::spawn(
+                run_client(ctr.clone(), addr, c.download_size, end)
+                    .instrument(info_span!("client", ?i)),
+            )
+        })
         .collect();
 
-    let joined: Vec<Result<usize, Report>> = clients.try_collect().await?;
+    let joined: Vec<Result<usize, Report>> = clients
+        .try_collect()
+        .await
+        .wrap_err("failed running one or more clients")?;
     joined.into_iter().sum()
 }
 
@@ -139,10 +147,18 @@ where
     let mut tot_bytes = 0;
     let mut num_msgs = 0;
     while Instant::now() < end_time {
+        debug!(?num_msgs, remaining = ?(end_time - Instant::now()), "starting iteration");
         // 1. connect
         let s = stack.clone();
-        let cn = ctr.connect(()).await.map_err(Into::into)?;
-        let cn = bertha::negotiate_client(s, cn, addr).await?;
+        let cn = ctr
+            .connect(())
+            .await
+            .map_err(Into::into)
+            .wrap_err("connector failed")?;
+        let cn = bertha::negotiate_client(s, cn, addr)
+            .await
+            .wrap_err("negotiation failed")?;
+        trace!(?num_msgs, "got connection");
 
         // 2. get bytes
         cn.send((addr, Msg::Request(num_msgs, download_size)))
@@ -195,16 +211,14 @@ where
     {
         tokio::spawn(async move {
             let mut rng = rand::rngs::SmallRng::from_entropy();
-            loop {
-                let (a, msg) = cn.recv().await?;
-                match msg {
-                    Msg::Request(id, resp_size) => {
-                        let mut buf = vec![0u8; resp_size];
-                        rng.fill(&mut buf[..]);
-                        cn.send((a, Msg::Response(id, buf))).await?;
-                    }
-                    _ => break Err::<(), _>(eyre!("Got response at server")),
+            let (a, msg) = cn.recv().await?;
+            match msg {
+                Msg::Request(id, resp_size) => {
+                    let mut buf = vec![0u8; resp_size];
+                    rng.fill(&mut buf[..]);
+                    cn.send((a, Msg::Response(id, buf))).await?;
                 }
+                _ => break Err::<(), _>(eyre!("Got response at server")),
             }
         });
     }
