@@ -145,13 +145,17 @@ where
     E: Into<Report> + Send + Sync + 'static,
 {
     info!(?addr, ?download_size, "starting client");
-    let stack = Select::from((
-        CxList::from(OrderedChunnelProj::default())
-            .wrap(ReliabilityProjChunnel::default())
-            .wrap(SerializeChunnelProject::default()),
-        CxList::from(KvReliabilityChunnel::default()).wrap(SerializeChunnelProject::default()),
-    ))
-    .prefer_right();
+    //let stack = Select::from((
+    //    CxList::from(OrderedChunnelProj::default())
+    //        .wrap(ReliabilityProjChunnel::default())
+    //        .wrap(SerializeChunnelProject::default()),
+    //    CxList::from(KvReliabilityChunnel::default()).wrap(SerializeChunnelProject::default()),
+    //))
+    //.prefer_right();
+    //let stack = CxList::from(OrderedChunnelProj::default())
+    //    .wrap(ReliabilityProjChunnel::default())
+    //    .wrap(SerializeChunnelProject::default());
+    let stack = SerializeChunnelProject::default();
     let mut tot_bytes = 0;
     let start = Instant::now();
 
@@ -168,11 +172,13 @@ where
 
     // 2. get bytes
     cn.send((addr, Msg::Request(42, download_size))).await?;
+    trace!("waiting for response");
 
     loop {
         match cn.recv().await? {
             (_, Msg::ResponsePart(_, payload)) => {
                 tot_bytes += payload.len();
+                trace!(?tot_bytes, "received part");
             }
             (_, Msg::ResponseDone(_)) => {
                 break;
@@ -199,14 +205,18 @@ where
         )))
         .await
         .map_err(Into::into)?;
-    let stack = Select::from((
-        CxList::from(OrderedChunnelProj::default())
-            .wrap(ReliabilityProjChunnel::default())
-            .wrap(SerializeChunnelProject::default()),
-        CxList::from(KvReliabilityServerChunnel::default())
-            .wrap(SerializeChunnelProject::default()),
-    ))
-    .prefer_right();
+    //let stack = Select::from((
+    //    CxList::from(OrderedChunnelProj::default())
+    //        .wrap(ReliabilityProjChunnel::default())
+    //        .wrap(SerializeChunnelProject::default()),
+    //    CxList::from(KvReliabilityServerChunnel::default())
+    //        .wrap(SerializeChunnelProject::default()),
+    //))
+    //.prefer_right();
+    //let stack = CxList::from(OrderedChunnelProj::default())
+    //    .wrap(ReliabilityProjChunnel::default())
+    //    .wrap(SerializeChunnelProject::default());
+    let stack = SerializeChunnelProject::default();
     let st = bertha::negotiate::negotiate_server(stack, st)
         .instrument(info_span!("negotiate_server"))
         .await
@@ -219,18 +229,21 @@ where
         .await?
     {
         tokio::spawn(async move {
-            let mut rng = rand::rngs::SmallRng::from_entropy();
+            //let mut rng = rand::rngs::SmallRng::from_entropy();
             let (a, msg) = cn.recv().await?;
             match msg {
                 Msg::Request(id, mut remaining) => {
+                    info!(?id, ?remaining, "starting response");
+                    let start = Instant::now();
                     while remaining > 0 {
                         let this_send_size = std::cmp::min(1480, remaining);
-                        let mut buf = vec![0u8; this_send_size];
-                        rng.fill(&mut buf[..]);
+                        let buf = vec![0u8; this_send_size];
+                        //rng.fill(&mut buf[..]);
                         cn.send((a, Msg::ResponsePart(id, buf))).await?;
                         remaining -= this_send_size;
                     }
 
+                    info!(?id, elapsed=?start.elapsed(), "finished response");
                     cn.send((a, Msg::ResponseDone(id))).await?;
                 }
                 _ => bail!("Got response at server"),
