@@ -30,11 +30,12 @@ struct Opt {
     port: u16,
 
     #[structopt(subcommand)]
-    client: Option<Client>,
+    mode: Mode,
 }
 
 #[derive(Debug, Clone, StructOpt)]
 struct Client {
+    #[structopt(long)]
     addr: Ipv4Addr,
 
     #[structopt(long)]
@@ -45,6 +46,12 @@ struct Client {
 
     #[structopt(long)]
     duration_secs: u64,
+}
+
+#[derive(Debug, Clone, StructOpt)]
+enum Mode {
+    Client(Client),
+    Server,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -69,7 +76,7 @@ fn main() -> Result<(), Report> {
     let d = tracing::Dispatch::new(subscriber);
     d.init();
     color_eyre::install()?;
-    let Opt { cfg, port, client } = Opt::from_args();
+    let Opt { cfg, port, mode } = Opt::from_args();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -77,7 +84,7 @@ fn main() -> Result<(), Report> {
         .build()?;
 
     rt.block_on(async move {
-        if let Some(cl) = client {
+        if let Mode::Client(cl) = mode {
             let ch = DpdkUdpSkChunnel::new(cfg)?;
             run_clients(ch, cl, port).await?;
         } else {
