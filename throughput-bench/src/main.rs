@@ -7,6 +7,7 @@ use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{bail, Report, WrapErr};
 use dpdk_direct::{DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use futures_util::stream::TryStreamExt;
+use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -23,6 +24,9 @@ struct Opt {
 
     #[structopt(short, long)]
     port: u16,
+
+    #[structopt(long)]
+    datapath: String,
 
     #[structopt(subcommand)]
     mode: Mode,
@@ -57,7 +61,12 @@ fn main() -> Result<(), Report> {
     let d = tracing::Dispatch::new(subscriber);
     d.init();
     color_eyre::install()?;
-    let Opt { cfg, port, mode } = Opt::from_args();
+    let Opt {
+        cfg,
+        port,
+        datapath,
+        mode,
+    } = Opt::from_args();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -66,11 +75,24 @@ fn main() -> Result<(), Report> {
 
     rt.block_on(async move {
         if let Mode::Client(mut cl) = mode {
-            let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk chunnel")?;
             let download_size = cl.download_size;
             let num_clients = cl.num_clients;
             let of = cl.out_file.take();
-            let (tot_bytes, elapsed) = run_clients(ch, cl, port).await?;
+
+            let (tot_bytes, elapsed) = match datapath.as_str() {
+                "dpdk" => {
+                    let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk chunnel")?;
+                    run_clients(ch, cl, port).await?
+                }
+                "shenango" => {
+                    let ch = ShenangoUdpSkChunnel::new(cfg);
+                    run_clients(ch, cl, port).await?
+                }
+                d => {
+                    bail!("unknown datapath {:?}", d);
+                }
+            };
+
             let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
             info!(?num_clients, ?download_size, rate_mbps=?(rate / 1e6), "finished");
             if let Some(of) = of {
@@ -96,9 +118,21 @@ fn main() -> Result<(), Report> {
                 );
             }
         } else {
-            let ch = DpdkUdpSkChunnel::new(cfg)?;
-            let ch = DpdkUdpReqChunnel(ch);
-            run_server(ch, port).await?;
+            match datapath.as_str() {
+                "dpdk" => {
+                    let ch = DpdkUdpSkChunnel::new(cfg)?;
+                    let ch = DpdkUdpReqChunnel(ch);
+                    run_server(ch, port).await?;
+                }
+                "shenango" => {
+                    let ch = ShenangoUdpSkChunnel::new(cfg);
+                    let ch = ShenangoUdpReqChunnel(ch);
+                    run_server(ch, port).await?;
+                }
+                d => {
+                    bail!("unknown datapath {:?}", d);
+                }
+            }
         }
 
         Ok::<_, Report>(())
