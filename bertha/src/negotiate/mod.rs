@@ -152,7 +152,7 @@ fn have_all(univ: &[Vec<u8>], joint: &[Vec<u8>]) -> bool {
     univ.iter().all(|x| joint.contains(x))
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StackNonce(HashMap<u64, Offer>);
 
 impl StackNonce {

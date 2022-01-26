@@ -158,12 +158,16 @@ where
         let offers = NegotiateMsg::ClientOffer(stack.offers().collect());
         let resp = try_negotiate_offer_loop(&cn, addr.clone(), offers).await?;
         match resp {
-            NegotiateMsg::ServerReply(Ok(picked)) => {
+            NegotiateMsg::ServerReply(Ok(mut picked)) => {
                 // 4. monomorphize `stack`, picking received choices
                 trace!(?picked, "received server pairs, applying");
                 let mut sc = 0;
                 let mut applied = None;
                 let mut apply_err = eyre!("Apply error");
+                if picked.is_empty() {
+                    picked.push(Default::default());
+                }
+
                 for p in picked {
                     let p2 = p.clone();
                     match super::apply::check_apply(stack.clone(), p)
@@ -355,10 +359,14 @@ where
 
         // 3. receive picked
         let (_, rbuf) = cn.recv().await?;
-        bincode::deserialize(&rbuf).wrap_err(eyre!(
-            "Could not deserialize negotiate_server response: {:?}",
-            rbuf
-        ))
+        if rbuf.is_empty() {
+            Ok(NegotiateMsg::ServerReply(Ok(vec![])))
+        } else {
+            bincode::deserialize(&rbuf).wrap_err(eyre!(
+                "Could not deserialize negotiate_server response: {:?}",
+                rbuf
+            ))
+        }
     }
 }
 
