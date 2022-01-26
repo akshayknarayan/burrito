@@ -4,14 +4,14 @@
 //! each download m bytes.
 
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{Report, WrapErr};
+use color_eyre::eyre::{bail, Report, WrapErr};
 use dpdk_direct::{DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use futures_util::stream::TryStreamExt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
-use tracing::{info, info_span, trace};
+use tracing::{debug, info, info_span, trace};
 use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
@@ -145,8 +145,9 @@ where
     trace!("got connection");
 
     // 2. get bytes
-    cn.send((addr, (download_size as u64).to_le_bytes().to_vec()))
-        .await?;
+    let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    req.extend((download_size as u64).to_le_bytes());
+    cn.send((addr, req)).await?;
     let mut last_recv_time = Instant::now();
     loop {
         let (_, r) = cn.recv().await?;
@@ -193,7 +194,12 @@ where
     {
         tokio::spawn(async move {
             let (a, msg) = cn.recv().await?;
-            let mut remaining = u64::from_le_bytes(msg[..8].try_into().unwrap());
+            if &msg[..8] != [1, 2, 3, 4, 5, 6, 7, 8] {
+                debug!("bad client request");
+                bail!("bad connection");
+            }
+
+            let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
             let start = Instant::now();
             info!(?remaining, ?a, "starting send");
             while remaining > 0 {
@@ -203,7 +209,7 @@ where
                 remaining -= this_send_size;
             }
 
-            info!(elapsed = ?start.elapsed(), "done sending");
+            info!(elapsed = ?start.elapsed(), ?a, "done sending");
             // fin
             cn.send((a, vec![1u8])).await?;
             let mut f = cn.recv();
@@ -221,6 +227,8 @@ where
                     }
                 }
             }
+
+            info!(elapsed = ?start.elapsed(), ?a, "exiting");
             Ok::<_, Report>(())
         });
     }
