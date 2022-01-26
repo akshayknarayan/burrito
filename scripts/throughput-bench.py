@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-from kv import ConnectionWrapper, check_machine, get_local, check, get_timeout
+from kv import ConnectionWrapper, check_machine, get_local, check, get_timeout, write_dpdk_config, write_shenango_config
 import agenda
 import argparse
 import os
@@ -15,7 +15,7 @@ def setup_machine(conn, outdir):
     ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
     check(ok, "mk outdir", conn.addr)
     agenda.subtask(f"building burrito on {conn.addr}")
-    ok = conn.run("cargo b --release", wd = "~/burrito/throughput-bench")
+    ok = conn.run("../../.cargo/bin/cargo b --release", wd = "~/burrito/throughput-bench")
     check(ok, "build", conn.addr)
     return conn
 
@@ -23,11 +23,18 @@ dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-
 
 def start_server(conn, outf, variant='dpdk', skip_negotiation=False):
     conn.run("sudo pkill -9 throughput-bench")
-    #conn.run("sudo pkill -INT iokerneld")
+    if 'shenango' in variant:
+        conn.run("sudo pkill -INT iokerneld")
+        write_shenango_config(conn)
+        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+    elif 'dpdk' in variant:
+        write_dpdk_config(conn)
+    else:
+        raise Exception("unknown datapath")
 
     #skip_neg = '--skip-negotiation' if skip_negotiation else ''
-    #time.sleep(2)
-    ok = conn.run(f"{dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/throughput-bench -p 4242 --cfg host.config",
+    time.sleep(2)
+    ok = conn.run(f"{dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/throughput-bench -p 4242 --datapath {variant} --cfg host.config server",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -37,30 +44,38 @@ def start_server(conn, outf, variant='dpdk', skip_negotiation=False):
     check(ok, "spawn server", conn.addr)
     agenda.subtask("wait for server check")
     time.sleep(8)
-    conn.check_proc(f"throughput-bench", f"{outf}.err")
+    conn.check_proc(f"throughput", f"{outf}.err")
 
-def run_client(conn, server, num_clients, file_size, skip_negotiation, outf):
-    #conn.run("sudo pkill -INT iokerneld")
+def run_client(conn, server, num_clients, file_size, variant, skip_negotiation, outf):
+    if 'shenango' in variant:
+        conn.run("sudo pkill -INT iokerneld")
+        write_shenango_config(conn)
+        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+    elif 'dpdk' in variant:
+        write_dpdk_config(conn)
+    else:
+        raise Exception("unknown datapath")
 
-    #write_shenango_config(conn)
-    #conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
-    #time.sleep(2)
+    time.sleep(2)
     agenda.subtask(f"client starting -> {outf}.out")
-    ok = conn.run(f"RUST_LOG=info ./target/release/throughput-bench \
-            -p 4242 \
-            --cfg host.config \
-            client \
-            --addr {server} \
-            --download-size {file_size} \
-            --num-clients {num_clients} \
-            --out-file={outf}.data \
-            ",
+    ok = conn.run(
+        f"RUST_LOG=info {dpdk_ld_var if 'dpdk' in variant else ''}  ./target/release/throughput-bench \
+        -p 4242 \
+        --datapath {variant} \
+        --cfg host.config \
+        client \
+        --addr {server} \
+        --download-size {file_size} \
+        --num-clients {num_clients} \
+        --out-file={outf}.data",
+        sudo=True,
         wd="~/burrito",
         stdout=f"{outf}.out",
         stderr=f"{outf}.err",
         )
     check(ok, "throughput-bench", conn.addr)
-    #conn.run("sudo pkill -INT iokerneld")
+    if 'shenango' in variant:
+        conn.run("sudo pkill -INT iokerneld")
     agenda.subtask("client done")
 
 def do_exp(iter_num,
@@ -68,6 +83,7 @@ def do_exp(iter_num,
     machines=None,
     file_size=None,
     num_clients=None,
+    datapath=None,
     skip_negotiation=False,
     overwrite=None
 ):
@@ -76,12 +92,13 @@ def do_exp(iter_num,
         machines is not None and
         file_size is not None and
         num_clients is not None and
+        datapath is not None and
         overwrite is not None
     )
 
     #noneg = '_noneg' if skip_negotiation else ''
-    server_prefix = f"{outdir}/dpdk-{num_clients}-file_size={file_size}-{iter_num}-tbench_server"
-    outf = f"{outdir}/dpdk-{num_clients}-file_size={file_size}-{iter_num}-tbench_client"
+    server_prefix = f"{outdir}/{datapath}-num_clients={num_clients}-file_size={file_size}-{iter_num}-tbench_server"
+    outf = f"{outdir}/{datapath}-num_clients={num_clients}-file_size={file_size}-{iter_num}-tbench_client"
 
     for m in machines:
         if m.local:
@@ -90,19 +107,19 @@ def do_exp(iter_num,
         m.run(f"rm -rf {outdir}", wd="~/burrito")
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
-    if not overwrite and os.path.exists(f"{outf}-{machines[1].addr}.data"):
-        agenda.task(f"skipping: server = {machines[0].addr}, skip_negotiation = {skip_negotiation}")
+    if not overwrite and os.path.exists(f"{outf}.data"):
+        agenda.task(f"skipping: {outf}.data")
         return True
     else:
-        agenda.task(f"running: {outf}-{machines[1].addr}.data")
+        agenda.task(f"running: {outf}.data")
 
     time.sleep(5)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {machines[0].addr}, skip_negotiation = {skip_negotiation}, num_clients = {num_clients} file_size = {file_size}")
+    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, skip_negotiation = {skip_negotiation}, num_clients = {num_clients} file_size = {file_size}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    start_server(machines[0], server_prefix)
+    start_server(machines[0], server_prefix, variant=datapath)
     time.sleep(5)
 
     # others are clients
@@ -112,6 +129,7 @@ def do_exp(iter_num,
             server_addr,
             num_clients,
             file_size,
+            datapath,
             False,
             outf,
         ),
@@ -122,16 +140,17 @@ def do_exp(iter_num,
     agenda.task("all clients returned")
 
     # kill the server
-    machines[0].run("sudo pkill -9 throughput-bench")
-    #machines[0].run("sudo pkill -INT iokerneld")
+    machines[0].run("sudo pkill -9 throughput")
+    if 'shenango' in datapath:
+        machines[0].run("sudo pkill -INT iokerneld")
 
     for m in machines:
         m.run("rm ~/burrito/*.config")
 
-    agenda.task("get server files")
-    if not machines[0].local:
-        machines[0].get(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
-        machines[0].get(f"~/burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+    #agenda.task("get server files")
+    #if not machines[0].local:
+    #    machines[0].get(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
+    #    machines[0].get(f"~/burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
 
     def get_files(num):
         fn = c.get
@@ -178,6 +197,7 @@ def do_exp(iter_num,
 ### [exp]
 ### num_clients = [1, 2, 4, 8, 16, 32, 64, 128]
 ### file_size = [50000000]
+### datapath = ['dpdk', 'shenango']
 ###
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -207,6 +227,12 @@ if __name__ == '__main__':
     if 'file_size' not in cfg['exp']:
         agenda.failure("Need file_size")
         sys.exit(1)
+    if 'datapath' not in cfg['exp']:
+        cfg['exp']['datapath'] = ['dpdk']
+    for t in cfg['exp']['datapath']:
+        if t not in ['dpdk', 'shenango']:
+            agenda.failure('unknown datapath: ' + t)
+            sys.exit(1)
 
     agenda.task(f"Checking for connection vs experiment ip")
     ips = [cfg['machines']['server']] + cfg['machines']['clients']
@@ -238,15 +264,17 @@ if __name__ == '__main__':
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
 
-    for fs in cfg['exp']['file_size']:
-        for nc in cfg['exp']['num_clients']:
-            do_exp(0,
-                    outdir=outdir,
-                    machines=machines,
-                    num_clients=nc,
-                    file_size=fs,
-                    skip_negotiation=False,
-                    overwrite=args.overwrite
-                    )
+    for d in cfg['exp']['datapath']:
+        for fs in cfg['exp']['file_size']:
+            for nc in cfg['exp']['num_clients']:
+                do_exp(0,
+                        outdir=outdir,
+                        machines=machines,
+                        num_clients=nc,
+                        file_size=fs,
+                        datapath=d,
+                        skip_negotiation=False,
+                        overwrite=args.overwrite
+                        )
 
     agenda.task("done")
