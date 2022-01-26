@@ -76,6 +76,11 @@ fn main() -> Result<(), Report> {
         mode,
     } = Opt::from_args();
 
+    if no_bertha && datapath == "shenango" {
+        shenango_nobertha(cfg, port, mode);
+        unreachable!();
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -447,5 +452,155 @@ async fn run_server_no_bertha(port: u16, cfg: std::path::PathBuf) -> Result<(), 
             info!(elapsed = ?start.elapsed(), ?a, "exiting");
             Ok::<_, Report>(())
         });
+    }
+}
+
+fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
+    use shenango::udp;
+    if let Mode::Client(mut cl) = mode {
+        let download_size = cl.download_size;
+        let num_clients = cl.num_clients;
+        let of = cl.out_file.take();
+        let addr = SocketAddrV4::new(cl.addr, port);
+
+        shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
+            let mut jhs = Vec::with_capacity(cl.num_clients);
+            for _ in 0..cl.num_clients {
+                let jh = shenango::thread::spawn(move || {
+                    let cn = udp::UdpConnection::dial(
+                        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+                        addr,
+                    )?;
+
+                    info!(?addr, ?download_size, "starting client");
+                    let mut tot_bytes = 0;
+                    let start = Instant::now();
+
+                    // 2. get bytes
+                    let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
+                    req.extend((download_size as u64).to_le_bytes());
+                    cn.write_to(&req, addr)?;
+                    let mut last_recv_time = Instant::now();
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        let s = cn.recv(&mut buf)?;
+                        tot_bytes += s;
+                        trace!(?tot_bytes, "received part");
+                        if buf[0] == 1 {
+                            cn.write_to(&buf[0..4], addr)?;
+                            break;
+                        } else {
+                            last_recv_time = Instant::now();
+                        }
+                    }
+
+                    let elapsed = last_recv_time - start;
+                    info!(?tot_bytes, ?elapsed, "done");
+                    Ok((tot_bytes, elapsed))
+                });
+                jhs.push(jh);
+            }
+
+            let joined: Vec<Result<(usize, Duration), Report>> =
+                jhs.into_iter().map(|jh| jh.join().unwrap()).collect();
+            let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+                .into_iter()
+                .collect::<Result<Vec<(usize, Duration)>, _>>()
+                .unwrap()
+                .into_iter()
+                .unzip();
+            let tot_bytes: usize = tot_bytes.into_iter().sum();
+            let elapsed = durs.into_iter().max().unwrap();
+            info!(?tot_bytes, ?elapsed, "all clients done");
+
+            let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
+            info!(?num_clients, ?download_size, rate_mbps=?(rate / 1e6), "finished");
+            if let Some(of) = of {
+                use std::io::Write;
+                let mut f = std::fs::File::create(of).unwrap();
+                writeln!(
+                    &mut f,
+                    "num_clients,download_size,tot_bytes,elapsed_us,rate_bps"
+                )
+                .unwrap();
+                writeln!(
+                    &mut f,
+                    "{:?},{:?},{:?},{:?},{:?}",
+                    num_clients,
+                    download_size,
+                    tot_bytes,
+                    elapsed.as_micros(),
+                    rate
+                )
+                .unwrap();
+            } else {
+                println!(
+                    "num_clients={:?},download_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
+                    num_clients,
+                    download_size,
+                    tot_bytes,
+                    elapsed.as_micros(),
+                    rate
+                );
+            }
+        }).unwrap();
+    } else {
+        info!(?port, "starting server");
+        let listen_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
+            udp::udp_accept(listen_addr, move |cn| {
+                let mut buf = [0u8; 2048];
+                let (sz, a) = cn.read_from(&mut buf[..]).unwrap();
+                let msg = &buf[..sz];
+                if &msg[..8] != [1, 2, 3, 4, 5, 6, 7, 8] {
+                    debug!("bad client request");
+                    return;
+                }
+
+                let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
+                let start = Instant::now();
+                info!(?remaining, ?a, "starting send");
+                while remaining > 0 {
+                    let this_send_size = std::cmp::min(1460, remaining);
+                    let buf = vec![0u8; this_send_size as usize];
+                    cn.write_to(&buf, a).unwrap();
+                    remaining -= this_send_size;
+                }
+
+                info!(elapsed = ?start.elapsed(), ?a, "done sending");
+                // fin
+                let fin_buf = [1u8; 1];
+                cn.write_to(&fin_buf, a).unwrap();
+                const RECV: u32 = 1;
+                const TIME: u32 = 2;
+                let mut p = shenango::poll::PollWaiter::new();
+                let recv_trigger = p.trigger(RECV);
+                let cn2 = cn.clone();
+                shenango::thread::spawn(move || {
+                    let _recv_trigger = recv_trigger;
+                    let mut buf = [0u8; 1024];
+                    cn.recv(&mut buf).unwrap();
+                });
+
+                loop {
+                    let sleep_trigger = p.trigger(TIME);
+                    shenango::thread::spawn(move || {
+                        let _sleep_trigger = sleep_trigger;
+                        shenango::time::sleep(Duration::from_millis(1));
+                    });
+
+                    if p.wait() == TIME {
+                        let fin_buf = [1u8; 1];
+                        cn2.write_to(&fin_buf, a).unwrap();
+                    } else {
+                        break;
+                    }
+                }
+
+                info!(elapsed = ?start.elapsed(), ?a, "exiting");
+            })
+            .unwrap();
+        })
+        .unwrap();
     }
 }

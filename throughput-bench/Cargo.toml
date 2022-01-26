@@ -9,6 +9,7 @@ kvstore = { path = "../kvstore" }
 dpdk-direct = { path = "../dpdk-direct" }
 dpdk-wrapper = { path = "../dpdk-direct/dpdk-wrapper" }
 shenango-chunnel = { path = "../shenango-chunnel" }
+shenango = { path = "../shenango-chunnel/caladan/bindings/rust" }
 flume = "0.10"
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }

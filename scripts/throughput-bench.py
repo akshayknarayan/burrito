@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-from kv import ConnectionWrapper, check_machine, get_local, check, get_timeout, write_dpdk_config, write_shenango_config
+from kv import ConnectionWrapper, check_machine, get_local, check, get_timeout, write_dpdk_config, write_cfg
 import agenda
 import argparse
 import os
@@ -10,6 +10,16 @@ import sys
 import threading
 import time
 import toml
+
+def write_shenango_config(conn):
+    shenango_config = f"""
+host_addr {conn.addr}
+host_netmask 255.255.255.0
+host_gateway 10.1.1.1
+runtime_kthreads 4
+runtime_spininng_kthreads 4
+runtime_guaranteed_kthreads 4"""
+    write_cfg(conn, shenango_config)
 
 def setup_machine(conn, outdir):
     ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
@@ -271,7 +281,7 @@ if __name__ == '__main__':
     shutil.copy2(args.config, args.outdir)
 
     for d in cfg['exp']['datapath']:
-        if d == 'dpdk':
+        if d == 'dpdk' or d == 'shenango':
             for use_bertha in cfg['exp']['bertha']:
                 for fs in cfg['exp']['file_size']:
                     for nc in cfg['exp']['num_clients']:
