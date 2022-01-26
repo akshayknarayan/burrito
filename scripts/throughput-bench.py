@@ -29,12 +29,14 @@ def start_server(conn, outf, variant='dpdk', skip_negotiation=False):
         conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     elif 'dpdk' in variant:
         write_dpdk_config(conn)
+    elif 'kernel' in variant:
+        pass
     else:
         raise Exception("unknown datapath")
 
     #skip_neg = '--skip-negotiation' if skip_negotiation else ''
     time.sleep(2)
-    ok = conn.run(f"{dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/throughput-bench -p 4242 --datapath {variant} --cfg host.config server",
+    ok = conn.run(f"{dpdk_ld_var} ./target/release/throughput-bench -p 4242 --datapath {variant} --cfg host.config server",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -53,13 +55,15 @@ def run_client(conn, server, num_clients, file_size, variant, skip_negotiation, 
         conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     elif 'dpdk' in variant:
         write_dpdk_config(conn)
+    elif 'kernel' in variant:
+        pass
     else:
         raise Exception("unknown datapath")
 
     time.sleep(2)
     agenda.subtask(f"client starting -> {outf}.out")
     ok = conn.run(
-        f"RUST_LOG=info {dpdk_ld_var if 'dpdk' in variant else ''}  ./target/release/throughput-bench \
+        f"RUST_LOG=info {dpdk_ld_var}  ./target/release/throughput-bench \
         -p 4242 \
         --datapath {variant} \
         --cfg host.config \
@@ -230,7 +234,7 @@ if __name__ == '__main__':
     if 'datapath' not in cfg['exp']:
         cfg['exp']['datapath'] = ['dpdk']
     for t in cfg['exp']['datapath']:
-        if t not in ['dpdk', 'shenango']:
+        if t not in ['dpdk', 'shenango', 'kernel']:
             agenda.failure('unknown datapath: ' + t)
             sys.exit(1)
 

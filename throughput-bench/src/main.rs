@@ -3,7 +3,10 @@
 //! One connection per request, n simultaneous clients looping on establishing connections that
 //! each download m bytes.
 
-use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
+use bertha::{
+    udp::{UdpReqChunnel, UdpSkChunnel},
+    ChunnelConnection, ChunnelConnector, ChunnelListener,
+};
 use color_eyre::eyre::{bail, Report, WrapErr};
 use dpdk_direct::{DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use futures_util::stream::TryStreamExt;
@@ -88,6 +91,10 @@ fn main() -> Result<(), Report> {
                     let ch = ShenangoUdpSkChunnel::new(cfg);
                     run_clients(ch, cl, port).await?
                 }
+                "kernel" => {
+                    let ch = UdpSkChunnel;
+                    run_clients(ch, cl, port).await?
+                }
                 d => {
                     bail!("unknown datapath {:?}", d);
                 }
@@ -127,6 +134,10 @@ fn main() -> Result<(), Report> {
                 "shenango" => {
                     let ch = ShenangoUdpSkChunnel::new(cfg);
                     let ch = ShenangoUdpReqChunnel(ch);
+                    run_server(ch, port).await?;
+                }
+                "kernel" => {
+                    let ch = UdpReqChunnel;
                     run_server(ch, port).await?;
                 }
                 d => {
