@@ -186,7 +186,7 @@ where
             let (a, msg) = cn.recv().await?;
             let mut remaining = u64::from_le_bytes(msg[..8].try_into().unwrap());
             let start = Instant::now();
-            info!(?remaining, "starting send");
+            info!(?remaining, ?a, "starting send");
             while remaining > 0 {
                 let this_send_size = std::cmp::min(1480, remaining);
                 let buf = vec![0u8; this_send_size as usize];
