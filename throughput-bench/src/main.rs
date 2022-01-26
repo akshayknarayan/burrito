@@ -14,6 +14,7 @@ use futures_util::stream::TryStreamExt;
 use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
 use tracing::{debug, info, info_span, trace, warn};
@@ -465,29 +466,63 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
         shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
             let mut jhs = Vec::with_capacity(cl.num_clients);
-            for _ in 0..cl.num_clients {
+            for i in 0..cl.num_clients {
                 let jh = shenango::thread::spawn(move || {
                     let cn = udp::UdpConnection::dial(
                         SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
                         addr,
                     )?;
+                    let cn = Arc::new(cn);
 
                     info!(?addr, ?download_size, "starting client");
                     let mut tot_bytes = 0;
-                    let start = Instant::now();
+                    let mut start = Instant::now();
 
                     // 2. get bytes
                     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
                     req.extend((download_size as u64).to_le_bytes());
                     cn.write_to(&req, addr)?;
-                    let mut last_recv_time = Instant::now();
-                    let mut buf = [0u8; 2048];
+
+                    const RECV: u32 = 1;
+                    const TIME: u32 = 2;
+                    let mut p = shenango::poll::PollWaiter::new();
+                    let recv_trigger = p.trigger(RECV);
+                    let cn2 = Arc::clone(&cn);
+                    let recv_jh = shenango::thread::spawn(move || {
+                        let _recv_trigger = recv_trigger;
+                        let mut buf = [0u8; 2048];
+                        cn2.recv(&mut buf)
+                    });
+
                     loop {
-                        let s = cn.recv(&mut buf)?;
+                        let sleep_trigger = p.trigger(TIME);
+                        shenango::thread::spawn(move || {
+                            let _sleep_trigger = sleep_trigger;
+                            shenango::time::sleep(Duration::from_millis(5));
+                        });
+
+                        debug!(elapsed = ?start.elapsed(), ?i, "waiting");
+                        if p.wait() == TIME {
+                            debug!(elapsed = ?start.elapsed(), ?i, "retrying req");
+                            start = Instant::now();
+                            cn.write_to(&req, addr)?;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    debug!(elapsed = ?start.elapsed(), ?i, "connection started");
+                    tot_bytes += recv_jh.join().unwrap()?;
+
+                    let mut buf = [0u8; 2048];
+                    let mut last_recv_time = Instant::now();
+                    loop {
+                        let s = cn.recv(&mut buf[0..2048])?;
+                        assert!(s != 0);
                         tot_bytes += s;
-                        trace!(?tot_bytes, "received part");
+                        trace!(?tot_bytes, ?i, ?s, "received part");
                         if buf[0] == 1 {
-                            cn.write_to(&buf[0..4], addr)?;
+                            cn.write_to(&buf[0..16], addr)?;
                             break;
                         } else {
                             last_recv_time = Instant::now();
@@ -572,7 +607,7 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     let this_send_size = std::cmp::min(1460, remaining);
                     let buf = vec![0u8; this_send_size as usize];
                     if let Err(e) = cn.write_to(&buf, a) {
-                        warn!(?e, "write errored");
+                        trace!(?e, "write errored");
                     }
                     remaining -= this_send_size;
                 }
@@ -601,11 +636,11 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     let sleep_trigger = p.trigger(TIME);
                     shenango::thread::spawn(move || {
                         let _sleep_trigger = sleep_trigger;
-                        shenango::time::sleep(Duration::from_millis(5));
+                        shenango::time::sleep(Duration::from_millis(100));
                     });
 
                     if p.wait() == TIME {
-                        info!(elapsed = ?start.elapsed(), ?a, "retrying fin");
+                        debug!(elapsed = ?start.elapsed(), ?a, "retrying fin");
                         let fin_buf = [1u8; 1];
                         cn2.write_to(&fin_buf, a).unwrap();
                     } else {
