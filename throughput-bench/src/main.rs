@@ -38,6 +38,9 @@ struct Client {
 
     #[structopt(long)]
     download_size: usize,
+
+    #[structopt(long)]
+    out_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, StructOpt)]
@@ -62,20 +65,36 @@ fn main() -> Result<(), Report> {
         .build()?;
 
     rt.block_on(async move {
-        if let Mode::Client(cl) = mode {
+        if let Mode::Client(mut cl) = mode {
             let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk chunnel")?;
             let download_size = cl.download_size;
             let num_clients = cl.num_clients;
+            let of = cl.out_file.take();
             let (tot_bytes, elapsed) = run_clients(ch, cl, port).await?;
             let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
             info!(?num_clients, ?download_size, rate_mbps=?(rate / 1e6), "finished");
-            println!(
-                "num_clients={:?},download_size={:?},elapsed_us={:?},rate_bps={:?}",
-                num_clients,
-                download_size,
-                elapsed.as_micros(),
-                rate
-            );
+            if let Some(of) = of {
+                use std::io::Write;
+                let mut f = std::fs::File::create(of)?;
+                write!(
+                    &mut f,
+                    "num_clients={:?},download_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
+                    num_clients,
+                    download_size,
+                    tot_bytes,
+                    elapsed.as_micros(),
+                    rate
+                )?;
+            } else {
+                println!(
+                    "num_clients={:?},download_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
+                    num_clients,
+                    download_size,
+                    tot_bytes,
+                    elapsed.as_micros(),
+                    rate
+                );
+            }
         } else {
             let ch = DpdkUdpSkChunnel::new(cfg)?;
             let ch = DpdkUdpReqChunnel(ch);
