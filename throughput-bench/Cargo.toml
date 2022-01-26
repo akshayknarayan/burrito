@@ -9,8 +9,6 @@ kvstore = { path = "../kvstore" }
 dpdk-direct = { path = "../dpdk-direct" }
 #shenango-chunnel = { path = "../shenango-chunnel" }
 futures-util = "0.3"
-rand = { version = "0.8", features = ["small_rng"] }
-serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 color-eyre = "0.5"
 tracing = "0.1"
