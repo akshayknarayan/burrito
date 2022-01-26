@@ -16,7 +16,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
-use tracing::{debug, info, info_span, trace};
+use tracing::{debug, info, info_span, trace, warn};
 use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
@@ -543,6 +543,8 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     rate
                 );
             }
+
+            std::process::exit(0);
         }).unwrap();
     } else {
         info!(?port, "starting server");
@@ -550,7 +552,13 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
         shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
             udp::udp_accept(listen_addr, move |cn| {
                 let mut buf = [0u8; 2048];
-                let (sz, a) = cn.read_from(&mut buf[..]).unwrap();
+                let (sz, a) = match cn.read_from(&mut buf[..]) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        warn!(?e, "request read failed");
+                        return;
+                    }
+                };
                 let msg = &buf[..sz];
                 if &msg[..8] != [1, 2, 3, 4, 5, 6, 7, 8] {
                     debug!("bad client request");
@@ -563,14 +571,19 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                 while remaining > 0 {
                     let this_send_size = std::cmp::min(1460, remaining);
                     let buf = vec![0u8; this_send_size as usize];
-                    cn.write_to(&buf, a).unwrap();
+                    if let Err(e) = cn.write_to(&buf, a) {
+                        warn!(?e, "write errored");
+                    }
                     remaining -= this_send_size;
                 }
 
                 info!(elapsed = ?start.elapsed(), ?a, "done sending");
                 // fin
                 let fin_buf = [1u8; 1];
-                cn.write_to(&fin_buf, a).unwrap();
+                if let Err(e) = cn.write_to(&fin_buf, a) {
+                    warn!(?e, "fin write failed");
+                }
+
                 const RECV: u32 = 1;
                 const TIME: u32 = 2;
                 let mut p = shenango::poll::PollWaiter::new();
@@ -579,17 +592,20 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                 shenango::thread::spawn(move || {
                     let _recv_trigger = recv_trigger;
                     let mut buf = [0u8; 1024];
-                    cn.recv(&mut buf).unwrap();
+                    if let Err(e) = cn.recv(&mut buf) {
+                        warn!(?e, "recv errored");
+                    }
                 });
 
                 loop {
                     let sleep_trigger = p.trigger(TIME);
                     shenango::thread::spawn(move || {
                         let _sleep_trigger = sleep_trigger;
-                        shenango::time::sleep(Duration::from_millis(1));
+                        shenango::time::sleep(Duration::from_millis(5));
                     });
 
                     if p.wait() == TIME {
+                        info!(elapsed = ?start.elapsed(), ?a, "retrying fin");
                         let fin_buf = [1u8; 1];
                         cn2.write_to(&fin_buf, a).unwrap();
                     } else {
