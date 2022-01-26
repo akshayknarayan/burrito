@@ -7,7 +7,9 @@ edition = "2021"
 bertha = { path = "../bertha" }
 kvstore = { path = "../kvstore" }
 dpdk-direct = { path = "../dpdk-direct" }
+dpdk-wrapper = { path = "../dpdk-direct/dpdk-wrapper" }
 shenango-chunnel = { path = "../shenango-chunnel" }
+flume = "0.10"
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 color-eyre = "0.5"

@@ -21,7 +21,7 @@ def setup_machine(conn, outdir):
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
 
-def start_server(conn, outf, variant='dpdk', skip_negotiation=False):
+def start_server(conn, outf, variant='dpdk', use_bertha=False):
     conn.run("sudo pkill -9 throughput-bench")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -34,9 +34,9 @@ def start_server(conn, outf, variant='dpdk', skip_negotiation=False):
     else:
         raise Exception("unknown datapath")
 
-    #skip_neg = '--skip-negotiation' if skip_negotiation else ''
+    no_bertha = '--no-bertha' if not use_bertha else ''
     time.sleep(2)
-    ok = conn.run(f"{dpdk_ld_var} ./target/release/throughput-bench -p 4242 --datapath {variant} --cfg host.config server",
+    ok = conn.run(f"{dpdk_ld_var} ./target/release/throughput-bench -p 4242 --datapath {variant} {no_bertha} --cfg host.config server",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -48,7 +48,7 @@ def start_server(conn, outf, variant='dpdk', skip_negotiation=False):
     time.sleep(8)
     conn.check_proc(f"throughput", f"{outf}.err")
 
-def run_client(conn, server, num_clients, file_size, variant, skip_negotiation, outf):
+def run_client(conn, server, num_clients, file_size, variant, use_bertha, outf):
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
         write_shenango_config(conn)
@@ -60,6 +60,7 @@ def run_client(conn, server, num_clients, file_size, variant, skip_negotiation, 
     else:
         raise Exception("unknown datapath")
 
+    no_bertha = '--no-bertha' if not use_bertha else ''
     time.sleep(2)
     agenda.subtask(f"client starting -> {outf}.out")
     ok = conn.run(
@@ -67,6 +68,7 @@ def run_client(conn, server, num_clients, file_size, variant, skip_negotiation, 
         -p 4242 \
         --datapath {variant} \
         --cfg host.config \
+        {no_bertha} \
         client \
         --addr {server} \
         --download-size {file_size} \
@@ -88,7 +90,7 @@ def do_exp(iter_num,
     file_size=None,
     num_clients=None,
     datapath=None,
-    skip_negotiation=False,
+    use_bertha=False,
     overwrite=None
 ):
     assert(
@@ -100,9 +102,9 @@ def do_exp(iter_num,
         overwrite is not None
     )
 
-    #noneg = '_noneg' if skip_negotiation else ''
-    server_prefix = f"{outdir}/{datapath}-num_clients={num_clients}-file_size={file_size}-{iter_num}-tbench_server"
-    outf = f"{outdir}/{datapath}-num_clients={num_clients}-file_size={file_size}-{iter_num}-tbench_client"
+    nobertha = '_nobertha' if not use_bertha else ''
+    server_prefix = f"{outdir}/{datapath}{nobertha}-num_clients={num_clients}-file_size={file_size}-{iter_num}-tbench_server"
+    outf = f"{outdir}/{datapath}{nobertha}-num_clients={num_clients}-file_size={file_size}-{iter_num}-tbench_client"
 
     for m in machines:
         if m.local:
@@ -119,11 +121,11 @@ def do_exp(iter_num,
 
     time.sleep(5)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, skip_negotiation = {skip_negotiation}, num_clients = {num_clients} file_size = {file_size}")
+    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, use_bertha = {use_bertha}, num_clients = {num_clients} file_size = {file_size}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    start_server(machines[0], server_prefix, variant=datapath)
+    start_server(machines[0], server_prefix, variant=datapath, use_bertha=use_bertha)
     time.sleep(5)
 
     # others are clients
@@ -134,7 +136,7 @@ def do_exp(iter_num,
             num_clients,
             file_size,
             datapath,
-            False,
+            use_bertha,
             outf,
         ),
     ) for m in machines[1:]]
@@ -219,11 +221,11 @@ if __name__ == '__main__':
         agenda.failure("Need more machines")
         sys.exit(1)
 
-    if 'negotiation' not in cfg['exp']:
-        cfg['exp']['negotiation'] = [True]
-    for t in cfg['exp']['negotiation']:
+    if 'bertha' not in cfg['exp']:
+        cfg['exp']['bertha'] = [True]
+    for t in cfg['exp']['bertha']:
         if t not in [True,False]:
-            agenda.failure("Skip-negotiation must be bool")
+            agenda.failure("No bertha must be bool")
             sys.exit(1)
     if 'num_clients' not in cfg['exp']:
         agenda.failure("Need num_clients")
@@ -269,16 +271,32 @@ if __name__ == '__main__':
     shutil.copy2(args.config, args.outdir)
 
     for d in cfg['exp']['datapath']:
-        for fs in cfg['exp']['file_size']:
-            for nc in cfg['exp']['num_clients']:
-                do_exp(0,
-                        outdir=outdir,
-                        machines=machines,
-                        num_clients=nc,
-                        file_size=fs,
-                        datapath=d,
-                        skip_negotiation=False,
-                        overwrite=args.overwrite
-                        )
+        if d == 'dpdk':
+            for use_bertha in cfg['exp']['bertha']:
+                for fs in cfg['exp']['file_size']:
+                    for nc in cfg['exp']['num_clients']:
+                        for i in range(int(cfg['exp']['iters'])):
+                            do_exp(i,
+                                    outdir=outdir,
+                                    machines=machines,
+                                    num_clients=nc,
+                                    file_size=fs,
+                                    datapath=d,
+                                    use_bertha=use_bertha,
+                                    overwrite=args.overwrite
+                                    )
+        else:
+            for fs in cfg['exp']['file_size']:
+                for nc in cfg['exp']['num_clients']:
+                    for i in range(int(cfg['exp']['iters'])):
+                        do_exp(i,
+                                outdir=outdir,
+                                machines=machines,
+                                num_clients=nc,
+                                file_size=fs,
+                                datapath=d,
+                                use_bertha=True,
+                                overwrite=args.overwrite
+                                )
 
     agenda.task("done")

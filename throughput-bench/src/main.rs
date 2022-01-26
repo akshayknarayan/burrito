@@ -9,6 +9,7 @@ use bertha::{
 };
 use color_eyre::eyre::{bail, Report, WrapErr};
 use dpdk_direct::{DpdkUdpReqChunnel, DpdkUdpSkChunnel};
+use dpdk_wrapper::DpdkIoKernel;
 use futures_util::stream::TryStreamExt;
 use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -30,6 +31,9 @@ struct Opt {
 
     #[structopt(long)]
     datapath: String,
+
+    #[structopt(long)]
+    no_bertha: bool,
 
     #[structopt(subcommand)]
     mode: Mode,
@@ -68,6 +72,7 @@ fn main() -> Result<(), Report> {
         cfg,
         port,
         datapath,
+        no_bertha,
         mode,
     } = Opt::from_args();
 
@@ -82,21 +87,30 @@ fn main() -> Result<(), Report> {
             let num_clients = cl.num_clients;
             let of = cl.out_file.take();
 
-            let (tot_bytes, elapsed) = match datapath.as_str() {
-                "dpdk" => {
-                    let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk chunnel")?;
-                    run_clients(ch, cl, port).await?
+            let (tot_bytes, elapsed) = if no_bertha {
+                match datapath.as_str() {
+                    "dpdk" => {
+                        run_clients_no_bertha(cl, port, cfg).await?
+                    }
+                    _ => bail!("no_bertha with non-dpdk not implemented"),
                 }
-                "shenango" => {
-                    let ch = ShenangoUdpSkChunnel::new(cfg);
-                    run_clients(ch, cl, port).await?
-                }
-                "kernel" => {
-                    let ch = UdpSkChunnel;
-                    run_clients(ch, cl, port).await?
-                }
-                d => {
-                    bail!("unknown datapath {:?}", d);
+            } else {
+                match datapath.as_str() {
+                    "dpdk" => {
+                        let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk chunnel")?;
+                        run_clients(ch, cl, port).await?
+                    }
+                    "shenango" => {
+                        let ch = ShenangoUdpSkChunnel::new(cfg);
+                        run_clients(ch, cl, port).await?
+                    }
+                    "kernel" => {
+                        let ch = UdpSkChunnel;
+                        run_clients(ch, cl, port).await?
+                    }
+                    d => {
+                        bail!("unknown datapath {:?}", d);
+                    }
                 }
             };
 
@@ -105,9 +119,10 @@ fn main() -> Result<(), Report> {
             if let Some(of) = of {
                 use std::io::Write;
                 let mut f = std::fs::File::create(of)?;
-                write!(
+                writeln!(&mut f, "num_clients,download_size,tot_bytes,elapsed_us,rate_bps")?;
+                writeln!(
                     &mut f,
-                    "num_clients={:?},download_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
+                    "{:?},{:?},{:?},{:?},{:?}",
                     num_clients,
                     download_size,
                     tot_bytes,
@@ -125,23 +140,32 @@ fn main() -> Result<(), Report> {
                 );
             }
         } else {
-            match datapath.as_str() {
-                "dpdk" => {
-                    let ch = DpdkUdpSkChunnel::new(cfg)?;
-                    let ch = DpdkUdpReqChunnel(ch);
-                    run_server(ch, port).await?;
+            if no_bertha {
+                match datapath.as_ref() {
+                    "dpdk" => {
+                        run_server_no_bertha(port, cfg).await?;
+                    }
+                    _ => bail!("non-dpdk no-bertha not implemented"),
                 }
-                "shenango" => {
-                    let ch = ShenangoUdpSkChunnel::new(cfg);
-                    let ch = ShenangoUdpReqChunnel(ch);
-                    run_server(ch, port).await?;
-                }
-                "kernel" => {
-                    let ch = UdpReqChunnel;
-                    run_server(ch, port).await?;
-                }
-                d => {
-                    bail!("unknown datapath {:?}", d);
+            } else {
+                match datapath.as_str() {
+                    "dpdk" => {
+                        let ch = DpdkUdpSkChunnel::new(cfg)?;
+                        let ch = DpdkUdpReqChunnel(ch);
+                        run_server(ch, port).await?;
+                    }
+                    "shenango" => {
+                        let ch = ShenangoUdpSkChunnel::new(cfg);
+                        let ch = ShenangoUdpReqChunnel(ch);
+                        run_server(ch, port).await?;
+                    }
+                    "kernel" => {
+                        let ch = UdpReqChunnel;
+                        run_server(ch, port).await?;
+                    }
+                    d => {
+                        bail!("unknown datapath {:?}", d);
+                    }
                 }
             }
         }
@@ -298,4 +322,130 @@ where
     }
 
     unreachable!() // negotiate_server never returns None
+}
+
+async fn run_clients_no_bertha(
+    c: Client,
+    port: u16,
+    cfg: std::path::PathBuf,
+) -> Result<(usize, Duration), Report> {
+    let addr = SocketAddrV4::new(c.addr, port);
+    info!(?addr, "starting clients");
+    let (handle_s, handle_r) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (iokernel, handle) = DpdkIoKernel::new(cfg).unwrap();
+        handle_s.send(handle).unwrap();
+        iokernel.run();
+    });
+    let handle = handle_r.recv().wrap_err("Could not start DpdkIoKernel")?;
+
+    let clients: futures_util::stream::FuturesUnordered<_> = (0..c.num_clients)
+        .map(|i| {
+            let res = handle.socket(None);
+            tokio::spawn(async move {
+                Ok(run_client_no_bertha(res?, addr, c.download_size)
+                    .instrument(info_span!("client", ?i))
+                    .await?)
+            })
+        })
+        .collect();
+
+    let joined: Vec<Result<(usize, Duration), Report>> = clients
+        .try_collect()
+        .await
+        .wrap_err("failed running one or more clients")?;
+    let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+        .into_iter()
+        .collect::<Result<Vec<(usize, Duration)>, _>>()?
+        .into_iter()
+        .unzip();
+    let tot_bytes = tot_bytes.into_iter().sum();
+    let elapsed = durs.into_iter().max().unwrap();
+    info!(?tot_bytes, ?elapsed, "all clients done");
+    Ok((tot_bytes, elapsed))
+}
+
+async fn run_client_no_bertha(
+    cn: dpdk_wrapper::DpdkConn,
+    addr: SocketAddrV4,
+    download_size: usize,
+) -> Result<(usize, Duration), Report> {
+    info!(?addr, ?download_size, "starting client");
+    let mut tot_bytes = 0;
+    let start = Instant::now();
+
+    // 2. get bytes
+    let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    req.extend((download_size as u64).to_le_bytes());
+    cn.send_async(addr, req).await?;
+    let mut last_recv_time = Instant::now();
+    loop {
+        let (_, r) = cn.recv_async().await?;
+        tot_bytes += r.len();
+        trace!(?tot_bytes, "received part");
+        if r[0] == 1 {
+            cn.send_async(addr, r).await?;
+            break;
+        } else {
+            last_recv_time = Instant::now();
+        }
+    }
+
+    let elapsed = last_recv_time - start;
+    info!(?tot_bytes, ?elapsed, "done");
+    Ok((tot_bytes, elapsed))
+}
+
+async fn run_server_no_bertha(port: u16, cfg: std::path::PathBuf) -> Result<(), Report> {
+    info!(?port, "starting server");
+    let (handle_s, handle_r) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (iokernel, handle) = DpdkIoKernel::new(cfg).unwrap();
+        handle_s.send(handle).unwrap();
+        iokernel.run();
+    });
+    let handle = handle_r.recv().wrap_err("Could not start DpdkIoKernel")?;
+    let st = handle.accept(port)?;
+    loop {
+        let cn = st.recv_async().await?;
+        tokio::spawn(async move {
+            let (a, msg) = cn.recv_async().await?;
+            if &msg[..8] != [1, 2, 3, 4, 5, 6, 7, 8] {
+                debug!("bad client request");
+                bail!("bad connection");
+            }
+
+            let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
+            let start = Instant::now();
+            info!(?remaining, ?a, "starting send");
+            while remaining > 0 {
+                let this_send_size = std::cmp::min(1460, remaining);
+                let buf = vec![0u8; this_send_size as usize];
+                cn.send_async(a, buf).await?;
+                remaining -= this_send_size;
+            }
+
+            info!(elapsed = ?start.elapsed(), ?a, "done sending");
+            // fin
+            cn.send_async(a, vec![1u8]).await?;
+            let mut f = Box::pin(cn.recv_async());
+            loop {
+                match futures_util::future::select(
+                    f,
+                    Box::pin(tokio::time::sleep(Duration::from_millis(1))),
+                )
+                .await
+                {
+                    futures_util::future::Either::Left((_, _)) => break,
+                    futures_util::future::Either::Right((_, rem)) => {
+                        cn.send_async(a, vec![1u8]).await?;
+                        f = rem;
+                    }
+                }
+            }
+
+            info!(elapsed = ?start.elapsed(), ?a, "exiting");
+            Ok::<_, Report>(())
+        });
+    }
 }
