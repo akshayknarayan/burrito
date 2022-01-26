@@ -256,7 +256,7 @@ where
             let start = Instant::now();
             info!(?remaining, ?a, "starting send");
             while remaining > 0 {
-                let this_send_size = std::cmp::min(1480, remaining);
+                let this_send_size = std::cmp::min(1460, remaining);
                 let buf = vec![0u8; this_send_size as usize];
                 cn.send((a, buf)).await?;
                 remaining -= this_send_size;
