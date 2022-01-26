@@ -95,7 +95,6 @@ where
 {
     let addr = SocketAddr::from(SocketAddrV4::new(c.addr, port));
 
-    let start = Instant::now();
     let clients: futures_util::stream::FuturesUnordered<_> = (0..c.num_clients)
         .map(|i| {
             tokio::spawn(
@@ -104,12 +103,17 @@ where
         })
         .collect();
 
-    let joined: Vec<Result<usize, Report>> = clients
+    let joined: Vec<Result<(usize, Duration), Report>> = clients
         .try_collect()
         .await
         .wrap_err("failed running one or more clients")?;
-    let elapsed = start.elapsed();
-    let tot_bytes = joined.into_iter().sum::<Result<_, _>>()?;
+    let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+        .into_iter()
+        .collect::<Result<Vec<(usize, Duration)>, _>>()?
+        .into_iter()
+        .unzip();
+    let tot_bytes = tot_bytes.into_iter().sum();
+    let elapsed = durs.into_iter().max().unwrap();
     info!(?tot_bytes, ?elapsed, "all clients done");
     Ok((tot_bytes, elapsed))
 }
@@ -118,7 +122,7 @@ async fn run_client<C, Cn, E>(
     mut ctr: C,
     addr: SocketAddr,
     download_size: usize,
-) -> Result<usize, Report>
+) -> Result<(usize, Duration), Report>
 where
     C: ChunnelConnector<Addr = (), Connection = Cn, Error = E> + Send + Sync + 'static,
     Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
@@ -143,17 +147,22 @@ where
     // 2. get bytes
     cn.send((addr, (download_size as u64).to_le_bytes().to_vec()))
         .await?;
+    let mut last_recv_time = Instant::now();
     loop {
         let (_, r) = cn.recv().await?;
         tot_bytes += r.len();
         trace!(?tot_bytes, "received part");
         if r[0] == 1 {
+            cn.send((addr, r)).await?;
             break;
+        } else {
+            last_recv_time = Instant::now();
         }
     }
 
-    info!(?tot_bytes, elapsed=?start.elapsed(), "done");
-    Ok(tot_bytes)
+    let elapsed = last_recv_time - start;
+    info!(?tot_bytes, ?elapsed, "done");
+    Ok((tot_bytes, elapsed))
 }
 
 async fn run_server<L, Cn, E>(mut listener: L, port: u16) -> Result<(), Report>
@@ -194,8 +203,24 @@ where
                 remaining -= this_send_size;
             }
 
-            cn.send((a, vec![1u8])).await?;
             info!(elapsed = ?start.elapsed(), "done sending");
+            // fin
+            cn.send((a, vec![1u8])).await?;
+            let mut f = cn.recv();
+            loop {
+                match futures_util::future::select(
+                    f,
+                    Box::pin(tokio::time::sleep(Duration::from_millis(1))),
+                )
+                .await
+                {
+                    futures_util::future::Either::Left((_, _)) => break,
+                    futures_util::future::Either::Right((_, rem)) => {
+                        cn.send((a, vec![1u8])).await?;
+                        f = rem;
+                    }
+                }
+            }
             Ok::<_, Report>(())
         });
     }
