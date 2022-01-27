@@ -472,7 +472,10 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
         shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
             let mut jhs = Vec::with_capacity(cl.num_clients);
+            let wg = shenango::sync::WaitGroup::new();
+            wg.add(cl.num_clients as _);
             for i in 0..cl.num_clients {
+                let wg = wg.clone();
                 let jh = shenango::thread::spawn(move || {
                     let cn = udp::UdpConnection::dial(
                         SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
@@ -483,6 +486,9 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     let cn = shenango_bertha::negotiate_client(stack, shenango_bertha::udp::UdpChunnelConnection:: new(cn), addr)
                         .wrap_err("negotiation failed")?;
                     let cn = Arc::new(cn);
+
+                    wg.done();
+                    wg.wait();
 
                     info!(?addr, ?download_size, "starting client");
                     let mut tot_bytes = 0;
@@ -514,11 +520,11 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
                         if p.wait() == TIME {
                             cnt += 1;
-                            if cnt > 2000 {
+                            if cnt > 50 {
                                 return Ok((0, start.elapsed()));
                             }
 
-                            debug!(elapsed = ?start.elapsed(), ?i, "retrying req");
+                            debug!(elapsed = ?start.elapsed(), ?i, ?cnt, "retrying req");
                             start = Instant::now();
                             cn.send((addr, req.clone()))?;
                         } else {
@@ -680,14 +686,20 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
         let addr = SocketAddrV4::new(cl.addr, port);
 
         shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
+            let wg = shenango::sync::WaitGroup::new();
+            wg.add(cl.num_clients as _);
             let mut jhs = Vec::with_capacity(cl.num_clients);
             for i in 0..cl.num_clients {
+                let wg = wg.clone();
                 let jh = shenango::thread::spawn(move || {
                     let cn = udp::UdpConnection::dial(
                         SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
                         addr,
                     )?;
                     let cn = Arc::new(cn);
+
+                    wg.done();
+                    wg.wait();
 
                     info!(?addr, ?download_size, "starting client");
                     let mut tot_bytes = 0;
@@ -709,6 +721,7 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                         cn2.recv(&mut buf)
                     });
 
+                    let mut cnt = 0;
                     loop {
                         let sleep_trigger = p.trigger(TIME);
                         shenango::thread::spawn(move || {
@@ -718,7 +731,12 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
                         debug!(elapsed = ?start.elapsed(), ?i, "waiting");
                         if p.wait() == TIME {
-                            debug!(elapsed = ?start.elapsed(), ?i, "retrying req");
+                            cnt += 1;
+                            debug!(elapsed = ?start.elapsed(), ?i, ?cnt, "retrying req");
+                            if cnt > 50 {
+                                return Ok((0, start.elapsed()));
+                            }
+
                             start = Instant::now();
                             cn.write_to(&req, addr)?;
                         } else {
