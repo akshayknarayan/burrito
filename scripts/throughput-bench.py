@@ -246,7 +246,7 @@ if __name__ == '__main__':
     if 'datapath' not in cfg['exp']:
         cfg['exp']['datapath'] = ['dpdk']
     for t in cfg['exp']['datapath']:
-        if t not in ['dpdk', 'shenango', 'kernel']:
+        if t not in ['dpdk', 'shenango', 'kernel', 'shenangort']:
             agenda.failure('unknown datapath: ' + t)
             sys.exit(1)
 

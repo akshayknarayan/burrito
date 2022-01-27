@@ -471,19 +471,25 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
         let addr = SocketAddrV4::new(cl.addr, port);
 
         shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
+            use rand::Rng;
             let mut jhs = Vec::with_capacity(cl.num_clients);
             let wg = shenango::sync::WaitGroup::new();
             wg.add(cl.num_clients as _);
             for i in 0..cl.num_clients {
                 let wg = wg.clone();
                 let jh = shenango::thread::spawn(move || {
+                    let mut rng = rand::thread_rng();
                     let cn = udp::UdpConnection::dial(
                         SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
                         addr,
                     )?;
+
+                    // space these out
+                    let start_wait: u64 = rng.gen_range(0..100);
+                    shenango::time::sleep(Duration::from_millis(start_wait));
                     
                     let stack = shenango_bertha::chunnels::Nothing::<()>::default();
-                    let cn = shenango_bertha::negotiate_client(stack, shenango_bertha::udp::UdpChunnelConnection:: new(cn), addr)
+                    let cn = shenango_bertha::negotiate_client(stack, shenango_bertha::udp::UdpChunnelConnection::new(cn), addr)
                         .wrap_err("negotiation failed")?;
                     let cn = Arc::new(cn);
 
@@ -521,10 +527,10 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                         if p.wait() == TIME {
                             cnt += 1;
                             if cnt > 50 {
-                                return Ok((0, start.elapsed()));
+                              return Ok((0, start.elapsed()));
                             }
 
-                            debug!(elapsed = ?start.elapsed(), ?i, ?cnt, "retrying req");
+                            debug!(elapsed = ?start.elapsed(), ?i, "retrying req");
                             start = Instant::now();
                             cn.send((addr, req.clone()))?;
                         } else {

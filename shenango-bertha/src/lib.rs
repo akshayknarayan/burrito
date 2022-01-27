@@ -117,7 +117,7 @@ pub mod udp {
         /// Retrieve next incoming message.
         fn recv(&self) -> Result<Self::Data, Report> {
             let from = self.0.remote_addr();
-            let mut buf = [0u8; 1024];
+            let mut buf = [0u8; 2048];
             let len = self.0.recv(&mut buf)?;
             Ok((from, buf[..len].to_vec()))
         }
