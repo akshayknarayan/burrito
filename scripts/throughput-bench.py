@@ -24,15 +24,15 @@ runtime_guaranteed_kthreads 4"""
 def setup_machine(conn, outdir):
     ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
     check(ok, "mk outdir", conn.addr)
-    agenda.subtask(f"building burrito on {conn.addr}")
-    ok = conn.run("../../.cargo/bin/cargo b --release", wd = "~/burrito/throughput-bench")
-    check(ok, "build", conn.addr)
+    #agenda.subtask(f"building burrito on {conn.addr}")
+    #ok = conn.run("../../.cargo/bin/cargo b --release", wd = "~/burrito/throughput-bench")
+    #check(ok, "build", conn.addr)
     return conn
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
 
 def start_server(conn, outf, variant='dpdk', use_bertha=False):
-    conn.run("sudo pkill -9 throughput-bench")
+    conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
         write_shenango_config(conn)
@@ -46,7 +46,7 @@ def start_server(conn, outf, variant='dpdk', use_bertha=False):
 
     no_bertha = '--no-bertha' if not use_bertha else ''
     time.sleep(2)
-    ok = conn.run(f"{dpdk_ld_var} ./target/release/throughput-bench -p 4242 --datapath {variant} {no_bertha} --cfg host.config server",
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/throughput-bench -p 4242 --datapath {variant} {no_bertha} --cfg host.config server",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -59,6 +59,7 @@ def start_server(conn, outf, variant='dpdk', use_bertha=False):
     conn.check_proc(f"throughput", f"{outf}.err")
 
 def run_client(conn, server, num_clients, file_size, variant, use_bertha, outf):
+    conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
         write_shenango_config(conn)
@@ -129,14 +130,14 @@ def do_exp(iter_num,
     else:
         agenda.task(f"running: {outf}.data")
 
-    time.sleep(5)
+    time.sleep(2)
     server_addr = machines[0].addr
     agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, use_bertha = {use_bertha}, num_clients = {num_clients} file_size = {file_size}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
     start_server(machines[0], server_prefix, variant=datapath, use_bertha=use_bertha)
-    time.sleep(5)
+    time.sleep(7)
 
     # others are clients
     agenda.task("starting clients")

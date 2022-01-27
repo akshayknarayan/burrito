@@ -464,6 +464,7 @@ async fn run_server_no_bertha(port: u16, cfg: std::path::PathBuf) -> Result<(), 
 fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
     use shenango_bertha::ChunnelConnection;
     use shenango::udp;
+    use shenango::time::Timer;
     if let Mode::Client(mut cl) = mode {
         let download_size = cl.download_size;
         let num_clients = cl.num_clients;
@@ -496,7 +497,7 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     wg.done();
                     wg.wait();
 
-                    info!(?addr, ?download_size, "starting client");
+                    info!(?addr, ?download_size, ?i, "starting_client");
                     let mut tot_bytes = 0;
                     let mut start = Instant::now();
 
@@ -527,6 +528,7 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                         if p.wait() == TIME {
                             cnt += 1;
                             if cnt > 50 {
+                              info!(?i, "terminate");
                               return Ok((0, start.elapsed()));
                             }
 
@@ -538,40 +540,64 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                         }
                     }
 
-                    debug!(elapsed = ?start.elapsed(), ?i, "connection started");
+                    info!(elapsed = ?start.elapsed(), ?i, "connection_started");
                     tot_bytes += recv_jh.join().unwrap()?;
 
                     let mut last_recv_time = Instant::now();
                     loop {
-                        let (a, s) = cn.recv()?;
-                        assert!(s.len() != 0);
-                        tot_bytes += s.len();
-                        trace!(?tot_bytes, ?i, "received part");
-                        if s[0] == 1 {
-                            cn.send((a, s))?;
+                        let mut p = shenango::poll::PollWaiter::new();
+                        let sleeper = Timer::new();
+                        let sl = sleeper.clone();
+                        let sleep_trigger = p.trigger(TIME);
+                        shenango::thread::spawn(move || {
+                            let _sleep_trigger = sleep_trigger;
+                            sl.sleep(Duration::from_millis(5));
+                        });
+                        let recv_trigger = p.trigger(RECV);
+                        let cn2 = Arc::clone(&cn);
+                        let recv_jh = shenango::thread::spawn(move || {
+                            let _recv_trigger = recv_trigger;
+                            let (_, m) = cn2.recv()?;
+                            assert!(!m.is_empty());
+                            Ok::<_, Report>((m.len(), m[0] == 1))
+                        });
+
+                        if p.wait() == TIME {
                             break;
                         } else {
+                            sleeper.cancel();
+                            let (bytes, done) = recv_jh.join().unwrap()?;
                             last_recv_time = Instant::now();
+                            tot_bytes += bytes;
+                            trace!(?tot_bytes, ?i, "received part");
+                            if done {
+                                break;
+                            }
                         }
                     }
 
+                    cn.send((addr, vec![1u8; 16]))?;
+
                     let elapsed = last_recv_time - start;
-                    info!(?tot_bytes, ?elapsed, "done");
+                    info!(?tot_bytes, ?elapsed, ?i, "done");
                     Ok((tot_bytes, elapsed))
                 });
                 jhs.push(jh);
             }
 
+            wg.wait();
+            let start = Instant::now();
             let joined: Vec<Result<(usize, Duration), Report>> =
                 jhs.into_iter().map(|jh| jh.join().unwrap()).collect();
-            let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+            let elapsed = start.elapsed();
+            let (tot_bytes, _): (Vec<usize>, Vec<Duration>) = joined
                 .into_iter()
                 .collect::<Result<Vec<(usize, Duration)>, _>>()
                 .unwrap()
                 .into_iter()
                 .unzip();
             let tot_bytes: usize = tot_bytes.into_iter().sum();
-            let elapsed = durs.into_iter().max().unwrap();
+            //let elapsed = durs.into_iter().max().unwrap();
             info!(?tot_bytes, ?elapsed, "all clients done");
 
             let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
