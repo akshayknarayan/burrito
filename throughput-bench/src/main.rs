@@ -82,6 +82,11 @@ fn main() -> Result<(), Report> {
         unreachable!();
     }
 
+    if datapath == "shenangort" {
+        shenangort_bertha(cfg, port, mode);
+        unreachable!();
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -453,6 +458,216 @@ async fn run_server_no_bertha(port: u16, cfg: std::path::PathBuf) -> Result<(), 
             info!(elapsed = ?start.elapsed(), ?a, "exiting");
             Ok::<_, Report>(())
         });
+    }
+}
+
+fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
+    use shenango_bertha::ChunnelConnection;
+    use shenango::udp;
+    if let Mode::Client(mut cl) = mode {
+        let download_size = cl.download_size;
+        let num_clients = cl.num_clients;
+        let of = cl.out_file.take();
+        let addr = SocketAddrV4::new(cl.addr, port);
+
+        shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
+            let mut jhs = Vec::with_capacity(cl.num_clients);
+            for i in 0..cl.num_clients {
+                let jh = shenango::thread::spawn(move || {
+                    let cn = udp::UdpConnection::dial(
+                        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+                        addr,
+                    )?;
+                    
+                    let stack = shenango_bertha::chunnels::Nothing::<()>::default();
+                    let cn = shenango_bertha::negotiate_client(stack, shenango_bertha::udp::UdpChunnelConnection:: new(cn), addr)
+                        .wrap_err("negotiation failed")?;
+                    let cn = Arc::new(cn);
+
+                    info!(?addr, ?download_size, "starting client");
+                    let mut tot_bytes = 0;
+                    let mut start = Instant::now();
+
+                    // 2. get bytes
+                    let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
+                    req.extend((download_size as u64).to_le_bytes());
+                    cn.send((addr, req.clone()))?;
+
+                    const RECV: u32 = 1;
+                    const TIME: u32 = 2;
+                    let mut p = shenango::poll::PollWaiter::new();
+                    let recv_trigger = p.trigger(RECV);
+                    let cn2 = Arc::clone(&cn);
+                    let recv_jh = shenango::thread::spawn(move || {
+                        let _recv_trigger = recv_trigger;
+                        let (_, m) = cn2.recv()?;
+                        Ok::<_, Report>(m.len())
+                    });
+
+                    let mut cnt = 0;
+                    loop {
+                        let sleep_trigger = p.trigger(TIME);
+                        shenango::thread::spawn(move || {
+                            let _sleep_trigger = sleep_trigger;
+                            shenango::time::sleep(Duration::from_millis(5));
+                        });
+
+                        if p.wait() == TIME {
+                            cnt += 1;
+                            if cnt > 2000 {
+                                return Ok((0, start.elapsed()));
+                            }
+
+                            debug!(elapsed = ?start.elapsed(), ?i, "retrying req");
+                            start = Instant::now();
+                            cn.send((addr, req.clone()))?;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    debug!(elapsed = ?start.elapsed(), ?i, "connection started");
+                    tot_bytes += recv_jh.join().unwrap()?;
+
+                    let mut last_recv_time = Instant::now();
+                    loop {
+                        let (a, s) = cn.recv()?;
+                        assert!(s.len() != 0);
+                        tot_bytes += s.len();
+                        trace!(?tot_bytes, ?i, "received part");
+                        if s[0] == 1 {
+                            cn.send((a, s))?;
+                            break;
+                        } else {
+                            last_recv_time = Instant::now();
+                        }
+                    }
+
+                    let elapsed = last_recv_time - start;
+                    info!(?tot_bytes, ?elapsed, "done");
+                    Ok((tot_bytes, elapsed))
+                });
+                jhs.push(jh);
+            }
+
+            let joined: Vec<Result<(usize, Duration), Report>> =
+                jhs.into_iter().map(|jh| jh.join().unwrap()).collect();
+            let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+                .into_iter()
+                .collect::<Result<Vec<(usize, Duration)>, _>>()
+                .unwrap()
+                .into_iter()
+                .unzip();
+            let tot_bytes: usize = tot_bytes.into_iter().sum();
+            let elapsed = durs.into_iter().max().unwrap();
+            info!(?tot_bytes, ?elapsed, "all clients done");
+
+            let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
+            info!(?num_clients, ?download_size, rate_mbps=?(rate / 1e6), "finished");
+            if let Some(of) = of {
+                use std::io::Write;
+                let mut f = std::fs::File::create(of).unwrap();
+                writeln!(
+                    &mut f,
+                    "num_clients,download_size,tot_bytes,elapsed_us,rate_bps"
+                )
+                .unwrap();
+                writeln!(
+                    &mut f,
+                    "{:?},{:?},{:?},{:?},{:?}",
+                    num_clients,
+                    download_size,
+                    tot_bytes,
+                    elapsed.as_micros(),
+                    rate
+                )
+                .unwrap();
+            } else {
+                println!(
+                    "num_clients={:?},download_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
+                    num_clients,
+                    download_size,
+                    tot_bytes,
+                    elapsed.as_micros(),
+                    rate
+                );
+            }
+
+            std::process::exit(0);
+        }).unwrap();
+    } else {
+        info!(?port, "starting server");
+        let listen_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
+            shenango_bertha::negotiate_server(shenango_bertha::chunnels::Nothing::<()>::default(), listen_addr, move |cn| {
+                let (a, msg) = match cn.recv() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        warn!(?e, "request read failed");
+                        return;
+                    }
+                };
+                
+                if &msg[..8] != [1, 2, 3, 4, 5, 6, 7, 8] {
+                    debug!("bad client request");
+                    return;
+                }
+
+                let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
+                let start = Instant::now();
+                info!(?remaining, ?a, "starting send");
+                while remaining > 0 {
+                    let this_send_size = std::cmp::min(1460, remaining);
+                    let buf = vec![0u8; this_send_size as usize];
+                    if let Err(e) = cn.send((a, buf)) {
+                        trace!(?e, "write errored");
+                    }
+                    remaining -= this_send_size;
+                }
+
+                info!(elapsed = ?start.elapsed(), ?a, "done sending");
+                // fin
+                let fin_buf = vec![1u8; 1];
+                if let Err(e) = cn.send((a, fin_buf)) {
+                    warn!(?e, "fin write failed");
+                }
+
+                const RECV: u32 = 1;
+                const TIME: u32 = 2;
+                let mut p = shenango::poll::PollWaiter::new();
+                let recv_trigger = p.trigger(RECV);
+                let cn = Arc::new(cn);
+                let cn2 = Arc::clone(&cn);
+                shenango::thread::spawn(move || {
+                    let _recv_trigger = recv_trigger;
+                    if let Err(e) = cn.recv() {
+                        warn!(?e, "recv errored");
+                    }
+                });
+
+                loop {
+                    let sleep_trigger = p.trigger(TIME);
+                    shenango::thread::spawn(move || {
+                        let _sleep_trigger = sleep_trigger;
+                        shenango::time::sleep(Duration::from_millis(100));
+                    });
+
+                    if p.wait() == TIME {
+                        debug!(elapsed = ?start.elapsed(), ?a, "retrying fin");
+                        let fin_buf = vec![1u8; 1];
+                        if let Err(e) = cn2.send((a, fin_buf)) {
+                            debug!(?e, "send errored");
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                info!(elapsed = ?start.elapsed(), ?a, "exiting");
+            })
+            .unwrap();
+        })
+        .unwrap();
     }
 }
 

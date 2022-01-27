@@ -89,7 +89,7 @@ mod base_traits {
     }
 }
 
-mod udp {
+pub mod udp {
     use crate::base_traits::ChunnelConnection;
     use color_eyre::eyre::{Report, WrapErr};
     use shenango::sync::Mutex;
@@ -153,7 +153,7 @@ mod udp {
 
 pub use negotiate::{negotiate_client, ClientNegotiator};
 pub use negotiate::{negotiate_server, Negotiate};
-mod negotiate {
+pub mod negotiate {
     use crate::base_traits::{Chunnel, ChunnelConnection};
     use crate::udp::{self, InjectOne, UdpChunnelConnection};
     use bertha::CapabilitySet;
@@ -1068,7 +1068,7 @@ pub use chunnels::{
 };
 pub use chunnels::{KvReliability, KvReliabilityChunnel, KvReliabilityServerChunnel};
 pub use chunnels::{SerializeChunnelProject, SerializeProject};
-mod chunnels {
+pub mod chunnels {
     use super::base_traits::{Chunnel, ChunnelConnection};
     use color_eyre::eyre::{eyre, Report, WrapErr};
     use shenango::poll::PollWaiter;
@@ -1079,6 +1079,26 @@ mod chunnels {
     use std::sync::Arc;
     use std::time::Duration;
     use tracing::{debug, trace, warn};
+
+    #[derive(Debug, Clone, Default, Copy)]
+    pub struct Nothing<N>(std::marker::PhantomData<N>);
+
+    impl<N: bertha::CapabilitySet> bertha::Negotiate for Nothing<N> {
+        type Capability = N;
+
+        fn guid() -> u64 {
+            0xa0c77d6bd6bef98c
+        }
+    }
+    impl<N: bertha::CapabilitySet> super::negotiate::Negotiate for Nothing<N> {}
+    impl<InC: super::ChunnelConnection, N> Chunnel<InC> for Nothing<N> {
+        type Connection = InC;
+        type Error = std::convert::Infallible;
+
+        fn connect_wrap(&mut self, cn: InC) -> Result<Self::Connection, Self::Error> {
+            Ok(cn)
+        }
+    }
 
     #[derive(Debug, Clone)]
     pub struct SerializeChunnelProject<D> {
