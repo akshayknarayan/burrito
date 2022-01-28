@@ -499,12 +499,13 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
                     info!(?addr, ?download_size, ?i, "starting_client");
                     let mut tot_bytes = 0;
-                    let mut start = Instant::now();
 
                     // 2. get bytes
                     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
                     req.extend((download_size as u64).to_le_bytes());
+                    req.extend((cl.num_clients as u32).to_le_bytes());
                     cn.send((addr, req.clone()))?;
+                    let mut start = Instant::now();
 
                     const RECV: u32 = 1;
                     const TIME: u32 = 2;
@@ -533,7 +534,7 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                             }
 
                             debug!(elapsed = ?start.elapsed(), ?i, "retrying req");
-                            start = Instant::now();
+                            start = Instant::now(); // measure from first byte received
                             cn.send((addr, req.clone()))?;
                         } else {
                             break;
@@ -586,18 +587,16 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
             }
 
             wg.wait();
-            let start = Instant::now();
             let joined: Vec<Result<(usize, Duration), Report>> =
                 jhs.into_iter().map(|jh| jh.join().unwrap()).collect();
-            let elapsed = start.elapsed();
-            let (tot_bytes, _): (Vec<usize>, Vec<Duration>) = joined
+            let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
                 .into_iter()
                 .collect::<Result<Vec<(usize, Duration)>, _>>()
                 .unwrap()
                 .into_iter()
                 .unzip();
             let tot_bytes: usize = tot_bytes.into_iter().sum();
-            //let elapsed = durs.into_iter().max().unwrap();
+            let elapsed = durs.into_iter().max().unwrap();
             info!(?tot_bytes, ?elapsed, "all clients done");
 
             let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
@@ -634,10 +633,15 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
             std::process::exit(0);
         }).unwrap();
     } else {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         info!(?port, "starting server");
         let listen_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
+            let activated_clients = Arc::new(AtomicUsize::default());
+            let wg = shenango::sync::WaitGroup::new();
             shenango_bertha::negotiate_server(shenango_bertha::chunnels::Nothing::<()>::default(), listen_addr, move |cn| {
+                let activated_clients = Arc::clone(&activated_clients);
+                let wg = wg.clone();
                 let (a, msg) = match cn.recv() {
                     Ok(x) => x,
                     Err(e) => {
@@ -652,6 +656,29 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                 }
 
                 let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
+                let num_clients = u32::from_le_bytes(msg[16..20].try_into().unwrap()) as usize;
+
+                if num_clients == 0 {
+                    debug!("bad client request");
+                    return;
+                }
+
+                match activated_clients.compare_exchange(0, num_clients, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(0) => {
+                        wg.add((num_clients - 1) as _);
+                    }
+                    Err(c) => {
+                        if c != num_clients {
+                            debug!(?c, ?num_clients, "unexpected number of clients");
+                        }
+
+                        wg.done();
+                    }
+                    Ok(_)  => unreachable!(),
+                }
+
+                wg.wait();
+
                 let start = Instant::now();
                 info!(?remaining, ?a, "starting send");
                 while remaining > 0 {
