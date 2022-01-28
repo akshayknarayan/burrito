@@ -701,14 +701,15 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                         debug!(elapsed = ?start.elapsed(), ?a, "retrying fin");
                         let fin_buf = vec![1u8; 1];
                         if let Err(e) = cn2.send((a, fin_buf)) {
-                            debug!(?e, "send errored");
+                            warn!(?e, "fin write failed");
                         }
                     } else {
                         break;
                     }
                 }
 
-                info!(elapsed = ?start.elapsed(), ?a, "exiting");
+                let remaining_conns = activated_clients.fetch_sub(1, Ordering::SeqCst);
+                info!(?remaining_conns, elapsed = ?start.elapsed(), ?a, "exiting");
             })
             .unwrap();
         })
