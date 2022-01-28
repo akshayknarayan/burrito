@@ -464,7 +464,6 @@ async fn run_server_no_bertha(port: u16, cfg: std::path::PathBuf) -> Result<(), 
 fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
     use shenango_bertha::ChunnelConnection;
     use shenango::udp;
-    use shenango::time::Timer;
     if let Mode::Client(mut cl) = mode {
         let download_size = cl.download_size;
         let num_clients = cl.num_clients;
@@ -546,34 +545,14 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
                     let mut last_recv_time = Instant::now();
                     loop {
-                        let mut p = shenango::poll::PollWaiter::new();
-                        let sleeper = Timer::new();
-                        let sl = sleeper.clone();
-                        let sleep_trigger = p.trigger(TIME);
-                        shenango::thread::spawn(move || {
-                            let _sleep_trigger = sleep_trigger;
-                            sl.sleep(Duration::from_millis(5));
-                        });
-                        let recv_trigger = p.trigger(RECV);
-                        let cn2 = Arc::clone(&cn);
-                        let recv_jh = shenango::thread::spawn(move || {
-                            let _recv_trigger = recv_trigger;
-                            let (_, m) = cn2.recv()?;
-                            assert!(!m.is_empty());
-                            Ok::<_, Report>((m.len(), m[0] == 1))
-                        });
-
-                        if p.wait() == TIME {
+                        let (_, m) = cn.recv()?;
+                        assert!(!m.is_empty());
+                        tot_bytes += m.len();
+                        trace!(?tot_bytes, ?i, "received part");
+                        if m[0] == 1 {
                             break;
                         } else {
-                            sleeper.cancel();
-                            let (bytes, done) = recv_jh.join().unwrap()?;
                             last_recv_time = Instant::now();
-                            tot_bytes += bytes;
-                            trace!(?tot_bytes, ?i, "received part");
-                            if done {
-                                break;
-                            }
                         }
                     }
 
@@ -686,8 +665,9 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     let buf = vec![0u8; this_send_size as usize];
                     if let Err(e) = cn.send((a, buf)) {
                         trace!(?e, "write errored");
+                    } else {
+                        remaining -= this_send_size;
                     }
-                    remaining -= this_send_size;
                 }
 
                 info!(elapsed = ?start.elapsed(), ?a, "done sending");
