@@ -464,6 +464,7 @@ async fn run_server_no_bertha(port: u16, cfg: std::path::PathBuf) -> Result<(), 
 fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
     use shenango_bertha::ChunnelConnection;
     use shenango::udp;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     if let Mode::Client(mut cl) = mode {
         let download_size = cl.download_size;
         let num_clients = cl.num_clients;
@@ -540,25 +541,45 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                         }
                     }
 
-                    info!(elapsed = ?start.elapsed(), ?i, "connection_started");
                     tot_bytes += recv_jh.join().unwrap()?;
+                    info!(elapsed = ?start.elapsed(), ?i, "connection_started");
+                    let mut p = shenango::poll::PollWaiter::new();
+                    let sleep_trigger = p.trigger(TIME);
+                    shenango::thread::spawn(move || {
+                        let _sleep_trigger = sleep_trigger;
+                        shenango::time::sleep(Duration::from_secs(15));
+                    });
 
-                    let mut last_recv_time = Instant::now();
-                    loop {
-                        let (_, m) = cn.recv()?;
-                        assert!(!m.is_empty());
-                        tot_bytes += m.len();
-                        trace!(?tot_bytes, ?i, "received part");
-                        if m[0] == 1 {
-                            break;
-                        } else {
-                            last_recv_time = Instant::now();
+                    let latest_elapsed = Arc::new(AtomicUsize::new((Instant::now() - start).as_micros() as _));
+                    let tot_bytes = Arc::new(AtomicUsize::new(tot_bytes));
+                    let recv_trigger = p.trigger(RECV);
+                    let le = Arc::clone(&latest_elapsed);
+                    let tb = Arc::clone(&tot_bytes);
+                    shenango::thread::spawn(move || {
+                        let _recv_trigger = recv_trigger;
+                        let tot_bytes = tb;
+                        let latest_elapsed = le;
+                        loop {
+                            let (_, m) = cn.recv()?;
+                            assert!(!m.is_empty());
+                            tot_bytes.fetch_add(m.len(), Ordering::Relaxed);
+                            trace!(?tot_bytes, ?i, "received part");
+                            if m[0] == 1 {
+                                break;
+                            } else {
+                                let elapsed = Instant::now() - start;
+                                latest_elapsed.store(elapsed.as_micros() as _, Ordering::Relaxed);
+                            }
                         }
-                    }
 
-                    cn.send((addr, vec![1u8; 16]))?;
+                        cn.send((addr, vec![1u8; 16]))?;
+                        Ok::<_, Report>(())
+                    });
 
-                    let elapsed = last_recv_time - start;
+                    p.wait();
+
+                    let tot_bytes = tot_bytes.load(Ordering::SeqCst);
+                    let elapsed = Duration::from_micros(latest_elapsed.load(Ordering::SeqCst) as _);
                     info!(?tot_bytes, ?elapsed, ?i, "done");
                     Ok((tot_bytes, elapsed))
                 });
@@ -612,7 +633,6 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
             std::process::exit(0);
         }).unwrap();
     } else {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         info!(?port, "starting server");
         let listen_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
