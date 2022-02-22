@@ -5,6 +5,7 @@ use color_eyre::eyre::{eyre, Report, WrapErr};
 use dpdk_direct::{DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use futures_util::stream::{StreamExt, TryStreamExt};
 use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
+use std::fs::OpenOptions;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -48,7 +49,13 @@ impl std::str::FromStr for Mode {
 }
 
 impl Mode {
-    async fn run_client<C>(self, sk: C, port: u16, ip: Ipv4Addr) -> Result<(), Report>
+    async fn run_client<C>(
+        self,
+        sk: C,
+        port: u16,
+        ip: Ipv4Addr,
+        padding: usize,
+    ) -> Result<Vec<Duration>, Report>
     where
         C: ChunnelListener<Addr = SocketAddr, Error = Report>
             + ChunnelConnector<Addr = (), Error = Report>,
@@ -58,21 +65,10 @@ impl Mode {
         <C as ChunnelConnector>::Connection:
             ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + 'static,
     {
-        let mut times = match self {
-            Mode::Echo => do_echo_client(sk, SocketAddrV4::new(ip, port))
-                .await
-                .unwrap(),
-            Mode::ConnEcho => do_conn_client(sk, SocketAddrV4::new(ip, port))
-                .await
-                .unwrap(),
-        };
-        let (p5, p25, p50, p75, p95) = percentiles_us(&mut times);
-        info!(?p5, ?p25, ?p50, ?p75, ?p95, "done");
-        println!(
-            "p5={:?}, p25={:?}, p50={:?}, p75={:?}, p95={:?}",
-            p5, p25, p50, p75, p95
-        );
-        std::process::exit(0);
+        match self {
+            Mode::Echo => Ok(do_echo_client(sk, SocketAddrV4::new(ip, port), padding).await?),
+            Mode::ConnEcho => Ok(do_conn_client(sk, SocketAddrV4::new(ip, port), padding).await?),
+        }
     }
 
     async fn run_server<C>(self, sk: C, port: u16) -> Result<(), Report>
@@ -104,8 +100,14 @@ struct Opt {
     #[structopt(short, long)]
     port: u16,
 
+    #[structopt(short, long, default_value = "0")]
+    length_padding: usize,
+
     #[structopt(short, long)]
     client: Option<Ipv4Addr>,
+
+    #[structopt(short, long)]
+    out_file: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Report> {
@@ -122,6 +124,8 @@ fn main() -> Result<(), Report> {
         client,
         mode,
         backend,
+        length_padding,
+        out_file,
     } = Opt::from_args();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -131,16 +135,43 @@ fn main() -> Result<(), Report> {
 
     rt.block_on(async move {
         if let Some(ip) = client {
-            match backend {
+            let mut times = match backend {
                 Backend::Dpdk => {
                     let ch = DpdkUdpSkChunnel::new(cfg)?;
-                    mode.run_client(ch, port, ip).await?;
+                    mode.run_client(ch, port, ip, length_padding).await?
                 }
                 Backend::Shenango => {
                     let ch = ShenangoUdpSkChunnel::new(&cfg);
-                    mode.run_client(ch, port, ip).await?;
+                    mode.run_client(ch, port, ip, length_padding).await?
+                }
+            };
+
+            if let Some(of) = out_file {
+                use std::io::Write;
+                let mut f = match OpenOptions::new().append(true).open(&of) {
+                    Ok(f) => f,
+                    Err(e) => match e.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            let mut f = OpenOptions::new().append(true).create(true).open(&of)?;
+                            writeln!(&mut f, "Latency_us")?;
+                            f
+                        }
+                        _ => Err(e)?,
+                    },
+                };
+
+                for t in &times {
+                    writeln!(&mut f, "{}", t.as_micros())?;
                 }
             }
+
+            let (p5, p25, p50, p75, p95) = percentiles_us(&mut times);
+            info!(?p5, ?p25, ?p50, ?p75, ?p95, "done");
+            println!(
+                "p5={:?}, p25={:?}, p50={:?}, p75={:?}, p95={:?}",
+                p5, p25, p50, p75, p95
+            );
+            std::process::exit(0);
         } else {
             match backend {
                 Backend::Dpdk => match mode {
@@ -192,7 +223,11 @@ where
 }
 
 #[tracing::instrument(err, skip(ch))]
-async fn do_echo_client<C>(mut ch: C, remote: SocketAddrV4) -> Result<Vec<Duration>, Report>
+async fn do_echo_client<C>(
+    mut ch: C,
+    remote: SocketAddrV4,
+    padding: usize,
+) -> Result<Vec<Duration>, Report>
 where
     C: ChunnelConnector<Addr = (), Error = Report>,
     <C as ChunnelConnector>::Connection:
@@ -203,13 +238,13 @@ where
     let mut times = Vec::with_capacity(1000);
     let start = Instant::now();
     for i in 0..1000 {
-        let msg = bincode::serialize(&TimeMsg::new(start))?;
+        let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
         cn.send((remote.into(), msg)).await?;
-        info!(?i, "sent");
+        debug!(?i, "sent");
         let (_, buf) = cn.recv().await.wrap_err("recv")?;
         let msg: TimeMsg = bincode::deserialize(&buf[..])?;
         let elap = msg.elapsed(start);
-        info!(?i, ?elap, "received response");
+        debug!(?i, ?elap, "received response");
         times.push(elap);
     }
 
@@ -240,7 +275,11 @@ where
 }
 
 #[tracing::instrument(err, skip(ch))]
-async fn do_conn_client<C>(mut ch: C, remote: SocketAddrV4) -> Result<Vec<Duration>, Report>
+async fn do_conn_client<C>(
+    mut ch: C,
+    remote: SocketAddrV4,
+    padding: usize,
+) -> Result<Vec<Duration>, Report>
 where
     C: ChunnelConnector<Addr = (), Error = Report>,
     <C as ChunnelConnector>::Connection:
@@ -258,24 +297,24 @@ where
     let start = Instant::now();
     for i in 0..1000 {
         let cn = &cns[i % num_conns];
-        let msg = bincode::serialize(&TimeMsg::new(start))?;
+        let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
         cn.send((remote.into(), msg)).await?;
-        info!(?i, "sent");
+        debug!(?i, "sent");
         let (_, buf) = cn.recv().await.wrap_err("recv")?;
-        let msg: TimeMsg = bincode::deserialize(&buf[..])?;
+        let msg: TimeMsg = bincode::deserialize(&buf[..]).wrap_err("deserialize")?;
         let elap = msg.elapsed(start);
-        info!(?i, ?elap, "received response");
+        debug!(?i, ?elap, "received response");
         times.push(elap);
     }
 
     Ok(times)
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-struct TimeMsg(Duration, u32);
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TimeMsg(Duration, u32, Vec<u8>);
 impl TimeMsg {
-    fn new(start: Instant) -> Self {
-        Self(start.elapsed(), 0xdead)
+    fn new(start: Instant, padding: usize) -> Self {
+        Self(start.elapsed(), 0xdead, vec![0u8; padding])
     }
 
     fn elapsed(&self, start: Instant) -> Duration {
