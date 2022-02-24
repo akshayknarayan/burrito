@@ -18,3 +18,4 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 structopt = "0.3"
 futures-util = "0.3"
+flume = "0.10"

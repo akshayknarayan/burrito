@@ -17,6 +17,7 @@ use tracing_subscriber::prelude::*;
 #[derive(Clone, Copy, Debug)]
 enum Backend {
     Dpdk,
+    DpdkRaw,
     Shenango,
 }
 
@@ -24,6 +25,7 @@ impl std::str::FromStr for Backend {
     type Err = Report;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "dpdk_raw" | "dpdkraw" => Ok(Self::DpdkRaw),
             "dpdk" => Ok(Self::Dpdk),
             "shenango" => Ok(Self::Shenango),
             x => Err(eyre!("Unkown backend {:?}", x)),
@@ -144,6 +146,10 @@ fn main() -> Result<(), Report> {
                     let ch = ShenangoUdpSkChunnel::new(&cfg);
                     mode.run_client(ch, port, ip, length_padding).await?
                 }
+                Backend::DpdkRaw => {
+                    let handle = dpdk_raw_start_iokernel(cfg).await?;
+                    dpdk_raw_client(handle, mode, port, ip, length_padding).await?
+                }
             };
 
             if let Some(of) = out_file {
@@ -185,6 +191,10 @@ fn main() -> Result<(), Report> {
                         mode.run_server(ch, port).await?;
                     }
                 },
+                Backend::DpdkRaw => {
+                    let handle = dpdk_raw_start_iokernel(cfg).await?;
+                    dpdk_raw_server(handle, mode, port).await?;
+                }
                 Backend::Shenango => match mode {
                     Mode::Echo => {
                         let ch = ShenangoUdpSkChunnel::new(&cfg);
@@ -201,6 +211,89 @@ fn main() -> Result<(), Report> {
 
         Ok::<_, Report>(())
     })
+}
+
+async fn dpdk_raw_start_iokernel(cfg: PathBuf) -> Result<dpdk_wrapper::DpdkIoKernelHandle, Report> {
+    use dpdk_wrapper::DpdkIoKernel;
+    let (handle_s, handle_r) = flume::bounded(1);
+
+    std::thread::spawn(move || {
+        let (iokernel, handle) = match DpdkIoKernel::new(cfg) {
+            Ok(x) => x,
+            Err(err) => {
+                tracing::error!(err = %format!("{:#?}", err), "Dpdk init failed");
+                return;
+            }
+        };
+        handle_s.send(handle).unwrap();
+        iokernel.run();
+    });
+
+    let handle = handle_r.recv_async().await?;
+    Ok(handle)
+}
+
+async fn dpdk_raw_server(
+    handle: dpdk_wrapper::DpdkIoKernelHandle,
+    mode: Mode,
+    port: u16,
+) -> Result<(), Report> {
+    let incoming = handle.accept(port)?;
+    info!(?port, "listening");
+
+    async fn echo_conn(conn: dpdk_wrapper::BoundDpdkConn) -> Result<(), Report> {
+        let remote = conn.remote_addr();
+        loop {
+            let (from, buf) = conn.recv_async().await.wrap_err("recv")?;
+            debug!(?remote, ?from, "got msg");
+            conn.send_async(remote, buf).await.wrap_err("send echo")?;
+            debug!(?remote, ?from, "sent echo");
+        }
+    }
+
+    for conn in incoming {
+        let remote = conn.remote_addr();
+        info!(?remote, "New bound connection");
+        tokio::spawn(async move {
+            if let Err(e) = echo_conn(conn).await {
+                debug!(?e, "conn errored")
+            } else {
+                unreachable!()
+            }
+        });
+    }
+
+    Err(eyre!("sender for incoming messages dropped"))
+}
+
+async fn dpdk_raw_client(
+    handle: dpdk_wrapper::DpdkIoKernelHandle,
+    mode: Mode,
+    port: u16,
+    ip: Ipv4Addr,
+    padding: usize,
+) -> Result<Vec<Duration>, Report> {
+    let conns: Result<_, _> = (0..4).map(|_| handle.socket(None)).collect();
+    let conns: Vec<_> = conns?;
+    let num_conns = conns.len();
+
+    let remote = SocketAddrV4::new(ip, port);
+    info!(?remote, ?num_conns, "made client connections");
+    let mut times = Vec::with_capacity(100);
+    let start = Instant::now();
+    for i in 0..1000 {
+        let conn = &conns[i % num_conns];
+        let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
+        conn.send(remote, msg).wrap_err("send")?;
+        info!(?i, "sent");
+        let (from, buf) = conn.recv().wrap_err("recv")?;
+        let msg: TimeMsg = bincode::deserialize(&buf)?;
+        let elap = msg.elapsed(start);
+        info!(?i, ?from, ?elap, "received response");
+        times.push(elap);
+    }
+
+    Ok(times)
 }
 
 #[tracing::instrument(err, skip(ch))]
