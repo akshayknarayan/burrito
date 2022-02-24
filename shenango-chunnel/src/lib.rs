@@ -54,7 +54,7 @@ impl IncomingCh {
         match self {
             Self::Msg(incoming) => {
                 // receive
-                let mut buf = [0u8; 1024];
+                let mut buf = [0u8; 2048];
                 loop {
                     let (read_len, from_addr) = rsk
                         .read_from(&mut buf)
@@ -73,7 +73,7 @@ impl IncomingCh {
                 }
             }
             Self::Conn { outgoing, conns } => {
-                let mut buf = [0u8; 1024];
+                let mut buf = [0u8; 2048];
                 let mut remotes = HashMap::default();
                 loop {
                     let (read_len, from_addr) = rsk

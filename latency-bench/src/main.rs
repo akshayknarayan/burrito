@@ -301,6 +301,7 @@ where
         cn.send((remote.into(), msg)).await?;
         debug!(?i, "sent");
         let (_, buf) = cn.recv().await.wrap_err("recv")?;
+        debug!(msg_len=?buf.len(), "received");
         let msg: TimeMsg = bincode::deserialize(&buf[..]).wrap_err("deserialize")?;
         let elap = msg.elapsed(start);
         debug!(?i, ?elap, "received response");
