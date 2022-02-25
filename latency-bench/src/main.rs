@@ -59,6 +59,7 @@ impl Mode {
         port: u16,
         ip: Ipv4Addr,
         padding: usize,
+        burst: usize,
     ) -> Result<Vec<Duration>, Report>
     where
         C: ChunnelListener<Addr = SocketAddr, Error = Report>
@@ -71,7 +72,9 @@ impl Mode {
     {
         match self {
             Mode::Echo => Ok(do_echo_client(sk, SocketAddrV4::new(ip, port), padding).await?),
-            Mode::ConnEcho => Ok(do_conn_client(sk, SocketAddrV4::new(ip, port), padding).await?),
+            Mode::ConnEcho => {
+                Ok(do_conn_client(sk, SocketAddrV4::new(ip, port), padding, burst).await?)
+            }
         }
     }
 
@@ -106,6 +109,9 @@ struct Opt {
 
     #[structopt(short, long, default_value = "0")]
     length_padding: usize,
+
+    #[structopt(short, long, default_value = "1")]
+    burst_size: usize,
 
     #[structopt(short, long)]
     client: Option<Ipv4Addr>,
@@ -159,13 +165,14 @@ fn main() -> Result<(), Report> {
         mode,
         backend,
         length_padding,
+        burst_size,
         out_file,
     } = Opt::from_args();
 
     if let Backend::ShenangoRt = backend {
         shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
             if let Some(ip) = client {
-                let times = shenangort_client(mode, ip, port, length_padding).unwrap();
+                let times = shenangort_client(mode, ip, port, length_padding, burst_size).unwrap();
                 dump(times, out_file).unwrap();
                 std::process::exit(0);
             } else {
@@ -186,15 +193,17 @@ fn main() -> Result<(), Report> {
             let times = match backend {
                 Backend::Dpdk => {
                     let ch = DpdkUdpSkChunnel::new(cfg)?;
-                    mode.run_client(ch, port, ip, length_padding).await?
+                    mode.run_client(ch, port, ip, length_padding, burst_size)
+                        .await?
                 }
                 Backend::Shenango => {
                     let ch = ShenangoUdpSkChunnel::new(&cfg);
-                    mode.run_client(ch, port, ip, length_padding).await?
+                    mode.run_client(ch, port, ip, length_padding, burst_size)
+                        .await?
                 }
                 Backend::DpdkRaw => {
                     let handle = dpdk_raw_start_iokernel(cfg).await?;
-                    dpdk_raw_client(handle, mode, port, ip, length_padding).await?
+                    dpdk_raw_client(handle, mode, port, ip, length_padding, burst_size).await?
                 }
                 Backend::ShenangoRt => unreachable!(),
             };
@@ -296,6 +305,7 @@ async fn dpdk_raw_client(
     port: u16,
     ip: Ipv4Addr,
     padding: usize,
+    burst: usize,
 ) -> Result<Vec<Duration>, Report> {
     let conns: Result<_, _> = (0..4).map(|_| handle.socket(None)).collect();
     let conns: Vec<_> = conns?;
@@ -307,14 +317,24 @@ async fn dpdk_raw_client(
     let start = Instant::now();
     for i in 0..1000 {
         let conn = &conns[i % num_conns];
-        let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
-        conn.send(remote, msg).wrap_err("send")?;
-        info!(?i, "sent");
-        let (from, buf) = conn.recv().wrap_err("recv")?;
-        let msg: TimeMsg = bincode::deserialize(&buf)?;
-        let elap = msg.elapsed(start);
-        info!(?i, ?from, ?elap, "received response");
-        times.push(elap);
+        for _ in 0..burst {
+            let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
+            conn.send(remote, msg).wrap_err("send")?;
+        }
+        debug!(?i, "sent");
+
+        let mut recvs = Vec::with_capacity(burst);
+        for _ in 0..burst {
+            let (_, buf) = conn.recv().wrap_err("recv")?;
+            recvs.push(buf);
+        }
+
+        for buf in recvs {
+            let msg: TimeMsg = bincode::deserialize(&buf)?;
+            let elap = msg.elapsed(start);
+            debug!(?i, ?elap, "received response");
+            times.push(elap);
+        }
     }
 
     Ok(times)
@@ -341,6 +361,7 @@ fn shenangort_client(
     ip: Ipv4Addr,
     port: u16,
     padding: usize,
+    burst: usize,
 ) -> Result<Vec<Duration>, Report> {
     let conns: Result<_, _> = (0..4)
         .map(|_| shenango::udp::UdpConnection::listen(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
@@ -350,18 +371,98 @@ fn shenangort_client(
     let remote = SocketAddrV4::new(ip, port);
     info!(?remote, ?num_conns, "made client connections");
     let mut times = Vec::with_capacity(100);
-    let mut buf = [0u8; 2048];
     let start = Instant::now();
     for i in 0..1000 {
         let conn = &conns[i % num_conns];
-        let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
-        conn.write_to(&msg[..], remote).wrap_err("send")?;
+        for _ in 0..burst {
+            let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
+            conn.write_to(&msg[..], remote).wrap_err("send")?;
+        }
         debug!(?i, "sent");
-        let (read_len, _) = conn.read_from(&mut buf).wrap_err("recv")?;
-        let msg: TimeMsg = bincode::deserialize(&buf[..read_len])?;
-        let elap = msg.elapsed(start);
-        debug!(?i, ?elap, "received response");
-        times.push(elap);
+
+        let mut recvs = vec![vec![0u8; 2048]; burst];
+        for i in 0..burst {
+            let (read_len, _) = conn.read_from(&mut recvs[i]).wrap_err("recv")?;
+            recvs[i].truncate(read_len);
+        }
+
+        for rbuf in recvs {
+            let msg: TimeMsg = bincode::deserialize(&rbuf)?;
+            let elap = msg.elapsed(start);
+            debug!(?i, ?elap, "received response");
+            times.push(elap);
+        }
+    }
+
+    Ok(times)
+}
+
+#[tracing::instrument(err, skip(ch))]
+async fn do_conn_server<C>(mut ch: C, port: u16) -> Result<(), Report>
+where
+    C: ChunnelListener<Addr = SocketAddr, Error = Report>,
+    <C as ChunnelListener>::Stream: Unpin,
+    <C as ChunnelListener>::Connection:
+        ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + 'static,
+{
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    let st = ch.listen(addr.into()).await?;
+    info!(?port, "listening");
+    st.try_for_each_concurrent(None, |cn| async move {
+        loop {
+            let (from_addr, d) = cn.recv().await?;
+            debug!(?from_addr, "got msg");
+            cn.send((from_addr, d)).await?;
+            debug!(?from_addr, "sent echo");
+        }
+    })
+    .await?;
+    unreachable!()
+}
+
+#[tracing::instrument(err, skip(ch))]
+async fn do_conn_client<C>(
+    mut ch: C,
+    remote: SocketAddrV4,
+    padding: usize,
+    burst: usize,
+) -> Result<Vec<Duration>, Report>
+where
+    C: ChunnelConnector<Addr = (), Error = Report>,
+    <C as ChunnelConnector>::Connection:
+        ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + 'static,
+{
+    let mut cns = vec![];
+    for _ in 0..4 {
+        let cn = ch.connect(()).await?;
+        cns.push(cn);
+    }
+
+    let num_conns = cns.len();
+    info!(?remote, "made client sks");
+    let mut times = Vec::with_capacity(1000);
+    let start = Instant::now();
+    for i in 0..1000 {
+        let cn = &cns[i % num_conns];
+        for _ in 0..burst {
+            let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
+            cn.send((remote.into(), msg)).await?;
+        }
+        debug!(?i, "sent");
+
+        let mut recvs = Vec::with_capacity(burst);
+        for _ in 0..burst {
+            let (_, buf) = cn.recv().await.wrap_err("recv")?;
+            recvs.push(buf);
+        }
+
+        for buf in recvs {
+            debug!(msg_len=?buf.len(), "received");
+            let msg: TimeMsg = bincode::deserialize(&buf[..]).wrap_err("deserialize")?;
+            let elap = msg.elapsed(start);
+            debug!(?i, ?elap, "received response");
+            times.push(elap);
+        }
     }
 
     Ok(times)
@@ -407,66 +508,6 @@ where
         debug!(?i, "sent");
         let (_, buf) = cn.recv().await.wrap_err("recv")?;
         let msg: TimeMsg = bincode::deserialize(&buf[..])?;
-        let elap = msg.elapsed(start);
-        debug!(?i, ?elap, "received response");
-        times.push(elap);
-    }
-
-    Ok(times)
-}
-
-#[tracing::instrument(err, skip(ch))]
-async fn do_conn_server<C>(mut ch: C, port: u16) -> Result<(), Report>
-where
-    C: ChunnelListener<Addr = SocketAddr, Error = Report>,
-    <C as ChunnelListener>::Stream: Unpin,
-    <C as ChunnelListener>::Connection:
-        ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + 'static,
-{
-    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-    let st = ch.listen(addr.into()).await?;
-    info!(?port, "listening");
-    st.try_for_each_concurrent(None, |cn| async move {
-        loop {
-            let (from_addr, d) = cn.recv().await?;
-            debug!(?from_addr, "got msg");
-            cn.send((from_addr, d)).await?;
-            debug!(?from_addr, "sent echo");
-        }
-    })
-    .await?;
-    unreachable!()
-}
-
-#[tracing::instrument(err, skip(ch))]
-async fn do_conn_client<C>(
-    mut ch: C,
-    remote: SocketAddrV4,
-    padding: usize,
-) -> Result<Vec<Duration>, Report>
-where
-    C: ChunnelConnector<Addr = (), Error = Report>,
-    <C as ChunnelConnector>::Connection:
-        ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + 'static,
-{
-    let mut cns = vec![];
-    for _ in 0..4 {
-        let cn = ch.connect(()).await?;
-        cns.push(cn);
-    }
-
-    let num_conns = cns.len();
-    info!(?remote, "made client sks");
-    let mut times = Vec::with_capacity(1000);
-    let start = Instant::now();
-    for i in 0..1000 {
-        let cn = &cns[i % num_conns];
-        let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
-        cn.send((remote.into(), msg)).await?;
-        debug!(?i, "sent");
-        let (_, buf) = cn.recv().await.wrap_err("recv")?;
-        debug!(msg_len=?buf.len(), "received");
-        let msg: TimeMsg = bincode::deserialize(&buf[..]).wrap_err("deserialize")?;
         let elap = msg.elapsed(start);
         debug!(?i, ?elap, "received response");
         times.push(elap);
