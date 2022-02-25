@@ -57,7 +57,7 @@ def start_server(conn, outf, variant='dpdk'):
     time.sleep(8)
     conn.check_proc(f"latency", f"{outf}.err")
 
-def run_client(conn, server, variant, msg_size, outf):
+def run_client(conn, server, variant, msg_size, burst_size, outf):
     conn.run("sudo pkill -INT latency")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -80,6 +80,7 @@ def run_client(conn, server, variant, msg_size, outf):
         --client {server} \
         -p 4242 \
         --length-padding {msg_size} \
+        --burst-size {burst_size} \
         --out-file={outf}.data",
         sudo=True,
         wd="~/burrito",
@@ -95,6 +96,7 @@ def do_exp(iter_num,
     outdir=None,
     machines=None,
     msg_size=None,
+    burst_size=None,
     datapath=None,
     overwrite=None
 ):
@@ -102,12 +104,13 @@ def do_exp(iter_num,
         outdir is not None and
         machines is not None and
         msg_size is not None and
+        burst_size is not None and
         datapath is not None and
         overwrite is not None
     )
 
-    server_prefix = f"{outdir}/{datapath}-msg_size={msg_size}-{iter_num}-lbench_server"
-    outf = f"{outdir}/{datapath}-msg_size={msg_size}-{iter_num}-lbench_client"
+    server_prefix = f"{outdir}/{datapath}-msg_size={msg_size}-burst_size={burst_size}-{iter_num}-lbench_server"
+    outf = f"{outdir}/{datapath}-msg_size={msg_size}-burst_size={burst_size}-{iter_num}-lbench_client"
 
     for m in machines:
         if m.local:
@@ -124,7 +127,7 @@ def do_exp(iter_num,
 
     time.sleep(2)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, msg_size = {msg_size}")
+    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, msg_size = {msg_size}, burst_size = {burst_size}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
@@ -133,7 +136,7 @@ def do_exp(iter_num,
 
     # others are clients
     agenda.task("starting client")
-    run_client( machines[1], server_addr, datapath, msg_size, outf)
+    run_client( machines[1], server_addr, datapath, msg_size, burst_size, outf)
     agenda.task("client returned")
 
     # kill the server
@@ -152,22 +155,22 @@ def do_exp(iter_num,
                 agenda.subtask(f"Use get_local: {c.host}")
                 fn = get_local
 
-            agenda.subtask(f"getting {outf}-{c.addr}.err")
+            agenda.subtask(f"getting {outf}.err")
             fn(
                 f"burrito/{outf}.err",
-                local=f"{outf}-{c.addr}.err",
+                local=f"{outf}.err",
                 preserve_mode=False,
             )
-            agenda.subtask(f"getting {outf}-{c.addr}.out")
+            agenda.subtask(f"getting {outf}.out")
             fn(
                 f"burrito/{outf}.out",
-                local=f"{outf}-{c.addr}.out",
+                local=f"{outf}.out",
                 preserve_mode=False,
             )
-            agenda.subtask(f"getting {outf}-{c.addr}.data")
+            agenda.subtask(f"getting {outf}.data")
             fn(
                 f"burrito/{outf}.data",
-                local=f"{outf}-{c.addr}.data",
+                local=f"{outf}.data",
                 preserve_mode=False,
             )
         except Exception as e:
@@ -185,6 +188,7 @@ def do_exp(iter_num,
 ###
 ### [exp]
 ### msg_size = [0, 128, 1024, 8192]
+### burst_size [1, 4, 16, 32]
 ### datapath = ['dpdk', 'shenango']
 ###
 if __name__ == '__main__':
@@ -206,10 +210,12 @@ if __name__ == '__main__':
     if 'msg_size' not in cfg['exp']:
         agenda.failure("Need msg_size")
         sys.exit(1)
+    if 'burst_size' not in cfg['exp']:
+        cfg['exp']['burst_size'] = [1]
     if 'datapath' not in cfg['exp']:
         cfg['exp']['datapath'] = ['dpdk']
     for t in cfg['exp']['datapath']:
-        if t not in ['dpdk', 'shenango', 'kernel', 'shenangort']:
+        if t not in ['dpdk', 'shenango', 'dpdk_raw', 'kernel', 'shenangort']:
             agenda.failure('unknown datapath: ' + t)
             sys.exit(1)
 
@@ -244,14 +250,16 @@ if __name__ == '__main__':
     shutil.copy2(args.config, args.outdir)
 
     for d in cfg['exp']['datapath']:
-        for fs in cfg['exp']['msg_size']:
-            for i in range(int(cfg['exp']['iters'])):
-                do_exp(i,
-                    outdir=outdir,
-                    machines=machines,
-                    msg_size=fs,
-                    datapath=d,
-                    overwrite=args.overwrite
-                    )
+        for bs in cfg['exp']['burst_size']:
+            for fs in cfg['exp']['msg_size']:
+                for i in range(int(cfg['exp']['iters'])):
+                    do_exp(i,
+                        outdir=outdir,
+                        machines=machines,
+                        msg_size=fs,
+                        burst_size=bs,
+                        datapath=d,
+                        overwrite=args.overwrite
+                        )
 
     agenda.task("done")

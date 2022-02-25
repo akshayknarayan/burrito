@@ -7,5 +7,5 @@ clients = [
 [exp]
 iters = 5
 msg_size = [0, 128, 1024]
-datapath = ['dpdk', 'shenango']
-#bertha = [True, False]
+burst_size = [1, 4, 16, 32]
+datapath = ['dpdk', 'shenango', 'dpdk_raw', 'shenangort']
