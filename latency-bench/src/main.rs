@@ -19,6 +19,7 @@ enum Backend {
     Dpdk,
     DpdkRaw,
     Shenango,
+    ShenangoRt,
 }
 
 impl std::str::FromStr for Backend {
@@ -28,6 +29,7 @@ impl std::str::FromStr for Backend {
             "dpdk_raw" | "dpdkraw" => Ok(Self::DpdkRaw),
             "dpdk" => Ok(Self::Dpdk),
             "shenango" => Ok(Self::Shenango),
+            "shenangort" => Ok(Self::ShenangoRt),
             x => Err(eyre!("Unkown backend {:?}", x)),
         }
     }
@@ -112,6 +114,36 @@ struct Opt {
     out_file: Option<PathBuf>,
 }
 
+fn dump(mut times: Vec<Duration>, out_file: Option<PathBuf>) -> Result<(), Report> {
+    if let Some(of) = out_file {
+        use std::io::Write;
+        let mut f = match OpenOptions::new().append(true).open(&of) {
+            Ok(f) => f,
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    let mut f = OpenOptions::new().append(true).create(true).open(&of)?;
+                    writeln!(&mut f, "Latency_us")?;
+                    f
+                }
+                _ => Err(e)?,
+            },
+        };
+
+        for t in &times {
+            writeln!(&mut f, "{}", t.as_micros())?;
+        }
+    }
+
+    let (p5, p25, p50, p75, p95) = percentiles_us(&mut times);
+    info!(?p5, ?p25, ?p50, ?p75, ?p95, "done");
+    println!(
+        "p5={:?}, p25={:?}, p50={:?}, p75={:?}, p95={:?}",
+        p5, p25, p50, p75, p95
+    );
+
+    Ok(())
+}
+
 fn main() -> Result<(), Report> {
     let subscriber = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -130,6 +162,20 @@ fn main() -> Result<(), Report> {
         out_file,
     } = Opt::from_args();
 
+    if let Backend::ShenangoRt = backend {
+        shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
+            if let Some(ip) = client {
+                let times = shenangort_client(mode, ip, port, length_padding).unwrap();
+                dump(times, out_file).unwrap();
+                std::process::exit(0);
+            } else {
+                shenangort_server(mode, port).unwrap();
+            }
+        })
+        .unwrap();
+        unreachable!();
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -137,7 +183,7 @@ fn main() -> Result<(), Report> {
 
     rt.block_on(async move {
         if let Some(ip) = client {
-            let mut times = match backend {
+            let times = match backend {
                 Backend::Dpdk => {
                     let ch = DpdkUdpSkChunnel::new(cfg)?;
                     mode.run_client(ch, port, ip, length_padding).await?
@@ -150,33 +196,10 @@ fn main() -> Result<(), Report> {
                     let handle = dpdk_raw_start_iokernel(cfg).await?;
                     dpdk_raw_client(handle, mode, port, ip, length_padding).await?
                 }
+                Backend::ShenangoRt => unreachable!(),
             };
 
-            if let Some(of) = out_file {
-                use std::io::Write;
-                let mut f = match OpenOptions::new().append(true).open(&of) {
-                    Ok(f) => f,
-                    Err(e) => match e.kind() {
-                        std::io::ErrorKind::NotFound => {
-                            let mut f = OpenOptions::new().append(true).create(true).open(&of)?;
-                            writeln!(&mut f, "Latency_us")?;
-                            f
-                        }
-                        _ => Err(e)?,
-                    },
-                };
-
-                for t in &times {
-                    writeln!(&mut f, "{}", t.as_micros())?;
-                }
-            }
-
-            let (p5, p25, p50, p75, p95) = percentiles_us(&mut times);
-            info!(?p5, ?p25, ?p50, ?p75, ?p95, "done");
-            println!(
-                "p5={:?}, p25={:?}, p50={:?}, p75={:?}, p95={:?}",
-                p5, p25, p50, p75, p95
-            );
+            dump(times, out_file)?;
             std::process::exit(0);
         } else {
             match backend {
@@ -206,6 +229,7 @@ fn main() -> Result<(), Report> {
                         mode.run_server(ch, port).await?;
                     }
                 },
+                Backend::ShenangoRt => unreachable!(),
             }
         }
 
@@ -290,6 +314,53 @@ async fn dpdk_raw_client(
         let msg: TimeMsg = bincode::deserialize(&buf)?;
         let elap = msg.elapsed(start);
         info!(?i, ?from, ?elap, "received response");
+        times.push(elap);
+    }
+
+    Ok(times)
+}
+
+fn shenangort_server(mode: Mode, port: u16) -> Result<(), Report> {
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    shenango::udp::udp_accept(addr, move |cn| {
+        let mut buf = [0u8; 2048];
+        let from = cn.remote_addr();
+        loop {
+            let read_len = cn.recv(&mut buf).wrap_err("udp_recv").unwrap();
+            let recvd = &buf[..read_len];
+            debug!(?from, ?read_len, "got msg");
+            cn.write_to(&recvd, from).wrap_err("udp_send").unwrap();
+            debug!(?from, "sent echo");
+        }
+    })?;
+    Ok(())
+}
+
+fn shenangort_client(
+    mode: Mode,
+    ip: Ipv4Addr,
+    port: u16,
+    padding: usize,
+) -> Result<Vec<Duration>, Report> {
+    let conns: Result<_, _> = (0..4)
+        .map(|_| shenango::udp::UdpConnection::listen(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+        .collect();
+    let conns: Vec<_> = conns?;
+    let num_conns = conns.len();
+    let remote = SocketAddrV4::new(ip, port);
+    info!(?remote, ?num_conns, "made client connections");
+    let mut times = Vec::with_capacity(100);
+    let mut buf = [0u8; 2048];
+    let start = Instant::now();
+    for i in 0..1000 {
+        let conn = &conns[i % num_conns];
+        let msg = bincode::serialize(&TimeMsg::new(start, padding))?;
+        conn.write_to(&msg[..], remote).wrap_err("send")?;
+        debug!(?i, "sent");
+        let (read_len, _) = conn.read_from(&mut buf).wrap_err("recv")?;
+        let msg: TimeMsg = bincode::deserialize(&buf[..read_len])?;
+        let elap = msg.elapsed(start);
+        debug!(?i, ?elap, "received response");
         times.push(elap);
     }
 

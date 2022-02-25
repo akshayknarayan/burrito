@@ -8,6 +8,7 @@ bertha = { path = "../bertha" }
 dpdk-direct = { path = "../dpdk-direct" }
 dpdk-wrapper = { path = "../dpdk-direct/dpdk-wrapper" }
 shenango-chunnel = { path = "../shenango-chunnel" }
+shenango = { path = "../shenango-chunnel/caladan/bindings/rust" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 color-eyre = "0.5"
 tracing = "0.1"
