@@ -12,6 +12,9 @@ color-eyre = "0.5"
 flume = "0.10"
 futures-util = "0.3"
 lazy_static = "1"
+eui48 = "1"
+ahash = "0.7"
+rand = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
