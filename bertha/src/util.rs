@@ -4,17 +4,13 @@ use super::{Chunnel, ChunnelConnection};
 use ahash::AHashMap;
 use color_eyre::eyre::{eyre, Report};
 use dashmap::DashMap;
-use futures_util::future::{
-    TryFutureExt, {ready, Ready},
-};
+use futures_util::future::{ready, Ready};
 use futures_util::stream::Stream;
-use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::trace;
 
 pub trait MsgId {
     fn id(&self) -> usize;
@@ -57,7 +53,7 @@ where
             self.sent.insert(data.id(), r);
         }
 
-        self.inner.send(data).await
+        self.inner.send(std::iter::once(data)).await
     }
 
     pub async fn recv_msg(&self, msg_id: usize) -> Result<D, Report> {
@@ -65,105 +61,25 @@ where
             .sent
             .remove(&msg_id)
             .ok_or_else(|| eyre!("Requested msg id {:?} isn't known", msg_id))?;
+        let mut slots = [None, None, None, None];
         loop {
             tokio::select! {
                 res = &mut r => {
                     let res = res.expect("sender won't be dropped");
                     return Ok(res);
                 }
-                res = self.inner.recv() => {
+                res = self.inner.recv(&mut slots[..]) => {
                     let res = res?;
-                    if let Some((_, s)) = self.inflight.remove(&res.id()) {
-                        s.send(res).map_err(|_| ()).expect("receiver won't be dropped");
-                    } else {
-                        continue;
+                    for i in 0..4 {
+                        if let Some(res) = res[i].take() {
+                            if let Some((_, s)) = self.inflight.remove(&res.id()) {
+                                s.send(res).map_err(|_| ()).expect("receiver won't be dropped");
+                            }
+                        }
                     }
                 }
             }
         }
-    }
-}
-
-/// Remember the order of calls to recv(), and return packets from the underlying connection in
-/// that order.
-#[derive(Debug)]
-pub struct RecvCallOrder<C: ChunnelConnection> {
-    inner: Arc<C>,
-    queue: Arc<StdMutex<VecDeque<oneshot::Sender<Result<C::Data, Report>>>>>,
-}
-
-impl<C: ChunnelConnection> Clone for RecvCallOrder<C> {
-    fn clone(&self) -> Self {
-        RecvCallOrder {
-            inner: Arc::clone(&self.inner),
-            queue: Arc::clone(&self.queue),
-        }
-    }
-}
-
-impl<C: ChunnelConnection> RecvCallOrder<C> {
-    pub fn new(inner: C) -> Self {
-        Self {
-            inner: Arc::new(inner),
-            queue: Default::default(),
-        }
-    }
-}
-
-impl<C> ChunnelConnection for RecvCallOrder<C>
-where
-    C: ChunnelConnection + Send + Sync + 'static,
-    C::Data: Send + Sync + 'static,
-{
-    type Data = C::Data;
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.inner.send(data)
-    }
-
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        //self.inner.recv()
-        let inner = Arc::clone(&self.inner);
-        let recv_queue = Arc::clone(&self.queue);
-        let (s, mut r) = oneshot::channel();
-        {
-            let mut rq = recv_queue.lock().unwrap();
-            rq.push_back(s);
-            trace!(pos = &rq.len(), "inserted");
-        }
-
-        Box::pin(async move {
-            loop {
-                tokio::select! {
-                    res = &mut r => {
-                        trace!("RecvCallOrder done");
-                        return res.expect("sender won't be dropped");
-                    }
-                    res = inner.recv() => {
-                        recv_queue
-                            .lock()
-                            .unwrap()
-                            .pop_front()
-                            .expect("Must have a sender waiting, since we pushed one")
-                            .send(res)
-                            .map_err(|_| ())
-                            .expect("Must have a receiver waiting");
-                    }
-                }
-
-                match r.try_recv() {
-                    Ok(res) => {
-                        trace!("RecvCallOrder done");
-                        return res;
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => (),
-                    Err(oneshot::error::TryRecvError::Closed) => unreachable!(),
-                }
-            }
-        })
     }
 }
 
@@ -198,10 +114,16 @@ where
             ),
             move |(sk, mut map, make_conn)| {
                 async move {
+                    let mut slot = [None];
                     loop {
                         // careful: potential deadlocks since calling `.recv()` on returned
                         // connection blocks on `.listen()`. Make sure to use `and_then_concurrent`.
-                        let (from, data) = sk.recv().await?;
+                        let msgs = sk.recv(&mut slot[..]).await?;
+                        if msgs[0].is_none() {
+                            continue;
+                        }
+
+                        let (from, data) = msgs[0].take().unwrap();
 
                         let mut done = None;
                         let c = map.entry(from.clone()).or_insert_with(|| {
@@ -232,28 +154,6 @@ where
     }
 }
 
-pub struct Unproject<C>(pub C);
-
-impl<C, D> ChunnelConnection for Unproject<C>
-where
-    C: ChunnelConnection<Data = D>,
-    D: 'static,
-{
-    type Data = ((), D);
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.0.send(data.1)
-    }
-
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let f = self.0.recv();
-        Box::pin(async move { Ok(((), f.await?)) })
-    }
-}
-
 /// Projects a given address over a connection's data.
 ///
 /// Given a `impl ChunnelConnection`s which expect `(addr, data)`, expose an interface which
@@ -270,21 +170,45 @@ impl<A, C> ProjectLeft<A, C> {
 
 impl<A, C, D> ChunnelConnection for ProjectLeft<A, C>
 where
-    A: Clone + Send + 'static,
-    D: 'static,
+    A: Clone + Send + Sync + 'static,
+    D: Send + 'static,
     C: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
 {
     type Data = D;
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        Box::pin(self.1.send((self.0.clone(), data))) as _
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        Box::pin(
+            self.1
+                .send(burst.into_iter().map(|data| (self.0.clone(), data))),
+        ) as _
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        Box::pin(self.1.recv().map_ok(|d| d.1)) as _
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        let mut slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+        Box::pin(async move {
+            let msgs = self.1.recv(&mut slots[..]).await?;
+            for (slot, (_, d)) in msgs_buf
+                .into_iter()
+                .zip(msgs.into_iter().map_while(Option::take))
+            {
+                *slot = Some(d);
+            }
+
+            Ok(&mut msgs_buf[..])
+        })
     }
 }
 
@@ -346,14 +270,24 @@ pub struct NeverCn<D = ()>(std::marker::PhantomData<D>);
 impl<D> ChunnelConnection for NeverCn<D> {
     type Data = D;
 
-    fn send(
-        &self,
-        _: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+    fn send<'cn, B>(
+        &'cn self,
+        _: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
         Box::pin(async move { Err(eyre!("No sends allowed on Never Chunnel")) })
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        _: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         Box::pin(async move { Err(eyre!("Unexpected recv in Never chunnel")) })
     }
 }

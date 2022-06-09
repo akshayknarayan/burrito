@@ -163,10 +163,13 @@ mod test {
                         i += 1;
                         async move {
                             debug!("new connection");
+                            let mut slots = [None, None];
                             loop {
-                                match cn.recv().await {
-                                    Ok(d) => {
-                                        cn.send(d).await.expect("server send");
+                                match cn.recv(&mut slots).await {
+                                    Ok(ms) => {
+                                        cn.send(ms.into_iter().map_while(Option::take))
+                                            .await
+                                            .expect("server send");
                                         debug!("echoed");
                                     }
                                     Err(e) => {
@@ -187,13 +190,16 @@ mod test {
 
                 r.await?;
                 let cn = c1.connect(address.clone()).await?;
-                cn.send((address.clone(), vec![1u8; 1])).await?;
-                let (_, buf) = cn.recv().await?;
-                assert_eq!(buf, vec![1u8; 1]);
+                cn.send(std::iter::once((address.clone(), vec![1u8; 1])))
+                    .await?;
+                let mut slots = [None];
+                let ms = cn.recv(&mut slots).await?;
+                assert_eq!(ms[0].take().unwrap().1, vec![1u8; 1]);
                 let cn = c2.connect(address.clone()).await?;
-                cn.send((address.clone(), vec![1u8; 1])).await?;
-                let (_, buf) = cn.recv().await?;
-                assert_eq!(buf, vec![1u8; 1]);
+                cn.send(std::iter::once((address.clone(), vec![1u8; 1])))
+                    .await?;
+                let ms = cn.recv(&mut slots).await?;
+                assert_eq!(ms[0].take().unwrap().1, vec![1u8; 1]);
                 Ok::<_, Report>(())
             }
             .instrument(info_span!("select_listener")),

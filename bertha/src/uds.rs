@@ -88,45 +88,85 @@ impl UnixSk {
     }
 }
 
+impl super::udp::TokioDatagramSk for Arc<tokio::net::UnixDatagram> {
+    type Addr = PathBuf;
+    fn try_recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, Self::Addr)> {
+        let (sz, from) = tokio::net::UnixDatagram::try_recv_from(&self, buf)?;
+        Ok((
+            sz,
+            from.as_pathname()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "received from unnamed socket",
+                    )
+                })?
+                .to_path_buf(),
+        ))
+    }
+}
+
 impl ChunnelConnection for UnixSk {
     type Data = (PathBuf, Vec<u8>);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let sk = Arc::clone(&self.sk);
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
         Box::pin(
             async move {
-                let (addr, data) = data;
-                trace!(to = ?&addr, "send");
-                sk.send_to(&data, &addr)
-                    .await
-                    .wrap_err(eyre!("unixsk send to address: {:?}", &addr))?;
+                let mut sent = 0;
+                for (addr, data) in burst {
+                    self.sk
+                        .send_to(&data, &addr)
+                        .await
+                        .wrap_err(eyre!("unixsk send to address: {:?}", &addr))?;
+                    sent += 1;
+                }
+
+                trace!(?sent, "send");
                 Ok(())
             }
             .instrument(trace_span!("uds_send")),
         )
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let mut buf = [0u8; 1024];
-        let sk = Arc::clone(&self.sk);
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        use super::udp::{peel_one, peel_rest, PeelErr};
 
-        Box::pin(
-            async move {
-                let (len, from) = sk.recv_from(&mut buf).await?;
-                trace!(from = ?&from, "recv");
-                let data = buf[0..len].to_vec();
-                Ok((
-                    from.as_pathname()
-                        .ok_or_else(|| eyre!("received from unnamed socket"))?
-                        .to_path_buf(),
-                    data,
-                ))
+        // we could block repeatedly until the array is filled, but we will not do that. instead we
+        // will only return what is immediately available.
+        Box::pin(async move {
+            let mut num_recveived = 0;
+            loop {
+                self.sk.readable().await?;
+
+                // at least one has to be readable. after that, don't try to wait for further
+                // readability and instead return what we have now.
+                match peel_one(&self.sk, &mut msgs_buf[0]) {
+                    Ok(_) => (),
+                    Err(PeelErr::WouldBlock) => continue,
+                    Err(PeelErr::Fatal(e)) => return Err(e),
+                }
+
+                num_recveived += 1;
+                break;
             }
-            .instrument(trace_span!("uds_recv")),
-        )
+
+            num_recveived += peel_rest(&self.sk, &mut msgs_buf[1..])?;
+            trace!(?num_recveived, "recv");
+            Ok(msgs_buf)
+        })
     }
 }
 
@@ -153,7 +193,7 @@ impl ChunnelListener for UnixReqChunnel {
 #[derive(Debug, Clone)]
 pub struct UnixConn {
     resp_addr: PathBuf,
-    recv: Arc<flume::Receiver<(PathBuf, Vec<u8>)>>,
+    recv: flume::Receiver<(PathBuf, Vec<u8>)>,
     send: UnixSk,
 }
 
@@ -161,7 +201,7 @@ impl UnixConn {
     fn new(resp_addr: PathBuf, send: UnixSk, recv: flume::Receiver<(PathBuf, Vec<u8>)>) -> Self {
         UnixConn {
             resp_addr,
-            recv: Arc::new(recv),
+            recv,
             send,
         }
     }
@@ -170,25 +210,33 @@ impl UnixConn {
 impl ChunnelConnection for UnixConn {
     type Data = (PathBuf, Vec<u8>);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let sk = self.send.clone();
-        let addr = self.resp_addr.clone();
-        let (_, data) = data;
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
         Box::pin(async move {
-            sk.send((addr, data)).await?;
-            Ok(())
+            self.send
+                .send(
+                    burst
+                        .into_iter()
+                        .map(|(_, data)| (self.resp_addr.clone(), data)),
+                )
+                .await
         })
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let r = Arc::clone(&self.recv);
-        Box::pin(async move {
-            let d = r.recv_async().await;
-            d.wrap_err(eyre!("Nothing more to receive"))
-        }) as _
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        Box::pin(super::udp::recv_channel_burst(&self.recv, msgs_buf)) as _
     }
 }
 
@@ -234,14 +282,21 @@ mod test {
                 let cli = UnixSkChunnel::default().connect(()).await.unwrap();
 
                 tokio::spawn(async move {
+                    let mut recv_slots = [None, None];
                     loop {
-                        let (from, data) = srv.recv().await.unwrap();
-                        srv.send((from, data)).await.unwrap();
+                        let msgs = srv.recv(&mut recv_slots).await.unwrap();
+                        srv.send(msgs.into_iter().map_while(Option::take))
+                            .await
+                            .unwrap();
                     }
                 });
 
-                cli.send((addr.clone(), vec![1u8; 12])).await.unwrap();
-                let (from, data) = cli.recv().await.unwrap();
+                cli.send(std::iter::once((addr.clone(), vec![1u8; 12])))
+                    .await
+                    .unwrap();
+                let mut recv_slots = [None, None];
+                let msgs = cli.recv(&mut recv_slots).await.unwrap();
+                let (from, data) = msgs[0].take().unwrap();
                 assert_eq!(from, addr);
                 assert_eq!(data, vec![1u8; 12]);
             }
@@ -274,8 +329,9 @@ mod test {
                 tokio::spawn(async move {
                     let srv = UnixReqChunnel::default().listen(saddr).await.unwrap();
                     srv.try_for_each_concurrent(None, |cn| async move {
-                        let data = cn.recv().await?;
-                        cn.send(data).await?;
+                        let mut recv_slots = [None, None];
+                        let data = cn.recv(&mut recv_slots).await?;
+                        cn.send(data.into_iter().map_while(Option::take)).await?;
                         Ok(())
                     })
                     .await
@@ -283,8 +339,12 @@ mod test {
                 });
 
                 let cli = UnixSkChunnel::default().connect(()).await.unwrap();
-                cli.send((addr.clone(), vec![1u8; 12])).await.unwrap();
-                let (from, data) = cli.recv().await.unwrap();
+                cli.send(std::iter::once((addr.clone(), vec![1u8; 12])))
+                    .await
+                    .unwrap();
+                let mut recv_slots = [None];
+                let recvs = cli.recv(&mut recv_slots).await.unwrap();
+                let (from, data) = recvs[0].take().unwrap();
                 assert_eq!(from, addr);
                 assert_eq!(data, vec![1u8; 12]);
             }

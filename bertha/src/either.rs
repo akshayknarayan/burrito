@@ -1,7 +1,7 @@
 //! The `Either` type implements traits where both variants implement the trait with the same
 //! output type.
 
-use super::{Chunnel, ChunnelConnection, CxListReverse};
+use super::{Chunnel, ChunnelConnection};
 use color_eyre::eyre::{eyre, Report};
 use futures_util::{
     future::{FutureExt, TryFutureExt},
@@ -105,20 +105,30 @@ where
 {
     type Data = D;
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+    fn send<'cn, R>(
+        &'cn self,
+        burst: R,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        R: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <R as IntoIterator>::IntoIter: Send,
+    {
         match self {
-            Either::Left(a) => a.send(data),
-            Either::Right(b) => b.send(data),
+            Either::Left(a) => a.send(burst),
+            Either::Right(b) => b.send(burst),
         }
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         match self {
-            Either::Left(a) => a.recv(),
-            Either::Right(b) => b.recv(),
+            Either::Left(a) => a.recv(msgs_buf),
+            Either::Right(b) => b.recv(msgs_buf),
         }
     }
 }
@@ -128,8 +138,8 @@ where
     Din: Send + Sync + 'static,
     Dout: Send + Sync + 'static,
     C: ChunnelConnection<Data = Din>,
-    A: Chunnel<C> + Send + 'static,
-    B: Chunnel<C> + Send + 'static,
+    A: Chunnel<C>,
+    B: Chunnel<C>,
     <A as Chunnel<C>>::Connection: ChunnelConnection<Data = Dout>,
     <B as Chunnel<C>>::Connection: ChunnelConnection<Data = Dout>,
     <A as Chunnel<C>>::Error: Into<Report> + Send + Sync + 'static,
@@ -172,21 +182,6 @@ where
         match self {
             Left(i) => i.next(),
             Right(i) => i.next(),
-        }
-    }
-}
-
-impl<A, B> CxListReverse for Either<A, B>
-where
-    A: CxListReverse,
-    B: CxListReverse,
-{
-    type Reversed = Either<A::Reversed, B::Reversed>;
-
-    fn rev(self) -> Self::Reversed {
-        match self {
-            Either::Left(a) => Either::Left(a.rev()),
-            Either::Right(b) => Either::Right(b.rev()),
         }
     }
 }
@@ -298,54 +293,110 @@ pub struct EitherCn<C, Side>(C, std::marker::PhantomData<Side>);
 
 impl<A, C, Cd, Od> ChunnelConnection for EitherCn<C, Left>
 where
-    C: ChunnelConnection<Data = (A, DataEither<Cd, Od>)>,
+    C: ChunnelConnection<Data = (A, DataEither<Cd, Od>)> + Send + Sync,
     Cd: Send + 'static,
     Od: Send + 'static,
     A: Send + Sync + 'static,
 {
     type Data = (A, Cd);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.0.send((data.0, DataEither::<Cd, Od>::left(data.1)))
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.0.send(
+            burst
+                .into_iter()
+                .map(|(addr, data)| (addr, DataEither::<Od, Cd>::left(data))),
+        )
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let fut = self.0.recv();
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         Box::pin(async move {
-            match fut.await? {
-                (a, DataEither::Left(d)) => Ok((a, d)),
-                _ => Err(eyre!("Incompatible data type")),
+            let mut recv_slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+            let msgs = self.0.recv(&mut recv_slots[..]).await?;
+            let mut num_received = 0;
+            for (recvd_msg, slot) in msgs
+                .into_iter()
+                .map_while(Option::take)
+                .zip(msgs_buf.into_iter())
+            {
+                match recvd_msg {
+                    (a, DataEither::Left(d)) => {
+                        *slot = Some((a, d));
+                    }
+                    _ => return Err(eyre!("Incompatible data type")),
+                }
+
+                num_received += 1;
             }
+
+            return Ok(&mut msgs_buf[..num_received]);
         })
     }
 }
 
 impl<A, C, Cd, Od> ChunnelConnection for EitherCn<C, Right>
 where
-    C: ChunnelConnection<Data = (A, DataEither<Od, Cd>)>,
-    Cd: Send + 'static,
-    Od: Send + 'static,
+    C: ChunnelConnection<Data = (A, DataEither<Od, Cd>)> + Send + Sync,
+    Cd: Send + Sync + 'static,
+    Od: Send + Sync + 'static,
     A: Send + Sync + 'static,
 {
     type Data = (A, Cd);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.0.send((data.0, DataEither::<Od, Cd>::right(data.1)))
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.0.send(
+            burst
+                .into_iter()
+                .map(|(addr, data)| (addr, DataEither::<Od, Cd>::right(data))),
+        )
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let fut = self.0.recv();
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         Box::pin(async move {
-            match fut.await? {
-                (a, DataEither::Right(d)) => Ok((a, d)),
-                _ => Err(eyre!("Incompatible data type")),
+            let mut recv_slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+            let msgs = self.0.recv(&mut recv_slots[..]).await?;
+            let mut num_received = 0;
+            for (recvd_msg, slot) in msgs
+                .into_iter()
+                .map_while(Option::take)
+                .zip(msgs_buf.into_iter())
+            {
+                match recvd_msg {
+                    (a, DataEither::Right(d)) => {
+                        *slot = Some((a, d));
+                    }
+                    _ => return Err(eyre!("Incompatible data type")),
+                }
+
+                num_received += 1;
             }
+
+            return Ok(&mut msgs_buf[..num_received]);
         })
     }
 }

@@ -15,7 +15,7 @@ use tracing_futures::Instrument;
 
 /// Return a stream of connections with `stack`'s semantics, listening on `raw_cn_st`.
 #[allow(clippy::manual_async_fn)] // we need the + 'static which async fn does not do.
-pub fn negotiate_server<Srv, Sc, Se, C, A>(
+pub fn negotiate_server<'c, Srv, Sc, Se, C, A>(
     stack: Srv,
     raw_cn_st: Sc,
 ) -> impl Future<
@@ -73,7 +73,7 @@ where
 }
 
 #[instrument(skip(cn, stack, pending_negotiated_connections), level = "debug", err)]
-async fn negotiate_server_connection<C, A, Srv>(
+async fn negotiate_server_connection<'c, C, A, Srv>(
     cn: C,
     stack: Srv,
     pending_negotiated_connections: Arc<Mutex<HashMap<A, StackNonce>>>,
@@ -104,9 +104,19 @@ where
 {
     debug!("new connection");
     let (cn, s) = InjectWithChannel::make(cn);
+    let mut slot = [None];
     loop {
         trace!("listening for potential negotiation pkt");
-        let (a, buf): (_, Vec<u8>) = cn.recv().await?;
+        let ms = cn.recv(&mut slot).await?;
+        if ms.is_empty() {
+            continue;
+        }
+
+        let (a, buf): (_, Vec<u8>) = if let Some(b) = ms[0].take() {
+            b
+        } else {
+            continue;
+        };
         trace!("got potential negotiation pkt");
 
         // if `a` is in pending_negotiated_connections, this is a post-negotiation message and we
@@ -153,7 +163,7 @@ where
 
                 // send ack
                 let ack = bincode::serialize(&NegotiateMsg::ServerNonceAck).unwrap();
-                cn.send((a, ack)).await?;
+                cn.send(std::iter::once((a, ack))).await?;
                 debug!("sent nonce ack");
 
                 // need to loop on this connection, processing nonces
@@ -193,7 +203,7 @@ where
 
                 let buf = bincode::serialize(&client_resp)?;
                 assert!(buf.len() < 1500); // response has to fit in a packet
-                cn.send((a, buf)).await?;
+                cn.send(std::iter::once((a, buf))).await?;
                 debug!("sent client response");
                 if let Some(mut new_stack) = new_stack {
                     debug!(stack = ?&new_stack, "handshake done, picked stack");
@@ -229,7 +239,7 @@ where
 
                 let client_resp_buf = bincode::serialize(&client_resp).unwrap();
                 assert!(client_resp_buf.len() < 1500);
-                cn.send((a, client_resp_buf)).await?;
+                cn.send(std::iter::once((a, client_resp_buf))).await?;
                 debug!("sent client response");
                 if let Some(mut new_stack) = new_stack {
                     debug!(stack = ?&new_stack, "zero-rtt handshake done, picked stack");
@@ -253,9 +263,20 @@ async fn process_nonces_connection<A>(
 where
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
 {
+    let mut slot = [None];
     loop {
         trace!("call recv()");
-        let (a, buf): (_, Vec<u8>) = cn.recv().await.wrap_err("conn recv")?;
+        let ms = cn.recv(&mut slot).await?;
+        if ms.is_empty() {
+            continue;
+        }
+
+        let (a, buf): (_, Vec<u8>) = if let Some(b) = ms[0].take() {
+            b
+        } else {
+            continue;
+        };
+
         let negotiate_msg: NegotiateMsg =
             bincode::deserialize(&buf).wrap_err("offer deserialize failed")?;
 
@@ -271,7 +292,7 @@ where
 
                 // send ack
                 let ack = bincode::serialize(&NegotiateMsg::ServerNonceAck).unwrap();
-                cn.send((a, ack)).await?;
+                cn.send(std::iter::once((a, ack))).await?;
                 debug!("sent nonce ack");
             }
             x => warn!(msg = ?x, "expected server nonce, got different message"),

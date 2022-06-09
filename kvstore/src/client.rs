@@ -5,7 +5,6 @@ use crate::reliability::KvReliabilityChunnel;
 use bertha::{
     bincode::SerializeChunnelProject,
     negotiate::Select,
-    reliable::ReliabilityProjChunnel,
     split::Split,
     tagger::OrderedChunnelProj,
     util::ProjectLeft,

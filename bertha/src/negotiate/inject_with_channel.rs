@@ -25,41 +25,56 @@ impl<C, D> InjectWithChannel<C, D> {
 
 impl<C, D> ChunnelConnection for InjectWithChannel<C, D>
 where
-    C: ChunnelConnection<Data = D>,
+    C: ChunnelConnection<Data = D> + Send + Sync,
     D: Send + 'static,
 {
     type Data = D;
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.0.send(data)
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.0.send(burst)
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let f = self.0.recv();
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         if self.1.load(std::sync::atomic::Ordering::SeqCst) {
-            f
+            self.0.recv(msgs_buf)
         } else {
-            let done = Arc::clone(&self.1);
-            let r = Arc::clone(&self.2);
-            let sel = select(
-                f,
-                Box::pin(async move {
-                    use std::ops::DerefMut;
-                    match r.lock().await.deref_mut().await {
-                        Ok(d) => {
-                            trace!("recirculate first packet on prenegotiated connection");
-                            done.store(true, std::sync::atomic::Ordering::SeqCst);
-                            Ok(d)
+            Box::pin(async move {
+                let mut slot_one = [None];
+                let mut slot_two = [None];
+                let slot_two = &mut slot_two;
+                let either_slot = select(
+                    self.0.recv(&mut slot_one),
+                    Box::pin(async move {
+                        use std::ops::DerefMut;
+                        match self.2.lock().await.deref_mut().await {
+                            Ok(d) => {
+                                trace!("recirculate first packet on prenegotiated connection");
+                                self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+                                slot_two[0] = Some(d);
+                                Ok(&mut slot_two[..1])
+                            }
+                            Err(_) => futures_util::future::pending().await,
                         }
-                        Err(_) => futures_util::future::pending().await,
-                    }
-                }),
-            )
-            .map(|e| e.factor_first().0);
-            Box::pin(sel)
+                    }),
+                )
+                .map(|e| e.factor_first().0)
+                .await?;
+                msgs_buf[0] = either_slot[0].take();
+                Ok(&mut msgs_buf[..1])
+            })
         }
     }
 }

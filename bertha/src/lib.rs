@@ -7,7 +7,6 @@ use color_eyre::eyre;
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::Poll;
 
 mod and_then_concurrent;
 pub mod atmostonce;
@@ -126,89 +125,22 @@ pub trait ChunnelConnector {
 pub trait ChunnelConnection {
     type Data;
 
-    /// Send a message
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>>;
-
-    /// Retrieve next incoming message.
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>>;
-
-    fn send_batch<'cn, D>(
+    fn send<'cn, B>(
         &'cn self,
-        data: D,
+        burst: B,
     ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'cn>>
     where
-        D: IntoIterator<Item = Self::Data> + Send + 'cn,
-        <D as IntoIterator>::IntoIter: Send,
-        Self::Data: Send,
-        Self: Sync,
-    {
-        Box::pin(async move {
-            futures_util::future::try_join_all(data.into_iter().map(|d| self.send(d))).await?;
-            Ok(())
-        })
-    }
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send;
 
-    // associated type defaults aren't possible, and we can't use impl trait here. so we're stuck
-    // with a Vec
-    fn recv_batch<'cn>(
+    fn recv<'cn, 'buf>(
         &'cn self,
-        batch_size: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Self::Data>, eyre::Report>> + Send + 'cn>>
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<
+        Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], eyre::Report>> + Send + 'cn>,
+    >
     where
-        Self::Data: Send,
-        Self: Sync,
-    {
-        Box::pin(async move {
-            let mut recv_batch = vec![];
-            loop {
-                let mut f = self.recv();
-                match futures_util::poll!(&mut f) {
-                    Poll::Ready(m) => {
-                        recv_batch.push(m?);
-                        tracing::debug!(batch_len = ?recv_batch.len(), "batch recv");
-                        if recv_batch.len() >= batch_size {
-                            break;
-                        }
-                    }
-                    Poll::Pending if recv_batch.is_empty() => {
-                        recv_batch.push(f.await?);
-                        break;
-                    }
-                    Poll::Pending => {
-                        break;
-                    }
-                }
-            }
-
-            Ok(recv_batch)
-        })
-    }
-}
-
-impl<T, C, D> ChunnelConnection for T
-where
-    T: std::ops::Deref<Target = C>,
-    C: ChunnelConnection<Data = D>,
-{
-    type Data = D;
-
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-        self.deref().send(data)
-    }
-
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
-        self.deref().recv()
-    }
+        'buf: 'cn;
 }
 
 /// For address types to expose ip and port information for inner addresses.
@@ -224,66 +156,6 @@ impl IpPort for std::net::SocketAddr {
 
     fn port(&self) -> u16 {
         self.port()
-    }
-}
-
-pub trait AppendBack<T> {
-    type Appended;
-    fn append(self, it: T) -> Self::Appended;
-}
-
-impl<T> AppendBack<T> for CxNil {
-    type Appended = CxList<T, CxNil>;
-
-    fn append(self, it: T) -> Self::Appended {
-        CxList {
-            head: it,
-            tail: self,
-        }
-    }
-}
-
-impl<H, T, I> AppendBack<I> for CxList<H, T>
-where
-    T: AppendBack<I>,
-{
-    type Appended = CxList<H, <T as AppendBack<I>>::Appended>;
-    fn append(self, it: I) -> Self::Appended {
-        CxList {
-            head: self.head,
-            tail: self.tail.append(it),
-        }
-    }
-}
-
-pub trait CxListReverse {
-    type Reversed;
-    fn rev(self) -> Self::Reversed;
-}
-
-//impl<N: Negotiate> CxListReverse for N {
-//    type Reversed = Self;
-//    fn rev(self) -> Self::Reversed {
-//        self
-//    }
-//}
-
-impl<H, T> CxListReverse for CxList<H, T>
-where
-    T: CxListReverse,
-    <T as CxListReverse>::Reversed: AppendBack<H>,
-{
-    type Reversed = <<T as CxListReverse>::Reversed as AppendBack<H>>::Appended;
-
-    fn rev(self) -> Self::Reversed {
-        self.tail.rev().append(self.head)
-    }
-}
-
-impl CxListReverse for CxNil {
-    type Reversed = Self;
-    fn rev(self) -> Self::Reversed {
-        self
     }
 }
 
@@ -364,33 +236,16 @@ mod test {
                 let cln = cln.connect(()).await?;
                 let snd = stack.connect_wrap(cln).await?;
 
-                snd.send(((), vec![1u8; 1])).await?;
-                let (_, buf) = rcv.recv().await?;
+                snd.send(std::iter::once(((), vec![1u8; 1]))).await?;
+                let mut recv_buf = [None];
+                let bufs = rcv.recv(&mut recv_buf).await?;
+                assert_eq!(bufs.len(), 1);
+                let (_, buf) = bufs[0].take().unwrap();
                 assert_eq!(buf, vec![1u8; 1]);
                 Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("cxnil")),
         )
         .unwrap();
-    }
-
-    #[test]
-    fn cxlist_reverse() {
-        use super::CxListReverse;
-
-        let cxlist = CxList::from(true).wrap(42).wrap("foo").wrap(2.14);
-        let rev = cxlist.rev();
-        let compare = CxList::from(2.14).wrap("foo").wrap(42).wrap(true);
-        assert_eq!(rev, compare);
-
-        let cxlist = CxList::from(false);
-        let rev = cxlist.rev();
-        let compare = CxList::from(false);
-        assert_eq!(rev, compare);
-
-        let cxlist = CxList::from("15").wrap(15);
-        let rev = cxlist.rev();
-        let compare = CxList::from(15).wrap("15");
-        assert_eq!(rev, compare);
     }
 }

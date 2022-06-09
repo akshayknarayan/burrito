@@ -229,6 +229,7 @@ mod test {
         future::{ready, Ready},
         stream::StreamExt,
     };
+    use std::net::SocketAddr;
     use std::net::ToSocketAddrs;
     use tracing::{debug, debug_span, info, info_span};
     use tracing_error::ErrorLayer;
@@ -341,8 +342,10 @@ mod test {
                             .next()
                             .await
                             .ok_or_else(|| eyre!("srv_stream returned none"))??;
-                        let buf = cn.recv().await?;
-                        cn.send(buf).await?;
+                        let mut slot = [None];
+                        let ms = cn.recv(&mut slot).await?;
+                        let buf = ms[0].take().take().ok_or_else(|| eyre!("no message"))?;
+                        cn.send(std::iter::once(buf)).await?;
                         Ok::<_, Report>(())
                     }
                     .instrument(debug_span!("server")),
@@ -355,13 +358,12 @@ mod test {
                     .instrument(info_span!("negotiate_client"))
                     .await?;
 
-                cn.send(((), vec![1u8; 10])).await?;
-                let (_, buf) = cn.recv().await?;
-
+                cn.send(std::iter::once(((), vec![1u8; 10]))).await?;
+                let mut slot = [None];
+                let ms = cn.recv(&mut slot).await?;
+                let (_, buf) = ms[0].take().take().ok_or_else(|| eyre!("no message"))?;
                 assert_eq!(buf, vec![1u8; 10]);
-
                 info!("done");
-
                 Ok::<_, Report>(())
             }
             .instrument(info_span!("both_select")),
@@ -401,9 +403,11 @@ mod test {
                         srv_stream
                             .try_for_each_concurrent(None, |cn| async move {
                                 info!("got connection");
+                                const EMPTY: Option<(SocketAddr, Vec<u8>)> = None;
+                                let mut slots = [EMPTY; 4];
                                 loop {
-                                    let buf = cn.recv().await?;
-                                    cn.send(buf).await?;
+                                    let ms = cn.recv(&mut slots).await?;
+                                    cn.send(ms.into_iter().map_while(Option::take)).await?;
                                     debug!("echoed");
                                 }
                             })
@@ -429,11 +433,15 @@ mod test {
 
                 for _ in 0..10 {
                     debug!("sending");
-                    cn1.send((addr, vec![1u8; 10])).await?;
-                    cn2.send((addr, vec![2u8; 10])).await?;
-                    let (_, buf1) = cn1.recv().await?;
-                    let (_, buf2) = cn2.recv().await?;
+                    cn1.send(std::iter::once((addr, vec![1u8; 10]))).await?;
+                    cn2.send(std::iter::once((addr, vec![2u8; 10]))).await?;
+                    let mut slots = [None];
+                    let ms = cn1.recv(&mut slots).await?;
+                    let (_, buf1) = ms[0].take().expect("no message");
                     assert_eq!(buf1, vec![1u8; 10]);
+
+                    let ms = cn2.recv(&mut slots).await?;
+                    let (_, buf2) = ms[0].take().expect("no message");
                     assert_eq!(buf2, vec![2u8; 10]);
                 }
                 info!("done");
@@ -514,9 +522,11 @@ mod test {
                         srv_stream
                             .try_for_each_concurrent(None, |cn| async move {
                                 info!("got connection");
+                                const EMPTY: Option<(SocketAddr, Vec<u8>)> = None;
+                                let mut slots = [EMPTY; 4];
                                 loop {
-                                    let buf = cn.recv().await?;
-                                    cn.send(buf).await?;
+                                    let ms = cn.recv(&mut slots).await?;
+                                    cn.send(ms.into_iter().map_while(Option::take)).await?;
                                     debug!("echoed");
                                 }
                             })
@@ -530,7 +540,6 @@ mod test {
 
                 r.await.unwrap();
                 info!("starting client");
-                //let cl_stack = CxList::from(ChunnelA).wrap(ChunnelD);
                 let cl_stack = ChunnelA;
                 let raw_cn = UdpSkChunnel::default().connect(()).await?;
                 let _ = negotiate_client(cl_stack, raw_cn, addr)
@@ -574,9 +583,11 @@ mod test {
                         srv_stream
                             .try_for_each_concurrent(None, |cn| async move {
                                 info!("got connection");
+                                const EMPTY: Option<(SocketAddr, Vec<u8>)> = None;
+                                let mut slots = [EMPTY; 4];
                                 loop {
-                                    let buf = cn.recv().await?;
-                                    cn.send(buf).await?;
+                                    let ms = cn.recv(&mut slots).await?;
+                                    cn.send(ms.into_iter().map_while(Option::take)).await?;
                                     debug!("echoed");
                                 }
                             })
@@ -599,8 +610,10 @@ mod test {
                         .await?;
 
                     info!("sending");
-                    cn.send((addr, vec![1u8; 8])).await?;
-                    let (a, r) = cn.recv().await?;
+                    cn.send(std::iter::once((addr, vec![1u8; 8]))).await?;
+                    let mut slot = [None];
+                    let b = cn.recv(&mut slot).await?;
+                    let (a, r) = b[0].take().expect("no message received");
                     info!("received");
                     assert_eq!(a, addr, "Address mismatched");
                     assert_eq!(r, [1u8; 8], "Payload mismatched");
@@ -618,8 +631,10 @@ mod test {
                         .await?;
 
                     info!("sending");
-                    cn.send((addr, vec![2u8; 8])).await?;
-                    let (a, r) = cn.recv().await?;
+                    cn.send(std::iter::once((addr, vec![2u8; 8]))).await?;
+                    let mut slot = [None];
+                    let b = cn.recv(&mut slot).await?;
+                    let (a, r) = b[0].take().expect("no message received");
                     info!("recvd");
                     assert_eq!(a, addr, "Address mismatched");
                     assert_eq!(r, [2u8; 8], "Payload mismatched");
@@ -642,15 +657,17 @@ mod test {
                     )
                     .await?;
                     info!(attempt = 1, "sending");
-                    cn.send((addr, vec![3u8; 8])).await?;
+                    cn.send(std::iter::once((addr, vec![3u8; 8]))).await?;
 
-                    let e = cn.recv().await.unwrap_err();
+                    let mut slot = [None];
+                    let e = cn.recv(&mut slot).await.unwrap_err();
                     info!("re-negotiate");
                     let cn = cl_neg.re_negotiate(stack.clone(), raw_cn, addr, e).await?;
 
                     info!(attempt = 2, "sending");
-                    cn.send((addr, vec![3u8; 8])).await?;
-                    let (a, r) = cn.recv().await?;
+                    cn.send(std::iter::once((addr, vec![3u8; 8]))).await?;
+                    let b = cn.recv(&mut slot).await?;
+                    let (a, r) = b[0].take().expect("no message received");
                     info!(attempt = 2, "recvd");
                     assert_eq!(a, addr, "Address mismatched");
                     assert_eq!(r, [3u8; 8], "Payload mismatched");

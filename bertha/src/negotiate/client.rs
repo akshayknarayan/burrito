@@ -15,7 +15,7 @@ use std::sync::{
 use std::{future::Future, pin::Pin};
 use tracing::{debug, trace};
 
-pub type NegotiatedConn<C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
+pub type NegotiatedConn<'c, C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
 
 pub struct ClientNegotiator<A> {
     nonces: HashMap<A, StackNonce>,
@@ -32,7 +32,7 @@ impl<A> Default for ClientNegotiator<A> {
 impl<A: Serialize + DeserializeOwned + Clone + Debug + Eq + Hash + Send + Sync + 'static>
     ClientNegotiator<A>
 {
-    pub async fn negotiate_fetch_nonce<C, S>(
+    pub async fn negotiate_fetch_nonce<'c, C, S>(
         &mut self,
         stack: S,
         cn: C,
@@ -50,7 +50,7 @@ impl<A: Serialize + DeserializeOwned + Clone + Debug + Eq + Hash + Send + Sync +
         Ok(cn)
     }
 
-    pub async fn negotiate_zero_rtt<C, S>(
+    pub async fn negotiate_zero_rtt<'c, C, S>(
         &mut self,
         stack: S,
         cn: C,
@@ -80,7 +80,7 @@ impl<A: Serialize + DeserializeOwned + Clone + Debug + Eq + Hash + Send + Sync +
         negotiate_client_nonce(stack, cn, nonce.clone(), addr).await
     }
 
-    pub async fn re_negotiate<C, S>(
+    pub async fn re_negotiate<'c, C, S>(
         &mut self,
         stack: S,
         cn: C,
@@ -122,11 +122,11 @@ impl<A: Serialize + DeserializeOwned + Clone + Debug + Eq + Hash + Send + Sync +
 /// This is the traditional "one-rtt" version. It will block until the remote end completes the
 /// negotiation handshake.
 #[allow(clippy::manual_async_fn)] // we need the + 'static which async fn does not do.
-pub fn negotiate_client<C, A, S>(
+pub fn negotiate_client<'c, C, A, S>(
     stack: S,
     cn: C,
     addr: A,
-) -> impl Future<Output = Result<NegotiatedConn<C, S>, Report>> + Send + 'static
+) -> impl Future<Output = Result<NegotiatedConn<'c, C, S>, Report>> + Send + 'static
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     S: Apply + GetOffers + Clone + Send + 'static,
@@ -141,11 +141,11 @@ where
 }
 
 /// Same as [`negotiate_client`], but also return the [`StackNonce`].
-pub fn negotiate_client_fetch_nonce<C, A, S>(
+pub fn negotiate_client_fetch_nonce<'c, C, A, S>(
     stack: S,
     cn: C,
     addr: A,
-) -> impl Future<Output = Result<(NegotiatedConn<C, S>, StackNonce), Report>> + Send + 'static
+) -> impl Future<Output = Result<(NegotiatedConn<'c, C, S>, StackNonce), Report>> + Send + 'static
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     S: Apply + GetOffers + Clone + Send + 'static,
@@ -217,7 +217,7 @@ where
 ///
 /// The nonce in this case is determined by inspecting the provided `stack`. The stack must be
 /// fully-determined, i.e., it cannot have any [`Select`]s. If it does, this will error.
-pub fn negotiate_client_fixed_stack<C, A, S>(
+pub fn negotiate_client_fixed_stack<'c, C, A, S>(
     mut stack: S,
     cn: C,
     addr: A,
@@ -251,7 +251,7 @@ where
 
         let msg = NegotiateMsg::ClientNonce(nonce.clone());
         let buf = bincode::serialize(&msg)?;
-        cn.send((addr.clone(), buf)).await?;
+        cn.send(std::iter::once((addr.clone(), buf))).await?;
 
         let picked = NegotiateMsg::ServerNonce {
             addr: bincode::serialize(&addr)?,
@@ -273,7 +273,7 @@ where
 /// This error will be `.downcast`-able to a [`ZeroRttNegotiationError`], which will contain the
 /// list of valid remote nonces.
 /// From this, callers can monomorphize a new nonce and try again with this function.
-pub fn negotiate_client_nonce<C, A, S>(
+pub fn negotiate_client_nonce<'c, C, A, S>(
     stack: S,
     cn: C,
     nonce: StackNonce,
@@ -355,10 +355,18 @@ where
         C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     {
         // 2. send offers
-        cn.send((addr, buf)).await?;
+        cn.send(std::iter::once((addr, buf))).await?;
 
         // 3. receive picked
-        let (_, rbuf) = cn.recv().await?;
+        let mut slot = [None];
+        let rbuf = loop {
+            let ms = cn.recv(&mut slot).await?;
+            if ms.len() == 0 || ms[0].is_none() {
+                continue;
+            }
+
+            break ms[0].take().unwrap().1;
+        };
         if rbuf.is_empty() {
             Ok(NegotiateMsg::ServerReply(Ok(vec![])))
         } else {
@@ -391,35 +399,51 @@ impl<C> From<C> for CheckZeroRttNegotiationReply<C> {
 
 impl<C, A> ChunnelConnection for CheckZeroRttNegotiationReply<C>
 where
-    C: ChunnelConnection<Data = (A, Vec<u8>)>,
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync,
     A: Send + 'static,
 {
     type Data = (A, Vec<u8>);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.inner.send(data)
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.inner.send(burst)
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let f = self.inner.recv();
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         if !self.success.load(Ordering::SeqCst) {
-            let f2 = self.inner.recv(); // keep this around in case we need it
-            let success = Arc::clone(&self.success);
             Box::pin(async move {
-                let (addr, data) = f.await?;
+                let mut slot = [None];
+                let (addr, data) = loop {
+                    let ms = self.inner.recv(&mut slot).await?;
+                    if ms.is_empty() || ms[0].is_none() {
+                        continue;
+                    }
+
+                    break ms[0].take().unwrap();
+                };
+
                 // try parsing a NegotiateMsg::ServerReply
                 let m: Result<NegotiateMsg, _> = bincode::deserialize(&data);
                 match m {
                     Ok(NegotiateMsg::ServerNonceAck) => {
-                        trace!("zero-rtt negotiation succeeded");
-                        success.as_ref().store(true, Ordering::SeqCst);
-                        // the next recv, f2, will get application data.
+                        debug!("zero-rtt negotiation succeeded");
+                        self.success.as_ref().store(true, Ordering::SeqCst);
+                        // the next recv will get application data.
                         // this is safe because we set success to true, so a subsequent call
                         // to this function would skip negotiaton logic anyway
-                        return f2.await;
+                        self.inner.recv(msgs_buf).await
                     }
                     Err(e) => {
                         // do NOT set success because we still need to listen for the
@@ -436,7 +460,8 @@ where
                         //    error from the base connection.
                         //    TODO check the error type
                         trace!(err = %format!("{:#}", e), ?data, "return reordered message");
-                        Ok((addr, data))
+                        msgs_buf[0] = Some((addr, data));
+                        Ok(&mut msgs_buf[0..1])
                     }
                     Ok(NegotiateMsg::ServerReply(Ok(options))) => {
                         bail!(ZeroRttNegotiationError::NotAccepted(options))
@@ -448,7 +473,7 @@ where
                 }
             })
         } else {
-            f
+            self.inner.recv(msgs_buf)
         }
     }
 }

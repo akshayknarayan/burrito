@@ -1,23 +1,19 @@
 //! Serialization chunnel with bincode.
 
-use crate::{
-    util::{ProjectLeft, Unproject},
-    Chunnel, ChunnelConnection, Negotiate,
-};
+use crate::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use tracing::{debug, trace, trace_span};
 use tracing_futures::Instrument;
 
 #[derive(Debug, Clone)]
-pub struct SerializeChunnelProject<D> {
+pub struct SerializeChunnel<D> {
     _data: std::marker::PhantomData<D>,
 }
 
-impl<D> Negotiate for SerializeChunnelProject<D> {
+impl<D> Negotiate for SerializeChunnel<D> {
     type Capability = ();
 
     fn guid() -> u64 {
@@ -25,78 +21,46 @@ impl<D> Negotiate for SerializeChunnelProject<D> {
     }
 }
 
-impl<D> Default for SerializeChunnelProject<D> {
+impl<D> Default for SerializeChunnel<D> {
     fn default() -> Self {
-        SerializeChunnelProject {
+        SerializeChunnel {
             _data: Default::default(),
         }
     }
 }
 
-impl<A, D, InC> Chunnel<InC> for SerializeChunnelProject<D>
+impl<A, D, InC> Chunnel<InC> for SerializeChunnel<D>
 where
     InC: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     A: Send + Sync + 'static,
     D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = SerializeProject<A, D, InC>;
+    type Connection = SerializeCn<A, D, InC>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(SerializeProject::from(cn)))
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SerializeChunnel<D> {
-    _data: std::marker::PhantomData<D>,
-}
-
-impl<D: 'static> Negotiate for SerializeChunnel<D> {
-    type Capability = ();
-    fn guid() -> u64 {
-        0xd5263bf239e761c3
-    }
-}
-
-impl<D, InC> Chunnel<InC> for SerializeChunnel<D>
-where
-    InC: ChunnelConnection<Data = Vec<u8>> + Send + Sync + 'static,
-    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
-{
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Connection = ProjectLeft<(), SerializeProject<(), D, Unproject<InC>>>;
-    type Error = std::convert::Infallible;
-
-    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        Box::pin(async move {
-            let cn = SerializeChunnelProject::default()
-                .connect_wrap(Unproject(cn))
-                .await?;
-            Ok(ProjectLeft::new((), cn))
-        })
+        ready(Ok(SerializeCn::from(cn)))
     }
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct SerializeProject<A, D, C> {
-    inner: Arc<C>,
+pub struct SerializeCn<A, D, C> {
+    inner: C,
     _data: std::marker::PhantomData<(A, D)>,
 }
 
-impl<Cx, A, D> From<Cx> for SerializeProject<A, D, Cx> {
-    fn from(cx: Cx) -> SerializeProject<A, D, Cx> {
+impl<Cn, A, D> From<Cn> for SerializeCn<A, D, Cn> {
+    fn from(cx: Cn) -> SerializeCn<A, D, Cn> {
         debug!(data = ?std::any::type_name::<D>(), "make serialize chunnel");
-        SerializeProject {
-            inner: Arc::new(cx),
+        SerializeCn {
+            inner: cx,
             _data: Default::default(),
         }
     }
 }
 
-impl<A, C, D> ChunnelConnection for SerializeProject<A, D, C>
+impl<A, C, D> ChunnelConnection for SerializeCn<A, D, C>
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     A: Send + Sync + 'static,
@@ -104,32 +68,68 @@ where
 {
     type Data = (A, D);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
         Box::pin(
             async move {
-                let buf = bincode::serialize(&data.1).wrap_err("serialize failed")?;
-                inner.send((data.0, buf)).await
+                let b: Result<Vec<_>, Report> = burst
+                    .into_iter()
+                    .map(|(a, d)| {
+                        Ok((
+                            a,
+                            bincode::serialize(&d).wrap_err(eyre!("serialize error"))?,
+                        ))
+                    })
+                    .collect();
+                self.inner.send(b?).await
             }
             .instrument(trace_span!("bincode_send")),
         )
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         Box::pin(
             async move {
-                let (a, buf) = inner.recv().await?;
-                trace!("recvd");
-                let data = bincode::deserialize(&buf[..]).wrap_err(eyre!(
-                    "deserialize failed: {:?} -> {:?}",
-                    buf,
-                    std::any::type_name::<D>()
-                ))?;
-                Ok((a, data))
+                let mut recv_slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+                let bufs = self.inner.recv(&mut recv_slots).await?;
+                trace!(num = ?bufs.len(), "recvd");
+
+                let mut ret_len = 0;
+                for (buf, slot) in bufs
+                    .into_iter()
+                    .map_while(|x| x.take())
+                    .zip(msgs_buf.into_iter())
+                {
+                    // we have a &mut Option<(A, D)> slot and a (A, Vec<u8>) message.
+                    // XXX might it be possible to re-use this already-existing Option<(A, D)>
+                    // memory and
+                    // `deserialize_into`(https://github.com/bincode-org/bincode/issues/252)?
+                    //
+                    // The main obstacle is what we do in the `None` case. The bytes are there, but
+                    // using them would make assumptions about Option's memory layout and thus be
+                    // UB.
+                    let data = bincode::deserialize(&buf.1[..]).wrap_err(eyre!(
+                        "deserialize failed: {:?} -> {:?}",
+                        buf.1,
+                        std::any::type_name::<D>()
+                    ))?;
+                    *slot = Some((buf.0, data));
+                    ret_len += 1;
+                }
+
+                Ok(&mut msgs_buf[..ret_len])
             }
             .instrument(trace_span!("bincode_recv")),
         )
@@ -176,45 +176,69 @@ where
 
 #[derive(Debug, Clone)]
 pub struct Base64Cn<C> {
-    inner: Arc<C>,
+    inner: C,
 }
 
 impl<C> From<C> for Base64Cn<C> {
     fn from(inner: C) -> Self {
-        Base64Cn {
-            inner: Arc::new(inner),
-        }
+        Base64Cn { inner }
     }
 }
 
 impl<A, C> ChunnelConnection for Base64Cn<C>
 where
-    C: ChunnelConnection<Data = (A, String)> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, String)> + Send + Sync,
     A: Send + Sync + 'static,
 {
     type Data = (A, Vec<u8>);
 
-    fn send(
-        &self,
-        (a, data): Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let msg = base64::encode(data);
-        self.inner.send((a, msg))
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.inner
+            .send(burst.into_iter().map(|(a, d)| (a, base64::encode(d))))
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(async move {
-            let (a, msg) = inner.recv().await.wrap_err("base64 chunnel recv")?;
-            let buf = base64::decode(msg).wrap_err("base64 decode")?;
-            Ok((a, buf))
-        })
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        Box::pin(
+            async move {
+                let mut recv_slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+                let bufs = self.inner.recv(&mut recv_slots).await?;
+                trace!(num = ?bufs.len(), "recvd");
+
+                let mut len = 0;
+                for (buf, slot) in bufs
+                    .into_iter()
+                    .map_while(|x| x.take())
+                    .zip(msgs_buf.into_iter())
+                {
+                    let data = base64::decode(&buf.1[..])
+                        .wrap_err(eyre!("base64 decode failed: {:?}", buf.1))?;
+                    *slot = Some((buf.0, data));
+                    len += 1;
+                }
+
+                Ok(&mut msgs_buf[..len])
+            }
+            .instrument(trace_span!("base64_recv")),
+        )
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::{SerializeChunnel, SerializeChunnelProject};
+    use super::SerializeChunnel;
     use crate::chan_transport::Chan;
     use crate::test::Serve;
     use crate::{util::ProjectLeft, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener};
@@ -225,7 +249,7 @@ mod test {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     async fn send_thingy<
-        C: ChunnelConnection<Data = T>,
+        C: ChunnelConnection<Data = ((), T)>,
         T: serde::Serialize
             + serde::de::DeserializeOwned
             + std::fmt::Debug
@@ -240,8 +264,10 @@ mod test {
     ) {
         let s = t.clone();
         trace!(msg = ?t, "sending");
-        snd_ch.send(t).await.expect("send");
-        let r = rcv_ch.recv().await.expect("recv");
+        snd_ch.send(std::iter::once(((), t))).await.expect("send");
+        let mut slots = [None; 1];
+        let r = rcv_ch.recv(&mut slots).await.expect("recv");
+        let r = r[0].take().unwrap().1;
         trace!(msg = ?r, "received");
         assert_eq!(r, s);
     }
@@ -350,7 +376,7 @@ mod test {
         rt.block_on(
             async move {
                 let (mut srv, mut cln) = Chan::default().split();
-                let stack = SerializeChunnelProject::default();
+                let stack = SerializeChunnel::default();
 
                 let srv_stack = stack.clone();
                 tokio::spawn(async move {
@@ -360,9 +386,10 @@ mod test {
                         .unwrap();
                     st.try_for_each_concurrent(None, |cn| async move {
                         let cn = ProjectLeft::new((), cn);
+                        let mut slots = [None, None, None, None];
                         loop {
-                            let buf = cn.recv().await?;
-                            cn.send(buf).await?;
+                            let msgs = cn.recv(&mut slots).await?;
+                            cn.send(msgs.into_iter().map_while(|x| x.take())).await?;
                         }
                     })
                     .await
@@ -381,9 +408,10 @@ mod test {
                     c: "hello".to_owned(),
                 };
 
-                cn.send(obj.clone()).await.unwrap();
-                let r = cn.recv().await.unwrap();
-                assert_eq!(r, obj);
+                cn.send(std::iter::once(obj.clone())).await.unwrap();
+                let mut slots = [None; 1];
+                let r = cn.recv(&mut slots).await.unwrap();
+                assert_eq!(r[0].take().unwrap(), obj);
             }
             .instrument(tracing::info_span!("serialize_negotiate")),
         );

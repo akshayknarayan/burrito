@@ -223,19 +223,19 @@ where
 }
 
 pub struct ChanChunnel<Data> {
-    snd: Arc<Mutex<mpsc::Sender<Data>>>,
+    snd: mpsc::Sender<Data>,
     rcv: Arc<Mutex<mpsc::Receiver<Data>>>,
     link: Arc<dyn Fn(Option<Data>) -> Option<Data> + Send + Sync + 'static>,
 }
 
 impl<D> ChanChunnel<D> {
     fn new(
-        s: mpsc::Sender<D>,
+        snd: mpsc::Sender<D>,
         r: mpsc::Receiver<D>,
         link: Arc<dyn Fn(Option<D>) -> Option<D> + Send + Sync + 'static>,
     ) -> Self {
         Self {
-            snd: Arc::new(Mutex::new(s)),
+            snd,
             rcv: Arc::new(Mutex::new(r)),
             link,
         }
@@ -248,28 +248,29 @@ where
 {
     type Data = D;
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        let s = Arc::clone(&self.snd);
-        let link = Arc::clone(&self.link);
-
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
         Box::pin(async move {
-            if let Some(data) = link(Some(data)) {
-                s.lock()
-                    .await
-                    .send(data)
-                    .await
-                    .map_err(|_| eyre!("receiver channel dropped"))?;
-            } else {
-                debug!("dropping send");
+            for data in burst {
+                if let Some(data) = (self.link)(Some(data)) {
+                    self.snd
+                        .send(data)
+                        .await
+                        .map_err(|_| eyre!("receiver channel dropped"))?;
+                } else {
+                    debug!("dropping send");
+                }
             }
 
-            while let Some(d) = link(None) {
+            while let Some(d) = (self.link)(None) {
                 debug!("sending deferred segment");
-                s.lock()
-                    .await
+                self.snd
                     .send(d)
                     .await
                     .map_err(|_| eyre!("receiver channel dropped"))?;
@@ -279,11 +280,27 @@ where
         })
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let r = Arc::clone(&self.rcv);
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         Box::pin(async move {
-            let mut l = r.lock().await;
-            l.recv().await.ok_or_else(|| eyre!("All senders dropped"))
+            let mut r = self.rcv.lock().await;
+            msgs_buf[0] = Some(r.recv().await.ok_or_else(|| eyre!("All senders dropped"))?);
+            let mut slot_idx = 1;
+            while let Ok(m) = r.try_recv() {
+                msgs_buf[slot_idx] = Some(m);
+                slot_idx += 1;
+
+                if slot_idx >= msgs_buf.len() {
+                    break;
+                }
+            }
+
+            Ok(msgs_buf)
         })
     }
 }
@@ -323,14 +340,20 @@ mod test {
                     let mut st = srv.listen(()).await.unwrap();
                     s.send(()).unwrap();
                     let cn = st.next().await.unwrap().unwrap();
-                    let d = cn.recv().await.unwrap();
-                    cn.send(d).await.unwrap();
+
+                    let mut slot = [None];
+                    let d = cn.recv(&mut slot).await.unwrap();
+                    cn.send(d.into_iter().map(|x| x.take().unwrap()))
+                        .await
+                        .unwrap();
                 });
 
                 r.await?;
                 let cn = cln.connect(()).await?;
-                cn.send(((), vec![1u8; 8])).await?;
-                let (_, d) = cn.recv().await?;
+                cn.send(std::iter::once(((), vec![1u8; 8]))).await?;
+                let mut slot = [None];
+                let ms = cn.recv(&mut slot).await?;
+                let d = ms[0].take().unwrap().1;
 
                 assert_eq!(d, vec![1u8; 8]);
                 Ok::<_, Report>(())
@@ -369,11 +392,14 @@ mod test {
                         let idx = i;
                         i += 1;
                         async move {
+                            let mut slot = [None];
                             debug!("new connection");
                             loop {
-                                match cn.recv().await {
+                                match cn.recv(&mut slot).await {
                                     Ok(d) => {
-                                        cn.send(d).await.expect("server send");
+                                        cn.send(d.into_iter().map_while(Option::take))
+                                            .await
+                                            .expect("server send");
                                         debug!("echoed");
                                     }
                                     Err(e) => {
@@ -400,8 +426,11 @@ mod test {
                 async move {
                     let cn = cln1.connect(caddr1.clone()).await?;
 
-                    cn.send((caddr1.clone(), vec![1u8; 8])).await?;
-                    let (_, d) = cn.recv().await?;
+                    cn.send(std::iter::once((caddr1.clone(), vec![1u8; 8])))
+                        .await?;
+                    let mut slot = [None];
+                    let ms = cn.recv(&mut slot).await?;
+                    let d = ms[0].take().unwrap().1;
                     assert_eq!(d, vec![1u8; 8]);
                     Ok::<_, Report>(())
                 }
@@ -416,10 +445,12 @@ mod test {
                     let cn = cln2.connect(caddr2.clone()).await?;
                     info!("connected");
 
-                    cn.send((caddr2.clone(), vec![2u8; 8]))
+                    cn.send(std::iter::once((caddr2.clone(), vec![2u8; 8])))
                         .await
                         .wrap_err("client send")?;
-                    let (_, d) = cn.recv().await.wrap_err("client recv")?;
+                    let mut slot = [None];
+                    let ms = cn.recv(&mut slot).await?;
+                    let d = ms[0].take().unwrap().1;
                     assert_eq!(d, vec![2u8; 8]);
                     Ok::<_, Report>(())
                 }

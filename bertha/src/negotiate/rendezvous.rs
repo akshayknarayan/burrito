@@ -386,24 +386,37 @@ where
 {
     type Data = D;
 
-    fn send(&self, data: D) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+    fn send<'cn, R>(
+        &'cn self,
+        burst: R,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        R: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <R as IntoIterator>::IntoIter: Send,
+    {
         use Either::*;
         match self.current {
-            Left(ref a) => a.send(data),
-            Right(ref b) => b.send(data),
+            Left(ref a) => a.send(burst),
+            Right(ref b) => b.send(burst),
         }
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         use Either::*;
         match self.current {
-            Left(ref a) => a.recv(),
-            Right(ref b) => b.recv(),
+            Left(ref a) => a.recv(msgs_buf),
+            Right(ref b) => b.recv(msgs_buf),
         }
     }
 }
 
-impl<A, B, Acn, Bcn> UpgradeEitherConn<A, B, Acn, Bcn>
+impl<'c, A, B, Acn, Bcn> UpgradeEitherConn<A, B, Acn, Bcn>
 where
     A: Apply + Clone,
     B: Apply + Clone,
@@ -435,7 +448,7 @@ impl<A, B, Acn, Bcn> Drop for UpgradeEitherConnWrap<A, B, Acn, Bcn> {
     }
 }
 
-impl<D, A, B, Acn, Bcn> ChunnelConnection for UpgradeEitherConnWrap<A, B, Acn, Bcn>
+impl<'c, D, A, B, Acn, Bcn> ChunnelConnection for UpgradeEitherConnWrap<A, B, Acn, Bcn>
 where
     UpgradeEitherConn<A, B, Acn, Bcn>: ChunnelConnection<Data = D>,
     A: Apply + Clone + Send + Sync + 'static,
@@ -453,61 +466,79 @@ where
     D: Send + Sync + 'static,
 {
     type Data = D;
-    fn send(&self, data: D) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        use std::task::Poll;
-        let inner = Arc::clone(&self.inner);
-        let neg = Arc::clone(&self.negotiation);
+    fn send<'cn, R>(
+        &'cn self,
+        burst: R,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        R: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <R as IntoIterator>::IntoIter: Send,
+    {
         Box::pin(async move {
-            let mut upgrade_receiver = neg.lock().await;
-            // tokio::mpsc does not have try_recv: https://github.com/tokio-rs/tokio/pull/3263
-            let f = Box::pin(upgrade_receiver.recv());
-            if let Poll::Ready(Some(upgrade)) = futures_util::poll!(f) {
+            if let Ok(upgrade) = self.negotiation.lock().await.try_recv() {
                 debug!("applying upgraded semantics (send)");
-                inner.lock().await.try_upgrade(upgrade).await?;
+                self.inner.lock().await.try_upgrade(upgrade).await?;
             }
 
-            std::mem::drop(upgrade_receiver);
-            inner.lock().await.send(data).await
+            self.inner.lock().await.send(burst).await
         })
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        let neg = Arc::clone(&self.negotiation);
-        let upgrade_fut = async move {
-            let mut rg = neg.lock().await;
-            if let Some(u) = rg.recv().await {
-                u
-            } else {
-                std::mem::drop(rg);
-                future::pending().await
-            }
-        };
-        let inner2 = Arc::clone(&self.inner);
-        let recv_fut = async move { inner.lock().await.recv().await };
-
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         Box::pin(async move {
+            let upgrade_fut = async move {
+                let mut rg = self.negotiation.lock().await;
+                if let Some(u) = rg.recv().await {
+                    u
+                } else {
+                    std::mem::drop(rg);
+                    future::pending().await
+                }
+            };
+
+            let mut slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+            let slots_borrow = &mut slots;
+            let recv_fut = async move { self.inner.lock().await.recv(slots_borrow).await };
+
             // We need to `Box::pin` this so that the `drop` call below actually drops the future,
             // instead of dropping a `Pin` of the future. We need to actually drop the future so
             // that it drops the `MutexGuard` it holds, so the lock doesn't deadlock.
             let recv_fut = Box::pin(recv_fut);
             let upgrade_fut = Box::pin(upgrade_fut);
-            match future::select(recv_fut, upgrade_fut).await {
-                future::Either::Left((recvd, _)) => recvd,
+            // we need a temporary variable here to let the compiler figure out slots_borrow will
+            // be dropped before slots
+            let x = match future::select(recv_fut, upgrade_fut).await {
+                future::Either::Left((recvd, _)) => {
+                    let mut slot_idx = 0;
+                    for r in recvd?.into_iter().map_while(Option::take) {
+                        msgs_buf[slot_idx] = Some(r);
+                        slot_idx += 1;
+                    }
+
+                    Ok(&mut msgs_buf[..slot_idx])
+                }
                 future::Either::Right((upgrade, recvr)) => {
                     debug!("received on upgrade channel");
                     std::mem::drop(recvr); // cancel the future and drop, so its lock on inner is dropped.
-                    let mut inner = inner2.lock().await;
+                    let mut inner = self.inner.lock().await;
                     debug!("applying upgraded semantics (recv)");
                     inner.try_upgrade(upgrade).await?;
-                    inner.recv().await
+                    inner.recv(msgs_buf).await
                 }
-            }
+            };
+
+            x
         })
     }
 }
 
-impl<D, A, B, Acn, Bcn> UpgradeEitherConnWrap<A, B, Acn, Bcn>
+impl<'c, D, A, B, Acn, Bcn> UpgradeEitherConnWrap<A, B, Acn, Bcn>
 where
     UpgradeEitherConn<A, B, Acn, Bcn>: ChunnelConnection<Data = D>,
     A: Pick + Apply + GetOffers + Clone + Debug + Send + 'static,
@@ -669,7 +700,7 @@ where
 
 /// Rendezvous-based negotiation.
 #[instrument(skip(stack, rendezvous_point))]
-pub async fn negotiate_rendezvous<Sleft, Sright, SleftCn, SrightCn, R>(
+pub async fn negotiate_rendezvous<'c, Sleft, Sright, SleftCn, SrightCn, R>(
     stack: UpgradeSelect<Sleft, Sright>,
     mut rendezvous_point: R,
     addr: String,
