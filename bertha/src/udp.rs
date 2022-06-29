@@ -120,7 +120,7 @@ pub(crate) fn peel_one<S: TokioDatagramSk, A: From<S::Addr>>(
                 b.1.truncate(n);
                 Ok(())
             } else {
-                *dst_buf = Some((addr.into(), buf.to_vec()));
+                *dst_buf = Some((addr.into(), buf[..n].to_vec()));
                 Ok(())
             }
         }

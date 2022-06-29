@@ -154,8 +154,12 @@ where
     {
         Box::pin(
             async move {
-                let mut num_slots_remaining = msgs_buf.len();
+                let mut slot_idx = 0;
                 'peel: loop {
+                    if slot_idx >= msgs_buf.len() {
+                        return Ok(msgs_buf);
+                    }
+
                     for mut e in self.state.iter_mut() {
                         let (a, st) = e.pair_mut();
                         if let Some(DataPair(seq, _)) = st.recvd.peek() {
@@ -167,8 +171,8 @@ where
                             if pop {
                                 trace!(addr = ?a, seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "returning ordered packet");
                                 st.expected_recv += 1;
-                                msgs_buf[msgs_buf.len() - num_slots_remaining] = Some(st.recvd.pop().unwrap().1);
-                                num_slots_remaining -= 1;
+                                msgs_buf[slot_idx] = Some(st.recvd.pop().unwrap().1);
+                                slot_idx += 1;
                                 continue 'peel;
                             } else {
                                 trace!(addr = ?a, head_seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "calling inner recv");
@@ -177,18 +181,18 @@ where
                     }
 
                     // need to fill.
-                    let mut slots: Vec<_> = (0..num_slots_remaining).map(|_| None).collect();
+                    let mut slots: Vec<_> = (0..msgs_buf.len() - slot_idx).map(|_| None).collect();
                     let msgs = self.inner.recv(&mut slots).await?;
 
-                    let tot_slots = msgs_buf.len();
-                    for ((from, (seq, data)), slot) in msgs.into_iter().map_while(Option::take).zip(msgs_buf[tot_slots - num_slots_remaining..].iter_mut()) {
+                    for (from, (seq, data)) in msgs.into_iter().map_while(Option::take) {
                         trace!(seq = ?seq, ?from, "received pkt, locking state");
                         let mut st = self.state.entry(from.clone()).or_default();
                         #[allow(clippy::comparison_chain)]
                         if seq == st.expected_recv {
                             trace!(seq = ?seq, ?from, "received in-order");
                             st.expected_recv += 1;
-                            *slot = Some((from, data));
+                            msgs_buf[slot_idx] = Some((from, data));
+                            slot_idx += 1;
                         } else if seq > st.expected_recv {
                             trace!(seq = ?seq, ?from, expected = ?st.expected_recv, "received out-of-order");
                             st.recvd.push((seq, (from, data)).into());
@@ -263,7 +267,12 @@ mod test {
 
         let ms = msgs.clone();
         tokio::spawn(
-            async move { snd_ch.send(msgs).await }.instrument(tracing::debug_span!("sender")),
+            async move {
+                snd_ch.send(msgs).await?;
+                let _: () = futures_util::future::pending().await;
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::debug_span!("sender")),
         );
 
         let msgs = ms;
@@ -271,6 +280,7 @@ mod test {
         let mut cnt = 0;
         let mut slots: Vec<_> = (0..8).map(|_| None).collect();
         loop {
+            debug!("calling recv");
             let ms = rcv_ch.recv(&mut slots).await.unwrap();
             for m in ms.into_iter().map_while(Option::take) {
                 debug!(m = ?m, "rcvd");
@@ -354,8 +364,8 @@ mod test {
                             debug!(cnt = ?c, msg=?x, deferred = st.len(), "sending packet");
                             Some(x)
                         }
-                    } else if *c > 8 && !st.is_empty() {
-                        debug!(cnt = ?c, msg = ?&st[0], deferred = st.len(), "sending packet");
+                    } else if *c >= 8 && !st.is_empty() {
+                        debug!(cnt = ?c, msg = ?&st.last(), deferred = st.len(), "sending deferred packet");
                         st.pop()
                     } else {
                         None

@@ -266,14 +266,14 @@ where
                 } else {
                     debug!("dropping send");
                 }
-            }
 
-            while let Some(d) = (self.link)(None) {
-                debug!("sending deferred segment");
-                self.snd
-                    .send(d)
-                    .await
-                    .map_err(|_| eyre!("receiver channel dropped"))?;
+                while let Some(d) = (self.link)(None) {
+                    debug!("sending deferred segment");
+                    self.snd
+                        .send(d)
+                        .await
+                        .map_err(|_| eyre!("receiver channel dropped"))?;
+                }
             }
 
             Ok(())
