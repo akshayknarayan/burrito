@@ -291,6 +291,10 @@ where
             let mut r = self.rcv.lock().await;
             msgs_buf[0] = Some(r.recv().await.ok_or_else(|| eyre!("All senders dropped"))?);
             let mut slot_idx = 1;
+            if slot_idx >= msgs_buf.len() {
+                return Ok(msgs_buf);
+            }
+
             while let Ok(m) = r.try_recv() {
                 msgs_buf[slot_idx] = Some(m);
                 slot_idx += 1;

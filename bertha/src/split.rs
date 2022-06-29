@@ -285,9 +285,11 @@ mod t {
                         let mut slots = [None, None];
                         info!("starting receiver");
                         loop {
-                            let m = rcv.recv(&mut slots).await.unwrap();
-                            debug!(m = ?m, "rcvd");
-                            done_s.send(()).await.unwrap();
+                            let ms = rcv.recv(&mut slots).await.unwrap();
+                            debug!(?ms, "rcvd");
+                            for _ in ms {
+                                done_s.send(()).await.unwrap();
+                            }
                         }
                     }
                     .instrument(info_span!("receiver")),
