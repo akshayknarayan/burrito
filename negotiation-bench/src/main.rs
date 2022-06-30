@@ -1,5 +1,5 @@
 use bertha::{
-    bincode::SerializeChunnelProject,
+    bincode::SerializeChunnel,
     negotiate_client, negotiate_rendezvous, negotiate_server,
     udp::{UdpReqChunnel, UdpSkChunnel},
     util::{NeverCn, ProjectLeft},
@@ -8,6 +8,7 @@ use bertha::{
 };
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use redis_basechunnel::RedisBase;
+use std::iter::once;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
@@ -130,9 +131,10 @@ async fn server_rendezvous(addr: SocketAddr, redis: RedisBase) -> Result<(), Rep
     ))
     .into();
     let cn = negotiate_rendezvous(st, redis, format!("{:?}", addr)).await?;
+    let mut slots = [None, None];
     loop {
-        let d = cn.recv().await?;
-        cn.send(d).await?;
+        let ms = cn.recv(&mut slots).await?;
+        cn.send(ms.into_iter().map_while(Option::take)).await?;
     }
 }
 
@@ -148,23 +150,25 @@ async fn client_rendezvous(addr: SocketAddr, redis: RedisBase) -> Result<Duratio
     .into();
     let cn = negotiate_rendezvous(st, redis, format!("{:?}", addr)).await?;
     trace!("finished negotiation");
-    cn.send((addr, t)).await?;
-    let (_, m) = cn.recv().await?;
+    cn.send(once((addr, t))).await?;
+    let mut slot = [None];
+    let (_, m) = cn.recv(&mut slot).await?[0]
+        .take()
+        .ok_or_else(|| eyre!("No Msg"))?;
     Ok(m.elapsed(start))
+}
+
+#[instrument(skip(cn), err, level = "debug")]
+async fn one_conn(cn: impl ChunnelConnection<Data = (SocketAddr, TimeMsg)>) -> Result<(), Report> {
+    let mut slots = [None, None];
+    let ms = cn.recv(&mut slots).await?;
+    cn.send(ms.into_iter().map_while(Option::take)).await?;
+    trace!("conn done");
+    Ok(())
 }
 
 #[instrument(err, level = "info")]
 async fn server_raw(addr: SocketAddr) -> Result<(), Report> {
-    #[instrument(skip(cn), err, level = "debug")]
-    async fn one_conn(
-        cn: impl ChunnelConnection<Data = (SocketAddr, TimeMsg)>,
-    ) -> Result<(), Report> {
-        let d = cn.recv().await?;
-        cn.send(d).await?;
-        trace!("conn done");
-        Ok(())
-    }
-
     let c = TimeMsgChunnel::default();
     let mut st = UdpReqChunnel::default().listen(addr).await?;
     use futures_util::stream::TryStreamExt;
@@ -186,8 +190,11 @@ async fn client_raw(addr: SocketAddr, num_reqs: usize) -> Result<Vec<Duration>, 
         let cn = TimeMsgChunnel::default().connect_wrap(cn).await?;
         let cn = ProjectLeft::new(addr, cn);
         trace!("finished negotiation");
-        cn.send(t).await?;
-        let m = cn.recv().await?;
+        cn.send(once(t)).await?;
+        let mut slot = [None];
+        let m = cn.recv(&mut slot).await?[0]
+            .take()
+            .ok_or_else(|| eyre!("No Msg"))?;
         durs.push(m.elapsed(start));
     }
 
@@ -196,16 +203,6 @@ async fn client_raw(addr: SocketAddr, num_reqs: usize) -> Result<Vec<Duration>, 
 
 #[instrument(err, level = "info")]
 async fn server_direct(addr: SocketAddr) -> Result<(), Report> {
-    #[instrument(skip(cn), err, level = "debug")]
-    async fn one_conn(
-        cn: impl ChunnelConnection<Data = (SocketAddr, TimeMsg)>,
-    ) -> Result<(), Report> {
-        let d = cn.recv().await?;
-        cn.send(d).await?;
-        trace!("conn done");
-        Ok(())
-    }
-
     let mut st = negotiate_server(
         TimeMsgChunnel::default(),
         UdpReqChunnel::default().listen(addr).await?,
@@ -235,8 +232,11 @@ async fn client_direct(addr: SocketAddr, num_reqs: usize) -> Result<Vec<Duration
             .await?,
         );
         trace!("finished negotiation");
-        cn.send(t).await?;
-        let m = cn.recv().await?;
+        cn.send(once(t)).await?;
+        let mut slot = [None];
+        let m = cn.recv(&mut slot).await?[0]
+            .take()
+            .ok_or_else(|| eyre!("No Msg"))?;
         durs.push(m.elapsed(start));
     }
 
@@ -262,8 +262,11 @@ async fn client_direct_zerortt(addr: SocketAddr, num_reqs: usize) -> Result<Vec<
     let t = TimeMsg::new(start);
     let cn = ProjectLeft::new(addr, cn);
     trace!("finished negotiation");
-    cn.send(t).await?;
-    let m = cn.recv().await?;
+    cn.send(once(t)).await?;
+    let mut slot = [None];
+    let m = cn.recv(&mut slot).await?[0]
+        .take()
+        .ok_or_else(|| eyre!("No Msg"))?;
     durs.push(m.elapsed(start));
 
     for i in 1..num_reqs {
@@ -280,8 +283,10 @@ async fn client_direct_zerortt(addr: SocketAddr, num_reqs: usize) -> Result<Vec<
                 .await?,
         );
         trace!("finished negotiation");
-        cn.send(t).await?;
-        let m = cn.recv().await?;
+        cn.send(once(t)).await?;
+        let m = cn.recv(&mut slot).await?[0]
+            .take()
+            .ok_or_else(|| eyre!("No Msg"))?;
         durs.push(m.elapsed(start));
     }
 
@@ -312,15 +317,15 @@ impl TimeMsg {
 }
 
 #[derive(Clone, Debug, Default)]
-struct TimeMsgChunnel(SerializeChunnelProject<TimeMsg>);
+struct TimeMsgChunnel(SerializeChunnel<TimeMsg>);
 
 impl<InC> Chunnel<InC> for TimeMsgChunnel
 where
-    SerializeChunnelProject<TimeMsg>: Chunnel<InC>,
+    SerializeChunnel<TimeMsg>: Chunnel<InC>,
 {
-    type Future = <SerializeChunnelProject<TimeMsg> as Chunnel<InC>>::Future;
-    type Connection = <SerializeChunnelProject<TimeMsg> as Chunnel<InC>>::Connection;
-    type Error = <SerializeChunnelProject<TimeMsg> as Chunnel<InC>>::Error;
+    type Future = <SerializeChunnel<TimeMsg> as Chunnel<InC>>::Future;
+    type Connection = <SerializeChunnel<TimeMsg> as Chunnel<InC>>::Connection;
+    type Error = <SerializeChunnel<TimeMsg> as Chunnel<InC>>::Error;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
         self.0.connect_wrap(cn)
