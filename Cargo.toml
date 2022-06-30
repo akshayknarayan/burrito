@@ -3,7 +3,6 @@
 members = [
     "bertha",
     "shenango-bertha",
-    "batcher",
     "burrito-localname-ctl",
     "burrito-shard-ctl",
     "kvstore",
@@ -18,7 +17,6 @@ members = [
     "sqs",
     "kafka",
     "queue-steer",
-    "round-order",
     "redis-basechunnel",
     "tls-tunnel",
     "negotiation-bench",
