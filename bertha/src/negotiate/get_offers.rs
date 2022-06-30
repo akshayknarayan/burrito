@@ -50,9 +50,9 @@ where
 /// The number of enumerated stacks will be 2^(number of selects).
 ///
 /// ```rust
-/// # use bertha::{reliable::ReliabilityProjChunnel, tagger::OrderedChunnelProj, CxList,
+/// # use bertha::{tagger::OrderedChunnel, bincode::SerializeChunnel, CxList,
 /// negotiate::GetOffers};
-/// let ls = CxList::from(OrderedChunnelProj::default()).wrap(ReliabilityProjChunnel::default());
+/// let ls = CxList::from(OrderedChunnel::default()).wrap(SerializeChunnel::<u32>::default());
 /// let offers: Vec<_> = ls.offers().collect();
 /// println!("{:?}", offers);
 /// ```
