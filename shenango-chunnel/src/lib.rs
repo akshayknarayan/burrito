@@ -323,30 +323,61 @@ impl ShenangoUdpSk {
 impl ChunnelConnection for ShenangoUdpSk {
     type Data = (SocketAddr, Vec<u8>);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
         use SocketAddr::*;
-        match data {
-            (V4(addr), d) => {
-                self.outgoing
-                    .send(Msg { addr, buf: d })
-                    .expect("shenango won't drop");
-                Box::pin(ready(Ok(())))
+        for data in burst {
+            match data {
+                (V4(addr), d) => {
+                    // unbounded channel will not block.
+                    self.outgoing
+                        .send(Msg { addr, buf: d })
+                        .expect("shenango won't drop");
+                }
+                (V6(a), _) => {
+                    return Box::pin(ready(Err(eyre!("Only IPv4 is supported: {:?}", a))))
+                }
             }
-            (V6(a), _) => Box::pin(ready(Err(eyre!("Only IPv4 is supported: {:?}", a)))),
         }
+
+        Box::pin(ready(Ok(())))
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let inc = self.incoming.clone();
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         Box::pin(async move {
-            let Msg { addr: a, buf: d } = inc
+            let Msg { addr: a, buf: d } = self
+                .incoming
                 .recv_async()
                 .await
-                .expect("shenango side will never drop");
-            Ok((SocketAddr::V4(a), d))
+                .wrap_err(eyre!("All senders dropped"))?;
+            msgs_buf[0] = Some((SocketAddr::V4(a), d));
+            let mut slot_idx = 1;
+            if slot_idx >= msgs_buf.len() {
+                return Ok(msgs_buf);
+            }
+
+            while let Ok(Msg { addr: a, buf: d }) = self.incoming.try_recv() {
+                msgs_buf[slot_idx] = Some((SocketAddr::V4(a), d));
+                slot_idx += 1;
+
+                if slot_idx >= msgs_buf.len() {
+                    break;
+                }
+            }
+
+            Ok(msgs_buf)
         })
     }
 }
