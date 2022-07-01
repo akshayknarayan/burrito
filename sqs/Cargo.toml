@@ -11,13 +11,13 @@ color-eyre = "0.6"
 tracing = { version = "0.1" }
 tracing-futures = "0.2"
 futures-util = "0.3"
-rusoto_core = "0.47"
-rusoto_sqs = "0.47"
-rusoto_credential = "0.47"
-rand = "0.7"
-base64 = "0.13"
+rusoto_core = "0.48"
+rusoto_sqs = "0.48"
+rusoto_credential = "0.48"
+rand = "0.8"
+base64 = "0.21"
 serde = "1"
 
 [dev-dependencies]
-tracing-subscriber = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-error = "0.2"
