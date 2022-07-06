@@ -5,7 +5,7 @@ authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2021"
 
 [features]
-bin = ["batcher", "structopt", "tracing-subscriber", "tracing-error", "redis-basechunnel"]
+bin = ["structopt", "tracing-subscriber", "tracing-error", "redis-basechunnel"]
 
 [dependencies]
 sqs = { path = "../sqs" }
@@ -13,7 +13,6 @@ gcp-pubsub = { path = "../gcp-pubsub" }
 az-queues = { path = "../az-queues" }
 kafka = { path = "../kafka" }
 bertha = { path = "../bertha" }
-batcher = { path = "../batcher", optional = true }
 futures-util = "0.3"
 base64 = "0.13"
 color-eyre = "=0.5.7"
