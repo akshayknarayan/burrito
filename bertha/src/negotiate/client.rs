@@ -15,7 +15,7 @@ use std::sync::{
 use std::{future::Future, pin::Pin};
 use tracing::{debug, trace};
 
-pub type NegotiatedConn<'c, C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
+pub type NegotiatedConn<C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
 
 pub struct ClientNegotiator<A> {
     nonces: HashMap<A, StackNonce>,
@@ -126,7 +126,7 @@ pub fn negotiate_client<'c, C, A, S>(
     stack: S,
     cn: C,
     addr: A,
-) -> impl Future<Output = Result<NegotiatedConn<'c, C, S>, Report>> + Send + 'static
+) -> impl Future<Output = Result<NegotiatedConn<C, S>, Report>> + Send + 'static
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     S: Apply + GetOffers + Clone + Send + 'static,
@@ -145,7 +145,7 @@ pub fn negotiate_client_fetch_nonce<'c, C, A, S>(
     stack: S,
     cn: C,
     addr: A,
-) -> impl Future<Output = Result<(NegotiatedConn<'c, C, S>, StackNonce), Report>> + Send + 'static
+) -> impl Future<Output = Result<(NegotiatedConn<C, S>, StackNonce), Report>> + Send + 'static
 where
     C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     S: Apply + GetOffers + Clone + Send + 'static,

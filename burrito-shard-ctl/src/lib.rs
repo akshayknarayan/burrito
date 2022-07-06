@@ -249,18 +249,19 @@ where
                             return;
                         }
                     };
-                    if let Err(e) = cn.send((shard.clone(), buf.clone())).await {
+                    if let Err(e) = cn.send(std::iter::once((shard.clone(), buf.clone()))).await {
                         warn!(err = ?e, "failed sending negotiation nonce to shard");
                         return;
                     }
 
                     trace!("wait for nonce ack");
-                    match cn.recv().await {
-                        Ok((a, buf)) => match bincode::deserialize(&buf) {
+                    let mut slot = [None];
+                    match cn.recv(&mut slot).await {
+                        Ok([Some((a, buf))]) => match bincode::deserialize(&buf) {
                             Ok(bertha::negotiate::NegotiateMsg::ServerNonceAck) => {
                                 // TODO collect received addresses since we could receive acks from
                                 // any shard
-                                if a != shard.clone() {
+                                if *a != shard.clone() {
                                     warn!(addr = ?a, expected = ?shard.clone(), "received from unexpected address");
                                 }
 
@@ -273,6 +274,9 @@ where
                                 warn!(err = ?e, shard = ?shard.clone(), "failed deserializing nonce ack");
                             }
                         },
+                        Ok(_) => {
+                            warn!("got empty response to nonce");
+                        }
                         Err(e) => {
                             warn!(err = ?e, shard = ?shard.clone(), "failed waiting for nonce ack");
                         }
@@ -327,7 +331,7 @@ where
                 let num_shards = addr.shard_addrs.len();
 
                 // connect to shards
-                let conns: Vec<Arc<_>> =
+                let conns: Vec<_> =
                     futures_util::future::join_all(internal_addr.into_iter().map(|a| async {
                         debug!(?a, "connecting to shard");
                         let a = a;
@@ -344,7 +348,7 @@ where
                         )
                         .await
                         .wrap_err("negotiate_client failed")?;
-                        Ok::<_, Error>(Arc::new(cn))
+                        Ok::<_, Error>(cn)
                     }))
                     .await
                     .into_iter()
@@ -356,7 +360,7 @@ where
                 // serve canonical address
                 // we are only responsible for the canonical address here.
                 Ok(ShardCanonicalServerConnection {
-                    inner: Arc::new(conn),
+                    inner: conn,
                     shards: conns,
                     shard_fn: Arc::new(move |d: &D| {
                         /* xdp_shard version of FNV: take the first 4 bytes of the key
@@ -491,7 +495,7 @@ where
                 let num_shards = addr.shard_addrs.len();
 
                 // negotiate with shards
-                let conns: Vec<Arc<_>> =
+                let conns: Vec<_> =
                     futures_util::future::join_all(internal_addr.into_iter().map(|a| async {
                         debug!(?a, "connecting to shard");
                         let a = a;
@@ -519,7 +523,7 @@ where
                         )
                         .await
                         .wrap_err("negotiate_client failed")?;
-                        Ok::<_, Error>(Arc::new(cn))
+                        Ok::<_, Error>(cn)
                     }))
                     .await
                     .into_iter()
@@ -531,7 +535,7 @@ where
                 // serve canonical address
                 // we are only responsible for the canonical address here.
                 Ok(ShardCanonicalServerConnection {
-                    inner: Arc::new(conn),
+                    inner: conn,
                     shards: conns,
                     shard_fn: Arc::new(move |d: &(_, Vec<u8>)| {
                         let mut hash = FNV1_64_INIT;
@@ -555,8 +559,8 @@ where
 /// the Data type is `()`, since any received message is forwarded to the appropriate shard.
 /// Expected usage is to call `recv()` in a loop.
 pub struct ShardCanonicalServerConnection<C, S, D> {
-    inner: Arc<C>,
-    shards: Vec<Arc<S>>,
+    inner: C,
+    shards: Vec<S>,
     shard_fn: Arc<dyn Fn(&D) -> usize + Send + Sync + 'static>,
 }
 
@@ -568,12 +572,15 @@ where
 {
     type Data = ();
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        let shard_fn = Arc::clone(&self.shard_fn);
-        let shard_conns = self.shards.clone();
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<
+        Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], eyre::Report>> + Send + 'cn>,
+    >
+    where
+        'buf: 'cn,
+    {
         Box::pin(
             async move {
                 // received a packet on the canonical_addr.
@@ -583,39 +590,74 @@ where
                 //    preserving the src addr so the response goes back to the client
 
                 // 0. receive the packet.
-                let data = inner.recv().await?;
-                trace!("got request");
+                let mut slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+                let ms = self.inner.recv(&mut slots).await?;
+                trace!("got request batch");
 
-                // 1. evaluate the hash fn to determine where to forward to.
-                let shard_idx = (shard_fn)(&data);
-                let conn = shard_conns[shard_idx].clone();
-                trace!(shard_idx, "checked shard");
+                let mut shard_batches: Vec<Vec<D>> =
+                    (0..self.shards.len()).map(|_| Vec::new()).collect();
+                for data in ms.iter_mut().map_while(Option::take) {
+                    // 1. evaluate the hash fn to determine where to forward to.
+                    let shard_idx = (self.shard_fn)(&data);
+                    trace!(shard_idx, "checked shard");
+                    shard_batches[shard_idx].push(data);
+                }
 
                 // 2. Forward to the shard.
                 // TODO this assumes no reordering.
-                conn.send(data).await.wrap_err("Forward to shard")?;
-                trace!(shard_idx, "wait for shard response");
+                let mut shard_completion_slots: Vec<Vec<_>> = shard_batches
+                    .iter()
+                    .map(|batch| (0..batch.len()).map(|_| None).collect())
+                    .collect();
+                let shard_completion_futs = self
+                    .shards
+                    .iter()
+                    .zip(shard_batches.into_iter())
+                    .zip(&mut shard_completion_slots)
+                    .enumerate()
+                    .filter_map(|(shard_idx, ((conn, batch), slots))| {
+                        if !batch.is_empty() {
+                            Some(async move {
+                                conn.send(batch).await.wrap_err("Forward to shard")?;
+                                // 3. Get response from the shard
+                                let resps = conn
+                                    .recv(&mut slots[..])
+                                    .instrument(trace_span!(
+                                        "canonical-server-internal-recv",
+                                        ?shard_idx
+                                    ))
+                                    .await
+                                    .wrap_err("receive from shard")?;
+                                Ok::<_, eyre::Report>((shard_idx, resps))
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                let resps = futures_util::future::try_join_all(shard_completion_futs).await?;
+                trace!("got shard responses");
+                for (shard_idx, resp_batch) in resps {
+                    // 4. Send back to client.
+                    self.inner
+                        .send(resp_batch.iter_mut().map_while(Option::take))
+                        .await?;
+                    trace!(shard_idx, "send response");
+                }
 
-                // 3. Get response from the shard, and send back to client.
-                let resp = conn
-                    .recv()
-                    .instrument(trace_span!("canonical-server-internal-recv"))
-                    .await
-                    .wrap_err("Receive from shard")?;
-                trace!(shard_idx, "got shard response");
-                let resp_fut = inner.send(resp);
-                tokio::spawn(resp_fut);
-                trace!(shard_idx, "send response");
-                Ok(())
+                Ok(&mut msgs_buf[0..0])
             }
             .instrument(trace_span!("server-shard-recv")),
         )
     }
 
-    fn send(
+    fn send<'cn, B>(
         &self,
-        _data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
+        _data: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
         warn!("Called ShardCanonicalServerConnection.send(), a useless function");
         Box::pin(async move { Ok(()) })
     }
@@ -763,7 +805,7 @@ pub struct ClientShardClientConnection<A, D, C>
 where
     C: ChunnelConnection<Data = (A, D)>,
 {
-    inner: Arc<C>,
+    inner: C,
     shard_addrs: Vec<A>,
     shard_fn: Arc<dyn Fn(&D) -> usize + Send + Sync + 'static>,
 }
@@ -778,7 +820,7 @@ where
         shard_fn: impl Fn(&D) -> usize + Send + Sync + 'static,
     ) -> Self {
         ClientShardClientConnection {
-            inner: Arc::new(inner),
+            inner,
             shard_addrs,
             shard_fn: Arc::new(shard_fn),
         }
@@ -793,28 +835,31 @@ where
 {
     type Data = (A, D);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        // figure out which shard to send to.
-        let shard_idx = (self.shard_fn)(&data.1);
-        let a = self.shard_addrs[shard_idx].clone();
-        Box::pin(async move {
-            let _ = &data;
-            inner.send((a, data.1)).await
-        })
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.inner.send(burst.into_iter().map(|(_, payload)| {
+            let shard_idx = (self.shard_fn)(&payload);
+            let a = self.shard_addrs[shard_idx].clone();
+            (a, payload)
+        }))
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(async move {
-            let p = inner.recv().await?;
-            Ok(p)
-        })
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<
+        Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], eyre::Report>> + Send + 'cn>,
+    >
+    where
+        'buf: 'cn,
+    {
+        self.inner.recv(msgs_buf)
     }
 }
 
@@ -904,7 +949,7 @@ pub mod static_client {
     where
         C: ChunnelConnection<Data = (A, D)>,
     {
-        inner: Arc<C>,
+        inner: C,
         shard_addrs: Vec<A>,
         shard_fn: Arc<dyn Fn(&D) -> usize + Send + Sync + 'static>,
     }
@@ -919,7 +964,7 @@ pub mod static_client {
             shard_fn: impl Fn(&D) -> usize + Send + Sync + 'static,
         ) -> Self {
             ClientShardClientConnection {
-                inner: Arc::new(inner),
+                inner,
                 shard_addrs,
                 shard_fn: Arc::new(shard_fn),
             }
@@ -934,29 +979,35 @@ pub mod static_client {
     {
         type Data = (A, D);
 
-        fn send(
-            &self,
-            data: Self::Data,
-        ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-            let inner = Arc::clone(&self.inner);
-            // figure out which shard to send to.
-            let shard_idx = (self.shard_fn)(&data.1);
-            let a = self.shard_addrs[shard_idx].clone();
-            Box::pin(async move {
-                let _ = &data;
-                inner.send((a, data.1)).await
-            })
+        fn send<'cn, B>(
+            &'cn self,
+            burst: B,
+        ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'cn>>
+        where
+            B: IntoIterator<Item = Self::Data> + Send + 'cn,
+            <B as IntoIterator>::IntoIter: Send,
+        {
+            self.inner.send(burst.into_iter().map(|(_, payload)| {
+                let shard_idx = (self.shard_fn)(&payload);
+                let a = self.shard_addrs[shard_idx].clone();
+                (a, payload)
+            }))
         }
 
-        fn recv(
-            &self,
-        ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>>
+        fn recv<'cn, 'buf>(
+            &'cn self,
+            msgs_buf: &'buf mut [Option<Self::Data>],
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<&'buf mut [Option<Self::Data>], eyre::Report>>
+                    + Send
+                    + 'cn,
+            >,
+        >
+        where
+            'buf: 'cn,
         {
-            let inner = Arc::clone(&self.inner);
-            Box::pin(async move {
-                let p = inner.recv().await?;
-                Ok(p)
-            })
+            self.inner.recv(msgs_buf)
         }
     }
 }
@@ -971,12 +1022,10 @@ mod ebpf;
 mod test {
     use super::{ClientShardChunnelClient, Kv, ShardCanonicalServer, ShardInfo};
     use bertha::{
-        bincode::SerializeChunnelProject,
+        bincode::SerializeChunnel,
         chan_transport::RendezvousChannel,
         negotiate::StackNonce,
-        reliable::ReliabilityProjChunnel,
         select::SelectListener,
-        tagger::TaggerProjChunnel,
         udp::{UdpReqChunnel, UdpSkChunnel},
         util::{Nothing, ProjectLeft},
         ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
@@ -1013,9 +1062,7 @@ mod test {
         internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, bertha::chan_transport::Srv>,
         s: tokio::sync::oneshot::Sender<Vec<StackNonce>>,
     ) {
-        let external = CxList::from(TaggerProjChunnel)
-            .wrap(ReliabilityProjChunnel::default())
-            .wrap(SerializeChunnelProject::default());
+        let external = SerializeChunnel::default();
         let stack = external.clone();
         info!(addr = ?&addr, "listening");
         let st = SelectListener::new(UdpReqChunnel::default(), internal_srv)
@@ -1033,12 +1080,15 @@ mod test {
             .try_for_each_concurrent(None, |cn| {
                 async move {
                     debug!("new");
+                    let mut slots = [None, None, None, None];
                     loop {
-                        let (a, msg): (_, Msg) =
-                            cn.recv().await.wrap_err(eyre!("receive message error"))?;
-                        debug!(msg = ?&msg, "got msg");
+                        let ms: &mut [Option<(_, Msg)>] = cn
+                            .recv(&mut slots)
+                            .await
+                            .wrap_err(eyre!("receive message error"))?;
+                        debug!("got msg batch");
                         // just echo.
-                        cn.send((a, msg))
+                        cn.send(ms.iter_mut().map_while(Option::take))
                             .await
                             .wrap_err(eyre!("send response err"))?;
                         debug!("sent echo");
@@ -1084,21 +1134,21 @@ mod test {
                 );
 
                 let _ = r.await.wrap_err("shard thread crashed").unwrap();
-                let stack = CxList::from(TaggerProjChunnel)
-                    .wrap(ReliabilityProjChunnel::default())
-                    .wrap(SerializeChunnelProject::default());
+                let stack = SerializeChunnel::default();
 
                 async fn do_msg(cn: impl ChunnelConnection<Data = Msg>) {
                     debug!("send request");
-                    cn.send(Msg {
+                    cn.send(std::iter::once(Msg {
                         k: "c".to_owned(),
                         v: "d".to_owned(),
-                    })
+                    }))
                     .await
                     .unwrap();
 
                     debug!("await response");
-                    let m = cn.recv().await.unwrap();
+                    let mut slot = [None];
+                    let ms = cn.recv(&mut slot).await.unwrap();
+                    let m = ms[0].take().unwrap();
                     debug!(msg = ?m, "got response");
                     assert_eq!(m.key(), "c");
                     assert_eq!(m.val(), "d");
@@ -1184,9 +1234,7 @@ mod test {
             si.clone(),
             None,
             internal_cli,
-            CxList::from(TaggerProjChunnel)
-                .wrap(ReliabilityProjChunnel::default())
-                .wrap(SerializeChunnelProject::default()),
+            SerializeChunnel::default(),
             offers.pop().unwrap().pop().unwrap(),
             &redis_addr,
         )
@@ -1197,10 +1245,7 @@ mod test {
         // ReliabilityChunnel: (A, _) -> (A, (u32, Msg))
         // TaggerChunnel: (A, (u32, Msg)) -> (A, Msg)
         // ShardCanonicalServer: (A, Msg) -> ()
-        let external = CxList::from(cnsrv)
-            .wrap(TaggerProjChunnel)
-            .wrap(ReliabilityProjChunnel::default())
-            .wrap(SerializeChunnelProject::default());
+        let external = CxList::from(cnsrv).wrap(SerializeChunnel::default());
         info!(shard_info = ?&si, "start canonical server");
         let st = UdpReqChunnel::default()
             .listen(si.canonical_addr)
@@ -1216,8 +1261,9 @@ mod test {
                 if let Err(e) = st
                     .try_for_each_concurrent(None, |r| {
                         async move {
+                            let mut slot = [None];
                             loop {
-                                r.recv().await?; // ShardCanonicalServerConnection is recv-only
+                                r.recv(&mut slot).await?; // ShardCanonicalServerConnection is recv-only
                             }
                         }
                     })
@@ -1257,9 +1303,7 @@ mod test {
                 // 5. make client
                 info!("make client");
 
-                let neg_stack = CxList::from(TaggerProjChunnel)
-                    .wrap(ReliabilityProjChunnel::default())
-                    .wrap(SerializeChunnelProject::default());
+                let neg_stack = SerializeChunnel::default();
 
                 let raw_cn = UdpSkChunnel::default().connect(()).await.unwrap();
                 let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
@@ -1269,15 +1313,17 @@ mod test {
 
                 // 6. issue a request
                 info!("send request");
-                cn.send(Msg {
+                cn.send(std::iter::once(Msg {
                     k: "aaaaaaaa".to_owned(),
                     v: "bbbbbbbb".to_owned(),
-                })
+                }))
                 .await
                 .unwrap();
 
                 info!("await response");
-                let m = cn.recv().await.unwrap();
+                let mut slot = [None];
+                let ms = cn.recv(&mut slot).await.unwrap();
+                let m = ms[0].take().unwrap();
                 use super::Kv;
                 assert_eq!(m.key(), "aaaaaaaa");
                 assert_eq!(m.val(), "bbbbbbbb");
@@ -1316,9 +1362,7 @@ mod test {
 
                 use bertha::negotiate::Select;
                 let neg_stack = CxList::from(Select::from((cl, Nothing::<()>::default())))
-                    .wrap(TaggerProjChunnel)
-                    .wrap(ReliabilityProjChunnel::default())
-                    .wrap(SerializeChunnelProject::default());
+                    .wrap(SerializeChunnel::default());
 
                 let raw_cn = UdpSkChunnel::default().connect(()).await.unwrap();
                 let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
@@ -1328,15 +1372,17 @@ mod test {
 
                 // 6. issue a request
                 info!("send request");
-                cn.send(Msg {
+                cn.send(std::iter::once(Msg {
                     k: "aaaaaaaa".to_owned(),
                     v: "bbbbbbbb".to_owned(),
-                })
+                }))
                 .await
                 .unwrap();
 
                 info!("await response");
-                let m = cn.recv().await.unwrap();
+                let mut slot = [None];
+                let ms = cn.recv(&mut slot).await.unwrap();
+                let m = ms[0].take().unwrap();
                 use super::Kv;
                 assert_eq!(m.key(), "aaaaaaaa");
                 assert_eq!(m.val(), "bbbbbbbb");
