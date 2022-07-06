@@ -13,7 +13,6 @@ ebpf = ["burrito-shard-ctl/ebpf"]
 
 [dependencies]
 bertha = { path = "../bertha" }
-batcher = { path = "../batcher" }
 burrito-shard-ctl = { path = "../burrito-shard-ctl" }
 color-eyre = "0.5"
 futures-util = "0.3"
@@ -25,6 +24,7 @@ tokio = {version = "1", features = ["rt", "sync", "macros"]}
 tracing = "0.1"
 tracing-futures = "0.2"
 tracing-error = "0.1"
+flume = "0.10"
 structopt = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
 tracing-timing  = { version = "0.5", features = ["layer"], optional = true }

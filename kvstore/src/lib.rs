@@ -12,7 +12,7 @@ pub mod bin;
 
 pub use client::{KvClient, KvClientBuilder};
 pub use msg::{Msg, Op};
-pub use server::{serve, serve_lb, single_shard, BatchMode};
+pub use server::{serve, serve_lb, single_shard};
 
 #[cfg(test)]
 mod tests {
@@ -81,7 +81,7 @@ mod tests {
                         srv_port,
                         2,
                         s,
-                        crate::BatchMode::None,
+                        false,
                     )
                     .instrument(info_span!("server")),
                 );
@@ -92,7 +92,7 @@ mod tests {
                     info!("make client");
                     let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
                     let client = KvClientBuilder::new(srv_addr.parse()?)
-                        .new_basicclient(raw_cn)
+                        .new_nonshardclient(raw_cn)
                         .instrument(info_span!("make kvclient"))
                         .await
                         .wrap_err("make basic KvClient")?;
@@ -168,7 +168,7 @@ mod tests {
                             UdpReqChunnel::default(),
                             true,
                             s,
-                            crate::BatchMode::None,
+                            false,
                         )
                         .instrument(info_span!("shard", addr = ?sa)),
                     );

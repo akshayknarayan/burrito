@@ -1,14 +1,14 @@
 //! Chunnel stack optimization
 
-use crate::reliability::KvReliabilityServerChunnel;
-use crate::Msg;
-use bertha::{
-    bincode::SerializeChunnelProject,
-    reliable::{Pkt, ReliabilityProjChunnel},
-    tagger::OrderedChunnelProj,
-    CxList, CxNil, Select,
-};
-use burrito_shard_ctl::{ShardCanonicalServer, ShardCanonicalServerRaw};
+//use crate::reliability::KvReliabilityServerChunnel;
+//use crate::Msg;
+//use bertha::{
+//    bincode::SerializeChunnelProject,
+//    reliable::{Pkt, ReliabilityProjChunnel},
+//    tagger::OrderedChunnelProj,
+//    CxList, CxNil, Select,
+//};
+//use burrito_shard_ctl::{ShardCanonicalServer, ShardCanonicalServerRaw};
 
 /// Optimization to inject ShardCanonicalServerRaw
 pub trait SerdeOpt {
@@ -109,90 +109,90 @@ pub trait SerdeOpt {
 // If the ordered |> reliable path is picked, we can't do the optimization because the bytes
 // have semantics. `KvReliabilityServerChunnel` is basically a no-op though, so we can
 // pass-through without the serialization.
-impl<A, S, Ss, D> SerdeOpt
-    for CxList<
-        Select<
-            CxList<
-                SerializeChunnelProject<Pkt<Msg>>,
-                CxList<ReliabilityProjChunnel, CxList<OrderedChunnelProj, CxNil>>,
-            >,
-            CxList<SerializeChunnelProject<Msg>, CxList<KvReliabilityServerChunnel, CxNil>>,
-        >,
-        CxList<ShardCanonicalServer<A, S, Ss, D>, CxNil>,
-    >
-where
-    ShardCanonicalServer<A, S, Ss, D>: Clone,
-{
-    type Opt = Select<
-        CxList<
-            SerializeChunnelProject<Pkt<Msg>>,
-            CxList<
-                ReliabilityProjChunnel,
-                CxList<OrderedChunnelProj, CxList<ShardCanonicalServer<A, S, Ss, D>, CxNil>>,
-            >,
-        >,
-        // why 18?: see msg.rs, bincode will put the key starting at byte 18.
-        CxList<KvReliabilityServerChunnel, CxList<ShardCanonicalServerRaw<A, S, Ss, D, 18>, CxNil>>,
-    >;
-
-    fn serde_opt(self) -> Self::Opt {
-        let CxList {
-            head:
-                Select {
-                    left:
-                        CxList {
-                            head: ser,
-                            tail:
-                                CxList {
-                                    head: rel,
-                                    tail:
-                                        CxList {
-                                            head: ord,
-                                            tail: CxNil,
-                                        },
-                                },
-                        },
-                    right:
-                        CxList {
-                            head: _ser,
-                            tail:
-                                CxList {
-                                    head: kv_server_rel,
-                                    tail: _,
-                                },
-                        },
-                    prefer,
-                    ..
-                },
-            tail: CxList {
-                head: cnsrv,
-                tail: CxNil,
-            },
-        } = self;
-
-        let left = CxList {
-            head: ser,
-            tail: CxList {
-                head: rel,
-                tail: CxList {
-                    head: ord,
-                    tail: CxList {
-                        head: cnsrv.clone(),
-                        tail: CxNil,
-                    },
-                },
-            },
-        };
-        let right = CxList {
-            head: kv_server_rel,
-            tail: CxList {
-                head: cnsrv.into(),
-                tail: CxNil,
-            },
-        };
-
-        let mut sel = Select::from((left, right));
-        sel.prefer = prefer;
-        sel
-    }
-}
+//impl<A, S, Ss, D> SerdeOpt
+//    for CxList<
+//        Select<
+//            CxList<
+//                SerializeChunnelProject<Pkt<Msg>>,
+//                CxList<ReliabilityProjChunnel, CxList<OrderedChunnelProj, CxNil>>,
+//            >,
+//            CxList<SerializeChunnelProject<Msg>, CxList<KvReliabilityServerChunnel, CxNil>>,
+//        >,
+//        CxList<ShardCanonicalServer<A, S, Ss, D>, CxNil>,
+//    >
+//where
+//    ShardCanonicalServer<A, S, Ss, D>: Clone,
+//{
+//    type Opt = Select<
+//        CxList<
+//            SerializeChunnelProject<Pkt<Msg>>,
+//            CxList<
+//                ReliabilityProjChunnel,
+//                CxList<OrderedChunnelProj, CxList<ShardCanonicalServer<A, S, Ss, D>, CxNil>>,
+//            >,
+//        >,
+//        // why 18?: see msg.rs, bincode will put the key starting at byte 18.
+//        CxList<KvReliabilityServerChunnel, CxList<ShardCanonicalServerRaw<A, S, Ss, D, 18>, CxNil>>,
+//    >;
+//
+//    fn serde_opt(self) -> Self::Opt {
+//        let CxList {
+//            head:
+//                Select {
+//                    left:
+//                        CxList {
+//                            head: ser,
+//                            tail:
+//                                CxList {
+//                                    head: rel,
+//                                    tail:
+//                                        CxList {
+//                                            head: ord,
+//                                            tail: CxNil,
+//                                        },
+//                                },
+//                        },
+//                    right:
+//                        CxList {
+//                            head: _ser,
+//                            tail:
+//                                CxList {
+//                                    head: kv_server_rel,
+//                                    tail: _,
+//                                },
+//                        },
+//                    prefer,
+//                    ..
+//                },
+//            tail: CxList {
+//                head: cnsrv,
+//                tail: CxNil,
+//            },
+//        } = self;
+//
+//        let left = CxList {
+//            head: ser,
+//            tail: CxList {
+//                head: rel,
+//                tail: CxList {
+//                    head: ord,
+//                    tail: CxList {
+//                        head: cnsrv.clone(),
+//                        tail: CxNil,
+//                    },
+//                },
+//            },
+//        };
+//        let right = CxList {
+//            head: kv_server_rel,
+//            tail: CxList {
+//                head: cnsrv.into(),
+//                tail: CxNil,
+//            },
+//        };
+//
+//        let mut sel = Select::from((left, right));
+//        sel.prefer = prefer;
+//        sel
+//    }
+//}

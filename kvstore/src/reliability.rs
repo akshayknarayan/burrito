@@ -3,13 +3,13 @@ use bertha::{
     util::{MsgId, Nothing},
     Chunnel, ChunnelConnection, Negotiate,
 };
-use color_eyre::eyre::{self, WrapErr};
+use color_eyre::eyre::{eyre, Report, WrapErr};
+use flume::{Receiver, Sender};
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::oneshot;
 
 /// Reliable transmission of request/response pairs.
 ///
@@ -103,22 +103,22 @@ where
 }
 
 pub struct KvReliability<C, A, D> {
-    inner: Arc<C>,
+    inner: C,
     timeout: Duration,
-    sends: Arc<dashmap::DashMap<usize, oneshot::Sender<()>>>,
-    signal_recv: mpsc::Sender<(A, D)>,
-    recvs: Arc<Mutex<mpsc::Receiver<(A, D)>>>,
+    sends: dashmap::DashMap<usize, oneshot::Sender<()>>,
+    signal_recv: Sender<(A, D)>,
+    recvs: Receiver<(A, D)>,
 }
 
 impl<C, A, D> KvReliability<C, A, D> {
     fn new(inner: C, timeout: Duration) -> Self {
-        let (s, r) = mpsc::channel(1000);
+        let (s, r) = flume::bounded(100);
         KvReliability {
-            inner: Arc::new(inner),
+            inner,
             timeout,
             sends: Default::default(),
             signal_recv: s,
-            recvs: Arc::new(Mutex::new(r)),
+            recvs: r,
         }
     }
 }
@@ -131,105 +131,87 @@ where
 {
     type Data = (A, D);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'static>> {
-        let inner = Arc::clone(&self.inner);
-        let msg_id = data.1.id();
-        let (s, mut r) = oneshot::channel();
-        let to = self.timeout;
-        let signal_recv = self.signal_recv.clone();
-
-        // state map id -> chan sender
-        self.sends.insert(msg_id, s);
-        let sends = Arc::clone(&self.sends);
-        Box::pin(async move {
-            inner.send(data.clone()).await?;
-            loop {
-                tokio::select!(
-                    resp = inner.recv() => {
-                        let resp = resp.wrap_err("kvreliability recv acks")?;
-                        let recv_msg_id = resp.1.id();
-                        // careful about blocking here, could deadlock
-                        signal_recv.send(resp).await.map_err(|_| ()).expect("receiver won't hang up");
-                        let send_ch = if let Some(s) = sends.remove(&recv_msg_id) {
-                            s
-                        } else { continue; };
-
-                        if recv_msg_id == msg_id {
-                            return Ok(());
-                        } else {
-                            send_ch.1.send(()).map_err(|_| ()).expect("send done notification failed");
-                        }
-                    }
-                    _ = &mut r => {
-                        return Ok(());
-                    }
-                    _ = tokio::time::sleep(to) => {
-                        inner.send(data.clone()).await?;
-                    }
-                );
-            }
-        })
-    }
-
-    fn send_batch<'cn, B>(
+    fn send<'cn, B>(
         &'cn self,
-        data: B,
-    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'cn>>
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
     where
         B: IntoIterator<Item = Self::Data> + Send + 'cn,
         <B as IntoIterator>::IntoIter: Send,
-        Self::Data: Send,
-        Self: Sync,
     {
         use futures_util::TryStreamExt;
         Box::pin(async move {
             let mut batch_pkts = Vec::new();
+            let mut slots = Vec::new();
             let batch_completions = futures_util::stream::FuturesUnordered::new();
-            for pkt in data {
+            for pkt in burst {
                 let (s, r) = oneshot::channel();
                 let msg_id = pkt.1.id();
                 self.sends.insert(msg_id, s);
-                batch_pkts.push(pkt.clone());
+                batch_pkts.push(pkt);
                 batch_completions.push(r);
-                self.inner.send(pkt).await?;
+                slots.push(None);
             }
+
+            self.inner.send(batch_pkts.clone()).await?;
 
             let mut done = batch_completions.try_collect();
             loop {
                 tokio::select!(
-                    resp = self.inner.recv() => {
-                        let resp = resp.wrap_err("kvreliability recv acks")?;
-                        let recv_msg_id = resp.1.id();
-                        // careful about blocking here, could deadlock
-                        self.signal_recv.send(resp).await.map_err(|_| ()).expect("receiver won't hang up");
-                        let send_ch = if let Some(s) = self.sends.remove(&recv_msg_id) {
-                            s
-                        } else { continue; };
-                        send_ch.1.send(()).map_err(|_| ()).expect("send done notification failed");
+                    ms_res = self.inner.recv(&mut slots) => {
+                        let ms = ms_res.wrap_err("kvreliability recv acks")?;
+                        for resp in ms.into_iter().map_while(Option::take) {
+                            let recv_msg_id = resp.1.id();
+                            // careful about blocking here, could deadlock
+                            self.signal_recv.send_async(resp).await.map_err(|_| ()).expect("receiver won't hang up");
+                            let send_ch = if let Some(s) = self.sends.remove(&recv_msg_id) {
+                                s
+                            } else { continue; };
+                            send_ch.1.send(()).map_err(|_| ()).expect("send done notification failed");
+                        }
                     }
                     r = &mut done => {
                         r?;
                         return Ok(());
                     }
                     _ = tokio::time::sleep(self.timeout) => {
-                        for p in batch_pkts.clone() {
-                            self.inner.send(p).await?;
-                        }
+                        self.inner.send(batch_pkts.clone()).await?;
                     }
                 );
             }
         })
     }
 
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Data, eyre::Report>> + Send + 'static>> {
-        // return next signaled recv
-        let r = Arc::clone(&self.recvs);
-        Box::pin(async move { Ok(r.lock().await.recv().await.unwrap()) })
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        Box::pin(async move {
+            msgs_buf[0] = Some(
+                self.recvs
+                    .recv_async()
+                    .await
+                    .wrap_err(eyre!("All senders dropped"))?,
+            );
+            let mut slot_idx = 1;
+            if slot_idx >= msgs_buf.len() {
+                return Ok(msgs_buf);
+            }
+
+            while let Ok(m) = self.recvs.try_recv() {
+                msgs_buf[slot_idx] = Some(m);
+                slot_idx += 1;
+
+                if slot_idx >= msgs_buf.len() {
+                    break;
+                }
+            }
+
+            Ok(msgs_buf)
+        })
     }
 }
 
@@ -299,10 +281,13 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting receiver");
+                        let mut slots = [None, None, None, None];
                         loop {
-                            let m: ((), Msg) = rcv.recv().await.unwrap();
-                            debug!(?m, "rcvd");
-                            rcv.send(m).await.unwrap();
+                            let ms = rcv.recv(&mut slots).await.unwrap();
+                            debug!(?ms, "rcvd");
+                            rcv.send(ms.into_iter().map_while(Option::take))
+                                .await
+                                .unwrap();
                         }
                     }
                     .instrument(tracing::info_span!("receiver")),
@@ -310,11 +295,13 @@ mod test {
 
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+                let mut slot = [None];
                 for m in msgs {
                     debug!(?m, "sending");
-                    snd.send(m).await.unwrap();
+                    snd.send(std::iter::once(m)).await.unwrap();
                     debug!(?m, "getting response");
-                    let m: ((), Msg) = snd.recv().await.unwrap();
+                    let ms = snd.recv(&mut slot).await.unwrap();
+                    let m: ((), Msg) = ms[0].take().unwrap();
                     debug!(?m, "done");
                 }
 
