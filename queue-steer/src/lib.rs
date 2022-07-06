@@ -2,7 +2,7 @@
 
 use bertha::{
     atmostonce::{AtMostOnceChunnel, AtMostOnceCn},
-    tagger::{OrderedChunnelProj, OrderedProj},
+    tagger::{OrderedChunnel, OrderedCn},
     Chunnel, ChunnelConnection, Negotiate,
 };
 use futures_util::future::{ready, Ready};
@@ -57,10 +57,10 @@ impl bertha::negotiate::CapabilitySet for MessageQueueCaps {
 /// Newtype [`bertha::tagger::OrderedChunnelProj`] to impl `Negotiate` on `MessageQueueCaps`
 /// semantics.
 #[derive(Debug, Clone, Default)]
-pub struct Ordered(OrderedChunnelProj);
+pub struct Ordered(OrderedChunnel);
 
-impl From<OrderedChunnelProj> for Ordered {
-    fn from(i: OrderedChunnelProj) -> Self {
+impl From<OrderedChunnel> for Ordered {
+    fn from(i: OrderedChunnel) -> Self {
         Self(i)
     }
 }
@@ -80,11 +80,11 @@ where
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = OrderedProj<A, InC, D>;
+    type Connection = OrderedCn<A, InC, D>;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(OrderedProj::new(cn, self.0.hole_thresh)))
+        ready(Ok(OrderedCn::new(cn, self.0.hole_thresh)))
     }
 }
 

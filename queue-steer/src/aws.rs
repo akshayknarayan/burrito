@@ -2,7 +2,7 @@ use crate::{MessageQueueCaps, MessageQueueOrdering, MessageQueueReliability};
 use bertha::{util::NeverCn, Chunnel, Negotiate};
 use color_eyre::eyre::Report;
 use futures_util::future::{ready, Ready};
-use sqs::{OrderedSqsChunnel, SqsChunnel, SqsChunnelBatch};
+use sqs::{OrderedSqsChunnel, SqsChunnel};
 
 #[derive(Debug, Clone)]
 pub struct SqsChunnelWrap(SqsChunnel);
@@ -29,45 +29,6 @@ impl Chunnel<NeverCn> for SqsChunnelWrap {
 }
 
 impl Negotiate for SqsChunnelWrap {
-    type Capability = MessageQueueCaps;
-
-    fn guid() -> u64 {
-        0xfe8e872efd74c245
-    }
-
-    fn capabilities() -> Vec<Self::Capability> {
-        vec![MessageQueueCaps {
-            ordering: MessageQueueOrdering::BestEffort,
-            reliability: MessageQueueReliability::AtLeastOnce,
-        }]
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BatchSqsChunnelWrap(SqsChunnelBatch);
-impl From<SqsChunnelBatch> for BatchSqsChunnelWrap {
-    fn from(i: SqsChunnelBatch) -> Self {
-        Self(i)
-    }
-}
-
-impl From<BatchSqsChunnelWrap> for SqsChunnelBatch {
-    fn from(BatchSqsChunnelWrap(s): BatchSqsChunnelWrap) -> SqsChunnelBatch {
-        s
-    }
-}
-
-impl Chunnel<NeverCn> for BatchSqsChunnelWrap {
-    type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = SqsChunnelBatch;
-    type Error = Report;
-
-    fn connect_wrap(&mut self, _: NeverCn) -> Self::Future {
-        ready(Ok(self.0.clone()))
-    }
-}
-
-impl Negotiate for BatchSqsChunnelWrap {
     type Capability = MessageQueueCaps;
 
     fn guid() -> u64 {
