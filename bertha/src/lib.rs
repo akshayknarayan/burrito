@@ -51,7 +51,7 @@ where
 }
 
 /// Chain multiple chunnels together with the `Chunnel` trait.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CxList<Head, Tail> {
     pub head: Head,
     pub tail: Tail,
