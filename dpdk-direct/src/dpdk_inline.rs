@@ -1,6 +1,6 @@
 use ahash::AHashMap as HashMap;
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
+use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{
     bindings::*,
     mbuf_slice,
@@ -17,8 +17,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 std::thread_local! {
     static DPDK_STATE: RefCell<Option<DpdkState>> = RefCell::new(None);
@@ -49,7 +48,7 @@ impl DpdkInlineChunnel {
     ///
     /// Should make sure `num_dpdk_threads` is >= the number of tokio workers (threads).
     /// Otherwise we might run out of mempools.
-    pub fn new(config_path: std::path::PathBuf, num_dpdk_threads: usize) -> Result<Self, Report> {
+    pub fn new(config_path: PathBuf, num_dpdk_threads: usize) -> Result<Self, Report> {
         let dpdks = DpdkState::new(config_path, num_dpdk_threads)?;
         Ok(DpdkInlineChunnel {
             initialized_mempools: Arc::new(Mutex::new(dpdks)),
@@ -128,12 +127,15 @@ impl ChunnelConnector for DpdkInlineChunnel {
 
 pub struct DpdkInlineCn {
     src_port: u16,
-    mempools: Arc<Mutex<Vec<DpdkState>>>,
+    _mempools: Arc<Mutex<Vec<DpdkState>>>,
 }
 
 impl DpdkInlineCn {
     fn new(src_port: u16, mempools: Arc<Mutex<Vec<DpdkState>>>) -> Self {
-        Self { src_port, mempools }
+        Self {
+            src_port,
+            _mempools: mempools,
+        }
     }
 }
 
@@ -146,44 +148,85 @@ impl std::fmt::Debug for DpdkInlineCn {
 impl ChunnelConnection for DpdkInlineCn {
     type Data = (SocketAddr, Vec<u8>);
 
-    fn send(
-        &self,
-        (addr, buf): Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
         let this_lcore = get_lcore_id();
         Box::pin(ready({
-            if let SocketAddr::V4(addr) = addr {
-                DPDK_STATE
-                    .try_with(|dpdk_cell| {
-                        let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                        dpdk.send(addr, self.src_port, &buf)?;
-                        Ok(())
-                    })
-                    .map_err(Into::into)
-                    .and_then(|x| x)
-            } else {
-                Err(eyre!("Need ipv4 addr: {:?}", addr))
-            }
+            DPDK_STATE
+                .try_with(|dpdk_cell| {
+                    let mut dpdk_opt = dpdk_cell.borrow_mut();
+                    let dpdk = dpdk_opt
+                        .as_mut()
+                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+
+                    dpdk.send_burst(burst.into_iter().map(|(to_addr, buf)| {
+                        use SocketAddr::*;
+                        let to_addr = match to_addr {
+                            V4(a) => a,
+                            V6(addr) => {
+                                error!(?addr, "Only IPv4 is supported");
+                                panic!("Only IPv4 is supported: {:?}", addr);
+                            }
+                        };
+                        SendMsg {
+                            src_port: self.src_port,
+                            to_addr,
+                            buf_ptr: buf.as_ptr(),
+                            buf_len: buf.len(),
+                        }
+                    }))?;
+                    Ok(())
+                })
+                .map_err(Into::into)
+                .and_then(|x| x)
         }))
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         let this_lcore = get_lcore_id();
         Box::pin(ready({
-            DPDK_STATE.try_with(|dpdk_cell| {
-                let mut dpdk_opt = dpdk_cell.borrow_mut();
-                let dpdk = dpdk_opt
-                    .as_mut()
-                    .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                let mut recv_msg_buf: [Option<Msg>; RECEIVE_BURST_SIZE as usize] =
-                    Default::default();
-                let msgs = dpdk.try_recv(&mut recv_msg_buf[..])?;
-                // what to do with these msgs??
-                todo!()
-            })
+            DPDK_STATE
+                .try_with(|dpdk_cell| {
+                    let mut dpdk_opt = dpdk_cell.borrow_mut();
+                    let dpdk = dpdk_opt
+                        .as_mut()
+                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                    let mut recv_msg_buf: Vec<Option<Msg>> =
+                        (0..std::cmp::min(RECEIVE_BURST_SIZE as usize, msgs_buf.len()))
+                            .map(|_| None)
+                            .collect();
+                    let msgs = dpdk.try_recv(&mut recv_msg_buf[..])?;
+                    // what to do with these msgs??
+                    let mut slot_idx = 0;
+                    for msg in msgs.iter_mut().map_while(Option::take) {
+                        ensure!(msg.port == self.src_port, "Port mismatch");
+                        if let Some((ref mut addr, ref mut payload)) = msgs_buf[slot_idx] {
+                            *addr = SocketAddr::V4(msg.addr);
+                            payload.copy_from_slice(msg.get_buf());
+                        } else {
+                            msgs_buf[slot_idx] =
+                                Some((SocketAddr::V4(msg.addr), msg.get_buf().to_vec()));
+                        }
+
+                        slot_idx += 1;
+                    }
+
+                    Ok(&mut msgs_buf[..slot_idx])
+                })
+                .map_err(Into::into)
+                .and_then(|x| x)
         }))
     }
 }
@@ -236,7 +279,6 @@ pub struct DpdkState {
 
     rx_queue_id: usize,
     rx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
-    listen_ports: Option<Vec<u16>>,
 
     tx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
     ip_id: u16,
@@ -299,18 +341,8 @@ impl DpdkState {
                 rx_bufs: unsafe { zeroed() },
                 tx_bufs: unsafe { zeroed() },
                 ip_id: 0,
-                listen_ports: None,
             })
             .collect())
-    }
-
-    /// This doesn't do anything other than filter incoming ports.
-    fn listen(&mut self, port: u16) {
-        if let Some(ref mut lp) = self.listen_ports {
-            lp.push(port);
-        } else {
-            self.listen_ports = Some(vec![port]);
-        }
     }
 
     fn try_recv<'buf>(
@@ -339,15 +371,6 @@ impl DpdkState {
                 continue;
             }
 
-            // if there are defined ports to listen on, enforce that only packets with those
-            // dst_ports are received.
-            if let Some(ref mut lp) = self.listen_ports {
-                if !lp.iter().any(|p| *p == dst_port) {
-                    unsafe { rte_pktmbuf_free(self.rx_bufs[i]) };
-                    continue;
-                }
-            }
-
             let [oct1, oct2, oct3, oct4] = src_ip.to_be_bytes();
             let pkt_src_ip = Ipv4Addr::new(oct1, oct2, oct3, oct4);
 
@@ -372,81 +395,6 @@ impl DpdkState {
         }
 
         Ok(&mut rcvd_msgs[..num_valid])
-    }
-
-    fn send<'a>(
-        &mut self,
-        to_addr: SocketAddrV4,
-        src_port: u16,
-        buf: &'a [u8],
-    ) -> Result<(), Report> {
-        let to_ip = to_addr.ip();
-        let to_port = to_addr.port();
-        unsafe {
-            let dst_ether_addr = match self.arp_table.get(to_ip) {
-                Some(eth) => eth,
-                None => {
-                    bail!("Could not find IP {:?} in ARP table", to_ip);
-                }
-            };
-
-            self.tx_bufs[0] = alloc_mbuf(self.mbuf_pool).unwrap();
-
-            let src_info = AddressInfo {
-                udp_port: src_port,
-                ipv4_addr: self.ip_addr,
-                ether_addr: self.eth_addr,
-            };
-
-            let dst_info = AddressInfo {
-                udp_port: to_port,
-                ipv4_addr: *to_ip,
-                ether_addr: *dst_ether_addr,
-            };
-
-            // fill header
-            let hdr_size = match fill_in_header(
-                self.tx_bufs[0],
-                &HeaderInfo { src_info, dst_info },
-                buf.len(),
-                self.ip_id,
-            ) {
-                Ok(s) => {
-                    self.ip_id += 1;
-                    self.ip_id %= 0xffff;
-                    s
-                }
-                Err(err) => {
-                    debug!(?err, "Error writing header");
-                    rte_pktmbuf_free(self.tx_bufs[0]);
-                    bail!("Error writing header: {:?}", err);
-                }
-            };
-
-            // write payload
-            let payload_slice = mbuf_slice!(self.tx_bufs[0], hdr_size, buf.len());
-            rte_memcpy_wrapper(
-                payload_slice.as_mut_ptr() as _,
-                buf.as_ptr() as _,
-                buf.len(),
-            );
-
-            (*self.tx_bufs[0]).pkt_len = (hdr_size + buf.len()) as u32;
-            (*self.tx_bufs[0]).data_len = (hdr_size + buf.len()) as u16;
-        }
-
-        if let Err(err) = unsafe {
-            tx_burst(
-                self.port,
-                self.rx_queue_id as _,
-                self.tx_bufs.as_mut_ptr(),
-                1 as u16,
-            )
-        } {
-            warn!(?err, "tx_burst error");
-        }
-
-        Ok(())
     }
 
     fn send_burst(&mut self, msgs: impl Iterator<Item = SendMsg>) -> Result<(), Report> {

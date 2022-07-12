@@ -101,29 +101,31 @@ impl std::fmt::Debug for DpdkUdpSk {
 impl ChunnelConnection for DpdkUdpSk {
     type Data = (SocketAddr, Vec<u8>);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        use SocketAddr::*;
-        match data {
-            (V4(addr), d) => {
-                let fut = self.inner.send_async(addr, d);
-                Box::pin(fut)
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        Box::pin(async move {
+            for (addr, data) in burst {
+                self.inner.send_async(addr, data).await?;
             }
-            (V6(a), _) => Box::pin(futures_util::future::ready(Err(eyre!(
-                "Only IPv4 is supported: {:?}",
-                a
-            )))),
-        }
+
+            Ok(())
+        })
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let fut = self.inner.recv_async();
-        Box::pin(async move {
-            let (a, d) = fut.await?;
-            Ok((SocketAddr::V4(a), d))
-        })
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        Box::pin(async move { self.inner.recv_async_batch(msgs_buf).await })
     }
 }
 
@@ -138,29 +140,31 @@ impl std::fmt::Debug for BoundDpdkUdpSk {
 impl ChunnelConnection for BoundDpdkUdpSk {
     type Data = (SocketAddr, Vec<u8>);
 
-    fn send(
-        &self,
-        data: Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        use SocketAddr::*;
-        match data {
-            (V4(addr), d) => {
-                let fut = self.0.send_async(addr, d);
-                Box::pin(fut)
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        Box::pin(async move {
+            for (_, data) in burst {
+                self.0.send_async(data).await?;
             }
-            (V6(a), _) => Box::pin(futures_util::future::ready(Err(eyre!(
-                "Only IPv4 is supported: {:?}",
-                a
-            )))),
-        }
+
+            Ok(())
+        })
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let fut = self.0.recv_async();
-        Box::pin(async move {
-            let (a, d) = fut.await?;
-            Ok((SocketAddr::V4(a), d))
-        })
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        Box::pin(async move { self.0.recv_async_batch(msgs_buf).await })
     }
 }
 
