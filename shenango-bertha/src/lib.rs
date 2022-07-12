@@ -2089,14 +2089,11 @@ mod kvstore {
         pub fn recv_msg(&self, msg_id: usize) -> Result<D, Report> {
             let done: Arc<AtomicBool> = Default::default();
             let recv_waiter: WaitGroup = {
-                //let g = self.inflight.lock();
-                //let (ref m, _) = g.get(&msg_id).ok_or_else(|| eyre!("msg id not found"))?;
-                let (ref m, _) = self
+                let val = self
                     .inflight
                     .get(&msg_id)
-                    .ok_or_else(|| eyre!("msg id not found"))?
-                    .value();
-                m.clone()
+                    .ok_or_else(|| eyre!("msg id not found"))?;
+                val.value().0.clone()
             };
 
             let inner = Arc::clone(&self.inner);
@@ -2107,25 +2104,6 @@ mod kvstore {
                 while !d.load(Ordering::SeqCst) {
                     let r = inner.recv();
                     match r {
-                        //Ok(r) => match infl.lock().get_mut(&r.id()) {
-                        //    Some(ref mut e) => {
-                        //        let (m, ref mut d) = e;
-                        //        if let Some(old_d) = d {
-                        //            assert!(old_d.id() == r.id(), "double recv mismatched");
-                        //        } else {
-                        //            *d = Some(r);
-                        //            m.done(); // wake up the other thread
-                        //        }
-
-                        //        if msg_id == id {
-                        //            break;
-                        //        }
-                        //    }
-                        //    None => {
-                        //        // probably a spurious retx.
-                        //        trace!(id = ?r.id(), local_id = ?msg_id, "got unexpected message");
-                        //    }
-                        //},
                         Ok(r) => match infl.get_mut(&r.id()) {
                             Some(ref mut e) => {
                                 let id = r.id();
@@ -2156,7 +2134,6 @@ mod kvstore {
 
             recv_waiter.wait();
             done.store(true, Ordering::SeqCst);
-            //Ok(self.inflight.lock().remove(&msg_id).unwrap().1.unwrap())
             Ok(self.inflight.remove(&msg_id).unwrap().1 .1.unwrap())
         }
     }
