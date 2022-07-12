@@ -1,4 +1,4 @@
-use color_eyre::eyre::{eyre, Report};
+use color_eyre::eyre::{eyre, Report, WrapErr};
 use kvstore::bin::tracing_init;
 use kvstore::serve;
 use structopt::StructOpt;
@@ -23,14 +23,8 @@ struct Opt {
     #[structopt(short, long)]
     shenango_cfg: Option<std::path::PathBuf>,
 
-    #[structopt(short, long, default_value = "none")]
-    batch_mode: kvstore::BatchMode,
-
     #[structopt(short, long)]
     num_shards: u16,
-
-    #[structopt(short, long)]
-    fragment_stack: bool,
 
     #[structopt(short, long)]
     skip_negotiation: bool,
@@ -72,12 +66,11 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         opt.port,
         opt.num_shards,
         None,
-        opt.batch_mode,
-        opt.fragment_stack,
         opt.skip_negotiation,
     )
     .instrument(info_span!("server"))
     .await
+    .wrap_err(eyre!("serve errored"))
 }
 
 #[cfg(feature = "use-shenango")]
@@ -98,8 +91,6 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         opt.port,
         opt.num_shards,
         None,
-        opt.batch_mode,
-        opt.fragment_stack,
         opt.skip_negotiation,
     )
     .instrument(info_span!("server"))
@@ -124,8 +115,6 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         opt.port,
         opt.num_shards,
         None,
-        opt.batch_mode,
-        opt.fragment_stack,
         opt.skip_negotiation,
     )
     .instrument(info_span!("server"))
