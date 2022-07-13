@@ -12,7 +12,6 @@ use futures_util::future::ready;
 use futures_util::Stream;
 use std::cell::RefCell;
 use std::future::Future;
-use std::mem::zeroed;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -207,7 +206,7 @@ impl ChunnelConnection for DpdkInlineCn {
                         (0..std::cmp::min(RECEIVE_BURST_SIZE as usize, msgs_buf.len()))
                             .map(|_| None)
                             .collect();
-                    let msgs = dpdk.try_recv(&mut recv_msg_buf[..])?;
+                    let msgs = dpdk.try_recv(self.src_port, &mut recv_msg_buf[..])?;
                     // what to do with these msgs??
                     let mut slot_idx = 0;
                     for msg in msgs.iter_mut().map_while(Option::take) {
@@ -279,6 +278,7 @@ pub struct DpdkState {
 
     rx_queue_id: usize,
     rx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
+    rx_packets_for_ports: Vec<(u16, Vec<Msg>)>,
 
     tx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
     ip_id: u16,
@@ -338,8 +338,9 @@ impl DpdkState {
                 mbuf_pool,
                 arp_table: arp_table.clone(),
                 rx_queue_id: qid,
-                rx_bufs: unsafe { zeroed() },
-                tx_bufs: unsafe { zeroed() },
+                rx_bufs: [std::ptr::null_mut(); RECEIVE_BURST_SIZE as usize],
+                rx_packets_for_ports: Vec::with_capacity(16),
+                tx_bufs: [std::ptr::null_mut(); RECEIVE_BURST_SIZE as usize],
                 ip_id: 0,
             })
             .collect())
@@ -347,8 +348,22 @@ impl DpdkState {
 
     fn try_recv<'buf>(
         &mut self,
+        call_port: u16,
         rcvd_msgs: &'buf mut [Option<Msg>],
     ) -> Result<&'buf mut [Option<Msg>], Report> {
+        // try popping off some packets from stashed packets.
+        for (p, ref mut stash) in &mut self.rx_packets_for_ports {
+            if *p == call_port && !stash.is_empty() {
+                let mut num_returned = 0;
+                while num_returned < rcvd_msgs.len() && !stash.is_empty() {
+                    rcvd_msgs[num_returned] = Some(stash.pop().unwrap());
+                    num_returned += 1;
+                }
+
+                return Ok(&mut rcvd_msgs[..num_returned]);
+            }
+        }
+
         ensure!(
             rcvd_msgs.len() >= RECEIVE_BURST_SIZE as usize,
             "Received messages slice not large enough"
@@ -379,15 +394,34 @@ impl DpdkState {
                 .entry(pkt_src_ip)
                 .or_insert_with(|| MacAddress::from_bytes(&src_ether.addr_bytes).unwrap());
             let pkt_src_addr = SocketAddrV4::new(pkt_src_ip, src_port);
-            let msg = Msg {
-                port: dst_port,
-                addr: pkt_src_addr,
-                mbuf: self.rx_bufs[i],
-                payload_length,
-            };
 
-            rcvd_msgs[num_valid] = Some(msg);
-            num_valid += 1;
+            // this call wants packets for the flow on `call_port`, but we might have gotten
+            // packets for other flows. So we stash those packets for future calls.
+            if dst_port != call_port {
+                for (p, ref mut stash) in &mut self.rx_packets_for_ports {
+                    if *p == dst_port {
+                        let msg = Msg {
+                            port: dst_port,
+                            addr: pkt_src_addr,
+                            mbuf: self.rx_bufs[i],
+                            payload_length,
+                        };
+                        stash.push(msg);
+                    }
+                }
+
+                // didn't match any ports. continue to the next packet, which will send msg out of
+                // scope, which will free the mbuf.
+            } else {
+                let msg = Msg {
+                    port: dst_port,
+                    addr: pkt_src_addr,
+                    mbuf: self.rx_bufs[i],
+                    payload_length,
+                };
+                rcvd_msgs[num_valid] = Some(msg);
+                num_valid += 1;
+            }
         }
 
         if num_valid > 0 {
