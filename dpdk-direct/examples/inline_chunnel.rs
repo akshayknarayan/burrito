@@ -56,6 +56,7 @@ async fn main() -> Result<(), Report> {
         cn_stream
             .try_for_each_concurrent(None, |cn| async move {
                 let mut slots: Vec<_> = (0..16).map(|_| None).collect();
+                info!("new connection");
                 loop {
                     let msgs = cn.recv(&mut slots[..]).await?;
                     cn.send(msgs.iter_mut().map_while(Option::take)).await?;

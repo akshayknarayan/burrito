@@ -306,37 +306,44 @@ impl ChunnelConnection for DpdkInlineCn {
         'buf: 'cn,
     {
         let this_lcore = get_lcore_id();
-        Box::pin(ready({
-            DPDK_STATE
-                .try_with(|dpdk_cell| {
-                    let mut dpdk_opt = dpdk_cell.borrow_mut();
-                    let dpdk = dpdk_opt
-                        .as_mut()
-                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                    let msgs = dpdk.try_recv_burst(
-                        Some((self.local_port, self.remote_addr)),
-                        self.new_conns.as_ref(),
-                    )?;
+        Box::pin(async move {
+            loop {
+                let ret = DPDK_STATE
+                    .try_with(|dpdk_cell| {
+                        let mut dpdk_opt = dpdk_cell.borrow_mut();
+                        let dpdk = dpdk_opt
+                            .as_mut()
+                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        let msgs = dpdk.try_recv_burst(
+                            Some((self.local_port, self.remote_addr)),
+                            self.new_conns.as_ref(),
+                        )?;
 
-                    let mut slot_idx = 0;
-                    for msg in msgs.iter_mut().map_while(Option::take) {
-                        ensure!(msg.port == self.local_port, "Port mismatch");
-                        if let Some((ref mut addr, ref mut payload)) = msgs_buf[slot_idx] {
-                            *addr = SocketAddr::V4(msg.addr);
-                            payload.copy_from_slice(msg.get_buf());
-                        } else {
-                            msgs_buf[slot_idx] =
-                                Some((SocketAddr::V4(msg.addr), msg.get_buf().to_vec()));
+                        let mut slot_idx = 0;
+                        for msg in msgs.iter_mut().map_while(Option::take) {
+                            ensure!(msg.port == self.local_port, "Port mismatch");
+                            if let Some((ref mut addr, ref mut payload)) = msgs_buf[slot_idx] {
+                                *addr = SocketAddr::V4(msg.addr);
+                                payload.copy_from_slice(msg.get_buf());
+                            } else {
+                                msgs_buf[slot_idx] =
+                                    Some((SocketAddr::V4(msg.addr), msg.get_buf().to_vec()));
+                            }
+
+                            slot_idx += 1;
                         }
 
-                        slot_idx += 1;
-                    }
-
-                    Ok(&mut msgs_buf[..slot_idx])
-                })
-                .map_err(Into::into)
-                .and_then(|x| x)
-        }))
+                        Ok(slot_idx)
+                    })
+                    .map_err(Into::into)
+                    .and_then(|x| x)?;
+                if ret > 0 {
+                    return Ok(&mut msgs_buf[..ret]);
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+        })
     }
 }
 
@@ -390,6 +397,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                         state,
                         |mut state| async move {
                             if !state.got_first {
+                                debug!("DpdkInlineReqChunnel listen stream poll for first packet");
                                 loop {
                                     DPDK_STATE.with(|dpdk_cell| {
                                         let this_lcore = get_lcore_id();
@@ -405,6 +413,10 @@ impl ChunnelListener for DpdkInlineReqChunnel {
 
                                     match state.receiver.try_recv() {
                                         Ok(addr) => {
+                                            debug!(
+                                                ?addr,
+                                                "DpdkInlineReqChunnel found first connection"
+                                            );
                                             let cn = DpdkInlineCn::new(
                                                 state.listen_addr.port(),
                                                 Some(addr),
@@ -425,6 +437,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                                 }
                             } else {
                                 let addr = state.receiver.recv_async().await?;
+                                debug!(?addr, "new connection");
                                 let cn = DpdkInlineCn::new(
                                     state.listen_addr.port(),
                                     Some(addr),
@@ -708,6 +721,12 @@ impl DpdkState {
                 RECEIVE_BURST_SIZE as u16,
             )
         } as usize;
+
+        if num_received > 0 {
+            trace!(?num_received, "received potential packets");
+        }
+
+        let mut num_valid = 0;
         'per_pkt: for i in 0..num_received {
             // first: parse if valid packet, and what the payload size is
             let (is_valid, src_ether, src_ip, src_port, dst_port, payload_length) =
@@ -726,6 +745,7 @@ impl DpdkState {
                 .or_insert_with(|| MacAddress::from_bytes(&src_ether.addr_bytes).unwrap());
             let pkt_src_addr = SocketAddrV4::new(pkt_src_ip, src_port);
 
+            num_valid += 1;
             let msg = Msg {
                 port: dst_port,
                 addr: pkt_src_addr,
@@ -741,6 +761,7 @@ impl DpdkState {
             for ((cand_dst_port, cand_src_addr), ref mut stash) in &mut self.rx_packets_for_ports {
                 if *cand_dst_port == dst_port {
                     found_dst_port = true;
+                    // packet for existing flow. we should not re-notify.
                     if *cand_src_addr == pkt_src_addr {
                         stash.push(msg);
                         continue 'per_pkt;
@@ -761,6 +782,10 @@ impl DpdkState {
                         .wrap_err("New connection channel send failed")?;
                 }
             }
+        }
+
+        if num_valid > 0 {
+            trace!(?num_valid, "stashed packets");
         }
 
         Ok(())
