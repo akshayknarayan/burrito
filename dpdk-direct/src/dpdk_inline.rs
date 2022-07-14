@@ -8,8 +8,10 @@ use dpdk_wrapper::{
     wrapper::*,
 };
 use eui48::MacAddress;
+use flume::{Receiver, Sender};
 use futures_util::future::ready;
 use futures_util::Stream;
+use futures_util::{future::Ready, stream::Once};
 use std::cell::RefCell;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -81,22 +83,58 @@ fn try_init_thread(init_pool: &Mutex<Vec<DpdkState>>) -> Result<(), Report> {
 impl ChunnelListener for DpdkInlineChunnel {
     type Addr = SocketAddr;
     type Connection = DpdkInlineCn;
-    type Future = futures_util::future::Ready<Result<Self::Stream, Report>>;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Future = Ready<Result<Self::Stream, Report>>;
+    type Stream = Once<Ready<Result<Self::Connection, Self::Error>>>;
     type Error = Report;
 
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
         use SocketAddr::*;
         ready(match addr {
-            V4(a) => Ok(Box::pin(futures_util::stream::once(ready({
+            V4(a) => Ok(futures_util::stream::once(ready(
                 try_init_thread(self.initialized_mempools.as_ref()).and_then(|_| {
+                    let mut ports = self.ephemeral_ports.lock().unwrap();
+                    let mut found = false;
+                    for i in 0..ports.len() {
+                        if ports[i] == a.port() {
+                            ports.remove(i);
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    ensure!(
+                        found,
+                        "Tried to listen on port that is already in use: {:?}",
+                        a.port()
+                    );
+
+                    DPDK_STATE.with(|dpdk_cell| {
+                        let this_lcore = get_lcore_id();
+                        let mut dpdk_opt = dpdk_cell.borrow_mut();
+                        let dpdk = dpdk_opt
+                            .as_mut()
+                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+
+                        dpdk.rx_packets_for_ports.push((
+                            (
+                                a.port(),
+                                SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+                            ),
+                            Vec::with_capacity(16),
+                        ));
+
+                        Ok::<_, Report>(())
+                    })?;
+
                     Ok(DpdkInlineCn::new(
                         a.port(),
+                        None,
+                        None,
                         Arc::clone(&self.initialized_mempools),
+                        Some(Arc::clone(&self.ephemeral_ports)),
                     ))
-                })
-            }))) as _),
+                }),
+            )) as _),
             V6(a) => Err(eyre!("Only IPv4 is supported: {:?}", a)),
         })
     }
@@ -109,30 +147,66 @@ impl ChunnelConnector for DpdkInlineChunnel {
     type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
-        ready({
+        ready(
             try_init_thread(self.initialized_mempools.as_ref()).and_then(|_| {
+                let port = self
+                    .ephemeral_ports
+                    .lock()
+                    .unwrap()
+                    .pop()
+                    .ok_or(eyre!("No available ports"))?;
+                DPDK_STATE.with(|dpdk_cell| {
+                    let this_lcore = get_lcore_id();
+                    let mut dpdk_opt = dpdk_cell.borrow_mut();
+                    let dpdk = dpdk_opt
+                        .as_mut()
+                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+
+                    dpdk.rx_packets_for_ports.push((
+                        (port, SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
+                        Vec::with_capacity(16),
+                    ));
+
+                    Ok::<_, Report>(())
+                })?;
+
                 Ok(DpdkInlineCn::new(
-                    self.ephemeral_ports
-                        .lock()
-                        .unwrap()
-                        .pop()
-                        .ok_or(eyre!("No available ports"))?,
+                    port,
+                    None,
+                    None,
                     Arc::clone(&self.initialized_mempools),
+                    Some(Arc::clone(&self.ephemeral_ports)),
                 ))
-            })
-        })
+            }),
+        )
     }
 }
 
+/// Is this connection type Send? If filter_port is on, and NIC RSS is on, then ports will only
+/// arrive on one thread, so moving to any other thread will always be a bad idea because packets
+/// will just pile up on the other thread's thread_local. This is still "safe", just really bad for
+/// performance.
 pub struct DpdkInlineCn {
-    src_port: u16,
+    local_port: u16,
+    remote_addr: Option<SocketAddrV4>,
+    new_conns: Option<Sender<SocketAddrV4>>,
+    port_pool: Option<Arc<Mutex<Vec<u16>>>>,
     _mempools: Arc<Mutex<Vec<DpdkState>>>,
 }
 
 impl DpdkInlineCn {
-    fn new(src_port: u16, mempools: Arc<Mutex<Vec<DpdkState>>>) -> Self {
+    fn new(
+        local_port: u16,
+        remote_addr: Option<SocketAddrV4>,
+        new_conns: Option<Sender<SocketAddrV4>>,
+        mempools: Arc<Mutex<Vec<DpdkState>>>,
+        port_pool: Option<Arc<Mutex<Vec<u16>>>>,
+    ) -> Self {
         Self {
-            src_port,
+            local_port,
+            remote_addr,
+            new_conns,
+            port_pool,
             _mempools: mempools,
         }
     }
@@ -140,7 +214,44 @@ impl DpdkInlineCn {
 
 impl std::fmt::Debug for DpdkInlineCn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DpdkInlineCn").finish()
+        f.debug_struct("DpdkInlineCn")
+            .field("local_port", &self.local_port)
+            .field("remote_addr", &self.remote_addr)
+            .finish()
+    }
+}
+
+impl Drop for DpdkInlineCn {
+    fn drop(&mut self) {
+        // drop any stashed packets for this port.
+        if let Err(err) = DPDK_STATE.try_with(|dpdk_cell| {
+            let mut dpdk_opt = dpdk_cell.borrow_mut();
+            if let Some(dpdk) = dpdk_opt.as_mut() {
+                for i in 0..dpdk.rx_packets_for_ports.len() {
+                    let ((local_port_slot, remote_addr_slot), ref mut stash) =
+                        &mut dpdk.rx_packets_for_ports[i];
+                    if let Some(remote_addr) = self.remote_addr {
+                        if *remote_addr_slot == remote_addr && *local_port_slot == self.local_port {
+                            // remove this stash from the list of stashes, so that a new matching
+                            // packet triggers new connection logic.
+                            dpdk.rx_packets_for_ports.swap_remove(i);
+                        }
+                    } else {
+                        if *local_port_slot == self.local_port {
+                            stash.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+        }) {
+            warn!(?err, "DPDK_STATE thread local access error");
+        }
+
+        // put our claimed port back
+        if let Some(pool) = &self.port_pool {
+            pool.lock().unwrap().push(self.local_port);
+        }
     }
 }
 
@@ -174,7 +285,7 @@ impl ChunnelConnection for DpdkInlineCn {
                             }
                         };
                         SendMsg {
-                            src_port: self.src_port,
+                            src_port: self.local_port,
                             to_addr,
                             buf_ptr: buf.as_ptr(),
                             buf_len: buf.len(),
@@ -202,15 +313,14 @@ impl ChunnelConnection for DpdkInlineCn {
                     let dpdk = dpdk_opt
                         .as_mut()
                         .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                    let mut recv_msg_buf: Vec<Option<Msg>> =
-                        (0..std::cmp::min(RECEIVE_BURST_SIZE as usize, msgs_buf.len()))
-                            .map(|_| None)
-                            .collect();
-                    let msgs = dpdk.try_recv(self.src_port, &mut recv_msg_buf[..])?;
-                    // what to do with these msgs??
+                    let msgs = dpdk.try_recv_burst(
+                        Some((self.local_port, self.remote_addr)),
+                        self.new_conns.as_ref(),
+                    )?;
+
                     let mut slot_idx = 0;
                     for msg in msgs.iter_mut().map_while(Option::take) {
-                        ensure!(msg.port == self.src_port, "Port mismatch");
+                        ensure!(msg.port == self.local_port, "Port mismatch");
                         if let Some((ref mut addr, ref mut payload)) = msgs_buf[slot_idx] {
                             *addr = SocketAddr::V4(msg.addr);
                             payload.copy_from_slice(msg.get_buf());
@@ -227,6 +337,109 @@ impl ChunnelConnection for DpdkInlineCn {
                 .map_err(Into::into)
                 .and_then(|x| x)
         }))
+    }
+}
+
+/// Implement separating
+pub struct DpdkInlineReqChunnel(DpdkInlineChunnel);
+
+impl From<DpdkInlineChunnel> for DpdkInlineReqChunnel {
+    fn from(i: DpdkInlineChunnel) -> Self {
+        Self(i)
+    }
+}
+
+impl ChunnelListener for DpdkInlineReqChunnel {
+    type Addr = SocketAddr;
+    type Connection = DpdkInlineCn;
+    type Future = futures_util::future::Ready<Result<Self::Stream, Report>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Report;
+
+    fn listen(&mut self, addr: Self::Addr) -> Self::Future {
+        use SocketAddr::*;
+        ready((|| {
+            match addr {
+                V4(a) => {
+                    try_init_thread(self.0.initialized_mempools.as_ref())?;
+
+                    let (s, r) = flume::bounded(16);
+
+                    // we have to first listen for a packet ourselves, since at the beginning there are no
+                    // connections calling recv.
+
+                    struct StreamState {
+                        got_first: bool,
+                        listen_addr: SocketAddrV4,
+                        sender: Sender<SocketAddrV4>,
+                        receiver: Receiver<SocketAddrV4>,
+                        initialized_mempools: Arc<Mutex<Vec<DpdkState>>>,
+                    }
+
+                    let state = StreamState {
+                        got_first: false,
+                        listen_addr: a,
+                        sender: s,
+                        receiver: r,
+                        initialized_mempools: Arc::clone(&self.0.initialized_mempools),
+                    };
+
+                    // we just initialized this, so `.with` is fine instead of `.try_with`.
+                    Ok(Box::pin(futures_util::stream::try_unfold(
+                        state,
+                        |mut state| async move {
+                            if !state.got_first {
+                                loop {
+                                    DPDK_STATE.with(|dpdk_cell| {
+                                        let this_lcore = get_lcore_id();
+                                        let mut dpdk_opt = dpdk_cell.borrow_mut();
+                                        let dpdk = dpdk_opt.as_mut().ok_or(eyre!(
+                                            "dpdk not initialized on core {:?}",
+                                            this_lcore
+                                        ))?;
+
+                                        dpdk.try_recv_burst_stash_only(Some(&state.sender))?;
+                                        Ok::<_, Report>(())
+                                    })?;
+
+                                    match state.receiver.try_recv() {
+                                        Ok(addr) => {
+                                            let cn = DpdkInlineCn::new(
+                                                state.listen_addr.port(),
+                                                Some(addr),
+                                                Some(state.sender.clone()),
+                                                Arc::clone(&state.initialized_mempools),
+                                                None,
+                                            );
+
+                                            state.got_first = true;
+                                            return Ok(Some((cn, state)));
+                                        }
+                                        Err(flume::TryRecvError::Empty) => (),
+                                        Err(flume::TryRecvError::Disconnected) => {
+                                            error!(addr = ?state.listen_addr, "New connection recevier closed without any connections");
+                                            panic!("New connection recevier closed without any connections");
+                                        }
+                                    }
+                                }
+                            } else {
+                                let addr = state.receiver.recv_async().await?;
+                                let cn = DpdkInlineCn::new(
+                                    state.listen_addr.port(),
+                                    Some(addr),
+                                    Some(state.sender.clone()),
+                                    Arc::clone(&state.initialized_mempools),
+                                    None,
+                                );
+                                return Ok(Some((cn, state)));
+                            }
+                        },
+                    )) as _)
+                }
+                V6(a) => Err(eyre!("Only IPv4 is supported: {:?}", a)),
+            }
+        })())
     }
 }
 
@@ -278,7 +491,9 @@ pub struct DpdkState {
 
     rx_queue_id: usize,
     rx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
-    rx_packets_for_ports: Vec<(u16, Vec<Msg>)>,
+    rx_packets_for_ports: Vec<((u16, SocketAddrV4), Vec<Msg>)>,
+
+    rx_recv_buf: Vec<Option<Msg>>,
 
     tx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
     ip_id: u16,
@@ -340,32 +555,44 @@ impl DpdkState {
                 rx_queue_id: qid,
                 rx_bufs: [std::ptr::null_mut(); RECEIVE_BURST_SIZE as usize],
                 rx_packets_for_ports: Vec::with_capacity(16),
+                rx_recv_buf: (0..RECEIVE_BURST_SIZE).map(|_| None).collect(),
                 tx_bufs: [std::ptr::null_mut(); RECEIVE_BURST_SIZE as usize],
                 ip_id: 0,
             })
             .collect())
     }
 
-    fn try_recv<'buf>(
-        &mut self,
-        call_port: u16,
-        rcvd_msgs: &'buf mut [Option<Msg>],
-    ) -> Result<&'buf mut [Option<Msg>], Report> {
-        // try popping off some packets from stashed packets.
-        for (p, ref mut stash) in &mut self.rx_packets_for_ports {
-            if *p == call_port && !stash.is_empty() {
-                let mut num_returned = 0;
-                while num_returned < rcvd_msgs.len() && !stash.is_empty() {
-                    rcvd_msgs[num_returned] = Some(stash.pop().unwrap());
-                    num_returned += 1;
-                }
+    fn try_recv_burst<'cn>(
+        &'cn mut self,
+        port_filter: Option<(u16, Option<SocketAddrV4>)>,
+        new_conns: Option<&Sender<SocketAddrV4>>,
+    ) -> Result<&'cn mut [Option<Msg>], Report> {
+        match port_filter {
+            None => (),
+            // if dst_port filter is enable or both dst_port and src_addr filter are enabled, try popping off some packets from stashed packets.
+            Some((wanted_dst_port, maybe_wanted_src_addr)) => {
+                for ((cand_dst_port, cand_src_addr), ref mut stash) in
+                    &mut self.rx_packets_for_ports
+                {
+                    if *cand_dst_port == wanted_dst_port
+                        && (maybe_wanted_src_addr.is_none()
+                            || *cand_src_addr == maybe_wanted_src_addr.unwrap())
+                        && !stash.is_empty()
+                    {
+                        let mut num_returned = 0;
+                        while num_returned < self.rx_recv_buf.len() && !stash.is_empty() {
+                            self.rx_recv_buf[num_returned] = Some(stash.pop().unwrap());
+                            num_returned += 1;
+                        }
 
-                return Ok(&mut rcvd_msgs[..num_returned]);
+                        return Ok(&mut self.rx_recv_buf[..num_returned]);
+                    }
+                }
             }
         }
 
         ensure!(
-            rcvd_msgs.len() >= RECEIVE_BURST_SIZE as usize,
+            self.rx_recv_buf.len() >= RECEIVE_BURST_SIZE as usize,
             "Received messages slice not large enough"
         );
         let num_received = unsafe {
@@ -377,7 +604,7 @@ impl DpdkState {
             )
         } as usize;
         let mut num_valid = 0;
-        for i in 0..num_received {
+        'per_pkt: for i in 0..num_received {
             // first: parse if valid packet, and what the payload size is
             let (is_valid, src_ether, src_ip, src_port, dst_port, payload_length) =
                 unsafe { parse_packet(self.rx_bufs[i], &self.eth_addr_raw as _, self.ip_addr_raw) };
@@ -395,32 +622,66 @@ impl DpdkState {
                 .or_insert_with(|| MacAddress::from_bytes(&src_ether.addr_bytes).unwrap());
             let pkt_src_addr = SocketAddrV4::new(pkt_src_ip, src_port);
 
+            let msg = Msg {
+                port: dst_port,
+                addr: pkt_src_addr,
+                mbuf: self.rx_bufs[i],
+                payload_length,
+            };
+
+            // Msg::drop will free the mbuf. So, after this point we should not call free
+            // ourselves, and instead let Msg handle it for us.
+
             // this call wants packets for the flow on `call_port`, but we might have gotten
             // packets for other flows. So we stash those packets for future calls.
-            if dst_port != call_port {
-                for (p, ref mut stash) in &mut self.rx_packets_for_ports {
-                    if *p == dst_port {
-                        let msg = Msg {
-                            port: dst_port,
-                            addr: pkt_src_addr,
-                            mbuf: self.rx_bufs[i],
-                            payload_length,
-                        };
-                        stash.push(msg);
+            match port_filter {
+                Some((wanted_dst_port, None)) if wanted_dst_port != dst_port => {
+                    for ((p, _), ref mut stash) in &mut self.rx_packets_for_ports {
+                        if *p == dst_port {
+                            stash.push(msg);
+                            break;
+                        }
                     }
-                }
 
-                // didn't match any ports. continue to the next packet, which will send msg out of
-                // scope, which will free the mbuf.
-            } else {
-                let msg = Msg {
-                    port: dst_port,
-                    addr: pkt_src_addr,
-                    mbuf: self.rx_bufs[i],
-                    payload_length,
-                };
-                rcvd_msgs[num_valid] = Some(msg);
-                num_valid += 1;
+                    // the packet didn't match any ports. can drop.
+                }
+                Some((ref wanted_dst_port, Some(ref wanted_src_addr)))
+                    if *wanted_dst_port != dst_port && *wanted_src_addr != pkt_src_addr =>
+                {
+                    let mut found_dst_port = false;
+                    for ((cand_dst_port, cand_src_addr), ref mut stash) in
+                        &mut self.rx_packets_for_ports
+                    {
+                        if *cand_dst_port == dst_port {
+                            found_dst_port = true;
+                            if *cand_src_addr == pkt_src_addr {
+                                stash.push(msg);
+                                continue 'per_pkt;
+                            }
+                        }
+                    }
+
+                    // if found_dst_port but we reached this point, then we've found a new flow.
+                    // allocate a new stash and save `msg` in it.
+                    if found_dst_port {
+                        let mut new_stash = Vec::with_capacity(16);
+                        new_stash.push(msg);
+                        self.rx_packets_for_ports
+                            .push(((dst_port, pkt_src_addr), new_stash));
+                        // signal new connection.
+                        if let Some(nc) = new_conns {
+                            nc.send(pkt_src_addr)
+                                .wrap_err("New connection channel send failed")?;
+                        }
+                    }
+                    // else !found_dst_port, which means no one was listening and we can drop.
+                }
+                _ => {
+                    // either there is no filtering, or there is and it matched. either way, we can
+                    // return this packet now.
+                    self.rx_recv_buf[num_valid] = Some(msg);
+                    num_valid += 1;
+                }
             }
         }
 
@@ -428,7 +689,81 @@ impl DpdkState {
             trace!(?num_valid, "Received valid packets");
         }
 
-        Ok(&mut rcvd_msgs[..num_valid])
+        Ok(&mut self.rx_recv_buf[..num_valid])
+    }
+
+    fn try_recv_burst_stash_only<'cn>(
+        &'cn mut self,
+        new_conns: Option<&Sender<SocketAddrV4>>,
+    ) -> Result<(), Report> {
+        ensure!(
+            self.rx_recv_buf.len() >= RECEIVE_BURST_SIZE as usize,
+            "Received messages slice not large enough"
+        );
+        let num_received = unsafe {
+            rte_eth_rx_burst(
+                self.port,
+                self.rx_queue_id as _,
+                self.rx_bufs.as_mut_ptr(),
+                RECEIVE_BURST_SIZE as u16,
+            )
+        } as usize;
+        'per_pkt: for i in 0..num_received {
+            // first: parse if valid packet, and what the payload size is
+            let (is_valid, src_ether, src_ip, src_port, dst_port, payload_length) =
+                unsafe { parse_packet(self.rx_bufs[i], &self.eth_addr_raw as _, self.ip_addr_raw) };
+            if !is_valid {
+                unsafe { rte_pktmbuf_free(self.rx_bufs[i]) };
+                continue;
+            }
+
+            let [oct1, oct2, oct3, oct4] = src_ip.to_be_bytes();
+            let pkt_src_ip = Ipv4Addr::new(oct1, oct2, oct3, oct4);
+
+            // opportunistically update arp
+            self.arp_table
+                .entry(pkt_src_ip)
+                .or_insert_with(|| MacAddress::from_bytes(&src_ether.addr_bytes).unwrap());
+            let pkt_src_addr = SocketAddrV4::new(pkt_src_ip, src_port);
+
+            let msg = Msg {
+                port: dst_port,
+                addr: pkt_src_addr,
+                mbuf: self.rx_bufs[i],
+                payload_length,
+            };
+
+            // Msg::drop will free the mbuf. So, after this point we should not call free
+            // ourselves, and instead let Msg handle it for us.
+
+            // we immediately stash this packet for later retrieval.
+            let mut found_dst_port = false;
+            for ((cand_dst_port, cand_src_addr), ref mut stash) in &mut self.rx_packets_for_ports {
+                if *cand_dst_port == dst_port {
+                    found_dst_port = true;
+                    if *cand_src_addr == pkt_src_addr {
+                        stash.push(msg);
+                        continue 'per_pkt;
+                    }
+                }
+            }
+
+            // if found_dst_port but we reached this point, then we've found a new flow.
+            // allocate a new stash and save `msg` in it.
+            if found_dst_port {
+                let mut new_stash = Vec::with_capacity(16);
+                new_stash.push(msg);
+                self.rx_packets_for_ports
+                    .push(((dst_port, pkt_src_addr), new_stash));
+                // signal new connection.
+                if let Some(nc) = new_conns {
+                    nc.try_send(pkt_src_addr)
+                        .wrap_err("New connection channel send failed")?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn send_burst(&mut self, msgs: impl Iterator<Item = SendMsg>) -> Result<(), Report> {
