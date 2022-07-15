@@ -722,10 +722,6 @@ impl DpdkState {
             )
         } as usize;
 
-        if num_received > 0 {
-            trace!(?num_received, "received potential packets");
-        }
-
         let mut num_valid = 0;
         'per_pkt: for i in 0..num_received {
             // first: parse if valid packet, and what the payload size is
@@ -757,10 +753,8 @@ impl DpdkState {
             // ourselves, and instead let Msg handle it for us.
 
             // we immediately stash this packet for later retrieval.
-            let mut found_dst_port = false;
             for ((cand_dst_port, cand_src_addr), ref mut stash) in &mut self.rx_packets_for_ports {
                 if *cand_dst_port == dst_port {
-                    found_dst_port = true;
                     // packet for existing flow. we should not re-notify.
                     if *cand_src_addr == pkt_src_addr {
                         stash.push(msg);
@@ -771,16 +765,14 @@ impl DpdkState {
 
             // if found_dst_port but we reached this point, then we've found a new flow.
             // allocate a new stash and save `msg` in it.
-            if found_dst_port {
-                let mut new_stash = Vec::with_capacity(16);
-                new_stash.push(msg);
-                self.rx_packets_for_ports
-                    .push(((dst_port, pkt_src_addr), new_stash));
-                // signal new connection.
-                if let Some(nc) = new_conns {
-                    nc.try_send(pkt_src_addr)
-                        .wrap_err("New connection channel send failed")?;
-                }
+            let mut new_stash = Vec::with_capacity(16);
+            new_stash.push(msg);
+            self.rx_packets_for_ports
+                .push(((dst_port, pkt_src_addr), new_stash));
+            // signal new connection.
+            if let Some(nc) = new_conns {
+                nc.try_send(pkt_src_addr)
+                    .wrap_err("New connection channel send failed")?;
             }
         }
 
