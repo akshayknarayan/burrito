@@ -6,7 +6,7 @@ use quanta::Instant;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use structopt::StructOpt;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "Inline Chunnel Test")]
@@ -69,6 +69,7 @@ async fn main() -> Result<(), Report> {
                 Either::Left((mut num_msgs, _)) => {
                     while num_msgs > 0 {
                         if let Some(msg) = msgs.next() {
+                            trace!(?msg, "sending");
                             batch.push(msg);
                             num_msgs -= 1;
                             tot_msg_count += 1;
@@ -86,6 +87,7 @@ async fn main() -> Result<(), Report> {
                 }
                 Either::Right((ms, _)) => {
                     tot_recv_count += handle_received(remote_addr, ms?)?;
+                    debug!(?tot_recv_count, "received");
                 }
             }
         }
@@ -93,6 +95,7 @@ async fn main() -> Result<(), Report> {
         while tot_recv_count < 1000 {
             let ms = cn.recv(&mut slots[..]).await?;
             tot_recv_count += handle_received(remote_addr, ms)?;
+            debug!(?tot_recv_count, "received messages");
         }
 
         info!("done");
@@ -107,9 +110,17 @@ async fn main() -> Result<(), Report> {
             .try_for_each_concurrent(None, |cn| async move {
                 let mut slots: Vec<_> = (0..16).map(|_| None).collect();
                 info!("new connection");
+                let mut recv_count = 0;
                 loop {
                     let msgs = cn.recv(&mut slots[..]).await?;
-                    cn.send(msgs.iter_mut().map_while(Option::take)).await?;
+                    let echoes = msgs.iter_mut().map_while(|m| {
+                        let x = m.take()?;
+                        recv_count += 1;
+                        trace!(?x, ?recv_count, "got msg");
+                        Some(x)
+                    });
+                    cn.send(echoes).await?;
+                    debug!(?recv_count, "received message burst");
                 }
             })
             .await?;

@@ -617,12 +617,14 @@ impl DpdkState {
             )
         } as usize;
         let mut num_valid = 0;
+        let mut num_invalid = 0;
         'per_pkt: for i in 0..num_received {
             // first: parse if valid packet, and what the payload size is
             let (is_valid, src_ether, src_ip, src_port, dst_port, payload_length) =
                 unsafe { parse_packet(self.rx_bufs[i], &self.eth_addr_raw as _, self.ip_addr_raw) };
             if !is_valid {
                 unsafe { rte_pktmbuf_free(self.rx_bufs[i]) };
+                num_invalid += 1;
                 continue;
             }
 
@@ -652,6 +654,7 @@ impl DpdkState {
                     for ((p, _), ref mut stash) in &mut self.rx_packets_for_ports {
                         if *p == dst_port {
                             stash.push(msg);
+                            debug!(stash_size = ?stash.len(), ?dst_port, "Stashed packet");
                             break;
                         }
                     }
@@ -669,6 +672,7 @@ impl DpdkState {
                             found_dst_port = true;
                             if *cand_src_addr == pkt_src_addr {
                                 stash.push(msg);
+                                debug!(stash_size = ?stash.len(), ?dst_port, ?pkt_src_addr, "Stashed packet");
                                 continue 'per_pkt;
                             }
                         }
@@ -681,6 +685,7 @@ impl DpdkState {
                         new_stash.push(msg);
                         self.rx_packets_for_ports
                             .push(((dst_port, pkt_src_addr), new_stash));
+                        trace!(?dst_port, ?pkt_src_addr, "created new stash for connection");
                         // signal new connection.
                         if let Some(nc) = new_conns {
                             nc.send(pkt_src_addr)
@@ -700,6 +705,10 @@ impl DpdkState {
 
         if num_valid > 0 {
             trace!(?num_valid, "Received valid packets");
+        }
+
+        if num_invalid > 0 {
+            debug!(?num_invalid, "Discarded invalid packets");
         }
 
         Ok(&mut self.rx_recv_buf[..num_valid])
@@ -769,6 +778,7 @@ impl DpdkState {
             new_stash.push(msg);
             self.rx_packets_for_ports
                 .push(((dst_port, pkt_src_addr), new_stash));
+            trace!(?dst_port, ?pkt_src_addr, "created new stash for connection");
             // signal new connection.
             if let Some(nc) = new_conns {
                 nc.try_send(pkt_src_addr)
