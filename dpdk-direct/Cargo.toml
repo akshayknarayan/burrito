@@ -15,7 +15,6 @@ futures-util = "0.3"
 lazy_static = "1"
 eui48 = "1"
 ahash = "0.7"
-rand = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
@@ -24,3 +23,5 @@ tracing-error = "0.1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 structopt = "0.3"
+rand = "0.8"
+quanta = "0.10"

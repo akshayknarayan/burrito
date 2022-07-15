@@ -2,7 +2,9 @@ use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{ensure, Report};
 use dpdk_direct::{DpdkInlineChunnel, DpdkInlineReqChunnel};
 use futures_util::TryStreamExt;
+use quanta::Instant;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::time::Duration;
 use structopt::StructOpt;
 use tracing::{debug, info};
 
@@ -33,18 +35,47 @@ async fn main() -> Result<(), Report> {
         let mut ch = DpdkInlineChunnel::new(opt.datapath_cfg, 1)?;
         let cn = ch.connect(()).await?;
 
-        let mut slot = [None];
-        for i in 0..100 {
-            debug!(?i, "sending");
-            cn.send(std::iter::once((remote_addr, vec![i; 32]))).await?;
-            debug!(?i, "sent");
-            let msg = cn.recv(&mut slot[..]).await?;
-            debug!(?msg, "received");
-            let msg = msg[0].take().unwrap();
-            ensure!(
-                msg.0 == remote_addr,
-                "received response from unexpected address"
-            )
+        let interarrival = std::time::Duration::from_micros(100);
+        let mut ticker = AsyncSpinTimer::new(interarrival);
+        let mut slots: Vec<_> = (0..16).map(|_| None).collect();
+        let mut msgs =
+            (0..1000usize).map(|i| (remote_addr, vec![(i % u8::MAX as usize) as u8; 32]));
+
+        use futures_util::future::Either;
+        let mut tot_msg_count = 0;
+        let mut batch = Vec::with_capacity(16);
+        loop {
+            let t = ticker.wait();
+            tokio::pin!(t);
+            match futures_util::future::select(t, cn.recv(&mut slots[..])).await {
+                Either::Left((mut num_msgs, _)) => {
+                    while num_msgs > 0 {
+                        if let Some(msg) = msgs.next() {
+                            batch.push(msg);
+                            num_msgs -= 1;
+                            tot_msg_count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    debug!(?tot_msg_count, "sending");
+                    cn.send(batch.drain(..)).await?;
+                    if num_msgs > 0 {
+                        info!("done");
+                        return Ok(());
+                    }
+                }
+                Either::Right((ms, _)) => {
+                    for msg in ms?.iter_mut().map_while(Option::take) {
+                        debug!(?msg, "received");
+                        ensure!(
+                            msg.0 == remote_addr,
+                            "received response from unexpected address"
+                        )
+                    }
+                }
+            }
         }
     } else {
         let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, opt.port));
@@ -65,4 +96,60 @@ async fn main() -> Result<(), Report> {
             .await?;
     }
     Ok(())
+}
+
+struct AsyncSpinTimer {
+    clk: quanta::Clock,
+    interarrival: Duration,
+    deficit: Duration,
+    last_return: Option<Instant>,
+}
+
+impl AsyncSpinTimer {
+    pub fn new(interarrival: Duration) -> Self {
+        AsyncSpinTimer {
+            clk: quanta::Clock::new(),
+            interarrival,
+            deficit: Duration::from_micros(0),
+            last_return: None,
+        }
+    }
+
+    pub async fn wait(&mut self) -> usize {
+        let mut num_ticks = 0;
+        loop {
+            while self.deficit > self.interarrival {
+                self.deficit -= self.interarrival;
+                num_ticks += 1;
+            }
+
+            if num_ticks > 0 {
+                self.last_return = Some(self.clk.now());
+                return num_ticks;
+            }
+
+            if self.last_return.is_none() {
+                self.last_return = Some(self.clk.now());
+            }
+
+            let target = self.last_return.unwrap() + self.interarrival;
+            loop {
+                let now = self.clk.now();
+                if now >= target {
+                    break;
+                }
+
+                if target - now > Duration::from_micros(10) {
+                    tokio::time::sleep(Duration::from_micros(5)).await;
+                } else {
+                    tokio::task::yield_now().await
+                }
+            }
+
+            let elapsed = self.clk.now() - self.last_return.unwrap();
+            if elapsed > self.interarrival {
+                self.deficit += elapsed - self.interarrival;
+            }
+        }
+    }
 }
