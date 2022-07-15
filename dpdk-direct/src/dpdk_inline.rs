@@ -802,28 +802,28 @@ impl DpdkState {
         {
             let to_ip = to_addr.ip();
             let to_port = to_addr.port();
+            let dst_ether_addr = match self.arp_table.get(to_ip) {
+                Some(eth) => eth,
+                None => {
+                    warn!(?to_ip, "Could not find IP in ARP table");
+                    continue;
+                }
+            };
+
+            let src_info = AddressInfo {
+                udp_port: src_port,
+                ipv4_addr: self.ip_addr,
+                ether_addr: self.eth_addr,
+            };
+
+            let dst_info = AddressInfo {
+                udp_port: to_port,
+                ipv4_addr: *to_ip,
+                ether_addr: *dst_ether_addr,
+            };
+
             unsafe {
-                let dst_ether_addr = match self.arp_table.get(to_ip) {
-                    Some(eth) => eth,
-                    None => {
-                        warn!(?to_ip, "Could not find IP in ARP table");
-                        continue;
-                    }
-                };
-
                 self.tx_bufs[i] = alloc_mbuf(self.mbuf_pool).unwrap();
-
-                let src_info = AddressInfo {
-                    udp_port: src_port,
-                    ipv4_addr: self.ip_addr,
-                    ether_addr: self.eth_addr,
-                };
-
-                let dst_info = AddressInfo {
-                    udp_port: to_port,
-                    ipv4_addr: *to_ip,
-                    ether_addr: *dst_ether_addr,
-                };
 
                 // fill header
                 let hdr_size = match fill_in_header(
@@ -856,8 +856,17 @@ impl DpdkState {
                 (*self.tx_bufs[i]).data_len = (hdr_size + buf.len()) as u16;
 
                 i += 1;
-                if i >= (RECEIVE_BURST_SIZE as _) {
-                    break;
+                if i >= self.tx_bufs.len() {
+                    if let Err(err) = tx_burst(
+                        self.port,
+                        self.rx_queue_id as _,
+                        self.tx_bufs.as_mut_ptr(),
+                        i as u16,
+                    ) {
+                        warn!(?err, "tx_burst error");
+                    }
+
+                    i = 0;
                 }
             }
         }
