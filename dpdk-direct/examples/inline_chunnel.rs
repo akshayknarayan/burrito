@@ -14,6 +14,9 @@ struct Opt {
     #[structopt(short, long)]
     port: u16,
 
+    #[structopt(short, long, default_value = "100")]
+    num_msgs: usize,
+
     /// If specified, this is a client. Otherwise it is a server.
     #[structopt(short, long)]
     ip_addr: Option<std::net::Ipv4Addr>,
@@ -39,7 +42,7 @@ async fn main() -> Result<(), Report> {
         let mut ticker = AsyncSpinTimer::new(interarrival);
         let mut slots: Vec<_> = (0..16).map(|_| None).collect();
         let mut msgs =
-            (0..1000usize).map(|i| (remote_addr, vec![(i % u8::MAX as usize) as u8; 32]));
+            (0..opt.num_msgs).map(|i| (remote_addr, vec![(i % u8::MAX as usize) as u8; 32]));
 
         use futures_util::future::Either;
         let mut tot_msg_count = 0;
@@ -69,7 +72,6 @@ async fn main() -> Result<(), Report> {
                 Either::Left((mut num_msgs, _)) => {
                     while num_msgs > 0 {
                         if let Some(msg) = msgs.next() {
-                            trace!(?msg, "sending");
                             batch.push(msg);
                             num_msgs -= 1;
                             tot_msg_count += 1;
@@ -92,7 +94,7 @@ async fn main() -> Result<(), Report> {
             }
         }
 
-        while tot_recv_count < 1000 {
+        while tot_recv_count < opt.num_msgs {
             let ms = cn.recv(&mut slots[..]).await?;
             tot_recv_count += handle_received(remote_addr, ms)?;
             debug!(?tot_recv_count, "received messages");

@@ -284,11 +284,11 @@ impl ChunnelConnection for DpdkInlineCn {
                                 panic!("Only IPv4 is supported: {:?}", addr);
                             }
                         };
+
                         SendMsg {
                             src_port: self.local_port,
                             to_addr,
-                            buf_ptr: buf.as_ptr(),
-                            buf_len: buf.len(),
+                            buf,
                         }
                     }))?;
                     Ok(())
@@ -481,12 +481,11 @@ impl Drop for Msg {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SendMsg {
     to_addr: SocketAddrV4,
     src_port: u16,
-    buf_ptr: *const u8,
-    buf_len: usize,
+    buf: Vec<u8>,
 }
 
 /// DPDK state with which packets can be sent/received.
@@ -798,8 +797,7 @@ impl DpdkState {
         for SendMsg {
             to_addr,
             src_port,
-            buf_ptr,
-            buf_len,
+            buf,
         } in msgs
         {
             let to_ip = to_addr.ip();
@@ -831,7 +829,7 @@ impl DpdkState {
                 let hdr_size = match fill_in_header(
                     self.tx_bufs[i],
                     &HeaderInfo { src_info, dst_info },
-                    buf_len,
+                    buf.len(),
                     self.ip_id,
                 ) {
                     Ok(s) => {
@@ -847,11 +845,15 @@ impl DpdkState {
                 };
 
                 // write payload
-                let payload_slice = mbuf_slice!(self.tx_bufs[i], hdr_size, buf_len);
-                rte_memcpy_wrapper(payload_slice.as_mut_ptr() as _, buf_ptr as _, buf_len);
+                let payload_slice = mbuf_slice!(self.tx_bufs[i], hdr_size, buf.len());
+                rte_memcpy_wrapper(
+                    payload_slice.as_mut_ptr() as _,
+                    buf.as_ptr() as _,
+                    buf.len(),
+                );
 
-                (*self.tx_bufs[i]).pkt_len = (hdr_size + buf_len) as u32;
-                (*self.tx_bufs[i]).data_len = (hdr_size + buf_len) as u16;
+                (*self.tx_bufs[i]).pkt_len = (hdr_size + buf.len()) as u32;
+                (*self.tx_bufs[i]).data_len = (hdr_size + buf.len()) as u16;
 
                 i += 1;
                 if i >= (RECEIVE_BURST_SIZE as _) {
