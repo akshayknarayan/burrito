@@ -43,7 +43,25 @@ async fn main() -> Result<(), Report> {
 
         use futures_util::future::Either;
         let mut tot_msg_count = 0;
+        let mut tot_recv_count = 0;
         let mut batch = Vec::with_capacity(16);
+
+        fn handle_received(
+            remote_addr: SocketAddr,
+            ms: &mut [Option<(SocketAddr, Vec<u8>)>],
+        ) -> Result<usize, Report> {
+            ms.iter_mut()
+                .map_while(Option::take)
+                .try_fold(0, |cnt, msg| {
+                    debug!(?msg, "received");
+                    ensure!(
+                        msg.0 == remote_addr,
+                        "received response from unexpected address"
+                    );
+                    Ok(cnt + 1)
+                })
+        }
+
         loop {
             let t = ticker.wait();
             tokio::pin!(t);
@@ -62,21 +80,22 @@ async fn main() -> Result<(), Report> {
                     debug!(?tot_msg_count, "sending");
                     cn.send(batch.drain(..)).await?;
                     if num_msgs > 0 {
-                        info!("done");
-                        return Ok(());
+                        info!("done sending");
+                        break;
                     }
                 }
                 Either::Right((ms, _)) => {
-                    for msg in ms?.iter_mut().map_while(Option::take) {
-                        debug!(?msg, "received");
-                        ensure!(
-                            msg.0 == remote_addr,
-                            "received response from unexpected address"
-                        )
-                    }
+                    tot_recv_count += handle_received(remote_addr, ms?)?;
                 }
             }
         }
+
+        while tot_recv_count < 1000 {
+            let ms = cn.recv(&mut slots[..]).await?;
+            tot_recv_count += handle_received(remote_addr, ms)?;
+        }
+
+        info!("done");
     } else {
         let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, opt.port));
         info!(?local_addr, "Dpdk Inline Chunnel Test - Server");
