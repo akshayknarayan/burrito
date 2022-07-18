@@ -435,7 +435,9 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                                             state.got_first = true;
                                             return Ok(Some((cn, state)));
                                         }
-                                        Err(flume::TryRecvError::Empty) => (),
+                                        Err(flume::TryRecvError::Empty) => {
+                                            tokio::task::yield_now().await
+                                        }
                                         Err(flume::TryRecvError::Disconnected) => {
                                             error!(addr = ?state.listen_addr, "New connection recevier closed without any connections");
                                             panic!("New connection recevier closed without any connections");
@@ -668,7 +670,7 @@ impl DpdkState {
                     // the packet didn't match any ports. can drop.
                 }
                 Some((ref wanted_dst_port, Some(ref wanted_src_addr)))
-                    if *wanted_dst_port != dst_port && *wanted_src_addr != pkt_src_addr =>
+                    if *wanted_dst_port != dst_port || *wanted_src_addr != pkt_src_addr =>
                 {
                     let mut found_dst_port = false;
                     for ((cand_dst_port, cand_src_addr), ref mut stash) in
