@@ -6,7 +6,8 @@ use quanta::Instant;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use structopt::StructOpt;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, info_span, instrument, trace};
+use tracing_futures::Instrument;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "Inline Chunnel Test")]
@@ -56,26 +57,32 @@ async fn main() -> Result<(), Report> {
         let cn_stream = ch.listen(local_addr).await?;
 
         cn_stream
-            .try_for_each_concurrent(None, |cn| async move {
-                let mut slots: Vec<_> = (0..16).map(|_| None).collect();
-                info!("new connection");
-                let mut recv_count = 0;
-                loop {
-                    let msgs = cn.recv(&mut slots[..]).await?;
-                    let echoes = msgs.iter_mut().map_while(|m| {
-                        let x = m.take()?;
-                        recv_count += 1;
-                        trace!(?x, ?recv_count, "got msg");
-                        Some(x)
-                    });
-                    cn.send(echoes).await?;
-                    debug!(?recv_count, "received message burst");
+            .try_for_each_concurrent(None, |cn| {
+                let port = cn.local_port();
+                let peer = cn.remote_addr();
+                async move {
+                    let mut slots: Vec<_> = (0..16).map(|_| None).collect();
+                    info!("new connection");
+                    let mut recv_count = 0;
+                    loop {
+                        let msgs = cn.recv(&mut slots[..]).await?;
+                        let echoes = msgs.iter_mut().map_while(|m| {
+                            let x = m.take()?;
+                            recv_count += 1;
+                            trace!(?x, ?recv_count, "got msg");
+                            Some(x)
+                        });
+                        cn.send(echoes).await?;
+                        debug!(?recv_count, "received message burst");
+                    }
                 }
+                .instrument(info_span!("connection", ?port, ?peer))
             })
             .await
     }
 }
 
+#[instrument(skip(cn), level = "info", err)]
 async fn client(
     cn: DpdkInlineCn,
     num_msgs: usize,

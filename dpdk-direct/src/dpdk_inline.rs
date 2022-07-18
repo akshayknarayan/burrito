@@ -182,10 +182,9 @@ impl ChunnelConnector for DpdkInlineChunnel {
     }
 }
 
-/// Is this connection type Send? If filter_port is on, and NIC RSS is on, then ports will only
-/// arrive on one thread, so moving to any other thread will always be a bad idea because packets
-/// will just pile up on the other thread's thread_local. This is still "safe", just really bad for
-/// performance.
+/// Is this connection type Send? If NIC RSS is on, then ports will only arrive on one thread, so
+/// moving to any other thread will always be a bad idea because packets will just pile up on the
+/// other thread's thread_local. This is still "safe", just really bad for performance.
 pub struct DpdkInlineCn {
     local_port: u16,
     remote_addr: Option<SocketAddrV4>,
@@ -209,6 +208,14 @@ impl DpdkInlineCn {
             port_pool,
             _mempools: mempools,
         }
+    }
+
+    pub fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddrV4> {
+        self.remote_addr
     }
 }
 
@@ -684,7 +691,7 @@ impl DpdkState {
                         new_stash.push(msg);
                         self.rx_packets_for_ports
                             .push(((dst_port, pkt_src_addr), new_stash));
-                        trace!(?dst_port, ?pkt_src_addr, "created new stash for connection");
+                        debug!(?dst_port, ?pkt_src_addr, "created new stash for connection");
                         // signal new connection.
                         if let Some(nc) = new_conns {
                             nc.send(pkt_src_addr)
