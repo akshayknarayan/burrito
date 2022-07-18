@@ -16,9 +16,15 @@ use std::{future::Future, pin::Pin};
 #[derive(Debug, Clone, Default)]
 pub struct UdpToShard<I>(pub I);
 
+impl<I> UdpToShard<I> {
+    pub fn new(inner: I) -> Self {
+        UdpToShard(inner)
+    }
+}
+
 impl<I, E> ChunnelConnector for UdpToShard<I>
 where
-    I: ChunnelConnector<Addr = SocketAddr, Error = E> + Clone + Send + Sync + 'static,
+    I: ChunnelConnector<Addr = SocketAddr, Error = E> + Send + Sync + 'static,
     E: Into<Report> + Send + Sync + 'static,
     UdpToShardCn<ProjectLeft<SocketAddr, <I as ChunnelConnector>::Connection>>:
         ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
@@ -42,7 +48,7 @@ where
 
 impl<I, E> ChunnelListener for UdpToShard<I>
 where
-    I: ChunnelListener<Addr = SocketAddr, Error = E> + Clone + Send + Sync + 'static,
+    I: ChunnelListener<Addr = SocketAddr, Error = E> + Send + Sync + 'static,
     E: Into<Report> + Send + Sync + 'static,
     UdpToShardCn<ProjectLeft<SocketAddr, <I as ChunnelListener>::Connection>>:
         ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,

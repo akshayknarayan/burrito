@@ -1,19 +1,19 @@
 use crate::kv::Store;
 use crate::msg::Msg;
 use crate::reliability::KvReliabilityServerChunnel;
+use crate::server::udp_to_shard::UdpToShard;
 use and_then_concurrent::TryStreamAndThenExt;
 use bertha::Chunnel;
 use bertha::{
-    bincode::SerializeChunnel, chan_transport::RendezvousChannel, negotiate::StackNonce,
-    select::SelectListener, ChunnelConnection, ChunnelListener, CxList, GetOffers,
+    bincode::SerializeChunnel, negotiate::StackNonce, select::SelectListener, ChunnelConnection,
+    ChunnelListener, CxList, GetOffers,
 };
-use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
-use color_eyre::eyre::{Report, WrapErr};
+use color_eyre::eyre::Report;
 use futures_util::stream::{Stream, TryStreamExt};
 use std::fmt::Debug;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{atomic::AtomicUsize, Arc};
-use tracing::{debug, debug_span, info, info_span, trace, warn};
+use tracing::{debug, debug_span, info, trace, warn};
 use tracing_futures::Instrument;
 
 /// Start and serve a single shard.
@@ -28,9 +28,21 @@ use tracing_futures::Instrument;
 /// `s`: Will send the offers on this channel when ready to listen for connections. This is needed
 /// so that `ShardCanonicalServer` can open negotiation with us if it hears from the client first,
 /// since we expect a negotiation handshake here.
+#[tracing::instrument(
+    skip(
+        raw_listener,
+        internal_addr,
+        internal_srv,
+        need_address_embedding,
+        s,
+        no_negotiation
+    ),
+    level = "debug",
+    err
+)]
 pub async fn single_shard(
     addr: SocketAddr,
-    raw_listener: impl ChunnelListener<
+    mut raw_listener: impl ChunnelListener<
             Addr = SocketAddr,
             Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
             Error = impl Into<Report> + Send + Sync + 'static,
@@ -53,7 +65,7 @@ pub async fn single_shard(
     need_address_embedding: bool,
     s: impl Into<Option<tokio::sync::oneshot::Sender<Vec<StackNonce>>>>,
     no_negotiation: bool,
-) {
+) -> Result<(), Report> {
     let s = s.into();
     let internal_addr = internal_addr.unwrap_or(addr);
     info!(?addr, ?internal_addr, "listening");
@@ -62,8 +74,7 @@ pub async fn single_shard(
         ($st_make: path, $stack: expr, $st: expr) => {{
             let offers = $stack.clone().offers().collect();
             let st = $st_make($stack, $st) // bertha::negotiate::negotiate_server
-                .await
-                .unwrap();
+                .await?;
 
             if let Some(s) = s {
                 s.send(offers).unwrap();
@@ -74,25 +85,24 @@ pub async fn single_shard(
             let idx = Arc::new(AtomicUsize::new(0));
 
             tokio::pin!(st);
-            st.try_for_each_concurrent(None, |cn| async move {
+            st.try_for_each_concurrent(None, |cn| {
                 let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let store = store.clone();
+                async move {
                 // TODO deduplicate possible spurious retxs by req id
                 serve_one(cn, store, idx, 16)
                     .instrument(debug_span!("shard_connection", idx = ?idx)).await
-            }).await?;
-            unreachable!()
+            }}).await?;
         }}
     }
 
     if let Some(internal_srv) = internal_srv {
         if need_address_embedding {
-            let st = SelectListener::new(raw_listener, udp_to_shard::UdpToShard(internal_srv))
+            let st = SelectListener::new(raw_listener, UdpToShard::new(internal_srv))
                 .separate_addresses()
                 .listen((addr, internal_addr))
                 .await
-                .map_err::<Report, _>(Into::into)
-                .unwrap();
+                .map_err::<Report, _>(Into::into)?;
             let external = CxList::from(KvReliabilityServerChunnel::default())
                 .wrap(SerializeChunnel::default());
             serve_stack!(bertha::negotiate::negotiate_server, external, st)
@@ -101,8 +111,7 @@ pub async fn single_shard(
                 .separate_addresses()
                 .listen((addr, internal_addr))
                 .await
-                .map_err::<Report, _>(Into::into)
-                .unwrap();
+                .map_err::<Report, _>(Into::into)?;
             if no_negotiation {
                 let external = SerializeChunnel::default();
                 serve_stack!(make_cn, external, st)
@@ -113,7 +122,7 @@ pub async fn single_shard(
             }
         }
     } else {
-        let st = raw_listener.listen(addr).await?;
+        let st = raw_listener.listen(addr).await.map_err(Into::into)?;
         if no_negotiation {
             let external = SerializeChunnel::default();
             serve_stack!(make_cn, external, st)
@@ -122,15 +131,18 @@ pub async fn single_shard(
                 .wrap(SerializeChunnel::default());
             serve_stack!(bertha::negotiate::negotiate_server, external, st)
         }
-    }
+    };
+
+    unreachable!()
 }
 
+#[tracing::instrument(skip(cn, store, batch_size), level = "debug", err)]
 async fn serve_one(
     cn: impl ChunnelConnection<Data = (SocketAddr, Msg)> + Send + Sync + 'static,
     store: Store,
     idx: usize,
     batch_size: usize,
-) {
+) -> Result<(), Report> {
     let mut slots: Vec<_> = (0..batch_size).map(|_| None).collect();
     debug!("new");
     loop {
@@ -139,7 +151,7 @@ async fn serve_one(
             Ok(ms) => ms,
             Err(e) => {
                 warn!(err = ?e, ?idx, "exiting on recv error");
-                break;
+                break Err(e);
             }
         };
 
@@ -159,7 +171,7 @@ async fn serve_one(
             Ok(_) => (),
             Err(e) => {
                 warn!(err = ?e, ?idx, "exiting on send error");
-                break;
+                break Err(e);
             }
         }
     }

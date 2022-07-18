@@ -1,15 +1,76 @@
 //! Utils to help the crate's binaries
 
-use color_eyre::eyre::Report;
-use std::path::PathBuf;
-use tracing::info;
+use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use tracing::{debug, info};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Datapath {
+    Kernel,
+    Shenango,
+    DpdkSingleThread,
+    DpdkMultiThread,
+}
+
+impl std::str::FromStr for Datapath {
+    type Err = Report;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "kernel" | "Kernel" => Self::Kernel,
+            "shenango" | "Shenango" => Self::Shenango,
+            "dpdkthread" => Self::DpdkSingleThread,
+            "dpdkmulti" | "dpdkinline" => Self::DpdkMultiThread,
+            s => bail!(eyre!("Unknown datapath {:?}", s)),
+        })
+    }
+}
+
+fn get_first_line(x: &Path) -> Result<String, Report> {
+    let mut f = BufReader::new(
+        std::fs::File::open(x).wrap_err(eyre!("could not open config file {:?}", x))?,
+    );
+    let mut line = String::new();
+    f.read_line(&mut line)
+        .wrap_err("error reading config file")?;
+    Ok(line)
+}
+
+impl Datapath {
+    pub fn validate_cfg(&self, cfg_file: Option<&Path>) -> Result<(), Report> {
+        let cfg_file: &Path = match self {
+            Datapath::Kernel => {
+                tracing::warn!(?cfg_file, "Using kernel datapath, ignoring datapath config");
+                return Ok(());
+            }
+            Datapath::Shenango | Datapath::DpdkSingleThread | Datapath::DpdkMultiThread => {
+                cfg_file.ok_or(eyre!("datapath cfg must be specified"))?
+            }
+        };
+
+        debug!(?cfg_file, "test config file contents");
+        let first_line = get_first_line(cfg_file)?;
+
+        ensure!(
+            first_line.starts_with(match self {
+                Datapath::Shenango => "host_addr",
+                Datapath::DpdkSingleThread | Datapath::DpdkMultiThread => "[dpdk]",
+                _ => unreachable!(),
+            }),
+            "config file has wrong format: {:?}",
+            first_line
+        );
+        Ok(())
+    }
+}
 
 /// `log`: enable stdout logging.
 /// `trace_time`: enable dumps of tracing times to file
 /// `trace_write_interval`: how often to write tracing times
-pub async fn tracing_init(
+pub fn tracing_init(
     log: bool,
     trace_time: Option<PathBuf>,
     trace_write_interval: std::time::Duration,
@@ -64,13 +125,13 @@ pub async fn tracing_init(
         })
         .unwrap();
 
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             let timing = timing_downcaster
                 .downcast(&d)
                 .expect("downcast timing layer");
 
             loop {
-                tokio::time::sleep(trace_write_interval).await;
+                std::thread::sleep(trace_write_interval);
                 let mut f = std::fs::File::create(&trace_file).unwrap();
                 info!("writing tracing info");
                 dump_tracing(timing, &mut f).unwrap();

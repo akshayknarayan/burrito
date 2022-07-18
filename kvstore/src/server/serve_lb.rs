@@ -1,6 +1,6 @@
 use crate::msg::Msg;
 use crate::reliability::KvReliabilityServerChunnel;
-use crate::server::udp_to_shard;
+use crate::server::UdpToShard;
 use bertha::{
     bincode::SerializeChunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     GetOffers,
@@ -9,10 +9,13 @@ use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::TryStreamExt;
 use std::net::SocketAddr;
-use tracing::{debug_span, info, info_span, warn};
+use std::sync::{atomic::AtomicUsize, Arc};
+use tracing::{debug_span, info, info_span, trace_span, warn};
 use tracing_futures::Instrument;
 
 /// Start and serve a load balancer, which just forwards connections to existing shards.
+///
+/// Don't call `spawn`.
 pub async fn serve_lb(
     addr: SocketAddr,
     shards: Vec<SocketAddr>,
@@ -26,14 +29,9 @@ pub async fn serve_lb(
     shards_internal: Vec<SocketAddr>,
     shard_connector: impl ChunnelConnector<
             Addr = SocketAddr,
-            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>
-                             + Clone
-                             + Send
-                             + Sync
-                             + 'static,
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
             Error = impl Into<Report> + Send + Sync + 'static,
-        > + Clone
-        + Send
+        > + Send
         + Sync
         + 'static,
     redis_addr: SocketAddr,
@@ -58,7 +56,7 @@ pub async fn serve_lb(
     let cnsrv = burrito_shard_ctl::ShardCanonicalServer::<_, _, _, (SocketAddr, Msg)>::new(
         si.clone(),
         Some(shards_internal),
-        udp_to_shard::UdpToShard(shard_connector),
+        UdpToShard::new(shard_connector),
         shard_stack,
         offer.pop().unwrap(),
         &redis_addr,
@@ -84,36 +82,31 @@ pub async fn serve_lb(
         ready.send(()).unwrap_or_default();
     }
 
-    let mut ctr = 0usize;
+    let ctr: Arc<AtomicUsize> = Default::default();
     tokio::pin!(st);
-    while let Some(r) = st
-        .try_next()
-        .instrument(info_span!("negotiate_server"))
-        .await?
-    {
-        tokio::spawn(
-            async move {
-                let ctr = ctr;
-                let mut slot = [None];
-                loop {
-                    match r
-                        .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
-                        .instrument(debug_span!("shard-canonical-server-connection", ?ctr))
-                        .await
-                        .wrap_err("kvstore/server: Error while processing requests")
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!(err = ?e, ?ctr, "exiting");
-                            break;
-                        }
+    st.try_for_each_concurrent(None, |cn| {
+        let ctr = Arc::clone(&ctr);
+        async move {
+            let ctr = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut slot = [None];
+            loop {
+                match cn
+                    .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
+                    .instrument(trace_span!("lb-serve-recv", ?ctr))
+                    .await
+                    .wrap_err("kvstore/server: Error while processing requests")
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(err = ?e, ?ctr, "exiting");
+                        break Err(e);
                     }
                 }
             }
-            .instrument(debug_span!("serve_lb_conn")),
-        );
-        ctr += 1;
-    }
+        }
+        .instrument(debug_span!("serve_lb_conn"))
+    })
+    .await?;
 
     unreachable!() // negotiate_server never returns None
 }

@@ -1,12 +1,9 @@
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use kvstore::bin::tracing_init;
+use kvstore::bin::{tracing_init, Datapath};
 use kvstore::serve;
+use std::path::PathBuf;
 use structopt::StructOpt;
-use tracing::{info, info_span};
-use tracing_futures::Instrument;
-
-#[cfg(all(feature = "use-shenango", feature = "use-dpdk-direct"))]
-compile_error!("Features \"use-shenango\" and \"use-dpdk-direct\" are incompatible");
+use tracing::info;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "kvserver")]
@@ -21,9 +18,6 @@ struct Opt {
     redis_addr: std::net::SocketAddr,
 
     #[structopt(short, long)]
-    shenango_cfg: Option<std::path::PathBuf>,
-
-    #[structopt(short, long)]
     num_shards: u16,
 
     #[structopt(short, long)]
@@ -33,32 +27,38 @@ struct Opt {
     log: bool,
 
     #[structopt(short, long)]
-    trace_time: Option<std::path::PathBuf>,
+    trace_time: Option<PathBuf>,
+
+    #[structopt(short, long)]
+    datapath: Datapath,
+
+    #[structopt(short, long)]
+    cfg: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Report> {
+fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
     color_eyre::install()?;
     tracing_init(
         opt.log,
         opt.trace_time.clone(),
         std::time::Duration::from_secs(5),
-    )
-    .await;
+    );
+
+    opt.datapath
+        .validate_cfg(opt.cfg.as_ref().map(PathBuf::as_path))?;
 
     info!("KV Server");
-    run_server(opt).await?;
-    Ok(())
+    match opt.datapath {
+        Datapath::Kernel => run_server_kernel(opt),
+        Datapath::Shenango => run_server_shenango(opt),
+        Datapath::DpdkSingleThread => run_server_dpdk_singlethread(opt),
+        Datapath::DpdkMultiThread => run_server_dpdk_multithread(opt),
+    }
 }
 
-#[cfg(all(not(feature = "use-shenango"), not(feature = "use-dpdk-direct")))]
-async fn run_server(opt: Opt) -> Result<(), Report> {
-    info!("using default feature");
-    if opt.shenango_cfg.is_some() {
-        tracing::warn!(cfg_file = ?opt.shenango_cfg, "Shenango is disabled, ignoring config");
-    }
-
+fn run_server_kernel(opt: Opt) -> Result<(), Report> {
+    info!("using kernel datapath");
     serve(
         bertha::udp::UdpReqChunnel::default(),
         opt.redis_addr,
@@ -68,21 +68,13 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         None,
         opt.skip_negotiation,
     )
-    .instrument(info_span!("server"))
-    .await
     .wrap_err(eyre!("serve errored"))
 }
 
-#[cfg(feature = "use-shenango")]
-async fn run_server(opt: Opt) -> Result<(), Report> {
-    info!("using shenango feature");
-    if opt.shenango_cfg.is_none() {
-        return Err(eyre!(
-            "If shenango feature is enabled, shenango_cfg must be specified"
-        ));
-    }
+fn run_server_shenango(opt: Opt) -> Result<(), Report> {
+    info!("using shenango datapath");
 
-    let s = shenango_chunnel::ShenangoUdpSkChunnel::new(&opt.shenango_cfg.unwrap());
+    let s = shenango_chunnel::ShenangoUdpSkChunnel::new(&opt.cfg.unwrap());
     let l = shenango_chunnel::ShenangoUdpReqChunnel(s);
     serve(
         l,
@@ -93,20 +85,13 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         None,
         opt.skip_negotiation,
     )
-    .instrument(info_span!("server"))
-    .await
+    .wrap_err(eyre!("serve errored"))
 }
 
-#[cfg(feature = "use-dpdk-direct")]
-async fn run_server(opt: Opt) -> Result<(), Report> {
-    info!("using dpdk feature");
-    if opt.shenango_cfg.is_none() {
-        return Err(eyre!(
-            "If use-dpdk-direct feature is enabled, shenango_cfg must be specified"
-        ));
-    }
+fn run_server_dpdk_singlethread(opt: Opt) -> Result<(), Report> {
+    info!("using dpdk single-thread datapath");
 
-    let s = dpdk_direct::DpdkUdpSkChunnel::new(&opt.shenango_cfg.unwrap())?;
+    let s = dpdk_direct::DpdkUdpSkChunnel::new(&opt.cfg.unwrap())?;
     let l = dpdk_direct::DpdkUdpReqChunnel(s);
     serve(
         l,
@@ -117,6 +102,21 @@ async fn run_server(opt: Opt) -> Result<(), Report> {
         None,
         opt.skip_negotiation,
     )
-    .instrument(info_span!("server"))
-    .await
+    .wrap_err(eyre!("serve errored"))
+}
+
+fn run_server_dpdk_multithread(opt: Opt) -> Result<(), Report> {
+    info!("using dpdk single-thread datapath");
+    let s = dpdk_direct::DpdkInlineChunnel::new(opt.cfg.unwrap(), opt.num_shards as _)?;
+    let l = dpdk_direct::DpdkInlineReqChunnel::from(s);
+    serve(
+        l,
+        opt.redis_addr,
+        opt.ip_addr,
+        opt.port,
+        opt.num_shards,
+        None,
+        opt.skip_negotiation,
+    )
+    .wrap_err(eyre!("serve errored"))
 }

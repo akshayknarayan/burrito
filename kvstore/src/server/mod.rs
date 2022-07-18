@@ -1,21 +1,20 @@
 //! Server side.
 
-use crate::kv::Store;
 use crate::msg::Msg;
 use crate::reliability::KvReliabilityServerChunnel;
-use and_then_concurrent::TryStreamAndThenExt;
-use bertha::Chunnel;
 use bertha::{
     bincode::SerializeChunnel, chan_transport::RendezvousChannel, negotiate::StackNonce,
-    select::SelectListener, ChunnelConnection, ChunnelListener, CxList, GetOffers,
+    ChunnelConnection, ChunnelListener, CxList,
 };
 use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::{Stream, TryStreamExt};
-use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{atomic::AtomicUsize, Arc};
-use tracing::{debug, debug_span, info, info_span, trace, warn};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tracing::{debug_span, error, info, info_span, trace_span, warn};
 use tracing_futures::Instrument;
 
 mod serve_lb;
@@ -26,7 +25,10 @@ pub use serve_lb::serve_lb;
 pub use single_shard::single_shard;
 pub use udp_to_shard::UdpToShard;
 
-/// Start and serve a `ShardCanonicalServer` and shards.
+/// Start and serve a `ShardCanonicalServer` and `num_shards` shards.
+///
+/// Need to avoid use of `tokio::spawn` since this interferes with `Datapath::DpdkMultiThread`
+/// configurations.
 ///
 /// `raw_listener`: A ChunnelListener that can return `Data = (SocketAddr, Vec<u8>)`
 /// `ChunnelConnection`s.
@@ -49,7 +51,7 @@ pub fn serve(
     srv_ip: IpAddr,
     srv_port: u16,
     num_shards: u16,
-    ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
     no_negotiation: bool,
 ) -> Result<(), Report> {
     // 1. Define addr.
@@ -62,44 +64,61 @@ pub fn serve(
         info!(addr = ?&a, "start shard");
         let (s, r) = tokio::sync::oneshot::channel();
         let int_srv = internal_srv.clone();
-        tokio::spawn(
-            single_shard(
-                a,
-                raw_listener.clone(),
-                None,
-                Some(int_srv),
-                false,
-                s,
-                no_negotiation,
-            )
-            .instrument(debug_span!("shardsrv", addr = ?&a)),
-        );
+        let listener = raw_listener.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    error!(?err, "Could not start tokio runtime for shard thread");
+                    return;
+                }
+            };
+            match rt.block_on(
+                single_shard(a, listener, None, Some(int_srv), false, s, no_negotiation)
+                    .instrument(debug_span!("shardsrv", addr = ?&a)),
+            ) {
+                Ok(_) => (),
+                Err(err) => {
+                    error!(?err, "Shard errored");
+                    return;
+                }
+            }
+        });
         rdy.push(r);
     }
 
-    if no_negotiation {
-        info!("no negotiation: no serve_canonical needed");
-        futures_util::future::pending().await
-    } else {
-        let mut offers: Vec<Vec<StackNonce>> = rdy.try_collect().await.unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        if no_negotiation {
+            info!("no negotiation: no serve_canonical needed");
+            futures_util::future::pending().await
+        } else {
+            let mut offers: Vec<Vec<StackNonce>> = rdy.try_collect().await.unwrap();
 
-        let st = raw_listener
-            .listen(si.canonical_addr)
+            let st = raw_listener
+                .listen(si.canonical_addr)
+                .await
+                .map_err(Into::into)
+                .wrap_err("Listen on raw_listener")?;
+            serve_canonical(
+                si,
+                st.map_err(Into::into),
+                internal_cli,
+                redis_addr,
+                offers.pop().unwrap(),
+                ready,
+            )
             .await
-            .map_err(Into::into)
-            .wrap_err("Listen on raw_listener")?;
-        serve_canonical(
-            si,
-            st.map_err(Into::into),
-            internal_cli,
-            redis_addr,
-            offers.pop().unwrap(),
-            ready,
-        )
-        .await
-    }
+        }
+    })
 }
 
+#[tracing::instrument(skip(st, internal_cli, redis_addr, offer, ready), level = "debug", err)]
 async fn serve_canonical(
     si: ShardInfo<SocketAddr>,
     st: impl Stream<
@@ -128,33 +147,29 @@ async fn serve_canonical(
                 ready.send(()).unwrap_or_default();
             }
 
-            let mut ctr = 0usize;
+            let ctr: Arc<AtomicUsize> = Default::default();
             tokio::pin!(st);
-            while let Some(r) = st
-                .try_next()
-                    .instrument(info_span!("negotiate_server"))
-                    .await?
-            {
-                tokio::spawn(async move {
-                    let ctr = ctr;
+            st.try_for_each_concurrent(None, |r| {
+                    let ctr = Arc::clone(&ctr);
                     let mut slot = [None];
-                    loop {
-                        match r
-                            .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
-                            .instrument(debug_span!("shard-canonical-server-connection", ?ctr))
-                            .await
-                            .wrap_err("kvstore/server: Error while processing requests")
-                            {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    warn!(err = ?e, ?ctr, "exiting");
-                                    break;
+                    async move {
+                        let ctr = ctr.fetch_add(1, Ordering::SeqCst);
+                        loop {
+                            match r
+                                .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
+                                .instrument(trace_span!("shard-canonical-server-connection", ?ctr))
+                                .await
+                                .wrap_err("kvstore/server: Error while processing requests")
+                                {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        warn!(err = ?e, ?ctr, "exiting");
+                                        break Err(e);
+                                    }
                                 }
-                            }
+                        }
                     }
-                });
-                ctr += 1;
-            }
+            }).await?;
         }}
     }
 

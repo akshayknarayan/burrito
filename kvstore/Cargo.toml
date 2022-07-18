@@ -6,7 +6,7 @@ edition = "2021"
 
 [features]
 default = []
-bin = ["tracing-subscriber", "tracing-timing", "structopt", "ctrlc", "tokio/rt-multi-thread", "tokio/fs"]
+bin = ["tracing-subscriber", "tracing-timing", "structopt", "ctrlc", "tokio/rt-multi-thread", "tokio/fs", "num_cpus", "use-shenango", "use-dpdk-direct"]
 use-shenango = ["shenango-chunnel"]
 use-dpdk-direct = ["dpdk-direct"]
 ebpf = ["burrito-shard-ctl/ebpf"]
@@ -29,6 +29,7 @@ structopt = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
 tracing-timing  = { version = "0.5", features = ["layer"], optional = true }
 ctrlc = { version = "3", optional = true }
+num_cpus = { version = "1", optional = true }
 shenango-chunnel = { path = "../shenango-chunnel", optional = true }
 dpdk-direct = { path = "../dpdk-direct", optional = true }
 
@@ -43,8 +44,8 @@ required-features = ["bin"]
 
 [[bin]]
 name = "burrito-lb"
-required-features = ["bin", "use-shenango"]
+required-features = ["bin"]
 
 [[bin]]
 name = "single-shard"
-required-features = ["bin", "use-shenango"]
+required-features = ["bin"]
