@@ -82,7 +82,7 @@ async fn main() -> Result<(), Report> {
     }
 }
 
-#[instrument(skip(cn), level = "info", err)]
+#[instrument(skip(num_msgs, interarrival, remote_addr), level = "info", err)]
 async fn client(
     cn: DpdkInlineCn,
     num_msgs: usize,
@@ -104,7 +104,7 @@ async fn client(
         ms.iter_mut()
             .map_while(Option::take)
             .try_fold(0, |cnt, msg| {
-                debug!(?msg, "received");
+                trace!(?msg, "received");
                 ensure!(
                     msg.0 == remote_addr,
                     "received response from unexpected address"
@@ -137,7 +137,7 @@ async fn client(
             }
             Either::Right((ms, _)) => {
                 tot_recv_count += handle_received(remote_addr, ms?)?;
-                debug!(?tot_recv_count, "received");
+                debug!(?tot_recv_count, "received burst");
             }
         }
     }
@@ -145,7 +145,7 @@ async fn client(
     while tot_recv_count < num_msgs {
         let ms = cn.recv(&mut slots[..]).await?;
         tot_recv_count += handle_received(remote_addr, ms)?;
-        debug!(?tot_recv_count, "received messages");
+        debug!(?tot_recv_count, "received burst");
     }
 
     info!("done");

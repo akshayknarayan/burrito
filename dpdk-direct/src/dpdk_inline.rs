@@ -221,10 +221,16 @@ impl DpdkInlineCn {
 
 impl std::fmt::Debug for DpdkInlineCn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DpdkInlineCn")
-            .field("local_port", &self.local_port)
-            .field("remote_addr", &self.remote_addr)
-            .finish()
+        if let Some(remote) = self.remote_addr {
+            f.debug_struct("DpdkInlineCn")
+                .field("local_port", &self.local_port)
+                .field("remote_addr", &remote)
+                .finish()
+        } else {
+            f.debug_struct("DpdkInlineCn")
+                .field("local_port", &self.local_port)
+                .finish()
+        }
     }
 }
 
@@ -662,7 +668,7 @@ impl DpdkState {
                     for ((p, _), ref mut stash) in &mut self.rx_packets_for_ports {
                         if *p == dst_port {
                             stash.push(msg);
-                            debug!(stash_size = ?stash.len(), ?dst_port, "Stashed packet");
+                            trace!(stash_size = ?stash.len(), "Stashed packet");
                             break;
                         }
                     }
@@ -680,7 +686,7 @@ impl DpdkState {
                             found_dst_port = true;
                             if *cand_src_addr == pkt_src_addr {
                                 stash.push(msg);
-                                debug!(stash_size = ?stash.len(), ?dst_port, ?pkt_src_addr, "Stashed packet");
+                                trace!(stash_size = ?stash.len(), "Stashed packet");
                                 continue 'per_pkt;
                             }
                         }
@@ -716,7 +722,7 @@ impl DpdkState {
         }
 
         if num_invalid > 0 {
-            debug!(?num_invalid, "Discarded invalid packets");
+            trace!(?num_invalid, "Discarded invalid packets");
         }
 
         Ok(&mut self.rx_recv_buf[..num_valid])
@@ -786,7 +792,7 @@ impl DpdkState {
             new_stash.push(msg);
             self.rx_packets_for_ports
                 .push(((dst_port, pkt_src_addr), new_stash));
-            trace!(?dst_port, ?pkt_src_addr, "created new stash for connection");
+            debug!(?dst_port, ?pkt_src_addr, "created new stash for connection");
             // signal new connection.
             if let Some(nc) = new_conns {
                 nc.try_send(pkt_src_addr)
