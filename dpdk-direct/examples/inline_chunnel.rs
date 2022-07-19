@@ -1,12 +1,14 @@
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{ensure, Report};
+use color_eyre::eyre::{ensure, Report, WrapErr};
 use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn, DpdkInlineReqChunnel};
+use futures_util::Stream;
 use futures_util::{future::Either, TryStreamExt};
 use quanta::Instant;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use structopt::StructOpt;
-use tracing::{debug, info, info_span, instrument, trace};
+use tracing::{debug, error, info, info_span, instrument, trace};
 use tracing_futures::Instrument;
 
 #[derive(Debug, StructOpt)]
@@ -18,6 +20,9 @@ struct Opt {
     #[structopt(short, long, default_value = "100")]
     num_msgs: usize,
 
+    #[structopt(short, long)]
+    threads: usize,
+
     /// If specified, this is a client. Otherwise it is a server.
     #[structopt(short, long)]
     ip_addr: Option<std::net::Ipv4Addr>,
@@ -26,8 +31,7 @@ struct Opt {
     datapath_cfg: std::path::PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Report> {
+fn main() -> Result<(), Report> {
     color_eyre::install()?;
     tracing_subscriber::fmt::init();
     let opt = Opt::from_args();
@@ -41,45 +45,132 @@ async fn main() -> Result<(), Report> {
             "Dpdk Inline Chunnel Test - Client"
         );
 
-        let mut ch = DpdkInlineChunnel::new(opt.datapath_cfg, 1)?;
-        let cn1 = ch.connect(()).await?;
-        let cn2 = ch.connect(()).await?;
-        let cl1 = client(cn1, opt.num_msgs / 2, interarrival, remote_addr);
-        let cl2 = client(cn2, opt.num_msgs / 2, interarrival, remote_addr);
-        let (r1, r2) = futures_util::join!(cl1, cl2);
-        r1?;
-        r2
+        let ch = DpdkInlineChunnel::new(opt.datapath_cfg, 1)?;
+        let ch = Arc::new(Mutex::new(ch));
+
+        let mut jhs = Vec::with_capacity(opt.threads);
+        for thread in 1..opt.threads {
+            debug!(?thread, "spawning thread");
+            let ch = Arc::clone(&ch);
+            let jh = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async move {
+                    let cn = {
+                        let mut ch_g = ch.lock().unwrap();
+                        ch_g.connect(()).await?
+                    };
+
+                    client(cn, opt.num_msgs / opt.threads, interarrival, remote_addr).await
+                })?;
+                Ok::<_, Report>(())
+            });
+            jhs.push(jh);
+        }
+
+        debug!(thread = 0, "using main tokio thread");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            let cn = {
+                let mut ch_g = ch.lock().unwrap();
+                ch_g.connect(()).await?
+            };
+
+            client(cn, opt.num_msgs / opt.threads, interarrival, remote_addr).await
+        })?;
+
+        for jh in jhs {
+            match jh.join() {
+                Ok(_) => (),
+                Err(e) => std::panic::resume_unwind(e),
+            }
+        }
+
+        Ok(())
     } else {
         let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, opt.port));
         info!(?local_addr, "Dpdk Inline Chunnel Test - Server");
-        let ch = DpdkInlineChunnel::new(opt.datapath_cfg, 1)?;
-        let mut ch = DpdkInlineReqChunnel::from(ch);
-        let cn_stream = ch.listen(local_addr).await?;
+        let ch = DpdkInlineChunnel::new(opt.datapath_cfg, opt.threads)?;
+        let ch = DpdkInlineReqChunnel::from(ch);
+        let ch = Arc::new(Mutex::new(ch));
 
-        cn_stream
-            .try_for_each_concurrent(None, |cn| {
-                let port = cn.local_port();
-                let peer = cn.remote_addr();
-                async move {
-                    let mut slots: Vec<_> = (0..16).map(|_| None).collect();
-                    info!("new connection");
-                    let mut recv_count = 0;
-                    loop {
-                        let msgs = cn.recv(&mut slots[..]).await?;
-                        let echoes = msgs.iter_mut().map_while(|m| {
-                            let x = m.take()?;
-                            recv_count += 1;
-                            trace!(?x, ?recv_count, "got msg");
-                            Some(x)
-                        });
-                        cn.send(echoes).await?;
-                        debug!(?recv_count, "received message burst");
-                    }
-                }
-                .instrument(info_span!("connection", ?port, ?peer))
-            })
-            .await
+        for thread in 1..opt.threads {
+            debug!(?thread, "spawning thread");
+            let ch = Arc::clone(&ch);
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async move {
+                    let cn_stream_fut = {
+                        let mut ch_g = ch.lock().unwrap();
+                        ch_g.listen(local_addr)
+                    };
+
+                    debug!(?thread, "awaiting stream future");
+                    let stream = match cn_stream_fut.await {
+                        Err(err) => {
+                            error!(?err, "failed to get connection stream");
+                            return Err(err);
+                        }
+                        Ok(s) => s,
+                    };
+
+                    server(stream, thread).await
+                })
+            });
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            debug!(thread = 0, "using main tokio thread");
+            let stream_fut = {
+                let mut ch_g = ch.lock().unwrap();
+                ch_g.listen(local_addr)
+            };
+
+            let stream = stream_fut
+                .await
+                .wrap_err("failed to get connection stream")?;
+            server(stream, 0).await
+        })
     }
+}
+
+#[instrument(skip(stream), level = "info", err)]
+async fn server(
+    stream: impl Stream<Item = Result<DpdkInlineCn, Report>> + Send + 'static,
+    thread_idx: usize,
+) -> Result<(), Report> {
+    info!("start listening");
+    stream
+        .try_for_each_concurrent(None, |cn| {
+            let port = cn.local_port();
+            let peer = cn.remote_addr();
+            async move {
+                let mut slots: Vec<_> = (0..16).map(|_| None).collect();
+                info!("new connection");
+                let mut recv_count = 0;
+                loop {
+                    let msgs = cn.recv(&mut slots[..]).await?;
+                    let echoes = msgs.iter_mut().map_while(|m| {
+                        let x = m.take()?;
+                        recv_count += 1;
+                        trace!(?x, ?recv_count, "got msg");
+                        Some(x)
+                    });
+                    cn.send(echoes).await?;
+                    debug!(?recv_count, "received message burst");
+                }
+            }
+            .instrument(info_span!("connection", ?port, ?peer))
+        })
+        .await
 }
 
 #[instrument(skip(num_msgs, interarrival, remote_addr), level = "info", err)]

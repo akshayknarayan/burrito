@@ -12,13 +12,13 @@ use flume::{Receiver, Sender};
 use futures_util::future::ready;
 use futures_util::Stream;
 use futures_util::{future::Ready, stream::Once};
-use std::cell::RefCell;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, trace, warn};
+use std::{cell::RefCell, fmt::Debug};
+use tracing::{debug, error, info, trace, warn};
 
 std::thread_local! {
     static DPDK_STATE: RefCell<Option<DpdkState>> = RefCell::new(None);
@@ -36,12 +36,24 @@ std::thread_local! {
 /// mempool to issue sends/receives against. If there is not one, it will try to initialize that
 /// thread. If there are no mempools left, this will fail, but in theory we should not have more
 /// threads than mempools.
+#[derive(Clone)]
 pub struct DpdkInlineChunnel {
     // for initialization only. once we start sending/receiving on some threads, we will take these
-    // out of this Vec and move them into
-    initialized_mempools: Arc<Mutex<Vec<DpdkState>>>,
+    // out of this Vec and move them into the `DPDK_STATE` thread local variable.
+    initialization_state: Arc<Mutex<DpdkInitState>>,
     // for connect-side connections, ephemeral source ports.
     ephemeral_ports: Arc<Mutex<Vec<u16>>>,
+}
+
+struct DpdkInitState {
+    mempools: Vec<DpdkState>,
+    lcore_map: Vec<u32>,
+}
+
+impl Debug for DpdkInlineChunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DpdkInlineChunnel").finish()
+    }
 }
 
 impl DpdkInlineChunnel {
@@ -51,32 +63,52 @@ impl DpdkInlineChunnel {
     /// Otherwise we might run out of mempools.
     pub fn new(config_path: PathBuf, num_dpdk_threads: usize) -> Result<Self, Report> {
         let dpdks = DpdkState::new(config_path, num_dpdk_threads)?;
+        let lcore_map = get_lcore_map().wrap_err("Could not fetch DPDK lcore map")?;
+        debug!(?lcore_map, "got lcore map");
+        ensure!(
+            lcore_map.len() >= num_dpdk_threads,
+            "Not enough DPDK lcores ({:?}) for number of requested threads ({:?})",
+            lcore_map.len(),
+            num_dpdk_threads
+        );
         Ok(DpdkInlineChunnel {
-            initialized_mempools: Arc::new(Mutex::new(dpdks)),
+            initialization_state: Arc::new(Mutex::new(DpdkInitState {
+                mempools: dpdks,
+                lcore_map,
+            })),
             ephemeral_ports: Arc::new(Mutex::new((1024..60_000).collect())),
         })
     }
 }
 
-fn try_init_thread(init_pool: &Mutex<Vec<DpdkState>>) -> Result<(), Report> {
+fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
     DPDK_STATE
         .try_with(|dpdk| {
             let mut dpdk = dpdk.borrow_mut();
             if dpdk.is_none() {
+                // get a core assignment.
+                let mut init_state_g = init_state.lock().unwrap();
+                let core_id = init_state_g
+                    .lcore_map
+                    .pop()
+                    .ok_or(eyre!("No remaining lcores"))?;
+
+                // affinitize
+                affinitize_thread(core_id as _)
+                    .wrap_err(eyre!("affinitizing thread to lcore {:?}", core_id))?;
+
+                info!(?core_id, "taking initialized DpdkState");
                 *dpdk = Some(
-                    init_pool
-                        .lock()
-                        .unwrap()
+                    init_state_g
+                        .mempools
                         .pop()
                         .ok_or(eyre!("No remaining initialized dpdk thread mempools"))?,
                 );
             }
             Ok::<_, Report>(())
         })
-        .wrap_err(eyre!("Error accessing dpdk state thread_local"))??;
-
-    // affinitize
-    affinitize_thread(get_lcore_id() as _).wrap_err(eyre!("affinitizing thread"))?;
+        .wrap_err(eyre!("Error accessing dpdk state thread_local"))?
+        .wrap_err(eyre!("Error initializing thread-local dpdk state"))?;
     Ok(())
 }
 
@@ -91,7 +123,7 @@ impl ChunnelListener for DpdkInlineChunnel {
         use SocketAddr::*;
         ready(match addr {
             V4(a) => Ok(futures_util::stream::once(ready(
-                try_init_thread(self.initialized_mempools.as_ref()).and_then(|_| {
+                try_init_thread(self.initialization_state.as_ref()).and_then(|_| {
                     let mut ports = self.ephemeral_ports.lock().unwrap();
                     let mut found = false;
                     for i in 0..ports.len() {
@@ -130,7 +162,7 @@ impl ChunnelListener for DpdkInlineChunnel {
                         a.port(),
                         None,
                         None,
-                        Arc::clone(&self.initialized_mempools),
+                        Arc::clone(&self.initialization_state),
                         Some(Arc::clone(&self.ephemeral_ports)),
                     ))
                 }),
@@ -148,7 +180,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         ready(
-            try_init_thread(self.initialized_mempools.as_ref()).and_then(|_| {
+            try_init_thread(self.initialization_state.as_ref()).and_then(|_| {
                 let port = self
                     .ephemeral_ports
                     .lock()
@@ -174,7 +206,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
                     port,
                     None,
                     None,
-                    Arc::clone(&self.initialized_mempools),
+                    Arc::clone(&self.initialization_state),
                     Some(Arc::clone(&self.ephemeral_ports)),
                 ))
             }),
@@ -190,7 +222,7 @@ pub struct DpdkInlineCn {
     remote_addr: Option<SocketAddrV4>,
     new_conns: Option<Sender<SocketAddrV4>>,
     port_pool: Option<Arc<Mutex<Vec<u16>>>>,
-    _mempools: Arc<Mutex<Vec<DpdkState>>>,
+    _init_state: Arc<Mutex<DpdkInitState>>,
 }
 
 impl DpdkInlineCn {
@@ -198,7 +230,7 @@ impl DpdkInlineCn {
         local_port: u16,
         remote_addr: Option<SocketAddrV4>,
         new_conns: Option<Sender<SocketAddrV4>>,
-        mempools: Arc<Mutex<Vec<DpdkState>>>,
+        init_state: Arc<Mutex<DpdkInitState>>,
         port_pool: Option<Arc<Mutex<Vec<u16>>>>,
     ) -> Self {
         Self {
@@ -206,7 +238,7 @@ impl DpdkInlineCn {
             remote_addr,
             new_conns,
             port_pool,
-            _mempools: mempools,
+            _init_state: init_state,
         }
     }
 
@@ -219,7 +251,7 @@ impl DpdkInlineCn {
     }
 }
 
-impl std::fmt::Debug for DpdkInlineCn {
+impl Debug for DpdkInlineCn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(remote) = self.remote_addr {
             f.debug_struct("DpdkInlineCn")
@@ -360,7 +392,14 @@ impl ChunnelConnection for DpdkInlineCn {
     }
 }
 
-/// Implement separating
+/// Demultiplex an incoming packet stream into connections by port.
+///
+/// To do this, we rely on `DpdkInlineCn`'s stashing implementation. We listen for the first
+/// connection in stash-only mode (i.e., don't return packets, only buffer them). Once we find a
+/// connection, we yield a connection from the stream. After this, calling `recv()` on that
+/// connection will send on a channel when new connections are found, so we no longer need to poll
+/// independently.
+#[derive(Debug, Clone)]
 pub struct DpdkInlineReqChunnel(DpdkInlineChunnel);
 
 impl From<DpdkInlineChunnel> for DpdkInlineReqChunnel {
@@ -382,7 +421,8 @@ impl ChunnelListener for DpdkInlineReqChunnel {
         ready((|| {
             match addr {
                 V4(a) => {
-                    try_init_thread(self.0.initialized_mempools.as_ref())?;
+                    try_init_thread(self.0.initialization_state.as_ref())
+                        .wrap_err("try_init_thread failed")?;
 
                     let (s, r) = flume::bounded(16);
 
@@ -394,7 +434,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                         listen_addr: SocketAddrV4,
                         sender: Sender<SocketAddrV4>,
                         receiver: Receiver<SocketAddrV4>,
-                        initialized_mempools: Arc<Mutex<Vec<DpdkState>>>,
+                        initialization_state: Arc<Mutex<DpdkInitState>>,
                     }
 
                     let state = StreamState {
@@ -402,7 +442,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                         listen_addr: a,
                         sender: s,
                         receiver: r,
-                        initialized_mempools: Arc::clone(&self.0.initialized_mempools),
+                        initialization_state: Arc::clone(&self.0.initialization_state),
                     };
 
                     // we just initialized this, so `.with` is fine instead of `.try_with`.
@@ -434,7 +474,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                                                 state.listen_addr.port(),
                                                 Some(addr),
                                                 Some(state.sender.clone()),
-                                                Arc::clone(&state.initialized_mempools),
+                                                Arc::clone(&state.initialization_state),
                                                 None,
                                             );
 
@@ -452,12 +492,12 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                                 }
                             } else {
                                 let addr = state.receiver.recv_async().await?;
-                                debug!(?addr, "new connection");
+                                debug!(?addr, "DpdkInlineReqChunnel returning new connection");
                                 let cn = DpdkInlineCn::new(
                                     state.listen_addr.port(),
                                     Some(addr),
                                     Some(state.sender.clone()),
-                                    Arc::clone(&state.initialized_mempools),
+                                    Arc::clone(&state.initialization_state),
                                     None,
                                 );
                                 return Ok(Some((cn, state)));

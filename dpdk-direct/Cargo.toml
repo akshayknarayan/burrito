@@ -17,9 +17,8 @@ eui48 = "1"
 ahash = "0.7"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["rt"] }
 tracing-subscriber = "0.2"
-tracing-error = "0.1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 structopt = "0.3"
