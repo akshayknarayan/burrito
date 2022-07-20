@@ -1,6 +1,6 @@
 use ahash::AHashMap as HashMap;
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
+use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{
     bindings::*,
     mbuf_slice,
@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::{cell::RefCell, fmt::Debug};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, trace_span, warn};
+use tracing_futures::Instrument;
 
 std::thread_local! {
     static DPDK_STATE: RefCell<Option<DpdkState>> = RefCell::new(None);
@@ -98,18 +99,17 @@ fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
                     .wrap_err(eyre!("affinitizing thread to lcore {:?}", core_id))?;
 
                 info!(?core_id, "taking initialized DpdkState");
-                *dpdk = Some(
-                    init_state_g
-                        .mempools
-                        .pop()
-                        .ok_or(eyre!("No remaining initialized dpdk thread mempools"))?,
-                );
+                let dpdk_state = init_state_g
+                    .mempools
+                    .pop()
+                    .ok_or(eyre!("No remaining initialized dpdk thread mempools"))?;
+                *dpdk = Some(dpdk_state);
             }
+
             Ok::<_, Report>(())
         })
         .wrap_err(eyre!("Error accessing dpdk state thread_local"))?
-        .wrap_err(eyre!("Error initializing thread-local dpdk state"))?;
-    Ok(())
+        .wrap_err(eyre!("Error initializing thread-local dpdk state"))
 }
 
 impl ChunnelListener for DpdkInlineChunnel {
@@ -173,20 +173,19 @@ impl ChunnelListener for DpdkInlineChunnel {
 }
 
 impl ChunnelConnector for DpdkInlineChunnel {
-    type Addr = ();
+    type Addr = SocketAddr;
     type Connection = DpdkInlineCn;
     type Future = futures_util::future::Ready<Result<Self::Connection, Report>>;
     type Error = Report;
 
-    fn connect(&mut self, _a: Self::Addr) -> Self::Future {
-        ready(
+    fn connect(&mut self, addr: Self::Addr) -> Self::Future {
+        ready((|| {
+            let remote_addr = match addr {
+                SocketAddr::V4(a) => a,
+                SocketAddr::V6(a) => bail!("Only Ipv4 addresses supported: {:?}", a),
+            };
+
             try_init_thread(self.initialization_state.as_ref()).and_then(|_| {
-                let port = self
-                    .ephemeral_ports
-                    .lock()
-                    .unwrap()
-                    .pop()
-                    .ok_or(eyre!("No available ports"))?;
                 DPDK_STATE.with(|dpdk_cell| {
                     let this_lcore = get_lcore_id();
                     let mut dpdk_opt = dpdk_cell.borrow_mut();
@@ -194,23 +193,45 @@ impl ChunnelConnector for DpdkInlineChunnel {
                         .as_mut()
                         .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
+                    // we have to choose the src port carefully so that its RSS hash leads it back to
+                    // this core.
+                    let port = {
+                        let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
+                        let mut found = None;
+                        for (i, cand_src_port) in free_ports_g.iter().enumerate() {
+                            if compute_flow_affinity(
+                                SocketAddrV4::new(dpdk.ip_addr, *cand_src_port),
+                                remote_addr,
+                            ) as usize
+                                == dpdk.rx_queue_id
+                            {
+                                found = Some(i);
+                                break;
+                            }
+                        }
+
+                        if let Some(i) = found {
+                            free_ports_g.swap_remove(i)
+                        } else {
+                            bail!("Could not find appropriate src port to use");
+                        }
+                    };
+
                     dpdk.rx_packets_for_ports.push((
                         (port, SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
                         Vec::with_capacity(16),
                     ));
 
-                    Ok::<_, Report>(())
-                })?;
-
-                Ok(DpdkInlineCn::new(
-                    port,
-                    None,
-                    None,
-                    Arc::clone(&self.initialization_state),
-                    Some(Arc::clone(&self.ephemeral_ports)),
-                ))
-            }),
-        )
+                    Ok(DpdkInlineCn::new(
+                        port,
+                        Some(remote_addr),
+                        None,
+                        Arc::clone(&self.initialization_state),
+                        Some(Arc::clone(&self.ephemeral_ports)),
+                    ))
+                })
+            })
+        })())
     }
 }
 
@@ -351,44 +372,49 @@ impl ChunnelConnection for DpdkInlineCn {
         'buf: 'cn,
     {
         let this_lcore = get_lcore_id();
-        Box::pin(async move {
-            loop {
-                let ret = DPDK_STATE
-                    .try_with(|dpdk_cell| {
-                        let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                        let msgs = dpdk.try_recv_burst(
-                            Some((self.local_port, self.remote_addr)),
-                            self.new_conns.as_ref(),
-                        )?;
+        Box::pin(
+            async move {
+                trace!("start");
+                loop {
+                    let ret = DPDK_STATE
+                        .try_with(|dpdk_cell| {
+                            let mut dpdk_opt = dpdk_cell.borrow_mut();
+                            let dpdk = dpdk_opt
+                                .as_mut()
+                                .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                            let msgs = dpdk.try_recv_burst(
+                                Some((self.local_port, self.remote_addr)),
+                                self.new_conns.as_ref(),
+                            )?;
 
-                        let mut slot_idx = 0;
-                        for msg in msgs.iter_mut().map_while(Option::take) {
-                            ensure!(msg.port == self.local_port, "Port mismatch");
-                            if let Some((ref mut addr, ref mut payload)) = msgs_buf[slot_idx] {
-                                *addr = SocketAddr::V4(msg.addr);
-                                payload.copy_from_slice(msg.get_buf());
-                            } else {
-                                msgs_buf[slot_idx] =
-                                    Some((SocketAddr::V4(msg.addr), msg.get_buf().to_vec()));
+                            let mut slot_idx = 0;
+                            for msg in msgs.iter_mut().map_while(Option::take) {
+                                ensure!(msg.port == self.local_port, "Port mismatch");
+                                if let Some((ref mut addr, ref mut payload)) = msgs_buf[slot_idx] {
+                                    *addr = SocketAddr::V4(msg.addr);
+                                    payload.copy_from_slice(msg.get_buf());
+                                } else {
+                                    msgs_buf[slot_idx] =
+                                        Some((SocketAddr::V4(msg.addr), msg.get_buf().to_vec()));
+                                }
+
+                                slot_idx += 1;
                             }
 
-                            slot_idx += 1;
-                        }
-
-                        Ok(slot_idx)
-                    })
-                    .map_err(Into::into)
-                    .and_then(|x| x)?;
-                if ret > 0 {
-                    return Ok(&mut msgs_buf[..ret]);
-                } else {
-                    tokio::task::yield_now().await;
+                            Ok(slot_idx)
+                        })
+                        .map_err(Into::into)
+                        .and_then(|x| x)?;
+                    if ret > 0 {
+                        trace!(num_returned = ?ret, "done");
+                        return Ok(&mut msgs_buf[..ret]);
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
-        })
+            .instrument(trace_span!("DpdkInlineCn::recv")),
+        )
     }
 }
 
@@ -714,6 +740,7 @@ impl DpdkState {
                     }
 
                     // the packet didn't match any ports. can drop.
+                    trace!(?dst_port, ?pkt_src_addr, "dropping pkt");
                 }
                 Some((ref wanted_dst_port, Some(ref wanted_src_addr)))
                     if *wanted_dst_port != dst_port || *wanted_src_addr != pkt_src_addr =>
@@ -746,6 +773,7 @@ impl DpdkState {
                                 .wrap_err("New connection channel send failed")?;
                         }
                     }
+
                     // else !found_dst_port, which means no one was listening and we can drop.
                 }
                 _ => {

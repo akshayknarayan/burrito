@@ -45,7 +45,7 @@ fn main() -> Result<(), Report> {
             "Dpdk Inline Chunnel Test - Client"
         );
 
-        let ch = DpdkInlineChunnel::new(opt.datapath_cfg, 1)?;
+        let ch = DpdkInlineChunnel::new(opt.datapath_cfg, opt.threads)?;
         let ch = Arc::new(Mutex::new(ch));
 
         let mut jhs = Vec::with_capacity(opt.threads);
@@ -59,12 +59,12 @@ fn main() -> Result<(), Report> {
                 rt.block_on(async move {
                     let cn = {
                         let mut ch_g = ch.lock().unwrap();
-                        ch_g.connect(()).await?
+                        ch_g.connect(remote_addr).await?
                     };
 
                     client(cn, opt.num_msgs / opt.threads, interarrival, remote_addr).await
                 })?;
-                Ok::<_, Report>(())
+                Ok::<_, Report>(thread)
             });
             jhs.push(jh);
         }
@@ -76,15 +76,19 @@ fn main() -> Result<(), Report> {
         rt.block_on(async move {
             let cn = {
                 let mut ch_g = ch.lock().unwrap();
-                ch_g.connect(()).await?
+                ch_g.connect(remote_addr).await?
             };
 
             client(cn, opt.num_msgs / opt.threads, interarrival, remote_addr).await
         })?;
+        info!(thread = 0, "client done");
 
         for jh in jhs {
             match jh.join() {
-                Ok(_) => (),
+                Ok(r) => {
+                    let thread = r?;
+                    info!(?thread, "client done");
+                }
                 Err(e) => std::panic::resume_unwind(e),
             }
         }
@@ -187,6 +191,8 @@ async fn client(
     let mut tot_msg_count = 0;
     let mut tot_recv_count = 0;
     let mut batch = Vec::with_capacity(16);
+
+    info!("starting");
 
     fn handle_received(
         remote_addr: SocketAddr,
