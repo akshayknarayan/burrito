@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tracing::{debug, debug_span, trace, trace_span, warn};
 use tracing_futures::Instrument;
@@ -102,15 +102,32 @@ enumerate_enum!(pub ShardFns, 0xe898734df758d0c0, Sharding);
 ///
 /// Forwards incoming messages to one of the internal connections specified by `shards_inner` after
 /// evaluating the sharding function.
-#[derive(Clone)]
 pub struct ShardCanonicalServer<A, S, Ss, D> {
     addr: ShardInfo<A>,
     internal_addr: Vec<A>,
-    shards_inner: S,
+    shards_inner: Arc<StdMutex<S>>,
     shards_inner_stack: Ss,
     shards_extern_nonce: StackNonce,
     redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
     _phantom: std::marker::PhantomData<D>,
+}
+
+impl<A, S, Ss, D> Clone for ShardCanonicalServer<A, S, Ss, D>
+where
+    A: Clone,
+    Ss: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            addr: self.addr.clone(),
+            internal_addr: self.internal_addr.clone(),
+            shards_inner: Arc::clone(&self.shards_inner),
+            shards_inner_stack: self.shards_inner_stack.clone(),
+            shards_extern_nonce: self.shards_extern_nonce.clone(),
+            redis_listen_connection: Arc::clone(&self.redis_listen_connection),
+            _phantom: Default::default(),
+        }
+    }
 }
 
 impl<A: std::fmt::Debug, S, Ss, D> std::fmt::Debug for ShardCanonicalServer<A, S, Ss, D> {
@@ -156,7 +173,7 @@ where
         Ok(ShardCanonicalServer {
             addr,
             internal_addr,
-            shards_inner,
+            shards_inner: Arc::new(StdMutex::new(shards_inner)),
             shards_inner_stack,
             shards_extern_nonce,
             redis_listen_connection,
@@ -177,7 +194,7 @@ where
         + Send
         + Sync
         + 'static,
-    S: ChunnelConnector<Addr = A> + Clone + Send + Sync + 'static,
+    S: ChunnelConnector<Addr = A> + Send + Sync + 'static,
     <S as ChunnelConnector>::Error: Into<eyre::Report>,
     S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
 {
@@ -193,7 +210,7 @@ where
 
     fn picked<'s>(&mut self, nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
         let addrs = self.internal_addr.clone();
-        let ctr = self.shards_inner.clone();
+        let ctr = Arc::clone(&self.shards_inner);
         let offer = self.shards_extern_nonce.clone();
         let msg: bertha::negotiate::NegotiateMsg = match bincode::deserialize(nonce) {
             Err(e) => {
@@ -238,10 +255,14 @@ where
 
             futures_util::future::join_all(addrs.into_iter().map(|shard| {
                 let buf = buf.clone();
-                let mut ctr = ctr.clone();
                 let shard_addr = shard.clone();
+                let ctr = Arc::clone(&ctr);
                 async move {
-                    let cn = match ctr.connect(shard.clone()).await {
+                    let connect_fut = {
+                        let mut  ctr_g = ctr.lock().unwrap();
+                        ctr_g.connect(shard.clone())
+                    };
+                    let cn = match connect_fut.await {
                         Ok(c) => c,
                         Err(e) => {
                             let e = e.into();
@@ -301,7 +322,7 @@ where
         + Send
         + Sync
         + 'static,
-    S: ChunnelConnector<Addr = A, Error = E> + Clone + Send + Sync + 'static,
+    S: ChunnelConnector<Addr = A, Error = E> + Send + Sync + 'static,
     S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     Ss: Apply + GetOffers + Clone + Send + Sync + 'static,
     <Ss as Apply>::Applied:
@@ -323,7 +344,7 @@ where
         let addr = self.addr.clone();
         let internal_addr = self.internal_addr.clone();
         let a1 = addr.clone();
-        let shards_inner = self.shards_inner.clone();
+        let shards_inner = Arc::clone(&self.shards_inner);
         let shards_inner_stack = self.shards_inner_stack.clone();
         Box::pin(
             async move {
@@ -335,9 +356,11 @@ where
                     futures_util::future::join_all(internal_addr.into_iter().map(|a| async {
                         debug!(?a, "connecting to shard");
                         let a = a;
-                        let cn = shards_inner
-                            .clone()
-                            .connect(a.clone())
+                        let connect_fut = {
+                            let mut ctr_g = shards_inner.lock().unwrap();
+                            ctr_g.connect(a.clone())
+                        };
+                        let cn = connect_fut
                             .await
                             .map_err(Into::into)
                             .wrap_err(eyre!("Could not connect to {}", a.clone()))?;
@@ -437,7 +460,7 @@ where
         + Send
         + Sync
         + 'static,
-    S: ChunnelConnector<Addr = A> + Clone + Send + Sync + 'static,
+    S: ChunnelConnector<Addr = A> + Send + Sync + 'static,
     <S as ChunnelConnector>::Error: Into<eyre::Report>,
     S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
 {
@@ -468,14 +491,15 @@ where
         + Send
         + Sync
         + 'static,
-    S: ChunnelConnector<Addr = A, Error = E> + Clone + Send + Sync + 'static,
-    S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Clone + Send + Sync + 'static,
+    S: ChunnelConnector<Addr = A, Error = E> + Send + Sync + 'static,
+    S::Connection: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
     Ss: Apply + GetOffers + Clone + Send + Sync + 'static,
     <Ss as Apply>::Applied:
-        Chunnel<S::Connection> + bertha::NegotiatePicked + Clone + Debug + Send + 'static,
-    <<Ss as Apply>::Applied as Chunnel<S::Connection>>::Connection:
+        Chunnel<Arc<S::Connection>> + bertha::NegotiatePicked + Clone + Debug + Send + 'static,
+    <<Ss as Apply>::Applied as Chunnel<Arc<S::Connection>>>::Connection:
         ChunnelConnection<Data = D> + Send + Sync + 'static,
-    <<Ss as Apply>::Applied as Chunnel<S::Connection>>::Error: Into<Error> + Send + Sync + 'static,
+    <<Ss as Apply>::Applied as Chunnel<Arc<S::Connection>>>::Error:
+        Into<Error> + Send + Sync + 'static,
     E: Into<Error> + Send + Sync + 'static,
 {
     type Connection = ShardCanonicalServerConnection<I, S::Connection, (A, Vec<u8>)>;
@@ -487,7 +511,7 @@ where
         let addr = self.inner.addr.clone();
         let internal_addr = self.inner.internal_addr.clone();
         let a1 = addr.clone();
-        let shards_inner = self.inner.shards_inner.clone();
+        let shards_inner = Arc::clone(&self.inner.shards_inner);
         let shards_inner_stack = self.inner.shards_inner_stack.clone();
         Box::pin(
             async move {
@@ -499,12 +523,15 @@ where
                     futures_util::future::join_all(internal_addr.into_iter().map(|a| async {
                         debug!(?a, "connecting to shard");
                         let a = a;
-                        let cn = shards_inner
-                            .clone()
-                            .connect(a.clone())
+                        let connect_fut = {
+                            let mut ctr_g = shards_inner.lock().unwrap();
+                            ctr_g.connect(a.clone())
+                        };
+                        let cn = connect_fut
                             .await
                             .map_err(Into::into)
                             .wrap_err(eyre!("Could not connect to {}", a.clone()))?;
+                        let cn = Arc::new(cn);
                         // What is happening here???
                         //
                         // We have a problem: we want our ShardCanonicalServerConnection to operate
@@ -523,6 +550,13 @@ where
                         )
                         .await
                         .wrap_err("negotiate_client failed")?;
+                        // we made an Arc, but it was potentially returned to us in the return type of
+                        // negotiate_client. Since we assigned the return value to `_`, it was
+                        // dropped, so the one clone we made of the Arc was dropped. So, the strong
+                        // count of the Arc is now 1, so we can unwrap.
+                        let cn = Arc::try_unwrap(cn)
+                            .map_err(|_| eyre!("Strong count should be 1"))
+                            .expect("Strong count should be 1");
                         Ok::<_, Error>(cn)
                     }))
                     .await
