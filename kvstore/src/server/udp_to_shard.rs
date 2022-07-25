@@ -18,7 +18,7 @@ pub struct UdpToShard<I>(pub I);
 
 impl<I, E> ChunnelConnector for UdpToShard<I>
 where
-    I: ChunnelConnector<Addr = (), Error = E> + Clone + Send + Sync + 'static,
+    I: ChunnelConnector<Addr = SocketAddr, Error = E> + Clone + Send + Sync + 'static,
     E: Into<Report> + Send + Sync + 'static,
     UdpToShardCn<ProjectLeft<SocketAddr, <I as ChunnelConnector>::Connection>>:
         ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
@@ -30,11 +30,11 @@ where
     type Error = Report;
 
     fn connect(&mut self, a: Self::Addr) -> Self::Future {
-        let mut ctr = self.0.clone();
+        let ctr_fut = self.0.connect(a);
         Box::pin(async move {
             Ok(UdpToShardCn(ProjectLeft::new(
                 a,
-                ctr.connect(()).await.map_err(Into::into)?,
+                ctr_fut.await.map_err(Into::into)?,
             )))
         })
     }
@@ -55,9 +55,9 @@ where
     type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        let mut lis = self.0.clone();
+        let lis_fut = self.0.listen(a);
         Box::pin(async move {
-            let l = lis.listen(a).await.map_err(Into::into)?;
+            let l = lis_fut.await.map_err(Into::into)?;
             // ProjectLeft a is a dummy, the UdpConn will ignore it and replace with the
             // req-connection source addr.
             Ok(Box::pin(

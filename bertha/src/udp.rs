@@ -45,7 +45,7 @@ impl ChunnelListener for UdpSkChunnel {
 }
 
 impl ChunnelConnector for UdpSkChunnel {
-    type Addr = ();
+    type Addr = SocketAddr;
     type Connection = UdpSk<SocketAddr>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;

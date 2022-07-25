@@ -291,7 +291,7 @@ impl ChunnelListener for ShenangoUdpSkChunnel {
 }
 
 impl ChunnelConnector for ShenangoUdpSkChunnel {
-    type Addr = ();
+    type Addr = SocketAddr;
     type Connection = ShenangoUdpSk;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;

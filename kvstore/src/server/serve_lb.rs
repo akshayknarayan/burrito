@@ -25,7 +25,7 @@ pub async fn serve_lb(
         + 'static,
     shards_internal: Vec<SocketAddr>,
     shard_connector: impl ChunnelConnector<
-            Addr = (),
+            Addr = SocketAddr,
             Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>
                              + Clone
                              + Send
