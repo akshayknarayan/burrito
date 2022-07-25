@@ -7,6 +7,7 @@ use color_eyre::eyre;
 use futures_util::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 mod and_then_concurrent;
 pub mod atmostonce;
@@ -141,6 +142,36 @@ pub trait ChunnelConnection {
     >
     where
         'buf: 'cn;
+}
+
+impl<C> ChunnelConnection for Arc<C>
+where
+    C: ChunnelConnection,
+{
+    type Data = C::Data;
+
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), eyre::Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.as_ref().send(burst)
+    }
+
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<
+        Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], eyre::Report>> + Send + 'cn>,
+    >
+    where
+        'buf: 'cn,
+    {
+        self.as_ref().recv(msgs_buf)
+    }
 }
 
 /// For address types to expose ip and port information for inner addresses.
