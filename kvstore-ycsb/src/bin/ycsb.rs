@@ -1,13 +1,19 @@
 use bertha::{ChunnelConnection, ChunnelConnector};
-use color_eyre::eyre::{eyre, Report, WrapErr};
-use kvstore::{KvClient, KvClientBuilder};
+use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
+use futures_util::{
+    future::{select, Either},
+    stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt},
+};
+use kvstore::{bin::Datapath, KvClient, KvClientBuilder};
 use kvstore_ycsb::{ops, Op};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use structopt::StructOpt;
-use tracing::{debug, info, info_span, instrument, trace};
+use tracing::{debug, info, info_span, instrument, trace, warn};
 use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
@@ -31,13 +37,13 @@ struct Opt {
     accesses: PathBuf,
 
     #[structopt(short, long)]
-    shenango_config: Option<PathBuf>,
+    datapath: Datapath,
+
+    #[structopt(short, long)]
+    cfg: Option<PathBuf>,
 
     #[structopt(long)]
     use_clientsharding: bool,
-
-    #[structopt(long)]
-    max_send_batching: Option<usize>,
 
     #[structopt(long)]
     skip_negotiation: Option<Vec<u16>>,
@@ -58,61 +64,7 @@ struct Opt {
     out_file: Option<PathBuf>,
 }
 
-#[cfg(all(feature = "use-shenango", feature = "use-dpdk-direct"))]
-compile_error!("Features \"use-shenango\" and \"use-dpdk-direct\" are incompatible");
-
-#[cfg(feature = "use-shenango")]
-fn get_raw_connector(
-    path: Option<PathBuf>,
-) -> Result<
-    impl ChunnelConnector<
-            Addr = (),
-            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
-            Error = impl Into<Report> + Send + Sync + 'static,
-        > + Clone,
-    Report,
-> {
-    info!("using shenango feature");
-    let path = path
-        .ok_or_else(|| eyre!("If shenango feature is enabled, shenango_cfg must be specified"))?;
-    Ok(shenango_chunnel::ShenangoUdpSkChunnel::new(&path))
-}
-
-#[cfg(feature = "use-dpdk-direct")]
-fn get_raw_connector(
-    path: Option<PathBuf>,
-) -> Result<
-    impl ChunnelConnector<
-            Addr = (),
-            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
-            Error = impl Into<Report> + Send + Sync + 'static,
-        > + Clone,
-    Report,
-> {
-    info!("using dpdk feature");
-    let path = path
-        .ok_or_else(|| eyre!("If shenango feature is enabled, shenango_cfg must be specified"))?;
-    Ok(dpdk_direct::DpdkUdpSkChunnel::new(&path)?)
-}
-
-#[cfg(all(not(feature = "use-shenango"), not(feature = "use-dpdk-direct")))]
-fn get_raw_connector(
-    p: Option<PathBuf>,
-) -> Result<
-    impl ChunnelConnector<
-            Addr = (),
-            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
-            Error = impl Into<Report> + Send + Sync + 'static,
-        > + Clone,
-    Report,
-> {
-    info!("using default feature");
-    if p.is_some() {
-        tracing::warn!(cfg_file = ?p, "Shenango is disabled, ignoring config");
-    }
-
-    Ok(bertha::udp::UdpSkChunnel::default())
-}
+const NUM_THREADS: usize = 4;
 
 fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
@@ -157,26 +109,84 @@ fn main() -> Result<(), Report> {
     };
 
     if opt.loads_only && opt.skip_loads {
-        return Err(eyre!("Must do either loads or skip them"));
+        warn!("Doing only loads and skipping loads. Done.");
+        return Err(eyre!("Cannot both do only loads and also skip them."));
     }
 
-    info!("reading workload");
-    let loads = ops(opt.accesses.with_extension("load")).wrap_err("Reading loads")?;
-    let accesses = ops(opt.accesses.clone()).wrap_err("Reading accesses")?;
-    info!(num_ops = ?accesses.len(), "done reading workload");
+    let of = opt.out_file.clone();
+    opt.datapath
+        .validate_cfg(opt.cfg.as_ref().map(PathBuf::as_path))?;
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    match opt.datapath {
+        Datapath::Kernel => {
+            let ctr = bertha::udp::UdpSkChunnel::default();
+            do_exp(opt, ctr)
+        }
+        Datapath::Shenango => {
+            let ctr = shenango_chunnel::ShenangoUdpSkChunnel::new(
+                opt.cfg.as_ref().map(PathBuf::as_path).unwrap(),
+            );
+            do_exp(opt, ctr)
+        }
+        Datapath::DpdkSingleThread => {
+            let ctr = dpdk_direct::DpdkUdpSkChunnel::new(
+                opt.cfg.as_ref().map(PathBuf::as_path).unwrap(),
+            )?;
+            do_exp(opt, ctr)
+        }
+        Datapath::DpdkMultiThread => {
+            let ctr = dpdk_direct::DpdkInlineChunnel::new(
+                opt.cfg.clone().expect("Needed config file not found"),
+                NUM_THREADS,
+            )?;
+            do_exp(opt, ctr)
+        }
+    }?;
+
+    if let Some((td, d)) = tracing {
+        if let Some(of) = of {
+            let timing = td.downcast(&d).expect("downcast timing layer");
+            let fname = of.with_extension("trace");
+            let mut f = std::fs::File::create(&fname).unwrap();
+            dump_tracing(timing, &mut f)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn do_exp(
+    opt: Opt,
+    ctr: impl ChunnelConnector<
+            Addr = SocketAddr,
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+            Error = impl Into<Report> + Send + Sync + 'static,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+) -> Result<(), Report> {
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let of = opt.out_file.clone();
-    rt.block_on(async move {
-        let ctr = get_raw_connector(opt.shenango_config)?;
-        if !opt.skip_loads {
-            if let Some(ref shards) = opt.skip_negotiation {
+
+    let loads_ctr = ctr.clone();
+    if !opt.skip_loads {
+        let accesses = opt.accesses.clone();
+        let skip_negotiation = opt.skip_negotiation.clone();
+        rt.block_on(async move {
+            info!("reading workload loads");
+            let loads = ops(accesses.with_extension("load")).wrap_err("Reading loads")?;
+            info!(num_ops = ?loads.len(), "done reading workload loads");
+
+            if let Some(ref shards) = skip_negotiation {
                 let mut fiat_client = KvClientBuilder::new(opt.addr)
                     .new_fiat_client(
-                        ctr.clone().connect(()).await.map_err(Into::into)?,
+                        loads_ctr
+                            .clone()
+                            .connect(opt.addr)
+                            .await
+                            .map_err(Into::into)?,
                         burrito_shard_ctl::ShardInfo {
                             canonical_addr: opt.addr,
                             shard_addrs: shards
@@ -192,212 +202,137 @@ fn main() -> Result<(), Report> {
                     .await?;
                 do_loads(&mut fiat_client, loads)
                     .instrument(info_span!("loads"))
-                    .await?;
+                    .await
             } else {
                 let mut basic_client = KvClientBuilder::new(opt.addr)
-                    .new_nonshardclient(ctr.clone().connect(()).await.map_err(Into::into)?)
+                    .new_nonshardclient(
+                        loads_ctr
+                            .clone()
+                            .connect(opt.addr)
+                            .await
+                            .map_err(Into::into)?,
+                    )
                     .instrument(info_span!("make kvclient", client_id = "loads_client"))
                     .await?;
                 do_loads(&mut basic_client, loads)
                     .instrument(info_span!("loads"))
-                    .await?;
+                    .await
             }
-            if opt.loads_only {
-                info!("doing only loads, done");
-                return Ok(());
-            }
-        } else {
-            info!("skipping loads");
-        }
+        })?;
+    } else {
+        info!("skipping loads");
+    }
 
-        macro_rules! run_exp {
-            ($client: expr) => {{
-                let mut access_by_client = HashMap::default();
-                for (cid, ops) in group_by_client(accesses).into_iter() {
-                    access_by_client.insert(
-                        cid,
-                        (($client)(cid).await.map_err::<Report, _>(Into::into)?, ops),
-                    );
-                }
-                let num_clients = access_by_client.len();
-                (
-                    num_clients,
-                    do_requests(
-                        access_by_client,
-                        opt.interarrival_client_micros as _,
-                        opt.poisson_arrivals,
-                    )
-                    .await?,
-                )
-            }};
-        }
+    if opt.loads_only {
+        info!("doing only loads, done");
+        return Ok(());
+    }
 
-        let (num_clients, (durs, remaining_inflight, time)) = if let Some(shard_ports) =
-            opt.skip_negotiation
-        {
-            let make_fiat_client = |_cid| {
-                let shard_ports = shard_ports.clone();
-                let ctr = &ctr;
-                async move {
-                    KvClientBuilder::new(opt.addr)
-                        .new_fiat_client(
-                            ctr.clone().connect(()).await.map_err(Into::into)?,
-                            burrito_shard_ctl::ShardInfo {
-                                canonical_addr: opt.addr,
-                                shard_addrs: shard_ports
-                                    .clone()
-                                    .into_iter()
-                                    .map(|p| SocketAddr::new(opt.addr.ip(), p))
-                                    .collect(),
-                                shard_info: burrito_shard_ctl::SimpleShardPolicy {
-                                    packet_data_offset: 18,
-                                    packet_data_length: 4,
-                                },
+    info!("reading workload");
+    let accesses = ops(opt.accesses).wrap_err("Reading accesses")?;
+    info!(num_ops = ?accesses.len(), "done reading workload");
+
+    let ExpResult {
+        num_clients,
+        durs,
+        remaining_inflight,
+        tot_time,
+    } = if let Some(shard_ports) = opt.skip_negotiation {
+        let make_fiat_client = move |_cid| {
+            let mut ctr = ctr.clone();
+            let shard_ports = shard_ports.clone();
+            async move {
+                KvClientBuilder::new(opt.addr)
+                    .new_fiat_client(
+                        ctr.connect(opt.addr).await.map_err(Into::into)?,
+                        burrito_shard_ctl::ShardInfo {
+                            canonical_addr: opt.addr,
+                            shard_addrs: shard_ports
+                                .clone()
+                                .into_iter()
+                                .map(|p| SocketAddr::new(opt.addr.ip(), p))
+                                .collect(),
+                            shard_info: burrito_shard_ctl::SimpleShardPolicy {
+                                packet_data_offset: 18,
+                                packet_data_length: 4,
                             },
-                        )
-                        .await
-                }
-            };
-            run_exp!(make_fiat_client)
-        } else if let Some(maxb) = opt.max_send_batching {
-            if !opt.use_clientsharding {
-                info!(mode = "nonshardclient", batching = ?maxb, "make clients");
-                let make_client = |cid| {
-                    let ctr = &ctr;
-                    async move {
-                        Ok::<_, Report>(
-                            KvClientBuilder::new(opt.addr)
-                                .set_batching()
-                                .new_nonshardclient(
-                                    ctr.clone().connect(()).await.map_err(Into::into)?,
-                                    maxb,
-                                )
-                                .instrument(info_span!("make kvclient", client_id = ?cid))
-                                .await
-                                .wrap_err("make KvClient")?,
-                        )
-                    }
-                };
-                run_exp!(make_client)
-            } else {
-                info!(mode = "shardclient", batching = ?maxb, "make clients");
-                let make_client = |cid| {
-                    let ctr = &ctr;
-                    async move {
-                        Ok::<_, Report>(
-                            KvClientBuilder::new(opt.addr)
-                                .set_batching()
-                                .new_shardclient(
-                                    ctr.clone().connect(()).await.map_err(Into::into)?,
-                                    opt.redis_addr,
-                                    maxb,
-                                )
-                                .instrument(info_span!("make kvclient", client_id = ?cid))
-                                .await
-                                .wrap_err("make KvClient")?,
-                        )
-                    }
-                };
-                run_exp!(make_client)
+                        },
+                    )
+                    .await
             }
-        } else if !opt.use_clientsharding {
-            info!(mode = "nonshardclient", batching = "no", "make clients");
-            let make_client = |cid| {
-                let ctr = &ctr;
-                async move {
-                    Ok::<_, Report>(
-                        KvClientBuilder::new(opt.addr)
-                            .new_nonshardclient(ctr.clone().connect(()).await.map_err(Into::into)?)
-                            .instrument(info_span!("make kvclient", client_id = ?cid))
-                            .await
-                            .wrap_err("make KvClient")?,
-                    )
-                }
-            };
-            run_exp!(make_client)
-        } else {
-            info!(mode = "shardclient", batching = "no", "make clients");
-            let make_client = |cid| {
-                let ctr = &ctr;
-                async move {
-                    Ok::<_, Report>(
-                        KvClientBuilder::new(opt.addr)
-                            .new_shardclient(
-                                ctr.clone().connect(()).await.map_err(Into::into)?,
-                                opt.redis_addr,
-                            )
-                            .instrument(info_span!("make kvclient", client_id = ?cid))
-                            .await
-                            .wrap_err("make KvClient")?,
-                    )
-                }
-            };
-            run_exp!(make_client)
         };
 
-        // done
-        write_results(
-            durs,
-            remaining_inflight,
-            time,
-            num_clients,
-            opt.interarrival_client_micros,
-            opt.out_file,
-        );
+        do_requests(
+            accesses,
+            opt.interarrival_client_micros as _,
+            opt.poisson_arrivals,
+            make_fiat_client,
+        )?
+    } else if !opt.use_clientsharding {
+        info!(mode = "nonshardclient", "make clients");
+        let make_client = move |cid| {
+            let mut ctr = ctr.clone();
+            async move {
+                Ok::<_, Report>(
+                    KvClientBuilder::new(opt.addr)
+                        .new_nonshardclient(ctr.connect(opt.addr).await.map_err(Into::into)?)
+                        .instrument(info_span!("make kvclient", client_id = ?cid))
+                        .await
+                        .wrap_err("make KvClient")?,
+                )
+            }
+        };
 
-        Ok::<_, Report>(())
-    })?;
+        do_requests(
+            accesses,
+            opt.interarrival_client_micros as _,
+            opt.poisson_arrivals,
+            make_client,
+        )?
+    } else {
+        info!(mode = "shardclient", "make clients");
+        let make_client = move |cid| {
+            let mut ctr = ctr.clone();
+            async move {
+                Ok::<_, Report>(
+                    KvClientBuilder::new(opt.addr)
+                        .new_shardclient(
+                            ctr.connect(opt.addr).await.map_err(Into::into)?,
+                            opt.redis_addr,
+                        )
+                        .instrument(info_span!("make kvclient", client_id = ?cid))
+                        .await
+                        .wrap_err("make KvClient")?,
+                )
+            }
+        };
 
-    if let Some((td, d)) = tracing {
-        if let Some(of) = of {
-            let timing = td.downcast(&d).expect("downcast timing layer");
-            let fname = of.with_extension("trace");
-            let mut f = std::fs::File::create(&fname).unwrap();
-            dump_tracing(timing, &mut f)?;
-        }
-    }
+        do_requests(
+            accesses,
+            opt.interarrival_client_micros as _,
+            opt.poisson_arrivals,
+            make_client,
+        )?
+    };
+
+    // done
+    write_results(
+        durs,
+        remaining_inflight,
+        tot_time,
+        num_clients,
+        opt.interarrival_client_micros,
+        opt.out_file,
+    );
 
     Ok(())
 }
 
-fn dump_tracing(
-    timing: &'_ tracing_timing::TimingLayer,
-    f: &mut std::fs::File,
-) -> Result<(), Report> {
-    use std::io::prelude::*;
-    timing.force_synchronize();
-    timing.with_histograms(|hs| {
-        for (span_group, hs) in hs {
-            for (event_group, h) in hs {
-                let tag = format!("{}.{}", span_group, event_group);
-                write!(
-                    f,
-                    "tracing: \
-                        event = {}, \
-                        min   = {}, \
-                        p25   = {}, \
-                        p50   = {}, \
-                        p75   = {}, \
-                        p95   = {}, \
-                        max   = {}, \
-                        cnt   = {} \
-                        ",
-                    &tag,
-                    h.min(),
-                    h.value_at_quantile(0.25),
-                    h.value_at_quantile(0.5),
-                    h.value_at_quantile(0.75),
-                    h.value_at_quantile(0.95),
-                    h.max(),
-                    h.len(),
-                )?;
-            }
-        }
-
-        Ok::<_, Report>(())
-    })?;
-
-    Ok(())
+struct ExpResult {
+    durs: Vec<Duration>,
+    remaining_inflight: usize,
+    tot_time: Duration,
+    num_clients: usize,
 }
 
 /// Issue a workload of requests, divided by client worker.
@@ -408,23 +343,30 @@ fn dump_tracing(
 /// otherwise.
 ///
 /// Have to measure from the time the request leaves the queue.
-async fn do_requests<S>(
-    access_by_client: HashMap<usize, (KvClient<S>, Vec<Op>)>,
+fn do_requests<S, MC, Fut>(
+    accesses: Vec<Op>, //HashMap<usize, (KvClient<S>, Vec<Op>)>,
     interarrival_micros: u64,
     poisson_arrivals: bool,
-) -> Result<(Vec<Duration>, usize, Duration), Report>
+    make_client: MC,
+) -> Result<ExpResult, Report>
 where
     S: bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static,
+    MC: Fn(usize) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<KvClient<S>, Report>>,
 {
-    use futures_util::{
-        future::{select, Either},
-        stream::{FuturesUnordered, Stream, StreamExt, TryStreamExt},
+    let access_by_client = group_by_client(accesses);
+    let num_clients = access_by_client.len();
+    let mut access_by_thread = {
+        let mut threads = vec![vec![]; NUM_THREADS];
+        for (client_id, ops) in access_by_client {
+            threads[client_id % NUM_THREADS].push((client_id, ops));
+        }
+
+        threads
     };
 
-    info!(?interarrival_micros, "starting requests");
-
     async fn time_req(
-        cl: KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static>,
+        cl: &KvClient<impl bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static>,
         op: Op,
     ) -> Result<Duration, Report> {
         let now = tokio::time::Instant::now();
@@ -462,7 +404,7 @@ where
             if let Some(ov) = ops_val {
                 match ov {
                     Some((remaining_cnt, o)) if remaining_cnt > 0 => {
-                        inflight.push(time_req(cl.clone(), o));
+                        inflight.push(time_req(&cl, o));
                         let interarrv = arrv.elapsed();
                         arrv = std::time::Instant::now();
                         trace!(
@@ -490,44 +432,139 @@ where
         Ok::<_, Report>((durs, inflight.len()))
     }
 
-    let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
-    let mut reqs: FuturesUnordered<_> = access_by_client
-        .into_iter()
-        .map(move |(client_id, (cl, ops))| {
-            assert!(!ops.is_empty());
-            let jh = if poisson_arrivals {
-                let ops = poisson_paced_ops_stream(ops, interarrival_micros, client_id);
-                tokio::spawn(req_loop(cl, ops, done_rx.clone(), client_id))
-            } else {
-                let ops = const_paced_ops_stream(ops, interarrival_micros, client_id);
-                tokio::spawn(req_loop(cl, ops, done_rx.clone(), client_id))
-            };
+    fn run_thread<S, MC, Fut>(
+        thread_id: usize,
+        done_tx: Arc<tokio::sync::watch::Sender<bool>>,
+        done_rx: tokio::sync::watch::Receiver<bool>,
+        mut start_rx: tokio::sync::watch::Receiver<bool>,
+        access_by_client: Vec<(usize, Vec<Op>)>,
+        interarrival_micros: u64,
+        poisson_arrivals: bool,
+        make_client: Arc<MC>,
+    ) -> Result<(Vec<Duration>, usize), Report>
+    where
+        S: bertha::ChunnelConnection<Data = kvstore::Msg> + Send + Sync + 'static,
+        MC: Fn(usize) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<KvClient<S>, Report>>,
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            let mut reqs: FuturesUnordered<_> = access_by_client
+                .into_iter()
+                .map(|(client_id, ops)| {
+                    assert!(!ops.is_empty());
+                    let done_rx = done_rx.clone();
+                    let make_client = Arc::clone(&make_client);
+                    async move {
+                        let cl = make_client(client_id)
+                            .await
+                            .wrap_err("could not make client")?;
+                        if poisson_arrivals {
+                            let ops = poisson_paced_ops_stream(ops, interarrival_micros, client_id);
+                            req_loop(cl, ops, done_rx.clone(), client_id).await
+                        } else {
+                            let ops = const_paced_ops_stream(ops, interarrival_micros, client_id);
+                            req_loop(cl, ops, done_rx.clone(), client_id).await
+                        }
+                    }
+                })
+                .collect();
 
-            async move { jh.await.unwrap() }
+            // wait for start signal
+            start_rx.changed().await.expect("awaiting start signal");
+
+            // do the accesses until the first client is done.
+            let (mut durs, mut remaining_inflight) = reqs
+                .try_next()
+                .await
+                .wrap_err("error driving request loop")?
+                .expect("No clients?");
+            ensure!(!durs.is_empty(), "No requests finished");
+            if !reqs.is_empty() {
+                info!(?thread_id, "broadcasting done");
+                done_tx
+                    .send(true)
+                    .wrap_err("failed to broadcast experiment termination")?;
+
+                // collect all the requests that have completed.
+                let rest_durs: Vec<(_, _)> = reqs
+                    .try_collect()
+                    .await
+                    .wrap_err("error driving request loop")?;
+                let (rest_durs, rest_left_inflight): (Vec<_>, Vec<_>) =
+                    rest_durs.into_iter().unzip();
+                assert!(!rest_durs.is_empty());
+                info!(?thread_id, "all clients reported");
+                durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
+                remaining_inflight += rest_left_inflight.into_iter().sum::<usize>();
+            }
+
+            Ok((durs, remaining_inflight))
         })
-        .collect();
-
-    let access_start = tokio::time::Instant::now();
-    // do the accesses until the first client is done.
-    let (mut durs, mut remaining_inflight) = reqs.try_next().await?.expect("durs");
-    assert!(!durs.is_empty());
-    let access_end = access_start.elapsed();
-    if !reqs.is_empty() {
-        info!("broadcasting done");
-        done_tx
-            .send(true)
-            .wrap_err("failed to broadcast experiment termination")?;
-
-        // collect all the requests that have completed.
-        let rest_durs: Vec<(_, _)> = reqs.try_collect().await?;
-        let (rest_durs, rest_left_inflight): (Vec<_>, Vec<_>) = rest_durs.into_iter().unzip();
-        assert!(!rest_durs.is_empty());
-        info!("all clients reported");
-        durs.extend(rest_durs.into_iter().flat_map(|x| x.into_iter()));
-        remaining_inflight += rest_left_inflight.into_iter().sum::<usize>();
     }
 
-    Ok((durs, remaining_inflight, access_end))
+    info!(?interarrival_micros, "starting requests");
+    let (start_tx, start_rx) = tokio::sync::watch::channel::<bool>(false);
+    let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
+    let done_tx = Arc::new(done_tx);
+    let make_client = Arc::new(make_client);
+    let mut threads = Vec::with_capacity(NUM_THREADS);
+    for thread_id in 1..NUM_THREADS {
+        let done_tx = done_tx.clone();
+        let done_rx = done_rx.clone();
+        let start_rx = start_rx.clone();
+        let access_by_client = std::mem::take(&mut access_by_thread[thread_id]);
+        let mc = Arc::clone(&make_client);
+        let thread_jh = std::thread::spawn(move || {
+            run_thread(
+                thread_id,
+                done_tx,
+                done_rx,
+                start_rx,
+                access_by_client,
+                interarrival_micros,
+                poisson_arrivals,
+                mc,
+            )
+        });
+
+        threads.push(thread_jh);
+    }
+
+    let access_start = tokio::time::Instant::now();
+    start_tx.send(true).expect("Could not send start signal");
+    // local thread
+    let (mut durs, mut remaining_inflight) = run_thread(
+        0,
+        done_tx,
+        done_rx,
+        start_rx,
+        std::mem::take(&mut access_by_thread[0]),
+        interarrival_micros,
+        poisson_arrivals,
+        make_client,
+    )?;
+
+    for t in threads {
+        match t.join() {
+            Ok(thread_res) => {
+                let (thread_durs, thread_remaining) = thread_res?;
+                durs.extend(thread_durs);
+                remaining_inflight += thread_remaining;
+            }
+            Err(err) => std::panic::resume_unwind(err),
+        }
+    }
+
+    let access_end = access_start.elapsed();
+    Ok(ExpResult {
+        durs,
+        remaining_inflight,
+        tot_time: access_end,
+        num_clients,
+    })
 }
 
 fn const_paced_ops_stream(
@@ -536,7 +573,6 @@ fn const_paced_ops_stream(
     client_id: usize,
 ) -> impl futures_util::stream::Stream<Item = (usize, Op)> + Send {
     let len = ops.len();
-    use futures_util::stream::StreamExt;
     let tkr = poisson_ticker::SpinTicker::new_const_with_log_id(
         Duration::from_micros(interarrival_micros as u64),
         client_id,
@@ -552,7 +588,6 @@ fn poisson_paced_ops_stream(
     client_id: usize,
 ) -> impl futures_util::stream::Stream<Item = (usize, Op)> + Send {
     let len = ops.len();
-    use futures_util::stream::StreamExt;
     let tkr = poisson_ticker::SpinTicker::new_const_with_log_id(
         Duration::from_micros(interarrival_micros as u64),
         client_id,
@@ -666,4 +701,44 @@ fn write_results(
             .expect("write");
         }
     }
+}
+
+fn dump_tracing(
+    timing: &'_ tracing_timing::TimingLayer,
+    f: &mut std::fs::File,
+) -> Result<(), Report> {
+    use std::io::prelude::*;
+    timing.force_synchronize();
+    timing.with_histograms(|hs| {
+        for (span_group, hs) in hs {
+            for (event_group, h) in hs {
+                let tag = format!("{}.{}", span_group, event_group);
+                write!(
+                    f,
+                    "tracing: \
+                        event = {}, \
+                        min   = {}, \
+                        p25   = {}, \
+                        p50   = {}, \
+                        p75   = {}, \
+                        p95   = {}, \
+                        max   = {}, \
+                        cnt   = {} \
+                        ",
+                    &tag,
+                    h.min(),
+                    h.value_at_quantile(0.25),
+                    h.value_at_quantile(0.5),
+                    h.value_at_quantile(0.75),
+                    h.value_at_quantile(0.95),
+                    h.max(),
+                    h.len(),
+                )?;
+            }
+        }
+
+        Ok::<_, Report>(())
+    })?;
+
+    Ok(())
 }

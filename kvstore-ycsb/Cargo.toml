@@ -6,16 +6,14 @@ edition = "2021"
 
 [features]
 default = []
-use-shenango = ["shenango-chunnel"]
-use-dpdk-direct = ["dpdk-direct"]
 
 [dependencies]
 bertha = { path = "../bertha" } 
-burrito-shard-ctl = {path = "../burrito-shard-ctl"}
-kvstore = {path = "../kvstore"}
+burrito-shard-ctl = { path = "../burrito-shard-ctl" }
+kvstore = { path = "../kvstore", features = ["bin-helper"] }
 futures-util = "0.3"
 structopt = "0.3"
-tokio = {version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = {version = "1", features = ["rt", "macros"] }
 poisson-ticker = { git = "https://github.com/akshayknarayan/poisson-ticker", branch="master" }
 tracing = "0.1"
 tracing-futures = "0.2"
@@ -23,5 +21,6 @@ tracing-subscriber = "0.2"
 tracing-timing  = "0.5"
 tracing-error  = "0.1"
 color-eyre = "0.5"
-shenango-chunnel = { path = "../shenango-chunnel", optional = true }
-dpdk-direct = { path = "../dpdk-direct", optional = true }
+shenango-chunnel = { path = "../shenango-chunnel" }
+dpdk-direct = { path = "../dpdk-direct" }
+quanta = "0.10"
