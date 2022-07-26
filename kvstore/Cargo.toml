@@ -6,7 +6,8 @@ edition = "2021"
 
 [features]
 default = []
-bin = ["tracing-subscriber", "tracing-timing", "structopt", "ctrlc", "tokio/rt-multi-thread", "tokio/fs", "num_cpus", "use-shenango", "use-dpdk-direct"]
+bin = ["bin-helper", "structopt", "tokio/rt-multi-thread", "tokio/fs", "num_cpus", "use-shenango", "use-dpdk-direct"]
+bin-helper = ["tracing-subscriber", "tracing-timing", "ctrlc"]
 use-shenango = ["shenango-chunnel"]
 use-dpdk-direct = ["dpdk-direct"]
 ebpf = ["burrito-shard-ctl/ebpf"]

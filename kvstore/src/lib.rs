@@ -7,7 +7,7 @@ mod opt;
 pub mod reliability;
 mod server;
 
-#[cfg(feature = "bin")]
+#[cfg(feature = "bin-helper")]
 pub mod bin;
 
 pub use client::{KvClient, KvClientBuilder};

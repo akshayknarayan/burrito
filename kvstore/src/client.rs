@@ -17,21 +17,13 @@ use tracing::{debug, debug_span, instrument, trace};
 use tracing_futures::Instrument;
 
 #[derive(Debug, Clone, Copy)]
-pub struct KvClientBuilder<const BATCH: bool> {
+pub struct KvClientBuilder {
     canonical_addr: SocketAddr,
 }
 
-impl KvClientBuilder<false> {
+impl KvClientBuilder {
     pub fn new(canonical_addr: SocketAddr) -> Self {
         KvClientBuilder { canonical_addr }
-    }
-}
-
-impl<const B: bool> KvClientBuilder<B> {
-    pub fn set_batching(self) -> KvClientBuilder<true> {
-        KvClientBuilder {
-            canonical_addr: self.canonical_addr,
-        }
     }
 }
 
@@ -63,33 +55,7 @@ macro_rules! shardcl {
     }};
 }
 
-impl KvClientBuilder<true> {
-    #[instrument(skip(raw_cn), err)]
-    pub async fn new_nonshardclient(
-        self,
-        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
-        max_batch_size: usize,
-    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
-        let cn = nonshard!(raw_cn, self.canonical_addr);
-        //batch_wrap!(cn, max_batch_size)
-        Ok(KvClient::new_from_cn(cn))
-    }
-
-    #[instrument(skip(raw_cn), err)]
-    pub async fn new_shardclient(
-        self,
-        raw_cn: impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
-        redis_addr: SocketAddr,
-        max_batch_size: usize,
-    ) -> Result<KvClient<impl ChunnelConnection<Data = Msg> + Send + Sync + 'static>, Report> {
-        let st = CxList::from(KvReliabilityChunnel::default()).wrap(SerializeChunnel::default());
-        let cn = shardcl!(raw_cn, redis_addr, self.canonical_addr, st);
-        //batch_wrap!(cn, max_batch_size)
-        Ok(KvClient::new_from_cn(cn))
-    }
-}
-
-impl KvClientBuilder<false> {
+impl KvClientBuilder {
     #[instrument(skip(raw_cn), err)]
     pub async fn new_nonshardclient(
         self,
@@ -111,7 +77,7 @@ impl KvClientBuilder<false> {
     }
 }
 
-impl<const T: bool> KvClientBuilder<T> {
+impl KvClientBuilder {
     #[instrument(skip(raw_cn), err)]
     pub async fn new_fiat_client(
         self,
