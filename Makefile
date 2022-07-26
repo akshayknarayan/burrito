@@ -21,32 +21,15 @@ all: sharding rpcbench
 
 .PHONY: sharding rpcbench
 
-sharding: ./target/release/ycsb-shenango ./target/release/kvserver-shenango ./target/release/kvserver-shenango-raw ./target/release/ycsb-shenango-raw ./shenango-chunnel/caladan/iokerneld ./target/release/ycsb-kernel ./target/release/kvserver-kernel ./target/release/kvserver-dpdk ./target/release/ycsb-dpdk
+sharding: ./target/release/ycsb ./target/release/kvserver ./target/release/kvserver-shenango-raw ./target/release/ycsb-shenango-raw ./shenango-chunnel/caladan/iokerneld 
+
 rpcbench: ./target/release/bincode-pingclient ./target/release/bincode-pingserver ./target/release/burrito-localname
 
-./target/release/ycsb-shenango: $(YCSB_SRCS) $(SHENANGO_SRCS)
-	cd kvstore-ycsb && $(CARGO) build --release --features="use-shenango"
-	rm -f ./target/release/ycsb-shenango && cp ./target/release/ycsb ./target/release/ycsb-shenango
+./target/release/ycsb: $(YCSB_SRCS) $(SHENANGO_SRCS) $(DPDK_SRCS)
+	cd kvstore-ycsb && $(CARGO) build --release
 
-./target/release/kvserver-shenango: $(KVSTORE_SRCS) $(SHENANGO_SRCS)
-	cd kvstore && $(CARGO) build --release --features="bin,use-shenango"
-	rm -f ./target/release/kvserver-shenango && cp ./target/release/kvserver ./target/release/kvserver-shenango
-
-./target/release/ycsb-dpdk: $(YCSB_SRCS) $(DPDK_SRCS)
-	cd kvstore-ycsb && $(CARGO) build --release  --features="use-dpdk-direct"
-	rm -f ./target/release/ycsb-dpdk && cp ./target/release/ycsb ./target/release/ycsb-dpdk
-
-./target/release/kvserver-dpdk: $(KVSTORE_SRCS) $(DPDK_SRCS)
-	cd kvstore && $(CARGO) build --release --features="bin,use-dpdk-direct"
-	rm -f ./target/release/kvserver-dpdk && cp ./target/release/kvserver ./target/release/kvserver-dpdk
-
-./target/release/ycsb-kernel: $(YCSB_SRCS)
-	cd kvstore-ycsb && $(CARGO) build --release 
-	rm -f ./target/release/ycsb-kernel && cp ./target/release/ycsb ./target/release/ycsb-kernel
-
-./target/release/kvserver-kernel: $(KVSTORE_SRCS)
+./target/release/kvserver: $(KVSTORE_SRCS) $(SHENANGO_SRCS)
 	cd kvstore && $(CARGO) build --release --features="bin"
-	rm -f ./target/release/kvserver-kernel && cp ./target/release/kvserver ./target/release/kvserver-kernel
 
 ./shenango-chunnel/caladan/iokerneld ./shenango-chunnel/caladan/libbase.a ./shenango-chunnel/caladan/libnet.a ./shenango-chunnel/caladan/libruntime.a: ./shenango-chunnel/caladan/Makefile $(SHENANGO_C_SRCS)
 	make -C ./shenango-chunnel/caladan
