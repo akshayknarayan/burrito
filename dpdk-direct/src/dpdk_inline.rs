@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::{cell::RefCell, fmt::Debug};
-use tracing::{debug, error, info, trace, trace_span, warn};
+use tracing::{debug, debug_span, error, info, trace, trace_span, warn};
 use tracing_futures::Instrument;
 
 std::thread_local! {
@@ -472,64 +472,66 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                     };
 
                     // we just initialized this, so `.with` is fine instead of `.try_with`.
-                    Ok(Box::pin(futures_util::stream::try_unfold(
-                        state,
-                        |mut state| async move {
-                            if !state.got_first {
-                                debug!("DpdkInlineReqChunnel listen stream poll for first packet");
-                                loop {
-                                    DPDK_STATE.with(|dpdk_cell| {
-                                        let this_lcore = get_lcore_id();
-                                        let mut dpdk_opt = dpdk_cell.borrow_mut();
-                                        let dpdk = dpdk_opt.as_mut().ok_or(eyre!(
-                                            "dpdk not initialized on core {:?}",
-                                            this_lcore
-                                        ))?;
+                    Ok(
+                        Box::pin(futures_util::stream::try_unfold(state, |mut state| {
+                            let listen_addr = state.listen_addr;
+                            async move {
+                                if !state.got_first {
+                                    debug!("DpdkInlineReqChunnel listen stream poll for first packet");
+                                    loop {
+                                        DPDK_STATE.with(|dpdk_cell| {
+                                            let this_lcore = get_lcore_id();
+                                            let mut dpdk_opt = dpdk_cell.borrow_mut();
+                                            let dpdk = dpdk_opt.as_mut().ok_or(eyre!(
+                                                "dpdk not initialized on core {:?}",
+                                                this_lcore
+                                            ))?;
 
-                                        dpdk.try_recv_burst_stash_only(Some(&state.sender))?;
-                                        Ok::<_, Report>(())
-                                    })?;
+                                            dpdk.try_recv_burst_stash_only(Some(&state.sender))?;
+                                            Ok::<_, Report>(())
+                                        })?;
 
-                                    match state.receiver.try_recv() {
-                                        Ok(addr) => {
-                                            debug!(
-                                                ?addr,
-                                                "DpdkInlineReqChunnel found first connection"
-                                            );
-                                            let cn = DpdkInlineCn::new(
-                                                state.listen_addr.port(),
-                                                Some(addr),
-                                                Some(state.sender.clone()),
-                                                Arc::clone(&state.initialization_state),
-                                                None,
-                                            );
+                                        match state.receiver.try_recv() {
+                                            Ok(addr) => {
+                                                debug!(
+                                                    ?addr,
+                                                    "DpdkInlineReqChunnel found first connection"
+                                                );
+                                                let cn = DpdkInlineCn::new(
+                                                    state.listen_addr.port(),
+                                                    Some(addr),
+                                                    Some(state.sender.clone()),
+                                                    Arc::clone(&state.initialization_state),
+                                                    None,
+                                                );
 
-                                            state.got_first = true;
-                                            return Ok(Some((cn, state)));
-                                        }
-                                        Err(flume::TryRecvError::Empty) => {
-                                            tokio::task::yield_now().await
-                                        }
-                                        Err(flume::TryRecvError::Disconnected) => {
-                                            error!(addr = ?state.listen_addr, "New connection recevier closed without any connections");
-                                            panic!("New connection recevier closed without any connections");
+                                                state.got_first = true;
+                                                return Ok(Some((cn, state)));
+                                            }
+                                            Err(flume::TryRecvError::Empty) => {
+                                                tokio::task::yield_now().await
+                                            }
+                                            Err(flume::TryRecvError::Disconnected) => {
+                                                error!(addr = ?state.listen_addr, "New connection recevier closed without any connections");
+                                                panic!("New connection recevier closed without any connections");
+                                            }
                                         }
                                     }
+                                } else {
+                                    let addr = state.receiver.recv_async().await?;
+                                    debug!(?addr, "DpdkInlineReqChunnel returning new connection");
+                                    let cn = DpdkInlineCn::new(
+                                        state.listen_addr.port(),
+                                        Some(addr),
+                                        Some(state.sender.clone()),
+                                        Arc::clone(&state.initialization_state),
+                                        None,
+                                    );
+                                    return Ok(Some((cn, state)));
                                 }
-                            } else {
-                                let addr = state.receiver.recv_async().await?;
-                                debug!(?addr, "DpdkInlineReqChunnel returning new connection");
-                                let cn = DpdkInlineCn::new(
-                                    state.listen_addr.port(),
-                                    Some(addr),
-                                    Some(state.sender.clone()),
-                                    Arc::clone(&state.initialization_state),
-                                    None,
-                                );
-                                return Ok(Some((cn, state)));
-                            }
-                        },
-                    )) as _)
+                        }.instrument(debug_span!("connection_listen", ?listen_addr))
+                        })) as _,
+                    )
                 }
                 V6(a) => Err(eyre!("Only IPv4 is supported: {:?}", a)),
             }
