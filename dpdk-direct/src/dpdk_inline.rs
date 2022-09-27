@@ -147,6 +147,8 @@ impl ChunnelListener for DpdkInlineChunnel {
                             .as_mut()
                             .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
+                        let flow_handle = dpdk.register_flow(a.port())?;
+
                         dpdk.rx_packets_for_ports.push((
                             (
                                 a.port(),
@@ -155,16 +157,15 @@ impl ChunnelListener for DpdkInlineChunnel {
                             Vec::with_capacity(16),
                         ));
 
-                        Ok::<_, Report>(())
-                    })?;
-
-                    Ok(DpdkInlineCn::new(
-                        a.port(),
-                        None,
-                        None,
-                        Arc::clone(&self.initialization_state),
-                        Some(Arc::clone(&self.ephemeral_ports)),
-                    ))
+                        Ok(DpdkInlineCn::new(
+                            a.port(),
+                            None,
+                            None,
+                            Arc::clone(&self.initialization_state),
+                            Some(Arc::clone(&self.ephemeral_ports)),
+                        )
+                        .with_flow_handle(flow_handle))
+                    })
                 }),
             )) as _),
             V6(a) => Err(eyre!("Only IPv4 is supported: {:?}", a)),
@@ -193,29 +194,17 @@ impl ChunnelConnector for DpdkInlineChunnel {
                         .as_mut()
                         .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
-                    // we have to choose the src port carefully so that its RSS hash leads it back to
-                    // this core.
                     let port = {
                         let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
-                        let mut found = None;
-                        for (i, cand_src_port) in free_ports_g.iter().enumerate() {
-                            if compute_flow_affinity(
-                                SocketAddrV4::new(dpdk.ip_addr, *cand_src_port),
-                                remote_addr,
-                            ) as usize
-                                == dpdk.rx_queue_id
-                            {
-                                found = Some(i);
-                                break;
-                            }
-                        }
-
-                        if let Some(i) = found {
-                            free_ports_g.swap_remove(i)
+                        if let Some(p) = free_ports_g.pop() {
+                            p
                         } else {
                             bail!("Could not find appropriate src port to use");
                         }
                     };
+
+                    // register with flow steering so packets will come back to us.
+                    let flow_handle = dpdk.register_flow(port)?;
 
                     dpdk.rx_packets_for_ports.push((
                         (port, SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
@@ -228,7 +217,8 @@ impl ChunnelConnector for DpdkInlineChunnel {
                         None,
                         Arc::clone(&self.initialization_state),
                         Some(Arc::clone(&self.ephemeral_ports)),
-                    ))
+                    )
+                    .with_flow_handle(flow_handle))
                 })
             })
         })())
@@ -243,6 +233,7 @@ pub struct DpdkInlineCn {
     remote_addr: Option<SocketAddrV4>,
     new_conns: Option<Sender<SocketAddrV4>>,
     port_pool: Option<Arc<Mutex<Vec<u16>>>>,
+    flow_steering_handle: Option<FlowSteeringHandle>,
     _init_state: Arc<Mutex<DpdkInitState>>,
 }
 
@@ -259,8 +250,14 @@ impl DpdkInlineCn {
             remote_addr,
             new_conns,
             port_pool,
+            flow_steering_handle: None,
             _init_state: init_state,
         }
+    }
+
+    fn with_flow_handle(mut self, handle: FlowSteeringHandle) -> Self {
+        self.flow_steering_handle = Some(handle);
+        self
     }
 
     pub fn local_port(&self) -> u16 {
@@ -372,6 +369,9 @@ impl ChunnelConnection for DpdkInlineCn {
         'buf: 'cn,
     {
         let this_lcore = get_lcore_id();
+        let local_port = self.local_port;
+        let remote_addr = self.remote_addr;
+        let new_conns = self.new_conns.as_ref();
         Box::pin(
             async move {
                 trace!("start");
@@ -382,14 +382,12 @@ impl ChunnelConnection for DpdkInlineCn {
                             let dpdk = dpdk_opt
                                 .as_mut()
                                 .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                            let msgs = dpdk.try_recv_burst(
-                                Some((self.local_port, self.remote_addr)),
-                                self.new_conns.as_ref(),
-                            )?;
+                            let msgs =
+                                dpdk.try_recv_burst(Some((local_port, remote_addr)), new_conns)?;
 
                             let mut slot_idx = 0;
                             for msg in msgs.iter_mut().map_while(Option::take) {
-                                ensure!(msg.port == self.local_port, "Port mismatch");
+                                ensure!(msg.port == local_port, "Port mismatch");
                                 if let Some((ref mut addr, ref mut payload)) = msgs_buf[slot_idx] {
                                     *addr = SocketAddr::V4(msg.addr);
                                     payload.copy_from_slice(msg.get_buf());
@@ -447,13 +445,25 @@ impl ChunnelListener for DpdkInlineReqChunnel {
         ready((|| {
             match addr {
                 V4(a) => {
+                    let this_lcore = get_lcore_id();
                     try_init_thread(self.0.initialization_state.as_ref())
                         .wrap_err("try_init_thread failed")?;
 
-                    let (s, r) = flume::bounded(16);
+                    // we don't return `FlowSteeringHandle`s to connections here. Instead we
+                    // register once here. If this stream is ever dropped/cancelled, the state will
+                    // get cleaned up then.
+                    //
+                    // we just initialized dpdk on this thread, so `.with` is fine instead of
+                    // `.try_with`.
+                    let flow_handle = DPDK_STATE.with(|dpdk_cell| {
+                        let mut dpdk_opt = dpdk_cell.borrow_mut();
+                        let dpdk = dpdk_opt
+                            .as_mut()
+                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
-                    // we have to first listen for a packet ourselves, since at the beginning there are no
-                    // connections calling recv.
+                        let flow_handle = dpdk.register_flow(a.port())?;
+                        Ok::<_, Report>(flow_handle)
+                    })?;
 
                     struct StreamState {
                         got_first: bool,
@@ -461,17 +471,19 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                         sender: Sender<SocketAddrV4>,
                         receiver: Receiver<SocketAddrV4>,
                         initialization_state: Arc<Mutex<DpdkInitState>>,
+                        _flow_handle: FlowSteeringHandle,
                     }
 
+                    let (s, r) = flume::bounded(16);
                     let state = StreamState {
                         got_first: false,
                         listen_addr: a,
                         sender: s,
                         receiver: r,
                         initialization_state: Arc::clone(&self.0.initialization_state),
+                        _flow_handle: flow_handle,
                     };
 
-                    // we just initialized this, so `.with` is fine instead of `.try_with`.
                     Ok(
                         Box::pin(futures_util::stream::try_unfold(state, |mut state| {
                             let listen_addr = state.listen_addr;
@@ -479,6 +491,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                                 if !state.got_first {
                                     debug!("DpdkInlineReqChunnel listen stream poll for first packet");
                                     loop {
+                                        // we initialized dpdk on this thread, so `.with` is fine instead of `.try_with`.
                                         DPDK_STATE.with(|dpdk_cell| {
                                             let this_lcore = get_lcore_id();
                                             let mut dpdk_opt = dpdk_cell.borrow_mut();
@@ -970,5 +983,15 @@ impl DpdkState {
         }
 
         Ok(())
+    }
+
+    fn register_flow(&mut self, local_port: u16) -> Result<FlowSteeringHandle, Report> {
+        unsafe { setup_flow_steering(self.port, local_port, self.rx_queue_id as _) }.wrap_err(
+            eyre!(
+                "Could not register flow steering for port {:?} to queue {:?}",
+                local_port,
+                self.rx_queue_id
+            ),
+        )
     }
 }
