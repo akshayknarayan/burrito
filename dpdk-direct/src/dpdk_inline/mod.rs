@@ -36,6 +36,7 @@ impl FlowSteering {
         std::mem::drop(port_handle.take());
         // 2. add to queues_on_port and make the new rule.
         queues_on_port.push(dpdk.rx_queue_id() as _);
+        queues_on_port.sort();
         let flow_handle = dpdk.register_flow_steering(port, &queues_on_port[..])?;
 
         // 3. save the flow_handle.
@@ -62,6 +63,7 @@ impl FlowSteering {
         ensure!(found, "queue not registered on port");
 
         // 2. now make a new rule for the current number of flows.
+        queues_on_port.sort();
         let flow_handle = dpdk.register_flow_steering(port, &queues_on_port[..])?;
 
         *port_handle = Some(flow_handle);
@@ -205,9 +207,11 @@ impl ChunnelListener for DpdkInlineChunnel {
                             .as_mut()
                             .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
-                        {
+                        if let Err(err) = {
                             let mut steering_g = self.flow_steering.lock().unwrap();
-                            steering_g.add_flow(dpdk, a.port())?;
+                            steering_g.add_flow(dpdk, a.port())
+                        } {
+                            warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                         }
 
                         dpdk.register_flow_buffer(
@@ -261,9 +265,11 @@ impl ChunnelConnector for DpdkInlineChunnel {
                         }
                     };
 
-                    {
+                    if let Err(err) = {
                         let mut steering_g = self.flow_steering.lock().unwrap();
-                        steering_g.add_flow(dpdk, port)?;
+                        steering_g.add_flow(dpdk, port)
+                    } {
+                        warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                     }
 
                     dpdk.register_flow_buffer(
@@ -514,7 +520,10 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                             let dpdk = dpdk_opt
                                 .as_mut()
                                 .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                            steering_g.add_flow(dpdk, a.port())?;
+                            if let Err(err) = steering_g.add_flow(dpdk, a.port()) {
+                                warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
+                            }
+
                             Ok::<_, Report>(())
                         })?;
                     }

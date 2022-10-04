@@ -166,15 +166,16 @@ impl DpdkState {
         local_port: u16,
         queues: &[u16],
     ) -> Result<FlowSteeringHandle, Report> {
+        debug!(?queues, ?local_port, "Registering flow steering rule");
         if queues.len() == 1 {
             unsafe { setup_flow_steering_solo(self.port, local_port, queues[0] as _) }
         } else {
             unsafe { setup_flow_steering_rss(self.port, local_port, queues) }
         }
         .wrap_err(eyre!(
-            "Could not register flow steering for port {:?} to queue {:?}",
+            "Could not register flow steering for port {:?} to queues {:?}",
             local_port,
-            self.rx_queue_id
+            queues
         ))
     }
 
