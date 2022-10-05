@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use structopt::StructOpt;
-use tracing::{debug, error, info, info_span, instrument, trace};
+use tracing::{debug, debug_span, error, info, info_span, instrument, trace};
 use tracing_futures::Instrument;
 
 #[derive(Debug, StructOpt)]
@@ -50,9 +50,11 @@ fn main() -> Result<(), Report> {
 
         let mut jhs = Vec::with_capacity(opt.threads);
         for thread in 1..opt.threads {
-            debug!(?thread, "spawning thread");
             let ch = Arc::clone(&ch);
             let jh = std::thread::spawn(move || {
+                let thread_span = debug_span!("thread", ?thread);
+                let _thread_span_g = thread_span.enter();
+                debug!("spawning thread");
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
@@ -69,7 +71,9 @@ fn main() -> Result<(), Report> {
             jhs.push(jh);
         }
 
-        debug!(thread = 0, "using main tokio thread");
+        let thread_span = debug_span!("thread", thread = 0);
+        let thread_span_g = thread_span.enter();
+        debug!("using main tokio thread");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -81,8 +85,11 @@ fn main() -> Result<(), Report> {
 
             client(cn, opt.num_msgs / opt.threads, interarrival, remote_addr).await
         })?;
-        info!(thread = 0, "client done");
+        std::mem::drop(thread_span_g);
 
+        let done_span = debug_span!("wait_done");
+        info!(thread = 0, "client done");
+        let _done_span_g = done_span.enter();
         for jh in jhs {
             match jh.join() {
                 Ok(r) => {
