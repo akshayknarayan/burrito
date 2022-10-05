@@ -2,6 +2,7 @@ use ahash::AHashMap as HashMap;
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{
+    bindings::compute_flow_affinity,
     bindings::{get_lcore_id, get_lcore_map},
     wrapper::{affinitize_thread, FlowSteeringHandle},
 };
@@ -48,6 +49,7 @@ impl FlowSteering {
     pub fn remove_flow(&mut self, dpdk: &mut DpdkState, port: u16) -> Result<(), Report> {
         let queue_id = dpdk.rx_queue_id() as u16;
         let (ref mut port_handle, ref mut queues_on_port) = self.0.entry(port).or_default();
+        debug!(?port, "removing flow steering rule");
         std::mem::drop(port_handle.take());
 
         // 1. remove `queue` from `queues_on_port`
@@ -61,6 +63,9 @@ impl FlowSteering {
         }
 
         ensure!(found, "queue not registered on port");
+        if queues_on_port.is_empty() {
+            return Ok(());
+        }
 
         // 2. now make a new rule for the current number of flows.
         queues_on_port.sort();
@@ -136,7 +141,7 @@ impl DpdkInlineChunnel {
                 mempools: dpdks,
                 lcore_map,
             })),
-            ephemeral_ports: Arc::new(Mutex::new((1024..60_000).collect())),
+            ephemeral_ports: Arc::new(Mutex::new((4096..16_384).collect())),
             flow_steering: Default::default(),
         })
     }
@@ -158,11 +163,17 @@ fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
                 affinitize_thread(core_id as _)
                     .wrap_err(eyre!("affinitizing thread to lcore {:?}", core_id))?;
 
-                info!(?core_id, "taking initialized DpdkState");
+                //let remaining_qids: Vec<_> = init_state_g
+                //    .mempools
+                //    .iter()
+                //    .map(DpdkState::rx_queue_id)
+                //    .collect();
+                //debug!(?remaining_qids, "pulling dpdk queue");
                 let dpdk_state = init_state_g
                     .mempools
                     .pop()
                     .ok_or(eyre!("No remaining initialized dpdk thread mempools"))?;
+                info!(?core_id, qid = ?dpdk_state.rx_queue_id(), "taking initialized DpdkState");
                 *dpdk = Some(dpdk_state);
             }
 
@@ -256,35 +267,62 @@ impl ChunnelConnector for DpdkInlineChunnel {
                         .as_mut()
                         .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
+                    //let port = {
+                    //    let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
+                    //    if let Some(p) = free_ports_g.pop() {
+                    //        p
+                    //    } else {
+                    //        bail!("Could not find appropriate src port to use");
+                    //    }
+                    //};
+
+                    //if let Err(err) = {
+                    //    let mut steering_g = self.flow_steering.lock().unwrap();
+                    //    steering_g.add_flow(dpdk, port)
+                    //} {
+                    //    warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
+                    //}
+
+                    // we have to choose the src port carefully so that its RSS hash leads it back to
+                    // this core.
                     let port = {
                         let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
-                        if let Some(p) = free_ports_g.pop() {
-                            p
+                        let mut found = None;
+                        let wanted_qid = dpdk.rx_queue_id();
+                        let local_ip = dpdk.ip_addr();
+                        for (i, cand_src_port) in free_ports_g.iter().enumerate() {
+                            if compute_flow_affinity(
+                                SocketAddrV4::new(local_ip, *cand_src_port),
+                                remote_addr,
+                            ) as usize
+                                == wanted_qid
+                            {
+                                found = Some(i);
+                                break;
+                            }
+                        }
+
+                        if let Some(i) = found {
+                            free_ports_g.swap_remove(i)
                         } else {
                             bail!("Could not find appropriate src port to use");
                         }
                     };
-
-                    if let Err(err) = {
-                        let mut steering_g = self.flow_steering.lock().unwrap();
-                        steering_g.add_flow(dpdk, port)
-                    } {
-                        warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
-                    }
 
                     dpdk.register_flow_buffer(
                         port,
                         SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
                     );
 
-                    Ok(DpdkInlineCn::new(
-                        port,
-                        Some(remote_addr),
-                        None,
-                        Arc::clone(&self.initialization_state),
-                        Some(Arc::clone(&self.ephemeral_ports)),
+                    Ok(
+                        DpdkInlineCn::new(
+                            port,
+                            Some(remote_addr),
+                            None,
+                            Arc::clone(&self.initialization_state),
+                            Some(Arc::clone(&self.ephemeral_ports)),
+                        ), //.with_flow_steering(Arc::clone(&self.flow_steering)))
                     )
-                    .with_flow_steering(Arc::clone(&self.flow_steering)))
                 })
             })
         })())

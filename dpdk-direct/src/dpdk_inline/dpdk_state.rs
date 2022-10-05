@@ -111,6 +111,8 @@ impl DpdkState {
         let octets = ip_addr.octets();
         let ip_addr_raw: u32 = unsafe { make_ip(octets[0], octets[1], octets[2], octets[3]) };
 
+        unsafe { flush_flow_steering(port) }?;
+
         Ok(mbuf_pools
             .into_iter()
             .enumerate()
@@ -134,6 +136,10 @@ impl DpdkState {
 
     pub fn rx_queue_id(&self) -> usize {
         self.rx_queue_id
+    }
+
+    pub fn ip_addr(&self) -> Ipv4Addr {
+        self.ip_addr
     }
 
     pub fn register_flow_buffer(&mut self, local_port: u16, remote_addr: SocketAddrV4) {
@@ -310,11 +316,11 @@ impl DpdkState {
         }
 
         if num_valid > 0 {
-            trace!(?num_valid, "Received valid packets");
+            trace!(?num_valid, qid = ?self.rx_queue_id, "Received valid packets");
         }
 
         if num_invalid > 0 {
-            trace!(?num_invalid, "Discarded invalid packets");
+            trace!(?num_invalid, qid = ?self.rx_queue_id, "Discarded invalid packets");
         }
 
         Ok(&mut self.rx_recv_buf[..num_valid])
