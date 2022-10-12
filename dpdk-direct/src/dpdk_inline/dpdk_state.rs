@@ -56,6 +56,7 @@ pub struct DpdkState {
     mbuf_pool: *mut rte_mempool,
     arp_table: HashMap<Ipv4Addr, MacAddress>,
 
+    num_queues: u16,
     rx_queue_id: usize,
     rx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
     rx_packets_for_ports: Vec<((u16, SocketAddrV4), Vec<Msg>)>,
@@ -99,6 +100,10 @@ impl DpdkState {
     ) -> Result<Vec<Self>, Report> {
         let (dpdk_config, ip_addr, arp_table) = parse_cfg(config_path.as_path())?;
         let (mbuf_pools, nb_ports) = dpdk_init(dpdk_config, num_dpdk_threads)?;
+        ensure!(
+            mbuf_pools.len() == num_dpdk_threads,
+            "Not enough mempools/queues initialized for requested number of threads"
+        );
         let port = nb_ports - 1;
 
         // what is my ethernet address (rte_ether_addr struct)
@@ -124,6 +129,7 @@ impl DpdkState {
                 port,
                 mbuf_pool,
                 arp_table: arp_table.clone(),
+                num_queues: num_dpdk_threads as _,
                 rx_queue_id: qid,
                 rx_bufs: [std::ptr::null_mut(); RECEIVE_BURST_SIZE as usize],
                 rx_packets_for_ports: Vec::with_capacity(16),
@@ -140,6 +146,10 @@ impl DpdkState {
 
     pub fn ip_addr(&self) -> Ipv4Addr {
         self.ip_addr
+    }
+
+    pub fn num_queues(&self) -> u16 {
+        self.num_queues
     }
 
     pub fn register_flow_buffer(&mut self, local_port: u16, remote_addr: SocketAddrV4) {
@@ -185,6 +195,10 @@ impl DpdkState {
         ))
     }
 
+    pub fn eth_stats(&self) -> Result<rte_eth_stats, Report> {
+        unsafe { get_eth_stats(self.port) }
+    }
+
     pub fn try_recv_burst<'cn>(
         &'cn mut self,
         port_filter: Option<(u16, Option<SocketAddrV4>)>,
@@ -228,6 +242,9 @@ impl DpdkState {
         } as usize;
         let mut num_valid = 0;
         let mut num_invalid = 0;
+        let mut num_stashed = 0;
+        let mut num_dropped = 0;
+
         'per_pkt: for i in 0..num_received {
             // first: parse if valid packet, and what the payload size is
             let (is_valid, src_ether, src_ip, src_port, dst_port, payload_length) =
@@ -265,11 +282,13 @@ impl DpdkState {
                         if *p == dst_port {
                             stash.push(msg);
                             trace!(stash_size = ?stash.len(), "Stashed packet");
+                            num_stashed += 1;
                             break;
                         }
                     }
 
                     // the packet didn't match any ports. can drop.
+                    num_dropped += 1;
                     trace!(?dst_port, ?pkt_src_addr, "dropping pkt");
                 }
                 Some((ref wanted_dst_port, Some(ref wanted_src_addr)))
@@ -283,7 +302,7 @@ impl DpdkState {
                             found_dst_port = true;
                             if *cand_src_addr == pkt_src_addr {
                                 stash.push(msg);
-                                trace!(stash_size = ?stash.len(), "Stashed packet");
+                                num_stashed += 1;
                                 continue 'per_pkt;
                             }
                         }
@@ -294,6 +313,7 @@ impl DpdkState {
                     if found_dst_port {
                         let mut new_stash = Vec::with_capacity(16);
                         new_stash.push(msg);
+                        num_stashed += 1;
                         self.rx_packets_for_ports
                             .push(((dst_port, pkt_src_addr), new_stash));
                         debug!(?dst_port, ?pkt_src_addr, "created new stash for connection");
@@ -302,9 +322,11 @@ impl DpdkState {
                             nc.send(pkt_src_addr)
                                 .wrap_err("New connection channel send failed")?;
                         }
+                    } else {
+                        // else !found_dst_port, which means no one was listening and we can drop.
+                        num_dropped += 1;
+                        trace!(?dst_port, ?pkt_src_addr, "dropping pkt");
                     }
-
-                    // else !found_dst_port, which means no one was listening and we can drop.
                 }
                 _ => {
                     // either there is no filtering, or there is and it matched. either way, we can
@@ -315,12 +337,21 @@ impl DpdkState {
             }
         }
 
-        if num_valid > 0 {
-            trace!(?num_valid, qid = ?self.rx_queue_id, "Received valid packets");
-        }
+        ensure!(
+            num_valid + num_stashed + num_invalid + num_dropped == num_received,
+            "packets have gone missing: received {:?}, {:?} valid {:?} stashed {:?} invalid {:?} dropped",
+            num_received, num_valid, num_stashed, num_invalid, num_dropped,
+        );
 
-        if num_invalid > 0 {
-            trace!(?num_invalid, qid = ?self.rx_queue_id, "Discarded invalid packets");
+        if num_received > 0 {
+            trace!(
+                ?num_received,
+                ?num_valid,
+                ?num_invalid,
+                ?num_stashed,
+                ?num_dropped,
+                "Received packets"
+            );
         }
 
         Ok(&mut self.rx_recv_buf[..num_valid])

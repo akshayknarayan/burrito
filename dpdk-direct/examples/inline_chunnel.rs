@@ -54,6 +54,7 @@ fn main() -> Result<(), Report> {
             let jh = std::thread::spawn(move || {
                 let thread_span = debug_span!("thread", ?thread);
                 let _thread_span_g = thread_span.enter();
+
                 debug!("spawning thread");
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -251,6 +252,25 @@ async fn client(
         tot_recv_count += handle_received(remote_addr, ms)?;
         debug!(?tot_recv_count, "received burst");
     }
+
+    //while tot_recv_count < num_msgs {
+    //    let sleep = tokio::time::sleep(std::time::Duration::from_secs(10));
+    //    tokio::pin!(sleep);
+    //    match futures_util::future::select(sleep, cn.recv(&mut slots[..])).await {
+    //        Either::Left((_, _)) => {
+    //            // timed out recv. exit
+    //            error!("timed out on wait. exiting");
+    //            break;
+    //        }
+    //        Either::Right((Ok(ms), _)) => {
+    //            tot_recv_count += handle_received(remote_addr, ms)?;
+    //            debug!(?tot_recv_count, "received burst");
+    //        }
+    //        Either::Right((Err(err), _)) => {
+    //            return Err(err);
+    //        }
+    //    }
+    //}
 
     info!("done");
     Ok(())

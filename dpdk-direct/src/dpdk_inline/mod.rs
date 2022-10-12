@@ -267,47 +267,49 @@ impl ChunnelConnector for DpdkInlineChunnel {
                         .as_mut()
                         .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
-                    //let port = {
-                    //    let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
-                    //    if let Some(p) = free_ports_g.pop() {
-                    //        p
-                    //    } else {
-                    //        bail!("Could not find appropriate src port to use");
-                    //    }
-                    //};
-
-                    //if let Err(err) = {
-                    //    let mut steering_g = self.flow_steering.lock().unwrap();
-                    //    steering_g.add_flow(dpdk, port)
-                    //} {
-                    //    warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
-                    //}
-
-                    // we have to choose the src port carefully so that its RSS hash leads it back to
-                    // this core.
                     let port = {
                         let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
-                        let mut found = None;
-                        let wanted_qid = dpdk.rx_queue_id();
-                        let local_ip = dpdk.ip_addr();
-                        for (i, cand_src_port) in free_ports_g.iter().enumerate() {
-                            if compute_flow_affinity(
-                                SocketAddrV4::new(local_ip, *cand_src_port),
-                                remote_addr,
-                            ) as usize
-                                == wanted_qid
-                            {
-                                found = Some(i);
-                                break;
-                            }
-                        }
-
-                        if let Some(i) = found {
-                            free_ports_g.swap_remove(i)
+                        if let Some(p) = free_ports_g.pop() {
+                            p
                         } else {
                             bail!("Could not find appropriate src port to use");
                         }
                     };
+
+                    if let Err(err) = {
+                        let mut steering_g = self.flow_steering.lock().unwrap();
+                        steering_g.add_flow(dpdk, port)
+                    } {
+                        warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
+                    }
+
+                    // we have to choose the src port carefully so that its RSS hash leads it back to
+                    // this core.
+                    //let port = {
+                    //    let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
+                    //    let mut found = None;
+                    //    let wanted_qid = dpdk.rx_queue_id();
+                    //    let local_ip = dpdk.ip_addr();
+                    //    let num_queues = dpdk.num_queues();
+                    //    for (i, cand_src_port) in free_ports_g.iter().enumerate() {
+                    //        if compute_flow_affinity(
+                    //            SocketAddrV4::new(local_ip, *cand_src_port),
+                    //            remote_addr,
+                    //            num_queues,
+                    //        ) as usize
+                    //            == wanted_qid
+                    //        {
+                    //            found = Some(i);
+                    //            break;
+                    //        }
+                    //    }
+
+                    //    if let Some(i) = found {
+                    //        free_ports_g.swap_remove(i)
+                    //    } else {
+                    //        bail!("Could not find appropriate src port to use");
+                    //    }
+                    //};
 
                     dpdk.register_flow_buffer(
                         port,
@@ -321,7 +323,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
                             None,
                             Arc::clone(&self.initialization_state),
                             Some(Arc::clone(&self.ephemeral_ports)),
-                        ), //.with_flow_steering(Arc::clone(&self.flow_steering)))
+                        ).with_flow_steering(Arc::clone(&self.flow_steering))
                     )
                 })
             })
@@ -468,6 +470,8 @@ impl ChunnelConnection for DpdkInlineCn {
         let local_port = self.local_port;
         let remote_addr = self.remote_addr;
         let new_conns = self.new_conns.as_ref();
+        let clk = quanta::Clock::new();
+        let mut start = clk.now();
         Box::pin(
             async move {
                 trace!("start");
@@ -503,6 +507,22 @@ impl ChunnelConnection for DpdkInlineCn {
                         trace!(num_returned = ?ret, "done");
                         return Ok(&mut msgs_buf[..ret]);
                     } else {
+                        if clk.now().duration_since(start) > std::time::Duration::from_secs(5) {
+                            if let Err(err) = DPDK_STATE.try_with(|dpdk_cell| {
+                                let mut dpdk_opt = dpdk_cell.borrow_mut();
+                                let dpdk = dpdk_opt.as_mut().ok_or(eyre!(
+                                    "dpdk not initialized on core {:?}",
+                                    this_lcore
+                                ))?;
+                                let stats =  dpdk.eth_stats()?;
+                                debug!(in_packets = ?stats.ipackets, in_errrors = ?stats.ierrors, "eth_dev stats");
+                                Ok::<_, Report>(())
+                            }) {
+                                debug!(?err, "error getting eth_dev stats");
+                            }
+                            start = clk.now();
+                        }
+
                         tokio::task::yield_now().await;
                     }
                 }
