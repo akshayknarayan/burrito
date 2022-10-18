@@ -158,22 +158,25 @@ impl DpdkState {
     }
 
     pub fn deregister_flow_buffer(&mut self, local_port: u16, remote_addr: Option<SocketAddrV4>) {
-        for i in 0..self.rx_packets_for_ports.len() {
-            let ((local_port_slot, remote_addr_slot), ref mut stash) =
-                &mut self.rx_packets_for_ports[i];
-            if let Some(remote_addr) = remote_addr {
-                if *remote_addr_slot == remote_addr && *local_port_slot == local_port {
-                    // remove this stash from the list of stashes, so that a new matching
-                    // packet triggers new connection logic.
-                    self.rx_packets_for_ports.swap_remove(i);
+        self.rx_packets_for_ports.retain_mut(
+            |((local_port_slot, remote_addr_slot), ref mut stash)| {
+                if let Some(remote_addr) = remote_addr {
+                    if *remote_addr_slot == remote_addr && *local_port_slot == local_port {
+                        // remove this stash from the list of stashes, so that a new matching
+                        // packet triggers new connection logic.
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    if *local_port_slot == local_port {
+                        stash.clear();
+                    }
+
+                    true
                 }
-            } else {
-                if *local_port_slot == local_port {
-                    stash.clear();
-                    break;
-                }
-            }
-        }
+            },
+        );
     }
 
     /// Set up a single-flow, single-queue steering rule.
