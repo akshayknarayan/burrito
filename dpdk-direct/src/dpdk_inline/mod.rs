@@ -2,7 +2,6 @@ use ahash::AHashMap as HashMap;
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{
-    bindings::compute_flow_affinity,
     bindings::{get_lcore_id, get_lcore_map},
     wrapper::{affinitize_thread, FlowSteeringHandle},
 };
@@ -282,34 +281,6 @@ impl ChunnelConnector for DpdkInlineChunnel {
                     } {
                         warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                     }
-
-                    // we have to choose the src port carefully so that its RSS hash leads it back to
-                    // this core.
-                    //let port = {
-                    //    let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
-                    //    let mut found = None;
-                    //    let wanted_qid = dpdk.rx_queue_id();
-                    //    let local_ip = dpdk.ip_addr();
-                    //    let num_queues = dpdk.num_queues();
-                    //    for (i, cand_src_port) in free_ports_g.iter().enumerate() {
-                    //        if compute_flow_affinity(
-                    //            SocketAddrV4::new(local_ip, *cand_src_port),
-                    //            remote_addr,
-                    //            num_queues,
-                    //        ) as usize
-                    //            == wanted_qid
-                    //        {
-                    //            found = Some(i);
-                    //            break;
-                    //        }
-                    //    }
-
-                    //    if let Some(i) = found {
-                    //        free_ports_g.swap_remove(i)
-                    //    } else {
-                    //        bail!("Could not find appropriate src port to use");
-                    //    }
-                    //};
 
                     dpdk.register_flow_buffer(
                         port,

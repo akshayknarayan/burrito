@@ -56,7 +56,6 @@ pub struct DpdkState {
     mbuf_pool: *mut rte_mempool,
     arp_table: HashMap<Ipv4Addr, MacAddress>,
 
-    num_queues: u16,
     rx_queue_id: usize,
     rx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
     rx_packets_for_ports: Vec<((u16, SocketAddrV4), Vec<Msg>)>,
@@ -129,7 +128,6 @@ impl DpdkState {
                 port,
                 mbuf_pool,
                 arp_table: arp_table.clone(),
-                num_queues: num_dpdk_threads as _,
                 rx_queue_id: qid,
                 rx_bufs: [std::ptr::null_mut(); RECEIVE_BURST_SIZE as usize],
                 rx_packets_for_ports: Vec::with_capacity(16),
@@ -142,14 +140,6 @@ impl DpdkState {
 
     pub fn rx_queue_id(&self) -> usize {
         self.rx_queue_id
-    }
-
-    pub fn ip_addr(&self) -> Ipv4Addr {
-        self.ip_addr
-    }
-
-    pub fn num_queues(&self) -> u16 {
-        self.num_queues
     }
 
     pub fn register_flow_buffer(&mut self, local_port: u16, remote_addr: SocketAddrV4) {
