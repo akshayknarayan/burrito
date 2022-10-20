@@ -183,12 +183,35 @@ def check_machine(ip):
     conn.alt = alt
     return (conn, commit)
 
-def setup_machine(conn, outdir):
+def setup_machine(conn, outdir, datapaths, dpdk_driver):
     ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
     check(ok, "mk outdir", conn.addr)
-    agenda.subtask(f"building burrito on {conn.addr}")
-    ok = conn.run("make sharding", wd = "~/burrito")
-    check(ok, "build", conn.addr)
+
+    agenda.task("building experiment binaries on {conn.addr}")
+
+    if 'shenango_channel' in datapaths:
+        # need to compile iokerneld
+        ok = conn.run("make", wd = "~/burrito/shenango-chunnel/caladan")
+        check(ok, "build shenango", conn.addr)
+
+    needed_features = ["bin"]
+    for d in datapaths:
+        if 'shenango_channel' == d:
+            needed_features.append('shenango-chunnel')
+        elif 'dpdk' in d:
+            needed_features.append('dpdk-direct')
+            if dpdk_driver == 'mlx':
+                needed_features.append('cx3_mlx')
+            else:
+                needed_features.append('xl710_intel')
+    agenda.subtask(f"building kvserver features={needed_features}")
+    ok = conn.run(f"cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"kvserver\"", wd = "~/burrito/kvstore")
+    check(ok, "kvserver build", conn.addr)
+
+    agenda.subtask(f"building ycsb features={needed_features}")
+    ok = conn.run(f"cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"ycsb\"", wd = "~/burrito/kvstore-ycsb")
+    check(ok, "ycsb build", conn.addr)
+
     return conn
 
 def write_cfg(conn, config):
@@ -588,6 +611,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--outdir', type=str, required=True)
     parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--dpdk_driver', type=str, choices=['mlx', 'intel'],  required=False)
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")
     cfg = toml.load(args.config)
@@ -615,11 +639,15 @@ if __name__ == '__main__':
             sys.exit(1)
 
     if 'datapath' not in cfg['exp']:
-        cfg['exp']['datapath'] = ['shenango_channel']
+        cfg['exp']['datapath'] = ['kernel']
     for t in cfg['exp']['datapath']:
-        if t not in ['shenango_channel', 'kernel', 'dpdk']:
+        if t not in ['shenango_channel', 'kernel', 'dpdkthread', 'dpdkmulti']:
             agenda.failure(f"Unknown datapath {t}")
             sys.exit(1)
+
+    if any('dpdk' in d for d in cfg['exp']['datapath']):
+        if args.dpdk_driver not in ['mlx', 'intel']:
+            agenda.failure("If using dpdk datapath, must specify mlx or intel driver.")
 
     if 'stack-fragmentation' not in cfg['exp']:
         cfg['exp']['stack-fragmentation'] = [False]
@@ -653,7 +681,7 @@ if __name__ == '__main__':
 
     # build
     agenda.task("building burrito...")
-    setups = [threading.Thread(target=setup_machine, args=(m,outdir)) for m in machines]
+    setups = [threading.Thread(target=setup_machine, args=(m, outdir, cfg['exp']['datapath'], args.dpdk_driver)) for m in machines]
     [t.start() for t in setups]
     [t.join() for t in setups]
     if not thread_ok:
