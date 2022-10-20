@@ -1,4 +1,4 @@
-use color_eyre::eyre::Report;
+use color_eyre::eyre::{bail, Report};
 use kvstore::bin::{tracing_init, Datapath};
 use kvstore::single_shard;
 use std::net::SocketAddr;
@@ -55,7 +55,8 @@ fn main() -> Result<(), Report> {
                 )
                 .await?;
             }
-            Datapath::Shenango => {
+            #[cfg(features = "shenango-chunnel")]
+            Datapath::Shenango if cfg!(features = "shenango-chunnel") => {
                 let cfg = opt.cfg.unwrap();
                 let listener = shenango_chunnel::ShenangoUdpReqChunnel(
                     shenango_chunnel::ShenangoUdpSkChunnel::new(&cfg),
@@ -72,7 +73,11 @@ fn main() -> Result<(), Report> {
                 )
                 .await?;
             }
-            Datapath::DpdkSingleThread => {
+            Datapath::Shenango => {
+                bail!("This binary was not compiled with shenango-chunnel support.")
+            }
+            #[cfg(features = "dpdk-direct")]
+            Datapath::DpdkSingleThread if cfg!(features = "dpdk-direct") => {
                 let cfg = opt.cfg.unwrap();
                 let s = dpdk_direct::DpdkUdpSkChunnel::new(&cfg)?;
                 let listener = dpdk_direct::DpdkUdpReqChunnel(s);
@@ -87,7 +92,8 @@ fn main() -> Result<(), Report> {
                 )
                 .await?;
             }
-            Datapath::DpdkMultiThread => {
+            #[cfg(features = "dpdk-direct")]
+            Datapath::DpdkMultiThread if cfg!(features = "dpdk-direct") => {
                 let cfg = opt.cfg.unwrap();
                 let ch = dpdk_direct::DpdkInlineChunnel::new(cfg, 1)?;
                 let listener = dpdk_direct::DpdkInlineReqChunnel::from(ch);
@@ -101,6 +107,9 @@ fn main() -> Result<(), Report> {
                     opt.skip_negotiation,
                 )
                 .await?;
+            }
+            Datapath::DpdkSingleThread | Datapath::DpdkMultiThread => {
+                bail!("This binary was not compiled with dpdk-direct support.")
             }
         }
 

@@ -6,6 +6,8 @@ edition = "2021"
 
 [features]
 default = []
+cx3_mlx = ["dpdk-direct?/cx3_mlx"]
+xl710_intel = ["dpdk-direct?/xl710_intel"]
 
 [dependencies]
 bertha = { path = "../bertha" } 
@@ -21,6 +23,6 @@ tracing-subscriber = "0.2"
 tracing-timing  = "0.5"
 tracing-error  = "0.1"
 color-eyre = "0.5"
-shenango-chunnel = { path = "../shenango-chunnel" }
-dpdk-direct = { path = "../dpdk-direct" }
+shenango-chunnel = { path = "../shenango-chunnel", optional = true }
+dpdk-direct = { path = "../dpdk-direct", optional = true }
 quanta = "0.10"

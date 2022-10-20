@@ -1,4 +1,4 @@
-use color_eyre::eyre::Report;
+use color_eyre::eyre::{bail, Report};
 use kvstore::bin::{tracing_init, Datapath};
 use kvstore::serve_lb;
 use std::net::SocketAddr;
@@ -63,7 +63,8 @@ async fn main() -> Result<(), Report> {
                 )
                 .await
             }
-            Datapath::Shenango => {
+            #[cfg(features = "shenango-chunnel")]
+            Datapath::Shenango if cfg!(features = "shenango-chunnel") => {
                 let cfg = opt.cfg.unwrap();
                 let sk = shenango_chunnel::ShenangoUdpSkChunnel::new(&cfg);
                 let listener = shenango_chunnel::ShenangoUdpReqChunnel(sk.clone());
@@ -78,7 +79,11 @@ async fn main() -> Result<(), Report> {
                 )
                 .await
             }
-            Datapath::DpdkSingleThread => {
+            Datapath::Shenango => {
+                bail!("This binary was not compiled with shenango-chunnel support.");
+            }
+            #[cfg(features = "dpdk-direct")]
+            Datapath::DpdkSingleThread if cfg!(features = "dpdk-direct") => {
                 let cfg = opt.cfg.unwrap();
                 let sk = dpdk_direct::DpdkUdpSkChunnel::new(&cfg)?;
                 let listener = dpdk_direct::DpdkUdpReqChunnel(sk.clone());
@@ -93,7 +98,8 @@ async fn main() -> Result<(), Report> {
                 )
                 .await
             }
-            Datapath::DpdkMultiThread => {
+            #[cfg(features = "dpdk-direct")]
+            Datapath::DpdkMultiThread if cfg!(features = "dpdk-direct") => {
                 let cfg = opt.cfg.unwrap();
                 let sk = dpdk_direct::DpdkInlineChunnel::new(cfg, 1)?;
                 let listener = dpdk_direct::DpdkInlineReqChunnel::from(sk.clone());
@@ -107,6 +113,9 @@ async fn main() -> Result<(), Report> {
                     None, // no ready notification
                 )
                 .await
+            }
+            Datapath::DpdkSingleThread | Datapath::DpdkMultiThread => {
+                bail!("This binary was not compiled with dpdk-direct support.")
             }
         }
     })?;

@@ -6,11 +6,11 @@ edition = "2021"
 
 [features]
 default = []
-bin = ["bin-helper", "structopt", "tokio/rt-multi-thread", "tokio/fs", "num_cpus", "use-shenango", "use-dpdk-direct"]
+bin = ["bin-helper", "structopt", "tokio/rt-multi-thread", "tokio/fs", "num_cpus"]
 bin-helper = ["tracing-subscriber", "tracing-timing", "ctrlc"]
-use-shenango = ["shenango-chunnel"]
-use-dpdk-direct = ["dpdk-direct"]
 ebpf = ["burrito-shard-ctl/ebpf"]
+cx3_mlx = ["dpdk-direct?/cx3_mlx"]
+xl710_intel = ["dpdk-direct?/xl710_intel"]
 
 [dependencies]
 bertha = { path = "../bertha" }
