@@ -3,6 +3,10 @@ name = "dpdk-direct"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+cx3_mlx = ["dpdk-wrapper/cx3_mlx"]
+xl710_intel = ["dpdk-wrapper/xl710_intel"]
+
 [dependencies]
 bertha = { path = "../bertha" }
 dpdk-wrapper = { path = "./dpdk-wrapper" }
@@ -18,7 +22,6 @@ ahash = "0.7"
 quanta = "0.10"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt"] }
 tracing-subscriber = "0.2"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
