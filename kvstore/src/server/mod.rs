@@ -83,7 +83,6 @@ pub fn serve(
                 Ok(_) => (),
                 Err(err) => {
                     error!(?err, "Shard errored");
-                    return;
                 }
             }
         });
