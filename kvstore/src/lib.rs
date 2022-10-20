@@ -57,41 +57,48 @@ mod tests {
         let _guard = subscriber.set_default();
         color_eyre::install().unwrap_or(());
 
+        let redis_port = 61179;
+        info!(port = ?redis_port, "start redis");
+        let _redis_guard = test_util::start_redis(redis_port);
+
+        let srv_port = 15125;
+        let srv_addr = format!("127.0.0.1:{}", 15125);
+        let redis_sk_addr = SocketAddr::new("127.0.0.1".parse()?, redis_port);
+        let (s, r) = tokio::sync::oneshot::channel();
+        let listen_addr = "127.0.0.1".parse()?;
+        info!("start server");
+        std::thread::spawn(move || {
+            let serve_span = info_span!("server");
+            let _serve_span_g = serve_span.entered();
+            if let Err(err) = serve(
+                UdpReqChunnel::default(),
+                redis_sk_addr,
+                listen_addr,
+                srv_port,
+                2,
+                Some(s),
+                false,
+            ) {
+                tracing::error!(?err, "server errored");
+            }
+        });
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
+        let srv_addr = srv_addr.parse()?;
         rt.block_on(
             async move {
-                let redis_port = 61179;
-                info!(port = ?redis_port, "start redis");
-                let _redis_guard = test_util::start_redis(redis_port);
-
-                let srv_port = 15125;
-                let srv_addr = format!("127.0.0.1:{}", 15125);
-                let redis_sk_addr = SocketAddr::new("127.0.0.1".parse()?, redis_port);
-                let (s, r) = tokio::sync::oneshot::channel();
-                info!("start server");
-                tokio::spawn(
-                    serve(
-                        UdpReqChunnel::default(),
-                        redis_sk_addr,
-                        "127.0.0.1".parse()?,
-                        srv_port,
-                        2,
-                        s,
-                        false,
-                    )
-                    .instrument(info_span!("server")),
-                );
-
                 r.await?;
 
                 async {
                     info!("make client");
-                    let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
-                    let client = KvClientBuilder::new(srv_addr.parse()?)
+                    let raw_cn = bertha::udp::UdpSkChunnel::default()
+                        .connect(srv_addr)
+                        .await?;
+                    let client = KvClientBuilder::new(srv_addr)
                         .new_nonshardclient(raw_cn)
                         .instrument(info_span!("make kvclient"))
                         .await
@@ -104,8 +111,10 @@ mod tests {
 
                 async {
                     info!("make shardclient");
-                    let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
-                    let client = KvClientBuilder::new(srv_addr.parse()?)
+                    let raw_cn = bertha::udp::UdpSkChunnel::default()
+                        .connect(srv_addr)
+                        .await?;
+                    let client = KvClientBuilder::new(srv_addr)
                         .new_shardclient(raw_cn, redis_sk_addr)
                         .instrument(info_span!("make shard kvclient"))
                         .await
@@ -165,7 +174,7 @@ mod tests {
                             *sa,
                             UdpReqChunnel::default(),
                             Some(internal_addr),
-                            UdpReqChunnel::default(),
+                            Some(UdpReqChunnel::default()),
                             true,
                             s,
                             false,
@@ -199,7 +208,9 @@ mod tests {
 
                 async {
                     info!("make client");
-                    let raw_cn = bertha::udp::UdpSkChunnel::default().connect(()).await?;
+                    let raw_cn = bertha::udp::UdpSkChunnel::default()
+                        .connect(srv_addr)
+                        .await?;
                     // TODO only works with new_nonshardclient, not basicclient
                     // for some reason the message is getting echoed.
                     let client = KvClientBuilder::new(srv_addr)
