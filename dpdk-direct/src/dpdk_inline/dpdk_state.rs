@@ -8,6 +8,7 @@ use dpdk_wrapper::{
 };
 use eui48::MacAddress;
 use flume::Sender;
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tracing::{debug, trace, warn};
 
@@ -58,7 +59,7 @@ pub struct DpdkState {
 
     rx_queue_id: usize,
     rx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
-    rx_packets_for_ports: Vec<((u16, SocketAddrV4), Vec<Msg>)>,
+    rx_packets_for_ports: Vec<((u16, SocketAddrV4), VecDeque<Msg>)>,
 
     rx_recv_buf: Vec<Option<Msg>>,
 
@@ -144,7 +145,7 @@ impl DpdkState {
 
     pub fn register_flow_buffer(&mut self, local_port: u16, remote_addr: SocketAddrV4) {
         self.rx_packets_for_ports
-            .push(((local_port, remote_addr), Vec::with_capacity(16)));
+            .push(((local_port, remote_addr), VecDeque::with_capacity(16)));
     }
 
     pub fn deregister_flow_buffer(&mut self, local_port: u16, remote_addr: Option<SocketAddrV4>) {
@@ -196,10 +197,30 @@ impl DpdkState {
         &'cn mut self,
         port_filter: Option<(u16, Option<SocketAddrV4>)>,
         new_conns: Option<&Sender<SocketAddrV4>>,
+        max_rx_packets: Option<usize>,
     ) -> Result<&'cn mut [Option<Msg>], Report> {
+        let max_rx_packets = std::cmp::min(
+            max_rx_packets.unwrap_or(self.rx_recv_buf.len()),
+            self.rx_recv_buf.len(),
+        );
+
         match port_filter {
+            None if max_rx_packets < self.rx_recv_buf.len() => {
+                for ((dport, _), ref mut stash) in &mut self.rx_packets_for_ports {
+                    if *dport == 0 && !stash.is_empty() {
+                        let mut num_returned = 0;
+                        while num_returned < max_rx_packets && !stash.is_empty() {
+                            self.rx_recv_buf[num_returned] = Some(stash.pop_front().unwrap());
+                            num_returned += 1;
+                        }
+
+                        return Ok(&mut self.rx_recv_buf[..num_returned]);
+                    }
+                }
+            }
             None => (),
-            // if dst_port filter is enable or both dst_port and src_addr filter are enabled, try popping off some packets from stashed packets.
+            // if dst_port filter is enable or both dst_port and src_addr filter are enabled, try
+            // popping off some packets from stashed packets.
             Some((wanted_dst_port, maybe_wanted_src_addr)) => {
                 for ((cand_dst_port, cand_src_addr), ref mut stash) in
                     &mut self.rx_packets_for_ports
@@ -210,8 +231,8 @@ impl DpdkState {
                         && !stash.is_empty()
                     {
                         let mut num_returned = 0;
-                        while num_returned < self.rx_recv_buf.len() && !stash.is_empty() {
-                            self.rx_recv_buf[num_returned] = Some(stash.pop().unwrap());
+                        while num_returned < max_rx_packets && !stash.is_empty() {
+                            self.rx_recv_buf[num_returned] = Some(stash.pop_front().unwrap());
                             num_returned += 1;
                         }
 
@@ -233,7 +254,7 @@ impl DpdkState {
                 RECEIVE_BURST_SIZE as u16,
             )
         } as usize;
-        let mut num_valid = 0;
+        let mut num_returned = 0;
         let mut num_invalid = 0;
         let mut num_stashed = 0;
         let mut num_dropped = 0;
@@ -270,22 +291,26 @@ impl DpdkState {
             // this call wants packets for the flow on `call_port`, but we might have gotten
             // packets for other flows. So we stash those packets for future calls.
             match port_filter {
-                Some((wanted_dst_port, None)) if wanted_dst_port != dst_port => {
+                Some((wanted_dst_port, None))
+                    if wanted_dst_port != dst_port || num_returned >= max_rx_packets =>
+                {
                     for ((p, _), ref mut stash) in &mut self.rx_packets_for_ports {
                         if *p == dst_port {
-                            stash.push(msg);
+                            stash.push_back(msg);
                             trace!(stash_size = ?stash.len(), "Stashed packet");
                             num_stashed += 1;
-                            break;
+                            continue 'per_pkt;
                         }
                     }
 
-                    // the packet didn't match any ports. can drop.
+                    // the packet didn't match any ports. we don't have to worry about a new flow, so we can drop.
                     num_dropped += 1;
                     trace!(?dst_port, ?pkt_src_addr, "dropping pkt");
                 }
                 Some((ref wanted_dst_port, Some(ref wanted_src_addr)))
-                    if *wanted_dst_port != dst_port || *wanted_src_addr != pkt_src_addr =>
+                    if *wanted_dst_port != dst_port
+                        || *wanted_src_addr != pkt_src_addr
+                        || num_returned > max_rx_packets =>
                 {
                     let mut found_dst_port = false;
                     for ((cand_dst_port, cand_src_addr), ref mut stash) in
@@ -294,7 +319,7 @@ impl DpdkState {
                         if *cand_dst_port == dst_port {
                             found_dst_port = true;
                             if *cand_src_addr == pkt_src_addr {
-                                stash.push(msg);
+                                stash.push_back(msg);
                                 num_stashed += 1;
                                 continue 'per_pkt;
                             }
@@ -304,8 +329,8 @@ impl DpdkState {
                     // if found_dst_port but we reached this point, then we've found a new flow.
                     // allocate a new stash and save `msg` in it.
                     if found_dst_port {
-                        let mut new_stash = Vec::with_capacity(16);
-                        new_stash.push(msg);
+                        let mut new_stash = VecDeque::with_capacity(16);
+                        new_stash.push_back(msg);
                         num_stashed += 1;
                         self.rx_packets_for_ports
                             .push(((dst_port, pkt_src_addr), new_stash));
@@ -321,25 +346,46 @@ impl DpdkState {
                         trace!(?dst_port, ?pkt_src_addr, "dropping pkt");
                     }
                 }
+                // either there is no filtering, or there is and it matched. either way, this is a
+                // valid packet that we can return. but, we have to only return the number of
+                // packets the caller asked for and stash the rest.
+                _ if num_returned < max_rx_packets => {
+                    self.rx_recv_buf[num_returned] = Some(msg);
+                    num_returned += 1;
+                }
                 _ => {
-                    // either there is no filtering, or there is and it matched. either way, we can
-                    // return this packet now.
-                    self.rx_recv_buf[num_valid] = Some(msg);
-                    num_valid += 1;
+                    // None case where num_returned >= max_rx_packets.
+                    // need to stash, so we use dummy port 0.
+                    for ((p, _), ref mut stash) in &mut self.rx_packets_for_ports {
+                        if *p == 0 {
+                            stash.push_back(msg);
+                            trace!(stash_size = ?stash.len(), "Stashed packet");
+                            num_stashed += 1;
+                            continue 'per_pkt;
+                        }
+                    }
+
+                    // no match. need to make a new stash.
+                    let mut new_stash = VecDeque::with_capacity(16);
+                    new_stash.push_back(msg);
+                    num_stashed += 1;
+                    let zero_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                    self.rx_packets_for_ports.push(((0, zero_addr), new_stash));
+                    debug!("created new stash for dummy non-match connection");
                 }
             }
         }
 
         ensure!(
-            num_valid + num_stashed + num_invalid + num_dropped == num_received,
+            num_returned + num_stashed + num_invalid + num_dropped == num_received,
             "packets have gone missing: received {:?}, {:?} valid {:?} stashed {:?} invalid {:?} dropped",
-            num_received, num_valid, num_stashed, num_invalid, num_dropped,
+            num_received, num_returned, num_stashed, num_invalid, num_dropped,
         );
 
         if num_received > 0 {
             trace!(
                 ?num_received,
-                ?num_valid,
+                ?num_returned,
                 ?num_invalid,
                 ?num_stashed,
                 ?num_dropped,
@@ -347,9 +393,13 @@ impl DpdkState {
             );
         }
 
-        Ok(&mut self.rx_recv_buf[..num_valid])
+        Ok(&mut self.rx_recv_buf[..num_returned])
     }
 
+    /// Receive packets to identify new flows, but don't return them.
+    ///
+    /// Calling this function only makes sense if the caller wants to match on both destination
+    /// port *and* source address, so that is the stashing structure this function uses.
     pub fn try_recv_burst_stash_only<'cn>(
         &'cn mut self,
         new_conns: Option<&Sender<SocketAddrV4>>,
@@ -402,7 +452,7 @@ impl DpdkState {
                 if *cand_dst_port == dst_port {
                     // packet for existing flow. we should not re-notify.
                     if *cand_src_addr == pkt_src_addr {
-                        stash.push(msg);
+                        stash.push_back(msg);
                         continue 'per_pkt;
                     }
                 }
@@ -410,8 +460,8 @@ impl DpdkState {
 
             // if found_dst_port but we reached this point, then we've found a new flow.
             // allocate a new stash and save `msg` in it.
-            let mut new_stash = Vec::with_capacity(16);
-            new_stash.push(msg);
+            let mut new_stash = VecDeque::with_capacity(16);
+            new_stash.push_back(msg);
             self.rx_packets_for_ports
                 .push(((dst_port, pkt_src_addr), new_stash));
             debug!(?dst_port, ?pkt_src_addr, "created new stash for connection");

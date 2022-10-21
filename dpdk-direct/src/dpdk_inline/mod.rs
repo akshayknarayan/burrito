@@ -454,7 +454,7 @@ impl ChunnelConnection for DpdkInlineCn {
                                 .as_mut()
                                 .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
                             let msgs =
-                                dpdk.try_recv_burst(Some((local_port, remote_addr)), new_conns)?;
+                                dpdk.try_recv_burst(Some((local_port, remote_addr)), new_conns, Some(msgs_buf.len()))?;
 
                             let mut slot_idx = 0;
                             for msg in msgs.iter_mut().map_while(Option::take) {
