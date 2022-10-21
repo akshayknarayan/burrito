@@ -122,8 +122,8 @@ fn main() -> Result<(), Report> {
             let ctr = bertha::udp::UdpSkChunnel::default();
             do_exp(opt, ctr)
         }
-        #[cfg(features = "shenango-chunnel")]
-        Datapath::Shenango if cfg!(features = "shenango-chunnel") => {
+        #[cfg(feature = "shenango-chunnel")]
+        Datapath::Shenango if cfg!(feature = "shenango-chunnel") => {
             let ctr = shenango_chunnel::ShenangoUdpSkChunnel::new(
                 opt.cfg.as_ref().map(PathBuf::as_path).unwrap(),
             );
@@ -132,15 +132,15 @@ fn main() -> Result<(), Report> {
         Datapath::Shenango => {
             bail!("This binary was not compiled with shenango-chunnel support.");
         }
-        #[cfg(features = "dpdk-direct")]
-        Datapath::DpdkSingleThread if cfg!(features = "dpdk-direct") => {
+        #[cfg(feature = "dpdk-direct")]
+        Datapath::DpdkSingleThread if cfg!(feature = "dpdk-direct") => {
             let ctr = dpdk_direct::DpdkUdpSkChunnel::new(
                 opt.cfg.as_ref().map(PathBuf::as_path).unwrap(),
             )?;
             do_exp(opt, ctr)
         }
-        #[cfg(features = "dpdk-direct")]
-        Datapath::DpdkMultiThread if cfg!(features = "dpdk-direct") => {
+        #[cfg(feature = "dpdk-direct")]
+        Datapath::DpdkMultiThread if cfg!(feature = "dpdk-direct") => {
             let ctr = dpdk_direct::DpdkInlineChunnel::new(
                 opt.cfg.clone().expect("Needed config file not found"),
                 NUM_THREADS,

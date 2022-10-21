@@ -55,8 +55,8 @@ fn main() -> Result<(), Report> {
                 )
                 .await?;
             }
-            #[cfg(features = "shenango-chunnel")]
-            Datapath::Shenango if cfg!(features = "shenango-chunnel") => {
+            #[cfg(feature = "shenango-chunnel")]
+            Datapath::Shenango if cfg!(feature = "shenango-chunnel") => {
                 let cfg = opt.cfg.unwrap();
                 let listener = shenango_chunnel::ShenangoUdpReqChunnel(
                     shenango_chunnel::ShenangoUdpSkChunnel::new(&cfg),
@@ -76,8 +76,8 @@ fn main() -> Result<(), Report> {
             Datapath::Shenango => {
                 bail!("This binary was not compiled with shenango-chunnel support.")
             }
-            #[cfg(features = "dpdk-direct")]
-            Datapath::DpdkSingleThread if cfg!(features = "dpdk-direct") => {
+            #[cfg(feature = "dpdk-direct")]
+            Datapath::DpdkSingleThread if cfg!(feature = "dpdk-direct") => {
                 let cfg = opt.cfg.unwrap();
                 let s = dpdk_direct::DpdkUdpSkChunnel::new(&cfg)?;
                 let listener = dpdk_direct::DpdkUdpReqChunnel(s);
@@ -92,8 +92,8 @@ fn main() -> Result<(), Report> {
                 )
                 .await?;
             }
-            #[cfg(features = "dpdk-direct")]
-            Datapath::DpdkMultiThread if cfg!(features = "dpdk-direct") => {
+            #[cfg(feature = "dpdk-direct")]
+            Datapath::DpdkMultiThread if cfg!(feature = "dpdk-direct") => {
                 let cfg = opt.cfg.unwrap();
                 let ch = dpdk_direct::DpdkInlineChunnel::new(cfg, 1)?;
                 let listener = dpdk_direct::DpdkInlineReqChunnel::from(ch);

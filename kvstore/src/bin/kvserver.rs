@@ -45,21 +45,27 @@ fn main() -> Result<(), Report> {
         std::time::Duration::from_secs(5),
     );
 
+    #[cfg(feature = "shenango-chunnel")]
+    info!("shenango feature is enabled");
+
+    #[cfg(feature = "dpdk-direct")]
+    info!("dpdk-direct feature is enabled");
+
     opt.datapath
         .validate_cfg(opt.cfg.as_ref().map(PathBuf::as_path))?;
 
     info!("KV Server");
     match opt.datapath {
         Datapath::Kernel => run_server_kernel(opt),
-        #[cfg(features = "shenango-chunnel")]
-        Datapath::Shenango if cfg!(features = "shenango-chunnel") => run_server_shenango(opt),
+        #[cfg(feature = "shenango-chunnel")]
+        Datapath::Shenango if cfg!(feature = "shenango-chunnel") => run_server_shenango(opt),
         Datapath::Shenango => bail!("This binary was not compiled with shenango-chunnel support."),
-        #[cfg(features = "dpdk-direct")]
-        Datapath::DpdkSingleThread if cfg!(features = "dpdk-direct") => {
+        #[cfg(feature = "dpdk-direct")]
+        Datapath::DpdkSingleThread if cfg!(feature = "dpdk-direct") => {
             run_server_dpdk_singlethread(opt)
         }
-        #[cfg(features = "dpdk-direct")]
-        Datapath::DpdkMultiThread if cfg!(features = "dpdk-direct") => {
+        #[cfg(feature = "dpdk-direct")]
+        Datapath::DpdkMultiThread if cfg!(feature = "dpdk-direct") => {
             run_server_dpdk_multithread(opt)
         }
         Datapath::DpdkSingleThread | Datapath::DpdkMultiThread => Err(eyre!(
@@ -82,7 +88,7 @@ fn run_server_kernel(opt: Opt) -> Result<(), Report> {
     .wrap_err(eyre!("serve errored"))
 }
 
-#[cfg(features = "shenango-chunnel")]
+#[cfg(feature = "shenango-chunnel")]
 fn run_server_shenango(opt: Opt) -> Result<(), Report> {
     info!("using shenango datapath");
 
@@ -100,7 +106,7 @@ fn run_server_shenango(opt: Opt) -> Result<(), Report> {
     .wrap_err(eyre!("serve errored"))
 }
 
-#[cfg(features = "dpdk-direct")]
+#[cfg(feature = "dpdk-direct")]
 fn run_server_dpdk_singlethread(opt: Opt) -> Result<(), Report> {
     info!("using dpdk single-thread datapath");
 
@@ -118,7 +124,7 @@ fn run_server_dpdk_singlethread(opt: Opt) -> Result<(), Report> {
     .wrap_err(eyre!("serve errored"))
 }
 
-#[cfg(features = "dpdk-direct")]
+#[cfg(feature = "dpdk-direct")]
 fn run_server_dpdk_multithread(opt: Opt) -> Result<(), Report> {
     info!("using dpdk multi-thread datapath");
     let s = dpdk_direct::DpdkInlineChunnel::new(opt.cfg.unwrap(), (opt.num_shards + 1) as _)?;
