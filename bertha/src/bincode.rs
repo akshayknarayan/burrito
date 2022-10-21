@@ -108,9 +108,9 @@ where
 
                 let mut ret_len = 0;
                 for (buf, slot) in bufs
-                    .into_iter()
+                    .iter_mut()
                     .map_while(|x| x.take())
-                    .zip(msgs_buf.into_iter())
+                    .zip(msgs_buf.iter_mut())
                 {
                     // we have a &mut Option<(A, D)> slot and a (A, Vec<u8>) message.
                     // XXX might it be possible to re-use this already-existing Option<(A, D)>
