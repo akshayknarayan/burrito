@@ -149,25 +149,26 @@ async fn serve_canonical(
             let ctr: Arc<AtomicUsize> = Default::default();
             tokio::pin!(st);
             st.try_for_each_concurrent(None, |r| {
-                    let ctr = Arc::clone(&ctr);
-                    let mut slot = [None];
-                    async move {
-                        let ctr = ctr.fetch_add(1, Ordering::SeqCst);
-                        loop {
-                            match r
-                                .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
-                                .instrument(trace_span!("shard-canonical-server-connection", ?ctr))
-                                .await
-                                .wrap_err("kvstore/server: Error while processing requests")
-                                {
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        warn!(err = ?e, ?ctr, "exiting");
-                                        break Err(e);
-                                    }
+                let ctr = Arc::clone(&ctr);
+                let mut slot = [None];
+                async move {
+                    let ctr = ctr.fetch_add(1, Ordering::SeqCst);
+                    loop {
+                        match tokio::time::timeout(std::time::Duration::from_millis(500), async { r
+                            .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
+                            .instrument(trace_span!("shard-canonical-server-connection", ?ctr)).await
+                            .wrap_err("kvstore/server: Error while processing requests")
+                        })
+                            .await.wrap_err("kvstore/server: Error in serving canonical connection")
+                            {
+                                Ok(Err(e)) | Err(e) => {
+                                    warn!(err = ?e, ?ctr, "exiting connection loop");
+                                    break Ok(());
                                 }
-                        }
+                                Ok(_) => {}
+                            }
                     }
+                }
             }).await?;
         }}
     }

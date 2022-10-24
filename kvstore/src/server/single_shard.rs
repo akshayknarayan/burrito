@@ -151,7 +151,7 @@ async fn serve_one(
             Ok(ms) => ms,
             Err(e) => {
                 warn!(err = ?e, ?idx, "exiting on recv error");
-                break Err(e);
+                break Ok(());
             }
         };
 
@@ -159,7 +159,7 @@ async fn serve_one(
 
         match cn
             .send(
-                msgs.into_iter()
+                msgs.iter_mut()
                     .map_while(Option::take)
                     .map(|(a, msg @ Msg { .. })| {
                         let rsp = store.call(msg);
@@ -171,7 +171,7 @@ async fn serve_one(
             Ok(_) => (),
             Err(e) => {
                 warn!(err = ?e, ?idx, "exiting on send error");
-                break Err(e);
+                break Ok(());
             }
         }
     }
