@@ -580,6 +580,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                         conn_closed_listener,
                         initialization_state: Arc::clone(&self.0.initialization_state),
                         flow_steering: Arc::clone(&self.0.flow_steering),
+                        conn_count: 0,
                     };
 
                     Ok(Box::pin(futures_util::stream::try_unfold(state, |state| {
@@ -603,6 +604,7 @@ struct StreamState {
     conn_closed_listener: Receiver<()>,
     initialization_state: Arc<Mutex<DpdkInitState>>,
     flow_steering: Arc<Mutex<FlowSteering>>,
+    conn_count: usize,
 }
 
 impl Drop for StreamState {
@@ -623,9 +625,9 @@ impl Drop for StreamState {
 }
 
 impl StreamState {
-    async fn get_next(self) -> Result<Option<(DpdkInlineCn, Self)>, Report> {
+    async fn get_next(mut self) -> Result<Option<(DpdkInlineCn, Self)>, Report> {
         loop {
-            if Arc::strong_count(&self.initialization_state) < 2 {
+            if self.conn_count == 0 {
                 debug!(addr = ?self.listen_addr, "DpdkInlineReqChunnel listen stream poll for first packet");
                 loop {
                     // we initialized dpdk on this thread, so `.with` is fine instead of `.try_with`.
@@ -651,7 +653,7 @@ impl StreamState {
                                 None,
                             )
                             .with_closed_notification(self.conn_closed_notifier.clone());
-
+                            self.conn_count += 1;
                             return Ok(Some((cn, self)));
                         }
                         Err(flume::TryRecvError::Empty) => tokio::task::yield_now().await,
@@ -662,6 +664,7 @@ impl StreamState {
                     }
                 }
             } else {
+                debug!(cnt = ?self.conn_count, "DpdkInlineReqChunnel listen stream wait for connection signal");
                 // recv will never have no senders since we keep one around locally. When a
                 // connection closes, it lets us know so we can check whether it was the last one
                 // (`Arc::strong_count` above), and thus we have to search for a connection
@@ -674,9 +677,9 @@ impl StreamState {
                 .await
                 {
                     // An existing conection found a new flow.
-                    Either::Left((Ok(addr), f)) => {
-                        std::mem::drop(f);
+                    Either::Left((Ok(addr), _)) => {
                         debug!(?addr, "DpdkInlineReqChunnel returning new connection");
+                        self.conn_count += 1;
                         Some(
                             DpdkInlineCn::new(
                                 self.listen_addr.port(),
@@ -689,7 +692,10 @@ impl StreamState {
                         )
                     }
                     // A flow exited. We have to check if we are the only one left.
-                    Either::Right((Ok(_), _)) => None,
+                    Either::Right((Ok(_), _)) => {
+                        self.conn_count -= 1;
+                        None
+                    }
                     Either::Left((Err(err), _)) | Either::Right((Err(err), _)) => {
                         // since this loop keeps a sender, it should not be possible for the
                         // receiver to disconnect.
