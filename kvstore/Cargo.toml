@@ -19,7 +19,7 @@ color-eyre = "0.6"
 futures-util = "0.3"
 and-then-concurrent = "0.1"
 dashmap = "3"
-rand = "0.7"
+rand = "0.8"
 serde  = { version = "1", features = ["derive"]}
 tokio = {version = "1", features = ["rt", "sync", "macros"]}
 tracing = "0.1"
