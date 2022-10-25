@@ -190,6 +190,7 @@ impl RecvState {
 mod test {
     use super::AtMostOnceChunnel;
     use crate::test::Serve;
+    use crate::test::COLOR_EYRE;
     use crate::{
         chan_transport::Chan, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener,
     };
@@ -209,7 +210,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()

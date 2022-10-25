@@ -312,6 +312,7 @@ where
 #[cfg(test)]
 mod test {
     use super::{Chan, RendezvousChannel};
+    use crate::test::COLOR_EYRE;
     use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use color_eyre::eyre::{Report, WrapErr};
     use futures_util::stream::{StreamExt, TryStreamExt};
@@ -327,7 +328,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -374,7 +375,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()

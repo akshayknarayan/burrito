@@ -10,7 +10,7 @@ burrito-shard-ctl = { path = "../burrito-shard-ctl" }
 kvstore = { path = "../kvstore" }
 kvstore-ycsb = { path = "../kvstore-ycsb" }
 tracing = { version = "0.1" }
-color-eyre = "0.5"
+color-eyre = "0.6"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 structopt = "0.3"

@@ -8,14 +8,14 @@ edition = "2021"
 bertha = { path = "../bertha" }
 tokio = { version = "1", features = [] }
 rdkafka = "0.26"
-color-eyre = "=0.5.7"
+color-eyre = "0.6"
 tracing = { version = "0.1" }
 tracing-futures = "0.2"
 futures-util = "0.3"
-rand = "0.7"
+rand = "0.8"
 base64 = "0.13"
 serde = "1"
 
 [dev-dependencies]
 tracing-subscriber = "0.2"
-tracing-error = "0.1"
+tracing-error = "0.2"

@@ -80,12 +80,9 @@ where
         let root = self.unix_root.clone();
         // generate unix local addresses corresponding to the listen-addr and remote-addr for
         // ghostunnel
-        use rand::Rng;
-        let rng = rand::thread_rng();
-        let stem: String = rng
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .take(10)
-            .collect();
+        use rand::distributions::{Alphanumeric, DistString};
+        let mut rng = rand::thread_rng();
+        let stem: String = Alphanumeric.sample_string(&mut rng, 10);
         debug!("called picked");
 
         let listen = self.listen.map(|srv| {

@@ -64,12 +64,9 @@ impl ChunnelConnector for UnixSkChunnel {
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         let d = self.root.clone();
         Box::pin(async move {
-            use rand::Rng;
-            let rng = rand::thread_rng();
-            let stem: String = rng
-                .sample_iter(&rand::distributions::Alphanumeric)
-                .take(10)
-                .collect();
+            use rand::distributions::{Alphanumeric, DistString};
+            let mut rng = rand::thread_rng();
+            let stem: String = Alphanumeric.sample_string(&mut rng, 10);
             let f = d.join(stem);
             let sk = tokio::net::UnixDatagram::bind(f)?;
             Ok(UnixSk::new(sk))
@@ -91,7 +88,7 @@ impl UnixSk {
 impl super::udp::TokioDatagramSk for Arc<tokio::net::UnixDatagram> {
     type Addr = PathBuf;
     fn try_recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, Self::Addr)> {
-        let (sz, from) = tokio::net::UnixDatagram::try_recv_from(&self, buf)?;
+        let (sz, from) = tokio::net::UnixDatagram::try_recv_from(self, buf)?;
         Ok((
             sz,
             from.as_pathname()
@@ -243,6 +240,7 @@ impl ChunnelConnection for UnixConn {
 #[cfg(test)]
 mod test {
     use super::{UnixReqChunnel, UnixSkChunnel};
+    use crate::test::COLOR_EYRE;
     use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::{StreamExt, TryStreamExt};
     use std::path::PathBuf;
@@ -257,7 +255,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -285,7 +283,7 @@ mod test {
                     let mut recv_slots = [None, None];
                     loop {
                         let msgs = srv.recv(&mut recv_slots).await.unwrap();
-                        srv.send(msgs.into_iter().map_while(Option::take))
+                        srv.send(msgs.iter_mut().map_while(Option::take))
                             .await
                             .unwrap();
                     }
@@ -311,7 +309,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()

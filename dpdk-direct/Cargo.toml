@@ -12,13 +12,13 @@ bertha = { path = "../bertha" }
 dpdk-wrapper = { path = "./dpdk-wrapper" }
 tracing = "0.1"
 tracing-futures = "0.2"
-color-eyre = "0.5"
+color-eyre = "0.6"
 tokio = { version = "1", features = ["rt"] }
 flume = "0.10"
 futures-util = "0.3"
 lazy_static = "1"
 eui48 = "1"
-ahash = "0.7"
+ahash = "0.8"
 quanta = "0.10"
 
 [dev-dependencies]

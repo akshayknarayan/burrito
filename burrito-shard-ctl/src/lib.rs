@@ -1069,10 +1069,13 @@ mod test {
     use futures_util::TryStreamExt;
     use serde::{Deserialize, Serialize};
     use std::net::SocketAddr;
+    use std::sync::Once;
     use tracing::{debug, debug_span, info, trace, warn};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    pub static COLOR_EYRE: Once = Once::new();
 
     #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub(crate) struct Msg {
@@ -1145,7 +1148,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         // 0. Make rt.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1192,7 +1195,7 @@ mod test {
                 async {
                     debug!("connect to shard");
                     let cn = UdpSkChunnel::default()
-                        .connect(())
+                        .connect(addr)
                         .await
                         .wrap_err(eyre!("client connect"))
                         .unwrap();
@@ -1321,7 +1324,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         // 0. Make rt.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1339,7 +1342,10 @@ mod test {
 
                 let neg_stack = SerializeChunnel::default();
 
-                let raw_cn = UdpSkChunnel::default().connect(()).await.unwrap();
+                let raw_cn = UdpSkChunnel::default()
+                    .connect(canonical_addr)
+                    .await
+                    .unwrap();
                 let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
                     .await
                     .unwrap();
@@ -1373,7 +1379,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         // 0. Make rt.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1398,7 +1404,10 @@ mod test {
                 let neg_stack = CxList::from(Select::from((cl, Nothing::<()>::default())))
                     .wrap(SerializeChunnel::default());
 
-                let raw_cn = UdpSkChunnel::default().connect(()).await.unwrap();
+                let raw_cn = UdpSkChunnel::default()
+                    .connect(canonical_addr)
+                    .await
+                    .unwrap();
                 let cn = bertha::negotiate::negotiate_client(neg_stack, raw_cn, canonical_addr)
                     .await
                     .unwrap();

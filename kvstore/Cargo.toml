@@ -15,7 +15,7 @@ xl710_intel = ["dpdk-direct?/xl710_intel"]
 [dependencies]
 bertha = { path = "../bertha" }
 burrito-shard-ctl = { path = "../burrito-shard-ctl" }
-color-eyre = "0.5"
+color-eyre = "0.6"
 futures-util = "0.3"
 and-then-concurrent = "0.1"
 dashmap = "3"
@@ -28,7 +28,7 @@ tracing-error = "0.1"
 flume = "0.10"
 structopt = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.2", optional = true }
-tracing-timing  = { version = "0.5", features = ["layer"], optional = true }
+tracing-timing  = { version = "0.6", features = ["layer"], optional = true }
 ctrlc = { version = "3", optional = true }
 num_cpus = { version = "1", optional = true }
 shenango-chunnel = { path = "../shenango-chunnel", optional = true }

@@ -23,10 +23,13 @@ mod tests {
     };
     use color_eyre::eyre::{eyre, Report, WrapErr};
     use std::net::SocketAddr;
+    use std::sync::Once;
     use tracing::{info, info_span};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    pub static COLOR_EYRE: Once = Once::new();
 
     async fn putget<C: bertha::ChunnelConnection<Data = super::Msg> + Send + Sync + 'static>(
         client: KvClient<C>,
@@ -55,7 +58,7 @@ mod tests {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let redis_port = 61179;
         info!(port = ?redis_port, "start redis");
@@ -138,7 +141,7 @@ mod tests {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

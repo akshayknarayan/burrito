@@ -5,18 +5,18 @@ authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+tokio = { version = "1.21", features = ["rt", "sync", "time", "macros", "net"] }
 tokio-stream = "0.1"
-color-eyre = "=0.5.7"
+color-eyre = "0.6"
 futures-util = "0.3"
 tracing = { version = "0.1" }
 tracing-futures = "0.2"
-rand = "0.7"
+rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 pin-project = "1"
 dashmap = "3"
-ahash = "0.7"
+ahash = "0.8"
 hdrhistogram = "7"
 base64 = "0.13"
 flume = "0.10"

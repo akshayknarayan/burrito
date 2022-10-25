@@ -122,6 +122,7 @@ where
 mod test {
     use super::SelectListener;
     use crate::chan_transport::RendezvousChannel;
+    use crate::test::COLOR_EYRE;
     use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use color_eyre::Report;
     use futures_util::TryStreamExt;
@@ -137,7 +138,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()

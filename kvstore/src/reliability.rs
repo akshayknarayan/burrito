@@ -218,6 +218,7 @@ where
 #[cfg(test)]
 mod test {
     use super::KvReliabilityChunnel;
+    use crate::tests::COLOR_EYRE;
     use bertha::{
         chan_transport::Chan, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener,
     };
@@ -245,7 +246,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
         let msgs: Vec<_> = (0..10).map(|field| ((), Msg { field })).collect();
 
         let rt = tokio::runtime::Builder::new_current_thread()

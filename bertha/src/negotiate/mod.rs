@@ -219,6 +219,7 @@ pub use rendezvous::{
 #[cfg(test)]
 mod test {
     use super::{negotiate_client, negotiate_server, CapabilitySet, Negotiate, Select};
+    use crate::test::COLOR_EYRE;
     use crate::udp::{UdpReqChunnel, UdpSkChunnel};
     use crate::{
         chan_transport::Chan, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
@@ -314,7 +315,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -378,7 +379,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -421,12 +422,12 @@ mod test {
 
                 r.await.unwrap();
                 info!("starting client");
-                let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                let raw_cn = UdpSkChunnel::default().connect(addr).await?;
                 let cn1 = negotiate_client(stack.clone(), raw_cn, addr)
                     .instrument(info_span!("negotiate_client"))
                     .await?;
 
-                let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                let raw_cn = UdpSkChunnel::default().connect(addr).await?;
                 let cn2 = negotiate_client(stack, raw_cn, addr)
                     .instrument(info_span!("negotiate_client"))
                     .await?;
@@ -498,7 +499,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -526,7 +527,7 @@ mod test {
                                 let mut slots = [EMPTY; 4];
                                 loop {
                                     let ms = cn.recv(&mut slots).await?;
-                                    cn.send(ms.into_iter().map_while(Option::take)).await?;
+                                    cn.send(ms.iter_mut().map_while(Option::take)).await?;
                                     debug!("echoed");
                                 }
                             })
@@ -541,7 +542,7 @@ mod test {
                 r.await.unwrap();
                 info!("starting client");
                 let cl_stack = ChunnelA;
-                let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                let raw_cn = UdpSkChunnel::default().connect(addr).await?;
                 let _ = negotiate_client(cl_stack, raw_cn, addr)
                     .instrument(info_span!("negotiate_client"))
                     .await
@@ -560,7 +561,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -603,7 +604,7 @@ mod test {
                 let mut cl_neg = super::ClientNegotiator::default();
                 async {
                     info!("starting client");
-                    let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                    let raw_cn = UdpSkChunnel::default().connect(addr).await?;
                     let cn = cl_neg
                         .negotiate_fetch_nonce(stack.clone(), raw_cn, addr)
                         .instrument(info_span!("negotiate_client"))
@@ -624,7 +625,7 @@ mod test {
 
                 async {
                     info!("starting client");
-                    let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                    let raw_cn = UdpSkChunnel::default().connect(addr).await?;
                     let cn = cl_neg
                         .negotiate_zero_rtt(stack.clone(), raw_cn, addr)
                         .instrument(info_span!("negotiate_client"))
@@ -648,7 +649,7 @@ mod test {
                     // make a fake bad nonce
                     let cl_stack = ChunnelA;
                     let bad_nonce = cl_stack.offers().next().unwrap();
-                    let raw_cn = UdpSkChunnel::default().connect(()).await?;
+                    let raw_cn = UdpSkChunnel::default().connect(addr).await?;
                     let cn = super::client::negotiate_client_nonce(
                         cl_stack,
                         raw_cn.clone(),

@@ -10,10 +10,10 @@ dpdk-wrapper = { path = "../dpdk-direct/dpdk-wrapper" }
 shenango-chunnel = { path = "../shenango-chunnel" }
 shenango = { path = "../shenango-chunnel/caladan/bindings/rust" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-color-eyre = "0.5"
+color-eyre = "0.6"
 tracing = "0.1"
 tracing-subscriber = "0.2"
-tracing-error = "0.1"
+tracing-error = "0.2"
 tracing-futures = "0.2"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"

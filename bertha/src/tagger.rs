@@ -251,6 +251,7 @@ mod test {
     use super::OrderedChunnel;
     use crate::chan_transport::Chan;
     use crate::test::Serve;
+    use crate::test::COLOR_EYRE;
     use crate::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener};
     use color_eyre::Report;
     use futures_util::StreamExt;
@@ -301,7 +302,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.try_init().unwrap_or(());
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -337,7 +338,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.try_init().unwrap_or(());
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -398,7 +399,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.try_init().unwrap_or(());
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()

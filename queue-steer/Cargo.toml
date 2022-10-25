@@ -15,10 +15,10 @@ kafka = { path = "../kafka" }
 bertha = { path = "../bertha" }
 futures-util = "0.3"
 base64 = "0.13"
-color-eyre = "=0.5.7"
+color-eyre = "0.6"
 tracing = "0.1"
 tracing-futures = "0.2"
-rand = "0.7"
+rand = "0.8"
 serde = "1"
 redis-basechunnel = { path = "../redis-basechunnel" , optional = true }
 tokio = { version = "1", features = ["macros", "sync"] }

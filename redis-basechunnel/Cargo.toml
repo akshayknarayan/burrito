@@ -11,14 +11,14 @@ tokio = { version = "1", features = ["sync"] }
 bertha = { path = "../bertha" }
 lazy_static = "1.4"
 futures-util = "0.3"
-color-eyre = "=0.5.7"
+color-eyre = "0.6"
 tracing = "0.1"
 tracing-futures = "0.2"
 bincode = "1"
-rand = "0.7"
+rand = "0.8"
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 tracing-subscriber = "0.2"
-tracing-error = "0.1"
+tracing-error = "0.2"

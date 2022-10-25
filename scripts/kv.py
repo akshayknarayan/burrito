@@ -159,6 +159,7 @@ def check(ok, msg, addr, allowed=[]):
         print(ok.stdout)
         agenda.subfailure("stderr")
         print(ok.stderr)
+        global thread_ok
         thread_ok = False # something went wrong.
         sys.exit(1)
 
@@ -197,19 +198,21 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
     needed_features = ["bin"]
     for d in datapaths:
         if 'shenango_channel' == d:
-            needed_features.append('shenango-chunnel')
+            if 'shenango-chunnel' not in needed_features:
+                needed_features.append('shenango-chunnel')
         elif 'dpdk' in d:
-            needed_features.append('dpdk-direct')
-            if dpdk_driver == 'mlx':
+            if 'dpdk-direct' not in needed_features:
+                needed_features.append('dpdk-direct')
+            if dpdk_driver == 'mlx' and 'cx3_mlx' not in needed_features:
                 needed_features.append('cx3_mlx')
-            else:
+            elif dpdk_driver == 'intel' and 'xl710_intel' not in needed_features:
                 needed_features.append('xl710_intel')
     agenda.subtask(f"building kvserver features={needed_features}")
-    ok = conn.run(f"cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"kvserver\"", wd = "~/burrito/kvstore")
+    ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"kvserver\"", wd = "~/burrito/kvstore")
     check(ok, "kvserver build", conn.addr)
 
     agenda.subtask(f"building ycsb features={needed_features}")
-    ok = conn.run(f"cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"ycsb\"", wd = "~/burrito/kvstore-ycsb")
+    ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features[1:])}\" --bin=\"ycsb\"", wd = "~/burrito/kvstore-ycsb")
     check(ok, "ycsb build", conn.addr)
 
     return conn
@@ -229,19 +232,20 @@ def write_cfg(conn, config):
         subprocess.run(f"rm -f host.config && cp {fname} host.config", shell=True)
 
 def write_shenango_config(conn):
-    shenango_config = f"""
+    shenango_config = f"""\
 host_addr {conn.addr}
 host_netmask 255.255.255.0
 host_gateway 10.1.1.1
 runtime_kthreads 2
 runtime_spininng_kthreads 2
-runtime_guaranteed_kthreads 2"""
+runtime_guaranteed_kthreads 2
+"""
     write_cfg(conn, shenango_config)
 
 def write_dpdk_config(conn):
-    dpdk_config = f"""
+    dpdk_config = f"""\
 [dpdk]
-eal_init = ["-n", "4", "-l", "0", "--allow", "0000:08:00.0", "--proc-type=auto"]
+eal_init = ["-n", "4", "-l", "0-6", "--allow", "0000:08:00.0", "--proc-type=auto"]
 
 [net]
 ip = "{conn.addr}"
@@ -281,28 +285,25 @@ def get_timeout(wrkfile, interarrival_us):
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
 
-def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, server_batch="none", stack_frag=False, skip_negotiation=False):
+def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, skip_negotiation=False):
     conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
-    variant = None
     if datapath == 'shenango_channel':
         write_shenango_config(conn)
         conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
-        variant = '-shenango'
+        datapath = 'shenango'
     elif datapath == 'kernel':
-        variant = '-kernel'
-    elif datapath == 'dpdk':
+        pass
+    elif 'dpdk' in datapath:
         write_dpdk_config(conn)
-        variant = '-dpdk'
-
-    if variant is None:
-        raise Exception(f"invalid datapath {datapath}")
+    else:
+        raise Exception(f"unknown datapath {datapath}")
 
     skip_neg = '--skip-negotiation' if skip_negotiation else ''
 
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/kvserver{variant} --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} -s host.config --batch-mode={server_batch} {'--fragment-stack' if stack_frag else ''} {skip_neg} --log",
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/kvserver --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} --datapath={datapath} --cfg host.config {skip_neg} --log",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -314,19 +315,19 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     time.sleep(8)
     conn.check_proc(f"kvserver", f"{outf}.err")
 
-def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapath, batch, shardtype, stack_frag, skip_negotiation, outf, wrkfile):
+def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
-    variant = None
     if datapath == 'shenango_channel':
         write_shenango_config(conn)
         conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
-        variant = '-shenango'
+        datapath = 'shenango'
     elif datapath == 'kernel':
-        variant = '-kernel'
-    elif datapath == 'dpdk':
+        pass
+    elif 'dpdk' in datapath:
         write_dpdk_config(conn)
-        variant = '-dpdk'
+    else:
+        raise Exception(f"unknown datapath {datapath}")
 
     if shardtype == 'client':
         shard_arg = '--use-clientsharding'
@@ -342,27 +343,25 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
         skip_neg += f' --skip-negotiation={4242 + skip_negotiation} '
         skip_negotiation -= 1
 
-    batch_arg = f'--max-send-batching={batch}' if batch != 0 else ''
     poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
     timeout = get_timeout(wrkfile, interarrival)
 
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/ycsb{variant} \
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/ycsb \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
             -i {interarrival} \
             --accesses {wrkfile} \
             --out-file={outf}0.data \
-            -s host.config \
-            {batch_arg} \
+            --datapath={datapath} \
+            --cfg host.config \
             {poisson_arg} \
             {shard_arg} \
-            {'--fragment-stack' if stack_frag else ''} \
             {skip_neg} \
             --logging --skip-loads",
         wd="~/burrito",
-        sudo='dpdk' in variant,
+        sudo='dpdk' in datapath,
         stdout=f"{outf}0.out",
         stderr=f"{outf}0.err",
         timeout=timeout,
@@ -388,15 +387,15 @@ def start_redis(machine, use_sudo=False):
 def run_loads(conn, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0):
     conn.run("sudo pkill -INT iokerneld")
 
-    variant = None
     if datapath == 'shenango_channel':
         write_shenango_config(conn)
-        variant = '-shenango'
+        datapath = 'shenango'
     elif datapath == 'kernel':
-        variant = '-kernel'
-    elif datapath == 'dpdk':
+        pass
+    elif 'dpdk' in  datapath:
         write_dpdk_config(conn)
-        variant = '-dpdk'
+    else:
+        raise Exception(f"unknown datapath {datapath}")
 
     skip_neg = ''
     while skip_negotiation > 0:
@@ -404,7 +403,7 @@ def run_loads(conn, server, datapath, redis_addr, outf, wrkfile, skip_negotiatio
         skip_negotiation -= 1
 
     while True:
-        if datapath == 'shenango_channel':
+        if 'shenango' in datapath:
             conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
 
         time.sleep(2)
@@ -412,16 +411,17 @@ def run_loads(conn, server, datapath, redis_addr, outf, wrkfile, skip_negotiatio
         agenda.subtask(f"loads client starting")
         ok = None
         try:
-            ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug {dpdk_ld_var if 'dpdk' in variant else ''} ./target/release/ycsb{variant} \
+            ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug {dpdk_ld_var} ./target/release/ycsb \
                     --addr {server}:4242 \
                     --redis-addr={redis_addr} \
                     -i 1000 \
                     --accesses {wrkfile} \
-                    -s host.config \
+                    --datapath {datapath} \
+                    --cfg host.config \
                     {skip_neg} \
                     --logging --loads-only",
                 wd="~/burrito",
-                sudo='dpdk' in variant,
+                sudo='dpdk' in datapath,
                 stdout=f"{outf}-loads.out",
                 stderr=f"{outf}-loads.err",
                 timeout=30,
@@ -444,10 +444,7 @@ def do_exp(iter_num,
     shardtype=None,
     ops_per_sec=None,
     datapath=None,
-    client_batch=None,
-    server_batch=None,
     poisson_arrivals=None,
-    stack_frag=None,
     skip_negotiation=None,
     wrkload=None,
     overwrite=None
@@ -459,10 +456,7 @@ def do_exp(iter_num,
         shardtype is not None and
         ops_per_sec is not None and
         datapath is not None and
-        client_batch is not None and
-        server_batch is not None and
         poisson_arrivals is not None and
-        stack_frag is not None and
         skip_negotiation is not None and
         wrkload is not None and
         overwrite is not None
@@ -470,8 +464,8 @@ def do_exp(iter_num,
 
     wrkname = wrkload.split("/")[-1].split(".")[0]
     noneg = '_noneg' if skip_negotiation else ''
-    server_prefix = f"{outdir}/{datapath}{noneg}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch={client_batch}-server_batch={server_batch}-stackfrag={stack_frag}-{wrkname}-{iter_num}-kvserver"
-    outf = f"{outdir}/{datapath}{noneg}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-client_batch={client_batch}-server_batch={server_batch}-stackfrag={stack_frag}-{wrkname}-{iter_num}-client"
+    server_prefix = f"{outdir}/{datapath}{noneg}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-kvserver"
+    outf = f"{outdir}/{datapath}{noneg}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-client"
 
     for m in machines:
         if m.local:
@@ -481,7 +475,7 @@ def do_exp(iter_num,
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
     if not overwrite and os.path.exists(f"{outf}0-{machines[1].addr}.data"):
-        agenda.task(f"skipping: server = {machines[0].addr}, datapath = {datapath}, skip_negotiation = {skip_negotiation} num_shards = {num_shards}, shardtype = {shardtype}, client_batch = {client_batch}, server_batch = {server_batch}, stack_fragmentation = {stack_frag}, load = {ops_per_sec} ops/s")
+        agenda.task(f"skipping: server = {machines[0].addr}, datapath = {datapath}, skip_negotiation = {skip_negotiation} num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
         return True
     else:
         agenda.task(f"running: {outf}0-{machines[1].addr}.data")
@@ -495,12 +489,12 @@ def do_exp(iter_num,
     redis_addr = start_redis(machines[0])
     time.sleep(5)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, num_shards = {num_shards}, shardtype = {shardtype}, client_batch = {client_batch}, server_batch = {server_batch}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
+    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
     redis_port = redis_addr.split(":")[-1]
-    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, datapath=datapath, shards=num_shards, server_batch=server_batch, stack_frag=stack_frag, skip_negotiation=skip_negotiation)
+    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, datapath=datapath, shards=num_shards, skip_negotiation=skip_negotiation)
     time.sleep(5)
     # prime the server with loads
     agenda.task("doing loads")
@@ -509,7 +503,7 @@ def do_exp(iter_num,
         machines[1].get(f"{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
         machines[1].get(f"{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
     except Exception as e:
-        agenda.subfailure(f"Could not get file from loads client: {e}")
+        agenda.subfailure(f"Could not get file {outf}-loads.[out,err] from loads client: {e}")
 
     # others are clients
     agenda.task("starting clients")
@@ -520,9 +514,7 @@ def do_exp(iter_num,
             interarrival_us,
             poisson_arrivals,
             datapath,
-            client_batch,
             shardtype,
-            stack_frag,
             num_shards if skip_negotiation else 0,
             outf,
             wrkload
@@ -649,13 +641,6 @@ if __name__ == '__main__':
         if args.dpdk_driver not in ['mlx', 'intel']:
             agenda.failure("If using dpdk datapath, must specify mlx or intel driver.")
 
-    if 'stack-fragmentation' not in cfg['exp']:
-        cfg['exp']['stack-fragmentation'] = [False]
-    if 'client-batching' not in cfg['exp']:
-        cfg['exp']['client-batching'] = [0]
-    if 'server-batching' not in cfg['exp']:
-        cfg['exp']['server-batching'] = ['none']
-
     if 'negotiation' not in cfg['exp']:
         cfg['exp']['negotiation'] = [True]
     for t in cfg['exp']['negotiation']:
@@ -693,29 +678,23 @@ if __name__ == '__main__':
     shutil.copy2(args.config, args.outdir)
 
     for dp in cfg['exp']['datapath']:
-        for frag in cfg['exp']['stack-fragmentation']:
-            for neg in cfg['exp']['negotiation']:
-                for w in cfg['exp']['wrk']:
-                    for s in cfg['exp']['shards']:
-                        for t in cfg['exp']['shardtype']:
-                            for p in cfg['exp']['poisson-arrivals']:
-                                for o in ops_per_sec:
-                                    for cb in cfg['exp']['client-batching']:
-                                        for sb in cfg['exp']['server-batching']:
-                                            do_exp(0,
-                                                outdir=outdir,
-                                                machines=machines,
-                                                num_shards=s,
-                                                shardtype=t,
-                                                ops_per_sec=o,
-                                                datapath=dp,
-                                                client_batch=cb,
-                                                server_batch=sb,
-                                                poisson_arrivals=p,
-                                                stack_frag=frag,
-                                                skip_negotiation=not neg,
-                                                wrkload=w,
-                                                overwrite=args.overwrite
-                                            )
+        for neg in cfg['exp']['negotiation']:
+            for w in cfg['exp']['wrk']:
+                for s in cfg['exp']['shards']:
+                    for t in cfg['exp']['shardtype']:
+                        for p in cfg['exp']['poisson-arrivals']:
+                            for o in ops_per_sec:
+                                do_exp(0,
+                                    outdir=outdir,
+                                    machines=machines,
+                                    num_shards=s,
+                                    shardtype=t,
+                                    ops_per_sec=o,
+                                    datapath=dp,
+                                    poisson_arrivals=p,
+                                    skip_negotiation=not neg,
+                                    wrkload=w,
+                                    overwrite=args.overwrite
+                                )
 
     agenda.task("done")

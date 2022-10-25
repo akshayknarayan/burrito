@@ -200,10 +200,13 @@ mod test {
         stream::Stream,
         StreamExt, TryStreamExt,
     };
+    use std::sync::Once;
     use std::{future::Future, pin::Pin};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    pub static COLOR_EYRE: Once = Once::new();
 
     pub(crate) trait Serve<I> {
         type Future: Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static;
@@ -246,7 +249,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()

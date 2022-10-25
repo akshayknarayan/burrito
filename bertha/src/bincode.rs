@@ -219,9 +219,9 @@ where
 
                 let mut len = 0;
                 for (buf, slot) in bufs
-                    .into_iter()
+                    .iter_mut()
                     .map_while(|x| x.take())
-                    .zip(msgs_buf.into_iter())
+                    .zip(msgs_buf.iter_mut())
                 {
                     let data = base64::decode(&buf.1[..])
                         .wrap_err(eyre!("base64 decode failed: {:?}", buf.1))?;
@@ -241,6 +241,7 @@ mod test {
     use super::SerializeChunnel;
     use crate::chan_transport::Chan;
     use crate::test::Serve;
+    use crate::test::COLOR_EYRE;
     use crate::{util::ProjectLeft, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::stream::{StreamExt, TryStreamExt};
     use tracing::trace;
@@ -279,7 +280,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_time()
@@ -311,7 +312,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_time()
@@ -366,7 +367,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_time()

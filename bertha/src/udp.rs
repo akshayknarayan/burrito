@@ -309,6 +309,7 @@ impl ChunnelConnection for UdpConn {
 #[cfg(test)]
 mod test {
     use super::{UdpReqChunnel, UdpSkChunnel};
+    use crate::test::COLOR_EYRE;
     use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
     use futures_util::{StreamExt, TryStreamExt};
     use std::net::ToSocketAddrs;
@@ -323,7 +324,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -343,7 +344,7 @@ mod test {
                     .unwrap()
                     .unwrap();
 
-                let cli = UdpSkChunnel::default().connect(()).await.unwrap();
+                let cli = UdpSkChunnel::default().connect(addr).await.unwrap();
 
                 tokio::spawn(async move {
                     let mut recv_slots = [None, None];
@@ -375,7 +376,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -399,7 +400,7 @@ mod test {
                     .unwrap();
                 });
 
-                let cli = UdpSkChunnel::default().connect(()).await.unwrap();
+                let cli = UdpSkChunnel::default().connect(addr).await.unwrap();
                 cli.send(std::iter::once((addr, vec![1u8; 12])))
                     .await
                     .unwrap();
@@ -420,7 +421,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -446,8 +447,8 @@ mod test {
                     .unwrap();
                 });
 
-                let cli1 = UdpSkChunnel::default().connect(()).await.unwrap();
-                let cli2 = UdpSkChunnel::default().connect(()).await.unwrap();
+                let cli1 = UdpSkChunnel::default().connect(addr).await.unwrap();
+                let cli2 = UdpSkChunnel::default().connect(addr).await.unwrap();
 
                 for i in 0..10 {
                     cli1.send(std::iter::once((addr, vec![i as u8; 12])))
