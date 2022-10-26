@@ -193,6 +193,13 @@ impl DpdkState {
         unsafe { get_eth_stats(self.port) }
     }
 
+    fn curr_num_stashed(&self) -> usize {
+        self.rx_packets_for_ports
+            .iter()
+            .map(|(_, stash)| stash.len())
+            .sum()
+    }
+
     pub fn try_recv_burst<'cn>(
         &'cn mut self,
         port_filter: Option<(u16, Option<SocketAddrV4>)>,
@@ -510,7 +517,21 @@ impl DpdkState {
             };
 
             unsafe {
-                self.tx_bufs[i] = alloc_mbuf(self.mbuf_pool).unwrap();
+                match alloc_mbuf(self.mbuf_pool) {
+                    Ok(mbuf) => self.tx_bufs[i] = mbuf,
+                    Err(err) => {
+                        warn!(stashed=?self.curr_num_stashed(), "Failed allocating mbufs");
+                        if self.curr_num_stashed() > 0 {
+                            for (bucket, stash) in &self.rx_packets_for_ports {
+                                if !stash.is_empty() {
+                                    warn!(?bucket, stashed_pkts = ?stash.len(), "stashed packets");
+                                }
+                            }
+                        }
+
+                        panic!("{:?}", err);
+                    }
+                }
 
                 // fill header
                 let hdr_size = match fill_in_header(
