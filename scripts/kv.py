@@ -243,9 +243,16 @@ runtime_guaranteed_kthreads 2
     write_cfg(conn, shenango_config)
 
 def write_dpdk_config(conn):
+    res = conn.run("sudo ./usertools/dpdk-devbind.py --status-dev net | grep 'mlx' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
+    pci_addr = None
+    if res.exited == 0:
+        pci_addr = res.stdout.strip()
+    else:
+        raise Exception(f"could not get pci address for {conn.addr}: {res}")
+
     dpdk_config = f"""\
 [dpdk]
-eal_init = ["-n", "4", "-l", "0-6", "--allow", "0000:08:00.0", "--proc-type=auto"]
+eal_init = ["-n", "4", "-l", "0-6", "--allow", "{pci_addr}", "--proc-type=auto"]
 
 [net]
 ip = "{conn.addr}"
@@ -253,6 +260,14 @@ ip = "{conn.addr}"
   [[net.arp]]
   ip = "10.1.1.2"
   mac = "f4:52:14:76:98:10"
+
+  [[net.arp]]
+  ip = "10.1.1.3"
+  mac = "f4:52:14:76:a1:a0"
+
+  [[net.arp]]
+  ip = "10.1.1.4"
+  mac = "f4:52:14:76:a4:80"
 
   [[net.arp]]
   ip = "10.1.1.5"
@@ -336,7 +351,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
     elif shardtype == 'basicclient':
         shard_arg = '--use-basicclient'
     else:
-        raise f"unknown shardtype {shardtype}"
+        raise Exception(f"unknown shardtype {shardtype}")
 
     skip_neg = ''
     while skip_negotiation > 0:
@@ -370,7 +385,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
     conn.run("sudo pkill -INT iokerneld")
     agenda.subtask("client done")
 
-def start_redis(machine, use_sudo=False):
+def start_redis(machine):
     machine.run("docker rm -f burrito-shard-redis", sudo=True)
     agenda.task("Starting redis")
     ok = machine.run("docker run \
