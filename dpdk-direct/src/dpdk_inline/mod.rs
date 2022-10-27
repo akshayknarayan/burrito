@@ -251,12 +251,12 @@ impl ChunnelConnector for DpdkInlineChunnel {
     type Future = futures_util::future::Ready<Result<Self::Connection, Report>>;
     type Error = Report;
 
-    fn connect(&mut self, addr: Self::Addr) -> Self::Future {
+    fn connect(&mut self, _addr: Self::Addr) -> Self::Future {
         ready((|| {
-            let remote_addr = match addr {
-                SocketAddr::V4(a) => a,
-                SocketAddr::V6(a) => bail!("Only Ipv4 addresses supported: {:?}", a),
-            };
+            //let remote_addr = match addr {
+            //    SocketAddr::V4(a) => a,
+            //    SocketAddr::V6(a) => bail!("Only Ipv4 addresses supported: {:?}", a),
+            //};
 
             try_init_thread(self.initialization_state.as_ref()).and_then(|_| {
                 DPDK_STATE.with(|dpdk_cell| {
@@ -290,7 +290,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
                     Ok(
                         DpdkInlineCn::new(
                             port,
-                            Some(remote_addr),
+                            None, //Some(remote_addr),
                             None,
                             Arc::clone(&self.initialization_state),
                             Some(Arc::clone(&self.ephemeral_ports)),
