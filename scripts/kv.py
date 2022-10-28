@@ -217,19 +217,18 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
 
     return conn
 
-def write_cfg(conn, config):
+def write_cfg(conn, config, name):
     from random import randint
     fname = randint(1,1000)
     fname = f"{fname}.config"
     with open(f"{fname}", 'w') as f:
         f.write(config)
 
-    agenda.subtask(f"{conn.addr} config file: {fname}")
+    agenda.subtask(f"{conn.addr} {name} config file: {fname}")
     if not conn.local:
-        agenda.subtask(f"{conn.addr} config file: {fname}")
-        conn.put(f"{fname}", "~/burrito/host.config")
+        conn.put(f"{fname}", "~/burrito/{name}.config")
     else:
-        subprocess.run(f"rm -f host.config && cp {fname} host.config", shell=True)
+        subprocess.run(f"rm -f {name}.config && cp {fname} {name}.config", shell=True)
 
 def write_shenango_config(conn):
     shenango_config = f"""\
@@ -240,56 +239,42 @@ runtime_kthreads 2
 runtime_spininng_kthreads 2
 runtime_guaranteed_kthreads 2
 """
-    write_cfg(conn, shenango_config)
+    write_cfg(conn, shenango_config, 'shenango')
 
-def write_dpdk_config(conn):
-    res = conn.run("sudo ./usertools/dpdk-devbind.py --status-dev net | grep 'mlx' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
+
+dpdk_driver = None
+def write_dpdk_config(conn, machines, num_threads=6):
+    res = None
+    if dpdk_driver == 'mlx':
+        res = conn.run("sudo ./usertools/dpdk-devbind.py --status-dev net | grep 'mlx' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
+    elif dpdk_driver == 'intel':
+        res = conn.run("sudo ./usertools/dpdk-devbind.py --status-dev net | grep 'dev=igb_uio' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
+    else:
+        raise Exception(f"unknown driver {dpdk_driver}")
+
     pci_addr = None
     if res.exited == 0:
         pci_addr = res.stdout.strip()
     else:
         raise Exception(f"could not get pci address for {conn.addr}: {res}")
 
+    # compile arp entries
+    machines = [machines['server']] + machines['clients']
+    arp_cfg = '\n\n'.join([f"""\
+  [[net.arp]]
+  ip = {m['exp']}
+  mac = {m['mac']}
+""" for m in machines])
     dpdk_config = f"""\
 [dpdk]
-eal_init = ["-n", "4", "-l", "0-6", "--allow", "{pci_addr}", "--proc-type=auto"]
+eal_init = ["-n", "4", "-l", "0-{num_threads}", "--allow", "{pci_addr}", "--proc-type=auto"]
 
 [net]
 ip = "{conn.addr}"
 
-  [[net.arp]]
-  ip = "10.1.1.2"
-  mac = "f4:52:14:76:98:10"
-
-  [[net.arp]]
-  ip = "10.1.1.3"
-  mac = "f4:52:14:76:a1:a0"
-
-  [[net.arp]]
-  ip = "10.1.1.4"
-  mac = "f4:52:14:76:a4:80"
-
-  [[net.arp]]
-  ip = "10.1.1.5"
-  mac = "f4:52:14:76:98:30"
-
-  [[net.arp]]
-  ip = "10.1.1.6"
-  mac = "f4:52:14:76:98:a0"
-
-  [[net.arp]]
-  ip = "10.1.1.7"
-  mac = "f4:52:14:76:a4:40"
-
-  [[net.arp]]
-  ip = "10.1.1.8"
-  mac = "f4:52:14:76:a4:90"
-
-  [[net.arp]]
-  ip = "10.1.1.9"
-  mac = "f4:52:14:76:a4:70"
+{arp_cfg}
 """
-    write_cfg(conn, dpdk_config)
+    write_cfg(conn, dpdk_config, 'dpdk')
 
 
 def get_timeout(wrkfile, interarrival_us):
@@ -308,17 +293,18 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
         write_shenango_config(conn)
         conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
         datapath = 'shenango'
+        cfg = '--cfg=shenango.config'
     elif datapath == 'kernel':
-        pass
+        cfg = ''
     elif 'dpdk' in datapath:
-        write_dpdk_config(conn)
+        cfg = '--cfg=dpdk.config'
     else:
         raise Exception(f"unknown datapath {datapath}")
 
     skip_neg = '--skip-negotiation' if skip_negotiation else ''
 
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/kvserver --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} --datapath={datapath} --cfg host.config {skip_neg} --log",
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/kvserver --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} --datapath={datapath} {cfg} {skip_neg} --log",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -334,13 +320,13 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
     conn.run("sudo pkill -INT iokerneld")
 
     if datapath == 'shenango_channel':
-        write_shenango_config(conn)
         conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
         datapath = 'shenango'
+        cfg = '--cfg=shenango.config'
     elif datapath == 'kernel':
-        pass
+        cfg = ''
     elif 'dpdk' in datapath:
-        write_dpdk_config(conn)
+        cfg = '--cfg=dpdk.config'
     else:
         raise Exception(f"unknown datapath {datapath}")
 
@@ -370,7 +356,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
             --accesses {wrkfile} \
             --out-file={outf}0.data \
             --datapath={datapath} \
-            --cfg host.config \
+            {cfg} \
             {poisson_arg} \
             {shard_arg} \
             {skip_neg} \
@@ -402,20 +388,20 @@ def start_redis(machine):
 def run_loads(conn, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0):
     conn.run("sudo pkill -INT iokerneld")
 
-    if datapath == 'shenango_channel':
-        write_shenango_config(conn)
-        datapath = 'shenango'
-    elif datapath == 'kernel':
-        pass
-    elif 'dpdk' in  datapath:
-        write_dpdk_config(conn)
-    else:
-        raise Exception(f"unknown datapath {datapath}")
-
     skip_neg = ''
     while skip_negotiation > 0:
         skip_neg += f' --skip-negotiation={4242 + skip_negotiation} '
         skip_negotiation -= 1
+
+    if datapath == 'shenango_channel':
+        datapath = 'shenango'
+        cfg = '--cfg=shenango.config'
+    elif datapath == 'kernel':
+        cfg = ''
+    elif 'dpdk' in  datapath:
+        cfg = '--cfg=dpdk.config'
+    else:
+        raise Exception(f"unknown datapath {datapath}")
 
     while True:
         if 'shenango' in datapath:
@@ -432,7 +418,7 @@ def run_loads(conn, server, datapath, redis_addr, outf, wrkfile, skip_negotiatio
                     -i 1000 \
                     --accesses {wrkfile} \
                     --datapath {datapath} \
-                    --cfg host.config \
+                    {cfg} \
                     {skip_neg} \
                     --logging --loads-only",
                 wd="~/burrito",
@@ -462,7 +448,7 @@ def do_exp(iter_num,
     poisson_arrivals=None,
     skip_negotiation=None,
     wrkload=None,
-    overwrite=None
+    overwrite=None,
 ):
     assert(
         outdir is not None and
@@ -596,21 +582,20 @@ def do_exp(iter_num,
 
 ### Sample config
 ### [machines]
-### server = { access = "127.0.0.1", alt = "192.168.1.2", exp = "10.1.1.2" }
+### server = { access = "127.0.0.1", alt = "192.168.1.6", exp = "10.1.1.6", mac = "f4:52:14:76:98:a0" } # pd6
 ### clients = [
-###     { access = "192.168.1.5", exp = "10.1.1.5" },
-###     { access = "192.168.1.6", exp = "10.1.1.6" },
-###     { access = "192.168.1.7", exp = "10.1.1.7" },
-###     { access = "192.168.1.8", exp = "10.1.1.8" },
-###     { access = "192.168.1.9", exp = "10.1.1.9" },
+###     { access = "192.168.1.3", exp = "10.1.1.3", mac = "f4:52:14:76:a1:a0" }, # pd3
+###     { access = "192.168.1.4", exp = "10.1.1.4", mac = "f4:52:14:76:a4:80" }, # pd4
+###     { access = "192.168.1.5", exp = "10.1.1.5", mac = "f4:52:14:76:98:30" }, # pd5
 ### ]
 ###
 ### [exp]
-### wrk = ["~/burrito/kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"]
-### load = [10000, 20000, 40000, 60000, 80000, 100000]
+### wrk = ["./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"]
+### datapath = ['shenango_channel', 'dpdkmulti', 'dpdkthread', 'kernel']
+### load = [10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000, 180000, 200000]
+### poisson-arrivals = [true]
 ### shardtype = ["client"]
-### shards = [6]
-### batching = [0, 16, 64, 256]
+### shards = [4]
 if __name__ == '__main__':
     global thread_ok
     thread_ok = True
@@ -692,6 +677,15 @@ if __name__ == '__main__':
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
 
+    dpdk_driver = args.dpdk_driver
+
+    if 'shenango_channel' in cfg['exp']['datapath']:
+        for m in machines:
+            write_shenango_config(m)
+    if any('dpdk' in d for d in cfg['exp']['datapath']):
+        for m in machines:
+            write_dpdk_config(m, cfg['machines'], max(cfg['exp']['shards']))
+
     for dp in cfg['exp']['datapath']:
         for neg in cfg['exp']['negotiation']:
             for w in cfg['exp']['wrk']:
@@ -709,7 +703,7 @@ if __name__ == '__main__':
                                     poisson_arrivals=p,
                                     skip_negotiation=not neg,
                                     wrkload=w,
-                                    overwrite=args.overwrite
+                                    overwrite=args.overwrite,
                                 )
 
     agenda.task("done")
