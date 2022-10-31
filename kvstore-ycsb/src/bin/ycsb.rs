@@ -42,6 +42,9 @@ struct Opt {
     #[structopt(short, long)]
     cfg: Option<PathBuf>,
 
+    #[structopt(short, long, default_value = "4")]
+    num_threads: usize,
+
     #[structopt(long)]
     use_clientsharding: bool,
 
@@ -63,8 +66,6 @@ struct Opt {
     #[structopt(short, long)]
     out_file: Option<PathBuf>,
 }
-
-const NUM_THREADS: usize = 4;
 
 fn main() -> Result<(), Report> {
     let opt = Opt::from_args();
@@ -143,7 +144,7 @@ fn main() -> Result<(), Report> {
         Datapath::DpdkMultiThread if cfg!(feature = "dpdk-direct") => {
             let ctr = dpdk_direct::DpdkInlineChunnel::new(
                 opt.cfg.clone().expect("Needed config file not found"),
-                NUM_THREADS,
+                opt.num_threads,
             )?;
             do_exp(opt, ctr)
         }
@@ -273,6 +274,7 @@ fn do_exp(
 
         do_requests(
             accesses,
+            opt.num_threads,
             opt.interarrival_client_micros as _,
             opt.poisson_arrivals,
             make_fiat_client,
@@ -294,6 +296,7 @@ fn do_exp(
 
         do_requests(
             accesses,
+            opt.num_threads,
             opt.interarrival_client_micros as _,
             opt.poisson_arrivals,
             make_client,
@@ -318,6 +321,7 @@ fn do_exp(
 
         do_requests(
             accesses,
+            opt.num_threads,
             opt.interarrival_client_micros as _,
             opt.poisson_arrivals,
             make_client,
@@ -354,6 +358,7 @@ struct ExpResult {
 /// Have to measure from the time the request leaves the queue.
 fn do_requests<S, MC, Fut>(
     accesses: Vec<Op>, //HashMap<usize, (KvClient<S>, Vec<Op>)>,
+    num_threads: usize,
     interarrival_micros: u64,
     poisson_arrivals: bool,
     make_client: MC,
@@ -366,9 +371,9 @@ where
     let access_by_client = group_by_client(accesses);
     let num_clients = access_by_client.len();
     let mut access_by_thread = {
-        let mut threads = vec![vec![]; NUM_THREADS];
+        let mut threads = vec![vec![]; num_threads];
         for (client_id, ops) in access_by_client {
-            threads[client_id % NUM_THREADS].push((client_id, ops));
+            threads[client_id % num_threads].push((client_id, ops));
         }
 
         threads
@@ -519,8 +524,8 @@ where
     let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
     let done_tx = Arc::new(done_tx);
     let make_client = Arc::new(make_client);
-    let mut threads = Vec::with_capacity(NUM_THREADS);
-    for thread_id in 1..NUM_THREADS {
+    let mut threads = Vec::with_capacity(num_threads);
+    for thread_id in 1..num_threads {
         let done_tx = done_tx.clone();
         let done_rx = done_rx.clone();
         let start_rx = start_rx.clone();
