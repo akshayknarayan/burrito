@@ -161,7 +161,6 @@ def check(ok, msg, addr, allowed=[]):
         print(ok.stderr)
         global thread_ok
         thread_ok = False # something went wrong.
-        sys.exit(1)
 
 def check_machine(ip):
     if 'exp' not in ip:
@@ -171,7 +170,7 @@ def check_machine(ip):
     host = ip['access'] if 'access' in ip else addr
     alt = ip['alt'] if 'alt' in ip else host
 
-    conn = ConnectionWrapper(host)
+    conn = ConnectionWrapper(host, user=ip['user'] if 'user' in ip else None, port=ip['port'] if 'port' in ip else None)
     if not conn.file_exists("~/burrito"):
         agenda.failure(f"No burrito on {host}")
         raise Exception(f"No burrito on {host}")
@@ -185,37 +184,43 @@ def check_machine(ip):
     return (conn, commit)
 
 def setup_machine(conn, outdir, datapaths, dpdk_driver):
-    ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
-    check(ok, "mk outdir", conn.addr)
+    agenda.task(f"[{conn.addr}] setup machine")
+    try:
+        agenda.subtask(f"[{conn.addr}] make outdir {outdir}")
+        ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
+        check(ok, "mk outdir", conn.addr)
 
-    agenda.task("building experiment binaries on {conn.addr}")
+        if 'shenango_channel' in datapaths:
+            agenda.subtask("[{conn.addr}] building shenango")
+            # need to compile iokerneld
+            ok = conn.run("make", wd = "~/burrito/shenango-chunnel/caladan")
+            check(ok, "build shenango", conn.addr)
 
-    if 'shenango_channel' in datapaths:
-        # need to compile iokerneld
-        ok = conn.run("make", wd = "~/burrito/shenango-chunnel/caladan")
-        check(ok, "build shenango", conn.addr)
+        needed_features = ["bin"]
+        for d in datapaths:
+            if 'shenango_channel' == d:
+                if 'shenango-chunnel' not in needed_features:
+                    needed_features.append('shenango-chunnel')
+            elif 'dpdk' in d:
+                if 'dpdk-direct' not in needed_features:
+                    needed_features.append('dpdk-direct')
+                if dpdk_driver == 'mlx' and 'cx3_mlx' not in needed_features:
+                    needed_features.append('cx3_mlx')
+                elif dpdk_driver == 'intel' and 'xl710_intel' not in needed_features:
+                    needed_features.append('xl710_intel')
+        agenda.subtask(f"building kvserver features={needed_features}")
+        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"kvserver\"", wd = "~/burrito/kvstore")
+        check(ok, "kvserver build", conn.addr)
 
-    needed_features = ["bin"]
-    for d in datapaths:
-        if 'shenango_channel' == d:
-            if 'shenango-chunnel' not in needed_features:
-                needed_features.append('shenango-chunnel')
-        elif 'dpdk' in d:
-            if 'dpdk-direct' not in needed_features:
-                needed_features.append('dpdk-direct')
-            if dpdk_driver == 'mlx' and 'cx3_mlx' not in needed_features:
-                needed_features.append('cx3_mlx')
-            elif dpdk_driver == 'intel' and 'xl710_intel' not in needed_features:
-                needed_features.append('xl710_intel')
-    agenda.subtask(f"building kvserver features={needed_features}")
-    ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"kvserver\"", wd = "~/burrito/kvstore")
-    check(ok, "kvserver build", conn.addr)
-
-    agenda.subtask(f"building ycsb features={needed_features}")
-    ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features[1:])}\" --bin=\"ycsb\"", wd = "~/burrito/kvstore-ycsb")
-    check(ok, "ycsb build", conn.addr)
-
-    return conn
+        agenda.subtask(f"building ycsb features={needed_features}")
+        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features[1:])}\" --bin=\"ycsb\"", wd = "~/burrito/kvstore-ycsb")
+        check(ok, "ycsb build", conn.addr)
+        return conn
+    except Exception as e:
+        agenda.failure(f"[{conn.addr}] setup_machine failed: {e}")
+        global thread_ok
+        thread_ok = False
+        raise e
 
 def write_cfg(conn, config, name):
     from random import randint
@@ -224,9 +229,9 @@ def write_cfg(conn, config, name):
     with open(f"{fname}", 'w') as f:
         f.write(config)
 
-    agenda.subtask(f"{conn.addr} {name} config file: {fname}")
+    agenda.subtask(f"[{conn.addr}] {name} config file: {fname}")
     if not conn.local:
-        conn.put(f"{fname}", "~/burrito/{name}.config")
+        conn.put(f"{fname}", f"~/burrito/{name}.config")
     else:
         subprocess.run(f"rm -f {name}.config && cp {fname} {name}.config", shell=True)
 
@@ -248,7 +253,7 @@ def write_dpdk_config(conn, machines, num_threads=6):
     if dpdk_driver == 'mlx':
         res = conn.run("sudo ./usertools/dpdk-devbind.py --status-dev net | grep 'mlx' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
     elif dpdk_driver == 'intel':
-        res = conn.run("sudo ./usertools/dpdk-devbind.py --status-dev net | grep 'dev=igb_uio' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
+        res = conn.run("sudo ./usertools/dpdk-devbind.py --status-dev net | grep 'drv=igb_uio' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
     else:
         raise Exception(f"unknown driver {dpdk_driver}")
 
@@ -258,12 +263,13 @@ def write_dpdk_config(conn, machines, num_threads=6):
     else:
         raise Exception(f"could not get pci address for {conn.addr}: {res}")
 
+    agenda.subtask(f"dpdk configuration file pci_addr={res} num_lcores={num_threads}")
     # compile arp entries
     machines = [machines['server']] + machines['clients']
     arp_cfg = '\n\n'.join([f"""\
   [[net.arp]]
-  ip = {m['exp']}
-  mac = {m['mac']}
+  ip = "{m['exp']}"
+  mac = "{m['mac']}"
 """ for m in machines])
     dpdk_config = f"""\
 [dpdk]
@@ -276,12 +282,22 @@ ip = "{conn.addr}"
 """
     write_cfg(conn, dpdk_config, 'dpdk')
 
+def get_timeout_inner(num_reqs, interarrival_us) -> int:
+    total_time_s = num_reqs * interarrival_us / 1e6
+    return max(int(total_time_s * 2), 180)
 
-def get_timeout(wrkfile, interarrival_us):
+def get_timeout_local(wrkfile, interarrival_us) -> int:
     with open(wrkfile, 'r') as f:
         num_reqs = sum(1 for _ in f)
-        total_time_s = num_reqs * interarrival_us / 1e6
-        return max(int(total_time_s * 2), 180)
+        return get_timeout_inner(num_reqs, interarrival_us)
+
+def get_timeout_remote(conn, wrkfile, interarrival_us) -> int:
+    res = conn.run(f"wc -l {wrkfile}")
+    if res.exited != 0:
+        raise Exception(f"Unable to read {wrkfile}")
+
+    num_reqs = int(res.stdout.strip())
+    return get_timeout_inner(num_reqs, interarrival_us)
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
 
@@ -316,7 +332,7 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     time.sleep(8)
     conn.check_proc(f"kvserver", f"{outf}.err")
 
-def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile):
+def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
     if datapath == 'shenango_channel':
@@ -345,7 +361,14 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
         skip_negotiation -= 1
 
     poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
-    timeout = get_timeout(wrkfile, interarrival)
+
+    timeout = None
+    try:
+        timeout = get_timeout_local(wrkfile, interarrival)
+    except:
+        timeout = get_timeout_remote(conn, wrkfile, interarrival)
+
+    extra_cfg = ' '.join(f"--{key}={cfg_client[key]}" for key in cfg_client)
 
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
@@ -357,6 +380,7 @@ def run_client(conn, server, redis_addr, interarrival, poisson_arrivals, datapat
             --out-file={outf}0.data \
             --datapath={datapath} \
             {cfg} \
+            {extra_cfg} \
             {poisson_arg} \
             {shard_arg} \
             {skip_neg} \
@@ -385,7 +409,7 @@ def start_redis(machine):
     agenda.subtask(f"Started redis on {machine.host}")
     return f"{machine.alt}:6379"
 
-def run_loads(conn, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0):
+def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0):
     conn.run("sudo pkill -INT iokerneld")
 
     skip_neg = ''
@@ -403,6 +427,8 @@ def run_loads(conn, server, datapath, redis_addr, outf, wrkfile, skip_negotiatio
     else:
         raise Exception(f"unknown datapath {datapath}")
 
+    extra_cfg = ' '.join(f"--{key}={cfg_client[key]}" for key in cfg_client)
+
     while True:
         if 'shenango' in datapath:
             conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
@@ -419,6 +445,7 @@ def run_loads(conn, server, datapath, redis_addr, outf, wrkfile, skip_negotiatio
                     --accesses {wrkfile} \
                     --datapath {datapath} \
                     {cfg} \
+                    {extra_cfg} \
                     {skip_neg} \
                     --logging --loads-only",
                 wd="~/burrito",
@@ -449,6 +476,7 @@ def do_exp(iter_num,
     skip_negotiation=None,
     wrkload=None,
     overwrite=None,
+    cfg_client=None,
 ):
     assert(
         outdir is not None and
@@ -499,10 +527,10 @@ def do_exp(iter_num,
     time.sleep(5)
     # prime the server with loads
     agenda.task("doing loads")
-    run_loads(machines[1], server_addr, datapath, redis_addr, outf, wrkload, skip_negotiation=num_shards if skip_negotiation else 0)
+    run_loads(machines[1], cfg_client, server_addr, datapath, redis_addr, outf, wrkload, skip_negotiation=num_shards if skip_negotiation else 0)
     try:
-        machines[1].get(f"{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
-        machines[1].get(f"{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
+        machines[1].get(f"burrito/{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
+        machines[1].get(f"burrito/{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
     except Exception as e:
         agenda.subfailure(f"Could not get file {outf}-loads.[out,err] from loads client: {e}")
 
@@ -510,6 +538,7 @@ def do_exp(iter_num,
     agenda.task("starting clients")
     clients = [threading.Thread(target=run_client, args=(
             m,
+            cfg_client,
             server_addr,
             redis_addr,
             interarrival_us,
@@ -530,13 +559,10 @@ def do_exp(iter_num,
     machines[0].run("sudo pkill -INT kvserver")
     machines[0].run("sudo pkill -INT iokerneld")
 
-    for m in machines:
-        m.run("rm ~/burrito/*.config")
-
     agenda.task("get server files")
     if not machines[0].local:
-        machines[0].get(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
-        machines[0].get(f"~/burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+        machines[0].get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
+        machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
 
     def get_files(num):
         fn = c.get
@@ -657,12 +683,17 @@ if __name__ == '__main__':
         agenda.subfailure(f"not all commits equal: {commits}")
         sys.exit(1)
 
+    found_local = False
     for m in machines:
         if m.host in ['127.0.0.1', '::1', 'localhost']:
             agenda.subtask(f"Local conn: {m.host}/{m.addr}")
             m.local = True
+            found_local = True
         else:
             m.local = False
+
+    if not found_local:
+        subprocess.run(f"mkdir -p {args.outdir}", shell=True)
 
     # build
     agenda.task("building burrito...")
@@ -679,12 +710,14 @@ if __name__ == '__main__':
 
     dpdk_driver = args.dpdk_driver
 
+    agenda.task("writing configuration files")
     if 'shenango_channel' in cfg['exp']['datapath']:
         for m in machines:
             write_shenango_config(m)
     if any('dpdk' in d for d in cfg['exp']['datapath']):
+        num_dpdk_lcores = max(cfg['cfg']['client']['num-threads'], max(cfg['exp']['shards']))
         for m in machines:
-            write_dpdk_config(m, cfg['machines'], max(cfg['exp']['shards']))
+            write_dpdk_config(m, cfg['machines'], num_dpdk_lcores)
 
     for dp in cfg['exp']['datapath']:
         for neg in cfg['exp']['negotiation']:
@@ -704,6 +737,7 @@ if __name__ == '__main__':
                                     skip_negotiation=not neg,
                                     wrkload=w,
                                     overwrite=args.overwrite,
+                                    cfg_client=cfg['cfg']['client'],
                                 )
 
     agenda.task("done")

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-from kv import ConnectionWrapper, check_machine, setup_machine, get_local, check, get_timeout
+from kv import ConnectionWrapper, check_machine, setup_machine, get_local, check, get_timeout_local
 import agenda
 import argparse
 import os
@@ -60,7 +60,7 @@ def start_server(conn, outf, shards=1, skip_negotiation=False, no_chunnels=False
 def run_client(conn, server, interarrival, poisson_arrivals, skip_negotiation, no_chunnels, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
-    timeout = get_timeout(wrkfile, interarrival)
+    timeout = get_timeout_local(wrkfile, interarrival)
     write_shenango_config(conn)
 
     conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)

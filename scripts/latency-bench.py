@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-from kv import ConnectionWrapper, check_machine, get_local, check, get_timeout, write_dpdk_config, write_cfg
+from kv import ConnectionWrapper, check_machine, get_local, check, get_timeout_local, write_dpdk_config, write_cfg
 import agenda
 import argparse
 import os
