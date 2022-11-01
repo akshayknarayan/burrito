@@ -3,6 +3,7 @@ target/
 **/*.rs.bk
 Cargo.lock
 scripts/__pycache__/
+scripts/venv/
 .ipynb_checkpoints/
 *.data
 *.out
