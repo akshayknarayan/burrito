@@ -1,7 +1,7 @@
 [machines]
-server = { access = "130.127.133.245", user = "akshayn", alt = "130.127.133.245", exp = "10.10.1.2", mac = "3c:fd:fe:55:48:7a" } # node-0
+server = { access = "130.127.134.7", user = "akshayn", alt = "130.127.134.7", exp = "10.10.1.2", mac = "3c:fd:fe:56:17:c2" } # node-0
 clients = [
-    { access = "130.127.133.230", user = "akshayn", alt = "130.127.133.230", exp = "10.10.1.1", mac = "3c:fd:fe:55:ea:42" }, # node-1
+    { access = "130.127.133.235", user = "akshayn", alt = "130.127.133.235", exp = "10.10.1.1", mac = "3c:fd:fe:55:e9:e2" }, # node-1
 ]
 
 # pd2: mac = "f4:52:14:76:98:10"
@@ -10,6 +10,8 @@ clients = [
 # pd9: mac = "f4:52:14:76:a4:70"
 
 [cfg]
+
+lcores = "0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32"
 
 [cfg.client]
 num-threads = 16

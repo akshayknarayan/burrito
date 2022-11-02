@@ -161,6 +161,7 @@ def check(ok, msg, addr, allowed=[]):
         print(ok.stderr)
         global thread_ok
         thread_ok = False # something went wrong.
+        raise Exception(f"{msg} on {addr}: {ok.exited} not in {allowed}")
 
 def check_machine(ip):
     if 'exp' not in ip:
@@ -196,6 +197,12 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
             ok = conn.run("make", wd = "~/burrito/shenango-chunnel/caladan")
             check(ok, "build shenango", conn.addr)
 
+            ok = conn.run("./scripts/setup_machine.sh", wd = "~/burrito/shenango-chunnel/caladan")
+            check(ok, "shenango setup-machine", conn.addr)
+        elif any('dpdk' in d for d in datapaths):
+            ok = conn.run("./usertools/dpdk-hugepages.py -p 2M --setup 10G", wd = "~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
+            check(ok, "reserve hugepages", conn.addr)
+
         needed_features = ["bin"]
         for d in datapaths:
             if 'shenango_channel' == d:
@@ -230,7 +237,7 @@ def write_cfg(conn, config, name):
         f.write(config)
 
     agenda.subtask(f"[{conn.addr}] {name} config file: {fname}")
-    if not conn.local:
+    if not conn.is_local:
         conn.put(f"{fname}", f"~/burrito/{name}.config")
     else:
         subprocess.run(f"rm -f {name}.config && cp {fname} {name}.config", shell=True)
@@ -248,22 +255,15 @@ runtime_guaranteed_kthreads 2
 
 
 dpdk_driver = None
-def write_dpdk_config(conn, machines, num_threads=6):
-    res = None
-    if dpdk_driver == 'mlx':
-        res = conn.run("sudo ./usertools/dpdk-devbind.py --status-dev net | grep 'mlx' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
-    elif dpdk_driver == 'intel':
-        res = conn.run("sudo ./usertools/dpdk-devbind.py --status-dev net | grep 'drv=igb_uio' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
-    else:
-        raise Exception(f"unknown driver {dpdk_driver}")
-
+def write_dpdk_config(conn, machines, lcores):
+    res = conn.run(f"sudo ./usertools/dpdk-devbind.py --status-dev net | grep \"{conn.mac}\" | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
     pci_addr = None
     if res.exited == 0:
         pci_addr = res.stdout.strip()
     else:
         raise Exception(f"could not get pci address for {conn.addr}: {res}")
 
-    agenda.subtask(f"dpdk configuration file pci_addr={res} num_lcores={num_threads}")
+    agenda.subtask(f"dpdk configuration file pci_addr={pci_addr} lcore_cfg={lcores}")
     # compile arp entries
     machines = [machines['server']] + machines['clients']
     arp_cfg = '\n\n'.join([f"""\
@@ -273,7 +273,7 @@ def write_dpdk_config(conn, machines, num_threads=6):
 """ for m in machines])
     dpdk_config = f"""\
 [dpdk]
-eal_init = ["-n", "4", "-l", "0-{num_threads}", "--allow", "{pci_addr}", "--proc-type=auto"]
+eal_init = ["-n", "4", "-l", "{lcores}", "--allow", "{pci_addr}", "--proc-type=auto"]
 
 [net]
 ip = "{conn.addr}"
@@ -497,7 +497,7 @@ def do_exp(iter_num,
     outf = f"{outdir}/{datapath}{noneg}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-client"
 
     for m in machines:
-        if m.local:
+        if m.is_local:
             m.run(f"mkdir -p {outdir}", wd="~/burrito")
             continue
         m.run(f"rm -rf {outdir}", wd="~/burrito")
@@ -560,13 +560,13 @@ def do_exp(iter_num,
     machines[0].run("sudo pkill -INT iokerneld")
 
     agenda.task("get server files")
-    if not machines[0].local:
+    if not machines[0].is_local:
         machines[0].get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
         machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
 
     def get_files(num):
         fn = c.get
-        if c.local:
+        if c.is_local:
             agenda.subtask(f"Use get_local: {c.host}")
             fn = get_local
 
@@ -605,6 +605,91 @@ def do_exp(iter_num,
     agenda.task("done")
     return True
 
+def intel_setup(machines):
+    agenda.task("setup intel-driver machine for DPDK")
+    for conn in machines:
+        ok = conn.run("lsmod | grep uio", wd = "~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
+        if ok.exited != 0:
+            agenda.subtask("igb_uio kmod not loaded")
+
+            # igb_uio
+            ok = conn.run("modprobe uio", wd = "~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
+            check(ok, "modprobe uio", conn.addr)
+
+            ok = conn.run("ls ./dpdk-kmods/linux/igb_uio/igb_uio.ko", wd = "~")
+            if ok.exited != 0:
+                agenda.subtask("igb_uio kmod not cloned or built")
+                ok = conn.run("ls ./dpdk-kmods", wd = "~")
+                if ok.exited != 0:
+                    # need to clone
+                    ok = conn.run("git clone https://dpdk.org/git/dpdk-kmods", wd = "~")
+                    check(ok, "clone dpdk-kmods", conn.addr)
+
+                agenda.subtask("compiling igb_uio")
+                # now can make
+                ok = conn.run("make", wd = "~/dpdk-kmods/linux/igb_uio")
+                check(ok, "build igb_uio", conn.addr)
+
+            agenda.subtask("inserting igb_uio kmod")
+            ok = conn.run("insmod ./igb_uio.ko", wd = "~/dpdk-kmods/linux/igb_uio", sudo=True)
+            check(ok, "modprobe igb_uio", conn.addr)
+
+def get_iface(ip_link_out, mac):
+    for line in ip_link_out.split('\n'):
+        if mac in line:
+            return line.split()[1][:-1]
+    raise Exception(f"interface for {ip_link_out}/{mac} not found")
+
+def intel_devbind(machines, datapath):
+    agenda.task(f"bind interfaces to correct driver for {datapath}")
+    for conn in machines:
+        # first determine the current driver assignment
+
+        res = conn.run(f"./usertools/dpdk-devbind.py --status-dev net | grep 'drv=igb_uio'", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
+        agenda.subtask(f"devbind status: {res}")
+        if res.exited != 0 and 'dpdk' in datapath:
+            agenda.subtask(f"[{conn.addr}] bind to DPDK driver")
+            # Kernel -> DPDK
+            # 0. get the iface and pci_addr
+            res = conn.run("ip -o link")
+            check(res, "ip link", conn.addr)
+            ip_link_out = res.stdout
+            iface = get_iface(ip_link_out, conn.mac)
+            res = conn.run(f"./usertools/dpdk-devbind.py --status-dev net | grep '{iface}' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
+            check(res, "dpdk-devbind show", conn.addr)
+            pci_addr = res.stdout.strip()
+            agenda.subtask(f"[{conn.addr}] pci: {pci_addr} iface: {iface}")
+
+            # 1. ip link set dev {interface} down
+            ok = conn.run(f"ip link set dev {iface} down", sudo=True)
+            check(ok, "ip link set down", conn.addr)
+
+            # 2. dpdk-devbind --bind igb_uio {pci_addr}
+            ok = conn.run(f"./usertools/dpdk-devbind.py --bind=\"igb_uio\" {pci_addr}", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
+            check(ok, "dpdk-devbind bind", conn.addr)
+        elif res.exited == 0 and datapath == 'kernel':
+            agenda.subtask(f"[{conn.addr}] bind to kernel driver")
+            # DPDK -> Kernel
+            pci_addr = res.stdout.strip().split()[0]
+            # 1. dpdk-devbind --bind i40e {pci_addr}
+            ok = conn.run(f"./usertools/dpdk-devbind.py --bind=\"i40e\" {pci_addr}", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
+            check(ok, "dpdk-devbind bind", conn.addr)
+
+            # 2. ip link set dev {interface} up
+            res = conn.run("ip -o link")
+            check(res, "ip link", conn.addr)
+            ip_link_out = res.stdout
+            iface = get_iface(ip_link_out, conn.mac)
+
+            ok = conn.run(f"ip link set dev {iface} up", sudo=True)
+            check(ok, "ip link set up", conn.addr)
+
+            # 3. ip addr add dev {interface} {addr}/24
+            ok = conn.run(f"ip addr add dev {iface} {conn.addr}/24", sudo=True)
+            check(ok, "ip addr add", conn.addr)
+        else:
+            agenda.subtask("correct driver already bound")
+        agenda.subtask(f"[{conn.addr}] done")
 
 ### Sample config
 ### [machines]
@@ -687,10 +772,10 @@ if __name__ == '__main__':
     for m in machines:
         if m.host in ['127.0.0.1', '::1', 'localhost']:
             agenda.subtask(f"Local conn: {m.host}/{m.addr}")
-            m.local = True
+            m.is_local = True
             found_local = True
         else:
-            m.local = False
+            m.is_local = False
 
     if not found_local:
         subprocess.run(f"mkdir -p {args.outdir}", shell=True)
@@ -705,6 +790,16 @@ if __name__ == '__main__':
         sys.exit(1)
     agenda.task("...done building burrito")
 
+    ms = [cfg['machines']['server']] + cfg['machines']['clients']
+    for m in ms:
+        for x in machines:
+            if x.addr == m['exp']:
+                x.mac = m['mac']
+                break
+
+    if 'intel' == args.dpdk_driver and any('dpdk' in d for d in cfg['exp']['datapath']):
+        intel_setup(machines)
+
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
 
@@ -715,11 +810,13 @@ if __name__ == '__main__':
         for m in machines:
             write_shenango_config(m)
     if any('dpdk' in d for d in cfg['exp']['datapath']):
-        num_dpdk_lcores = max(cfg['cfg']['client']['num-threads'], max(cfg['exp']['shards']))
         for m in machines:
-            write_dpdk_config(m, cfg['machines'], num_dpdk_lcores)
+            write_dpdk_config(m, cfg['machines'], cfg['cfg']['lcores'])
 
     for dp in cfg['exp']['datapath']:
+        if 'intel' == args.dpdk_driver:
+            intel_devbind(machines, dp)
+
         for neg in cfg['exp']['negotiation']:
             for w in cfg['exp']['wrk']:
                 for s in cfg['exp']['shards']:
