@@ -192,8 +192,7 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         check(ok, "mk outdir", conn.addr)
 
         # docker
-        conn.put("~/burrito/scripts/install-docker.sh")
-        ok = conn.run("bash ./scripts/install-docker.sh", wd="~/burrito")
+        ok = conn.run("bash scripts/install-docker.sh", wd="~/burrito")
         check(ok, "install docker", conn.addr)
 
         ok = conn.run("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > ~/rustup.sh", wd="~")
