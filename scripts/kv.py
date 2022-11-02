@@ -191,6 +191,16 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
         check(ok, "mk outdir", conn.addr)
 
+        # docker
+        conn.put("~/burrito/scripts/install-docker.sh")
+        ok = conn.run("bash ./scripts/install-docker.sh", wd="~/burrito")
+        check(ok, "install docker", conn.addr)
+
+        ok = conn.run("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > ~/rustup.sh", wd="~")
+        check(ok, "download rust installer", conn.addr)
+        ok = conn.run("./rustup.sh -y", wd="~")
+        check(ok, "run rust installer", conn.addr)
+
         if 'shenango_channel' in datapaths:
             agenda.subtask("[{conn.addr}] building shenango")
             # need to compile iokerneld
@@ -256,12 +266,31 @@ runtime_guaranteed_kthreads 2
 
 dpdk_driver = None
 def write_dpdk_config(conn, machines, lcores):
-    res = conn.run(f"sudo ./usertools/dpdk-devbind.py --status-dev net | grep \"{conn.mac}\" | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
+    search = None
+    if dpdk_driver == 'mlx':
+        search = 'drv=mlx'
+    elif dpdk_driver == 'intel':
+        search = 'drv=igb'
+    else:
+        raise Exception(f"Unknown driver {dpdk_driver}")
+
+    res = conn.run(f"sudo ./usertools/dpdk-devbind.py --status-dev net | grep \"{search}\"", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk")
     pci_addr = None
     if res.exited == 0:
+        pci_addr = res.stdout.strip().split()[0]
+        agenda.subtask(f"[{conn.addr}] pci: {pci_addr}")
+    elif dpdk_driver == 'intel':
+        res = conn.run("ip -o link")
+        check(res, "ip link", conn.addr)
+        ip_link_out = res.stdout
+        iface = get_iface(ip_link_out, conn.mac)
+        conn.exp_iface = iface
+        res = conn.run(f"./usertools/dpdk-devbind.py --status-dev net | grep '{iface}' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
+        check(res, "dpdk-devbind show", conn.addr)
         pci_addr = res.stdout.strip()
+        agenda.subtask(f"[{conn.addr}] pci: {pci_addr} iface: {iface}")
     else:
-        raise Exception(f"could not get pci address for {conn.addr}: {res}")
+        raise Exception(f"Could not get pci address on {conn.addr}")
 
     agenda.subtask(f"dpdk configuration file pci_addr={pci_addr} lcore_cfg={lcores}")
     # compile arp entries
@@ -644,9 +673,7 @@ def intel_devbind(machines, datapath):
     agenda.task(f"bind interfaces to correct driver for {datapath}")
     for conn in machines:
         # first determine the current driver assignment
-
         res = conn.run(f"./usertools/dpdk-devbind.py --status-dev net | grep 'drv=igb_uio'", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
-        agenda.subtask(f"devbind status: {res}")
         if res.exited != 0 and 'dpdk' in datapath:
             agenda.subtask(f"[{conn.addr}] bind to DPDK driver")
             # Kernel -> DPDK
@@ -655,6 +682,7 @@ def intel_devbind(machines, datapath):
             check(res, "ip link", conn.addr)
             ip_link_out = res.stdout
             iface = get_iface(ip_link_out, conn.mac)
+            conn.exp_iface = iface
             res = conn.run(f"./usertools/dpdk-devbind.py --status-dev net | grep '{iface}' | cut -d' ' -f1", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
             check(res, "dpdk-devbind show", conn.addr)
             pci_addr = res.stdout.strip()
@@ -680,6 +708,7 @@ def intel_devbind(machines, datapath):
             check(res, "ip link", conn.addr)
             ip_link_out = res.stdout
             iface = get_iface(ip_link_out, conn.mac)
+            conn.exp_iface = iface
 
             ok = conn.run(f"ip link set dev {iface} up", sudo=True)
             check(ok, "ip link set up", conn.addr)
@@ -804,6 +833,8 @@ if __name__ == '__main__':
     shutil.copy2(args.config, args.outdir)
 
     dpdk_driver = args.dpdk_driver
+    if 'intel' == args.dpdk_driver:
+        intel_devbind(machines, 'kernel')
 
     agenda.task("writing configuration files")
     if 'shenango_channel' in cfg['exp']['datapath']:
