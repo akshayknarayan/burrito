@@ -197,7 +197,7 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
 
         ok = conn.run("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > ~/rustup.sh", wd="~")
         check(ok, "download rust installer", conn.addr)
-        ok = conn.run("./rustup.sh -y", wd="~")
+        ok = conn.run("sh ./rustup.sh -y", wd="~")
         check(ok, "run rust installer", conn.addr)
 
         if 'shenango_channel' in datapaths:
@@ -320,11 +320,11 @@ def get_timeout_local(wrkfile, interarrival_us) -> int:
         return get_timeout_inner(num_reqs, interarrival_us)
 
 def get_timeout_remote(conn, wrkfile, interarrival_us) -> int:
-    res = conn.run(f"wc -l {wrkfile}")
+    res = conn.run(f"wc -l {wrkfile}", wd="~/burrito")
     if res.exited != 0:
         raise Exception(f"Unable to read {wrkfile}")
 
-    num_reqs = int(res.stdout.strip())
+    num_reqs = int(res.stdout.strip().split()[0])
     return get_timeout_inner(num_reqs, interarrival_us)
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
@@ -394,7 +394,12 @@ def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arriv
     try:
         timeout = get_timeout_local(wrkfile, interarrival)
     except:
-        timeout = get_timeout_remote(conn, wrkfile, interarrival)
+        try:
+            timeout = get_timeout_remote(conn, wrkfile, interarrival)
+        except Exception as e:
+            global thread_ok
+            thread_ok = False
+            raise e
 
     extra_cfg = ' '.join(f"--{key}={cfg_client[key]}" for key in cfg_client)
 
