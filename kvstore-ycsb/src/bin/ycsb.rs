@@ -461,6 +461,10 @@ where
         MC: Fn(usize) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<KvClient<S>, Report>>,
     {
+        if access_by_client.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
