@@ -191,14 +191,9 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
         check(ok, "mk outdir", conn.addr)
 
-        # docker
-        ok = conn.run("bash scripts/install-docker.sh", wd="~/burrito")
-        check(ok, "install docker", conn.addr)
-
-        ok = conn.run("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > ~/rustup.sh", wd="~")
-        check(ok, "download rust installer", conn.addr)
-        ok = conn.run("sh ./rustup.sh -y", wd="~")
-        check(ok, "run rust installer", conn.addr)
+        # dpdk dependencies, rust, and docker
+        ok = conn.run("bash scripts/install-kv-deps.sh", wd="~/burrito")
+        check(ok, "install dependencies", conn.addr)
 
         if 'shenango_channel' in datapaths:
             agenda.subtask("[{conn.addr}] building shenango")
@@ -334,7 +329,6 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     conn.run("sudo pkill -INT iokerneld")
 
     if datapath == 'shenango_channel':
-        write_shenango_config(conn)
         conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
         datapath = 'shenango'
         cfg = '--cfg=shenango.config'
@@ -638,6 +632,23 @@ def do_exp(iter_num,
     agenda.task("done")
     return True
 
+def generate_ycsb_file(conn, wrkfile):
+    # "./kvstore-ycsb/ycsbc-mock/wrkloadb-4.access" -> wrkloadb-4
+    slug = wrkfile.strip().split('/')[-1].split('.')[0]
+    wrkload, threads = slug.split('-')
+
+    ok = conn.run(f"ls {wrkload}-{threads}.access", wd="~/burrito/kvstore-ycsb/ycsbc-mock")
+    if ok.exited != 0:
+        ok = conn.run(f"ls {wrkload}.out", wd="~/burrito/kvstore-ycsb/ycsbc-mock")
+        if ok.exited != 0:
+           ok = conn.run(f"./ycsbc -db mock -threads 1 -P workloads/{wrkload}.spec > {wrkload}.out", wd="~/burrito/kvstore-ycsb/ycsbc-mock")
+           if ok.exited != 0:
+               raise Exception(f"Problem running ycsb. Either ycsbc not compiled, or dependency not installed, or spec file not available. {ok}")
+
+        ok = conn.run(f"python3 augment.py {wrkload}.out {wrkload}-{threads} {threads}", wd = "~/burrito/kvstore-ycsb/ycsbc-mock")
+        if ok.exited != 0:
+            raise Exception(f"augment script failed: {ok}")
+
 def intel_setup(machines):
     agenda.task("setup intel-driver machine for DPDK")
     for conn in machines:
@@ -748,6 +759,7 @@ if __name__ == '__main__':
     parser.add_argument('--outdir', type=str, required=True)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--dpdk_driver', type=str, choices=['mlx', 'intel'],  required=False)
+    parser.add_argument('--setup_only', action='store_true',  required=False)
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")
     cfg = toml.load(args.config)
@@ -847,6 +859,16 @@ if __name__ == '__main__':
     if any('dpdk' in d for d in cfg['exp']['datapath']):
         for m in machines:
             write_dpdk_config(m, cfg['machines'], cfg['cfg']['lcores'])
+
+    for w in cfg['exp']['wrk']:
+        for conn in machines:
+            ok = conn.run(f"ls {w}")
+            if ok.exited != 0:
+                generate_ycsb_file(conn, w)
+
+    if args.setup_only:
+        agenda.task("setup done")
+        sys.exit(0)
 
     for dp in cfg['exp']['datapath']:
         if 'intel' == args.dpdk_driver:
