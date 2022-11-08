@@ -213,16 +213,22 @@ impl DpdkState {
 
         match port_filter {
             None if max_rx_packets < self.rx_recv_buf.len() => {
-                for ((dport, _), ref mut stash) in &mut self.rx_packets_for_ports {
-                    if *dport == 0 && !stash.is_empty() {
-                        let mut num_returned = 0;
+                let mut num_returned = 0;
+                for ((_, _), ref mut stash) in &mut self.rx_packets_for_ports {
+                    if !stash.is_empty() {
                         while num_returned < max_rx_packets && !stash.is_empty() {
                             self.rx_recv_buf[num_returned] = Some(stash.pop_front().unwrap());
                             num_returned += 1;
                         }
 
-                        return Ok(&mut self.rx_recv_buf[..num_returned]);
+                        if num_returned >= max_rx_packets {
+                            return Ok(&mut self.rx_recv_buf[..num_returned]);
+                        }
                     }
+                }
+
+                if num_returned > 0 {
+                    return Ok(&mut self.rx_recv_buf[..num_returned]);
                 }
             }
             None => (),
@@ -362,9 +368,9 @@ impl DpdkState {
                 }
                 _ => {
                     // None case where num_returned >= max_rx_packets.
-                    // need to stash, so we use dummy port 0.
-                    for ((p, _), ref mut stash) in &mut self.rx_packets_for_ports {
-                        if *p == 0 {
+                    // need to stash.
+                    for ((p, addr), ref mut stash) in &mut self.rx_packets_for_ports {
+                        if *p == dst_port && *addr == pkt_src_addr {
                             stash.push_back(msg);
                             trace!(stash_size = ?stash.len(), "Stashed packet");
                             num_stashed += 1;
@@ -376,9 +382,9 @@ impl DpdkState {
                     let mut new_stash = VecDeque::with_capacity(16);
                     new_stash.push_back(msg);
                     num_stashed += 1;
-                    let zero_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
-                    self.rx_packets_for_ports.push(((0, zero_addr), new_stash));
-                    debug!("created new stash for dummy non-match connection");
+                    self.rx_packets_for_ports
+                        .push(((dst_port, pkt_src_addr), new_stash));
+                    debug!(?dst_port, ?pkt_src_addr, "created new stash connection");
                 }
             }
         }
