@@ -1,9 +1,14 @@
-use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use crate::switcher::{ActiveConnection, DatapathConnectionMigrator, LoadedConnections};
+use ahash::HashMap;
+use bertha::{either::Either, ChunnelConnection, ChunnelConnector, ChunnelListener};
+use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{BoundDpdkConn, DpdkConn, DpdkIoKernel, DpdkIoKernelHandle};
-use futures_util::stream::Stream;
+use eui48::MacAddress;
+use flume::Receiver;
+use futures_util::future::{ready, Ready};
+use futures_util::stream::{once, Once, Stream, StreamExt};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -13,8 +18,6 @@ static ref RUNTIME_HANDLE: Arc<StdMutex<Option<DpdkIoKernelHandle>>> =
     Arc::new(StdMutex::new(None));
 }
 
-// everything here blocks.
-// On success, this won't return while the DpdkIoKernel still lives.
 fn iokernel_start(config: PathBuf) -> Result<DpdkIoKernelHandle, Report> {
     let mut rt_guard = RUNTIME_HANDLE
         .lock()
@@ -28,6 +31,41 @@ fn iokernel_start(config: PathBuf) -> Result<DpdkIoKernelHandle, Report> {
         let (iokernel, handle) = DpdkIoKernel::new(config.to_path_buf()).unwrap();
         handle_s.send(handle).unwrap();
         iokernel.run();
+
+        // exit and shut down. need to clear out the out handle.
+        let mut rt_guard = RUNTIME_HANDLE
+            .lock()
+            .expect("Runtime lock acquisition failure is critical");
+        rt_guard.take();
+    });
+
+    let handle = handle_r.recv().wrap_err("Could not start DpdkIoKernel")?;
+    rt_guard.replace(handle.clone());
+    Ok(handle)
+}
+
+fn iokernel_restart(
+    ip_addr: Ipv4Addr,
+    arp_table: HashMap<Ipv4Addr, MacAddress>,
+) -> Result<DpdkIoKernelHandle, Report> {
+    let mut rt_guard = RUNTIME_HANDLE
+        .lock()
+        .expect("Runtime lock acquisition failure is critical");
+    if let Some(ref s) = *rt_guard {
+        return Ok(s.clone());
+    }
+
+    let (handle_s, handle_r) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (iokernel, handle) = DpdkIoKernel::new_configure_only(ip_addr, arp_table).unwrap();
+        handle_s.send(handle).unwrap();
+        iokernel.run();
+
+        // exit and shut down. need to clear out the out handle.
+        let mut rt_guard = RUNTIME_HANDLE
+            .lock()
+            .expect("Runtime lock acquisition failure is critical");
+        rt_guard.take();
     });
 
     let handle = handle_r.recv().wrap_err("Could not start DpdkIoKernel")?;
@@ -40,37 +78,149 @@ pub struct DpdkUdpSkChunnel {
     handle: DpdkIoKernelHandle,
 }
 
+struct LoadedConns {
+    conns: HashMap<ActiveConnection, Either<DpdkUdpSk, BoundDpdkUdpSk>>,
+    further_conns: HashMap<u16, Receiver<BoundDpdkConn>>,
+}
+
 impl DpdkUdpSkChunnel {
     pub fn new(config: impl AsRef<Path>) -> Result<Self, Report> {
         let config = config.as_ref().to_path_buf();
         let handle = iokernel_start(config)?;
         Ok(Self { handle })
     }
+
+    pub fn new_preconfig(
+        ip_addr: Ipv4Addr,
+        arp_table: HashMap<Ipv4Addr, MacAddress>,
+    ) -> Result<Self, Report> {
+        let handle = iokernel_restart(ip_addr, arp_table)?;
+        Ok(Self { handle })
+    }
+
+    pub fn get_cfg(&self) -> (Ipv4Addr, HashMap<Ipv4Addr, MacAddress>) {
+        (self.handle.ip_addr(), self.handle.arp_table())
+    }
+
+    fn do_shutdown(&self) {
+        self.handle.shutdown();
+        loop {
+            let rt_guard = RUNTIME_HANDLE
+                .lock()
+                .expect("Runtime lock acquisition failure is critical");
+            if rt_guard.is_none() {
+                break;
+            }
+        }
+    }
+
+    fn load_connections(&mut self, conns: Vec<ActiveConnection>) -> Result<LoadedConns, Report> {
+        let mut out = HashMap::default();
+        // first group by ActiveConnection type
+        let acceptors: Result<HashMap<_, _>, _> = conns
+            .into_iter()
+            .map(|c| match c {
+                ActiveConnection::UnConnected { local_port } => {
+                    let inner = self.handle.socket(Some(local_port))?;
+                    let cn = DpdkUdpSk { inner };
+
+                    out.insert(c, Either::Left(cn));
+                    Ok::<_, Report>(None)
+                }
+                ActiveConnection::Connected {
+                    local_port,
+                    remote_addr,
+                } => Ok::<_, Report>(Some((local_port, remote_addr))),
+            })
+            // need to group into port, [remote_addr]
+            .try_fold(HashMap::<_, Vec<_>>::default(), |mut acceptors, e| {
+                if let Some((local_port, remote_addr)) = e? {
+                    acceptors.entry(local_port).or_default().push(remote_addr);
+                }
+
+                Ok::<_, Report>(acceptors)
+            });
+
+        let mut further_conns = HashMap::default();
+        for (local_port, remote_addrs) in acceptors? {
+            let (conns, further_conns_on_port) =
+                self.handle.init_accepted(local_port, remote_addrs)?;
+            for (remote_addr, conn) in conns {
+                out.insert(
+                    ActiveConnection::Connected {
+                        local_port,
+                        remote_addr,
+                    },
+                    Either::Right(BoundDpdkUdpSk { inner: conn }),
+                );
+            }
+
+            further_conns.insert(local_port, further_conns_on_port);
+        }
+
+        Ok(LoadedConns {
+            conns: out,
+            further_conns,
+        })
+    }
+
+    pub(crate) fn do_listen_non_accept(&mut self, addr: SocketAddr) -> Result<DpdkUdpSk, Report> {
+        let a = match addr {
+            SocketAddr::V4(a) => a,
+            _ => bail!("Only IPv4 is supported: {:?}", addr),
+        };
+
+        let inner = self.handle.socket(Some(a.port()))?;
+
+        Ok(DpdkUdpSk { inner })
+    }
+}
+
+impl DatapathConnectionMigrator for DpdkUdpSkChunnel {
+    type Conn = Either<DpdkUdpSk, BoundDpdkUdpSk>;
+    type Stream = futures_util::stream::Empty<Result<Self::Conn, Self::Error>>;
+    type Error = Report;
+
+    fn shut_down(&mut self) -> Result<(), Report> {
+        self.do_shutdown();
+        Ok(())
+    }
+
+    fn load_connections(
+        &mut self,
+        conns: Vec<ActiveConnection>,
+    ) -> Result<LoadedConnections<Self::Conn, Self::Stream>, Self::Error> {
+        let LoadedConns {
+            conns,
+            further_conns,
+        } = self.load_connections(conns)?;
+
+        // `DpdkUdpSkChunnel` does not implement accept-style connections, only `DpdkUdpReqChunnel`
+        // does.
+        ensure!(
+            further_conns.is_empty(),
+            "DpdkUdpSkChunnel should not have any accept-style connections"
+        );
+
+        Ok(LoadedConnections {
+            conns,
+            accept_streams: Default::default(),
+        })
+    }
 }
 
 impl ChunnelListener for DpdkUdpSkChunnel {
     type Addr = SocketAddr;
     type Connection = DpdkUdpSk;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Future = Ready<Result<Self::Stream, Report>>;
+    type Stream = Once<Ready<Result<Self::Connection, Self::Error>>>;
     type Error = Report;
 
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
-        use SocketAddr::*;
-        match addr {
-            V4(a) => {
-                let sk = self.handle.socket(Some(a.port()));
-                Box::pin(futures_util::future::ready(Ok(
-                    Box::pin(futures_util::stream::once(futures_util::future::ready(
-                        sk.map(|inner| DpdkUdpSk { inner }),
-                    ))) as _,
-                )))
-            }
-            V6(a) => Box::pin(futures_util::future::ready(Err(eyre!(
-                "Only IPv4 is supported: {:?}",
-                a
-            )))),
+        let res = self.do_listen_non_accept(addr);
+        match res {
+            Ok(r) => ready(Ok(once(ready(Ok(r))))),
+            Err(e) => ready(Err(e)),
         }
     }
 }
@@ -78,18 +228,23 @@ impl ChunnelListener for DpdkUdpSkChunnel {
 impl ChunnelConnector for DpdkUdpSkChunnel {
     type Addr = SocketAddr;
     type Connection = DpdkUdpSk;
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Future = futures_util::future::Ready<Result<Self::Connection, Report>>;
     type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         let sk = self.handle.socket(None).map(|inner| DpdkUdpSk { inner });
-        Box::pin(futures_util::future::ready(sk))
+        futures_util::future::ready(sk)
     }
 }
 
 pub struct DpdkUdpSk {
     inner: DpdkConn,
+}
+
+impl DpdkUdpSk {
+    pub fn local_port(&self) -> u16 {
+        self.inner.get_port()
+    }
 }
 
 impl std::fmt::Debug for DpdkUdpSk {
@@ -129,7 +284,19 @@ impl ChunnelConnection for DpdkUdpSk {
     }
 }
 
-pub struct BoundDpdkUdpSk(BoundDpdkConn);
+pub struct BoundDpdkUdpSk {
+    inner: BoundDpdkConn,
+}
+
+impl BoundDpdkUdpSk {
+    pub fn local_port(&self) -> u16 {
+        self.inner.port()
+    }
+
+    pub fn remote_addr(&self) -> SocketAddrV4 {
+        self.inner.remote_addr()
+    }
+}
 
 impl std::fmt::Debug for BoundDpdkUdpSk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -150,7 +317,7 @@ impl ChunnelConnection for BoundDpdkUdpSk {
     {
         Box::pin(async move {
             for (_, data) in burst {
-                self.0.send_async(data).await?;
+                self.inner.send_async(data).await?;
             }
 
             Ok(())
@@ -164,31 +331,75 @@ impl ChunnelConnection for BoundDpdkUdpSk {
     where
         'buf: 'cn,
     {
-        Box::pin(async move { self.0.recv_async_batch(msgs_buf).await })
+        Box::pin(async move { self.inner.recv_async_batch(msgs_buf).await })
     }
 }
 
 #[derive(Clone)]
 pub struct DpdkUdpReqChunnel(pub DpdkUdpSkChunnel);
+
 impl ChunnelListener for DpdkUdpReqChunnel {
     type Addr = SocketAddr;
     type Connection = BoundDpdkUdpSk;
     type Future = futures_util::future::Ready<Result<Self::Stream, Self::Error>>;
     type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + Sync + 'static>>;
     type Error = Report;
 
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
-        use futures_util::stream::StreamExt;
         use SocketAddr::*;
         match addr {
             V4(a) => {
                 let sk = self.0.handle.accept(a.port());
-                futures_util::future::ready(
-                    sk.map(|s| Box::pin(s.into_stream().map(BoundDpdkUdpSk).map(Ok)) as _),
-                )
+                futures_util::future::ready(sk.map(move |s| {
+                    Box::pin(
+                        s.into_stream()
+                            .map(move |inner| Ok(BoundDpdkUdpSk { inner })),
+                    ) as _
+                }))
             }
             V6(a) => futures_util::future::ready(Err(eyre!("Only IPv4 is supported: {:?}", a))),
         }
+    }
+}
+
+impl DatapathConnectionMigrator for DpdkUdpReqChunnel {
+    type Conn = Either<DpdkUdpSk, BoundDpdkUdpSk>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Conn, Self::Error>> + Send + Sync + 'static>>;
+    type Error = Report;
+
+    fn shut_down(&mut self) -> Result<(), Report> {
+        self.0.do_shutdown();
+        Ok(())
+    }
+
+    fn load_connections(
+        &mut self,
+        conns: Vec<ActiveConnection>,
+    ) -> Result<LoadedConnections<Self::Conn, Self::Stream>, Self::Error> {
+        let LoadedConns {
+            conns,
+            further_conns,
+        } = self.0.load_connections(conns)?;
+
+        let accept_streams = further_conns
+            .into_iter()
+            .map(|(port, further_conns_on_port)| {
+                (
+                    port,
+                    Box::pin(
+                        further_conns_on_port
+                            .into_stream()
+                            .map(move |inner| Ok(Either::Right(BoundDpdkUdpSk { inner }))),
+                    ) as _,
+                )
+            })
+            .collect();
+
+        Ok(LoadedConnections {
+            conns,
+            accept_streams,
+        })
     }
 }

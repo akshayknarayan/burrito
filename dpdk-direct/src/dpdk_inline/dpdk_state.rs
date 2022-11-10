@@ -1,4 +1,4 @@
-use ahash::AHashMap as HashMap;
+use ahash::HashMap;
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{
     bindings::*,
@@ -70,6 +70,19 @@ pub struct DpdkState {
 // SAFETY: rte_mempools should be ok to pass between threads.
 unsafe impl Send for DpdkState {}
 
+impl Drop for DpdkState {
+    fn drop(&mut self) {
+        // drop all buffered packets since they contain pointers into the mempool we're about to
+        // free.
+        std::mem::drop(std::mem::take(&mut self.rx_packets_for_ports));
+        std::mem::drop(std::mem::take(&mut self.rx_recv_buf));
+
+        unsafe {
+            rte_mempool_free(self.mbuf_pool);
+        }
+    }
+}
+
 impl DpdkState {
     /// Do global initialization.
     ///
@@ -104,6 +117,28 @@ impl DpdkState {
             mbuf_pools.len() == num_dpdk_threads,
             "Not enough mempools/queues initialized for requested number of threads"
         );
+        Self::do_new(ip_addr, arp_table, mbuf_pools, nb_ports)
+    }
+
+    pub fn new_preconfig(
+        ip_addr: Ipv4Addr,
+        arp_table: HashMap<Ipv4Addr, MacAddress>,
+        num_dpdk_threads: usize,
+    ) -> Result<Vec<Self>, Report> {
+        let (mbuf_pools, nb_ports) = dpdk_configure(num_dpdk_threads)?;
+        ensure!(
+            mbuf_pools.len() == num_dpdk_threads,
+            "Not enough mempools/queues initialized for requested number of threads"
+        );
+        Self::do_new(ip_addr, arp_table, mbuf_pools, nb_ports)
+    }
+
+    fn do_new(
+        ip_addr: Ipv4Addr,
+        arp_table: HashMap<Ipv4Addr, MacAddress>,
+        mbuf_pools: Vec<*mut rte_mempool>,
+        nb_ports: u16,
+    ) -> Result<Vec<Self>, Report> {
         let port = nb_ports - 1;
 
         // what is my ethernet address (rte_ether_addr struct)
@@ -137,6 +172,19 @@ impl DpdkState {
                 ip_id: 0,
             })
             .collect())
+    }
+
+    // The only per-flow thing we need to initialize is self.register_flow_buffer(). Flow steering
+    // will be managed at a higher level.
+    pub fn init_accepted(
+        &mut self,
+        flows: impl IntoIterator<Item = (u16, SocketAddrV4)>,
+    ) -> Result<(), Report> {
+        for (local_port, remote_addr) in flows {
+            self.register_flow_buffer(local_port, remote_addr);
+        }
+
+        Ok(())
     }
 
     pub fn rx_queue_id(&self) -> usize {
@@ -191,6 +239,10 @@ impl DpdkState {
 
     pub fn eth_stats(&self) -> Result<rte_eth_stats, Report> {
         unsafe { get_eth_stats(self.port) }
+    }
+
+    pub(crate) fn get_cfg(&self) -> (Ipv4Addr, HashMap<Ipv4Addr, MacAddress>) {
+        (self.ip_addr, self.arp_table.clone())
     }
 
     fn curr_num_stashed(&self) -> usize {
@@ -350,8 +402,9 @@ impl DpdkState {
                         debug!(?dst_port, ?pkt_src_addr, "created new stash for connection");
                         // signal new connection.
                         if let Some(nc) = new_conns {
-                            nc.send(pkt_src_addr)
-                                .wrap_err("New connection channel send failed")?;
+                            if let Err(err) = nc.send(pkt_src_addr) {
+                                debug!(?pkt_src_addr, ?err, "New connection channel send failed");
+                            }
                         }
                     } else {
                         // else !found_dst_port, which means no one was listening and we can drop.
