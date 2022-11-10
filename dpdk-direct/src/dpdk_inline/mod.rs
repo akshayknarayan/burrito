@@ -140,8 +140,7 @@ impl DpdkInlineChunnel {
     /// Should make sure `num_dpdk_threads` is >= the number of tokio workers (threads).
     /// Otherwise we might run out of mempools.
     pub fn new(config_path: PathBuf, num_dpdk_threads: usize) -> Result<Self, Report> {
-        let shutdown = Default::default();
-        let dpdks = DpdkState::new(config_path, num_dpdk_threads, &shutdown)?;
+        let dpdks = DpdkState::new(config_path, num_dpdk_threads)?;
         let lcore_map = get_lcore_map().wrap_err("Could not fetch DPDK lcore map")?;
         debug!(?lcore_map, "got lcore map");
         ensure!(
@@ -159,7 +158,7 @@ impl DpdkInlineChunnel {
             ephemeral_ports: Arc::new(Mutex::new((4096..16_384).collect())),
             flow_steering: Default::default(),
             active_conns: Default::default(),
-            shutdown,
+            shutdown: Default::default(),
         })
     }
 
@@ -170,6 +169,11 @@ impl DpdkInlineChunnel {
             .iter()
             .map(|x| *x)
             .collect()
+    }
+
+    fn do_shutdown(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Initialize state for the given set of connection descriptors.
@@ -265,6 +269,7 @@ impl DpdkInlineChunnel {
                         initialization_state: Arc::clone(&this.initialization_state),
                         flow_steering: Arc::clone(&this.flow_steering),
                         active_conns: Arc::clone(&this.active_conns),
+                        shutdown: Arc::clone(&this.shutdown),
                     }
                 });
 
@@ -279,6 +284,7 @@ impl DpdkInlineChunnel {
                     Arc::clone(&this.initialization_state),
                     Some(Arc::clone(&this.ephemeral_ports)),
                     Arc::clone(&this.active_conns),
+                    Arc::clone(&this.shutdown),
                 )
                 .with_closed_notification(conn_closed_notifier.clone());
                 Ok((c, cn))
@@ -292,6 +298,7 @@ impl DpdkInlineChunnel {
                     Arc::clone(&this.initialization_state),
                     Some(Arc::clone(&this.ephemeral_ports)),
                     Arc::clone(&this.active_conns),
+                    Arc::clone(&this.shutdown),
                 )
                 .with_flow_steering(Arc::clone(&this.flow_steering));
                 Ok((c, cn))
@@ -333,6 +340,11 @@ impl DatapathConnectionMigrator for DpdkInlineChunnel {
     /// Get a description of the currently active connections.
     fn active_connections(&self) -> Vec<ActiveConnection> {
         self.active_connections()
+    }
+
+    fn shut_down(&mut self) -> Result<(), Report> {
+        self.do_shutdown();
+        Ok(())
     }
 
     /// Construct connection state (and connection objects) corresponding to the provided set of
@@ -442,6 +454,7 @@ impl ChunnelListener for DpdkInlineChunnel {
                             Arc::clone(&self.initialization_state),
                             Some(Arc::clone(&self.ephemeral_ports)),
                             Arc::clone(&self.active_conns),
+                            Arc::clone(&self.shutdown),
                         )
                         .with_flow_steering(Arc::clone(&self.flow_steering)))
                     })
@@ -499,6 +512,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
                             Arc::clone(&self.initialization_state),
                             Some(Arc::clone(&self.ephemeral_ports)),
                             Arc::clone(&self.active_conns),
+                    Arc::clone(&self.shutdown),
                         ).with_flow_steering(Arc::clone(&self.flow_steering))
                     )
                 })
@@ -826,6 +840,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                         initialization_state: Arc::clone(&self.0.initialization_state),
                         flow_steering: Arc::clone(&self.0.flow_steering),
                         active_conns: Arc::clone(&self.0.active_conns),
+                        shutdown: Arc::clone(&self.0.shutdown),
                     };
 
                     Ok(Box::pin(futures_util::stream::try_unfold(state, |state| {
@@ -849,6 +864,11 @@ impl DatapathConnectionMigrator for DpdkInlineReqChunnel {
     /// Get a description of the currently active connections.
     fn active_connections(&self) -> Vec<ActiveConnection> {
         self.0.active_connections()
+    }
+
+    fn shut_down(&mut self) -> Result<(), Report> {
+        self.0.do_shutdown();
+        Ok(())
     }
 
     /// Construct connection state (and connection objects) corresponding to the provided set of
@@ -893,6 +913,7 @@ struct StreamState {
     initialization_state: Arc<Mutex<DpdkInitState>>,
     flow_steering: Arc<Mutex<FlowSteering>>,
     active_conns: Arc<Mutex<HashSet<ActiveConnection>>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Drop for StreamState {
@@ -948,6 +969,7 @@ impl StreamState {
                                 Arc::clone(&self.initialization_state),
                                 None,
                                 Arc::clone(&self.active_conns),
+                                Arc::clone(&self.shutdown),
                             )
                             .with_closed_notification(self.conn_closed_notifier.clone());
                             return Ok(Some((cn, self)));
@@ -991,6 +1013,7 @@ impl StreamState {
                                 Arc::clone(&self.initialization_state),
                                 None,
                                 Arc::clone(&self.active_conns),
+                                Arc::clone(&self.shutdown),
                             )
                             .with_closed_notification(self.conn_closed_notifier.clone()),
                         )

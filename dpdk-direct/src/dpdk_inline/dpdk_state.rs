@@ -8,8 +8,8 @@ use dpdk_wrapper::{
 };
 use eui48::MacAddress;
 use flume::Sender;
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::{collections::VecDeque, sync::atomic::AtomicBool};
 use tracing::{debug, trace, warn};
 
 /// A message from DPDK.

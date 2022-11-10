@@ -76,10 +76,10 @@ impl DpdkUdpSkChunnel {
             .collect()
     }
 
-    fn shut_down(&self) {
+    fn do_shutdown(&self) {
         self.handle.shutdown();
         loop {
-            let mut rt_guard = RUNTIME_HANDLE
+            let rt_guard = RUNTIME_HANDLE
                 .lock()
                 .expect("Runtime lock acquisition failure is critical");
             if rt_guard.is_none() {
@@ -155,7 +155,7 @@ impl DatapathConnectionMigrator for DpdkUdpSkChunnel {
     }
 
     fn shut_down(&mut self) -> Result<(), Report> {
-        self.shut_down();
+        self.do_shutdown();
         Ok(())
     }
 
@@ -374,7 +374,7 @@ impl DatapathConnectionMigrator for DpdkUdpReqChunnel {
     }
 
     fn shut_down(&mut self) -> Result<(), Report> {
-        self.0.shut_down();
+        self.0.do_shutdown();
         Ok(())
     }
 
