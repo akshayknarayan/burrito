@@ -1,4 +1,4 @@
-use ahash::AHashMap as HashMap;
+use ahash::HashMap;
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{
     bindings::*,
@@ -8,8 +8,8 @@ use dpdk_wrapper::{
 };
 use eui48::MacAddress;
 use flume::Sender;
-use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::{collections::VecDeque, sync::atomic::AtomicBool};
 use tracing::{debug, trace, warn};
 
 /// A message from DPDK.
@@ -69,6 +69,19 @@ pub struct DpdkState {
 
 // SAFETY: rte_mempools should be ok to pass between threads.
 unsafe impl Send for DpdkState {}
+
+impl Drop for DpdkState {
+    fn drop(&mut self) {
+        // drop all buffered packets since they contain pointers into the mempool we're about to
+        // free.
+        std::mem::drop(std::mem::take(&mut self.rx_packets_for_ports));
+        std::mem::drop(std::mem::take(&mut self.rx_recv_buf));
+
+        unsafe {
+            rte_mempool_free(self.mbuf_pool);
+        }
+    }
+}
 
 impl DpdkState {
     /// Do global initialization.
@@ -137,6 +150,19 @@ impl DpdkState {
                 ip_id: 0,
             })
             .collect())
+    }
+
+    // The only per-flow thing we need to initialize is self.register_flow_buffer(). Flow steering
+    // will be managed at a higher level.
+    pub fn init_accepted(
+        &mut self,
+        flows: impl IntoIterator<Item = (u16, SocketAddrV4)>,
+    ) -> Result<(), Report> {
+        for (local_port, remote_addr) in flows {
+            self.register_flow_buffer(local_port, remote_addr);
+        }
+
+        Ok(())
     }
 
     pub fn rx_queue_id(&self) -> usize {
@@ -350,8 +376,9 @@ impl DpdkState {
                         debug!(?dst_port, ?pkt_src_addr, "created new stash for connection");
                         // signal new connection.
                         if let Some(nc) = new_conns {
-                            nc.send(pkt_src_addr)
-                                .wrap_err("New connection channel send failed")?;
+                            if let Err(err) = nc.send(pkt_src_addr) {
+                                debug!(?pkt_src_addr, ?err, "New connection channel send failed");
+                            }
                         }
                     } else {
                         // else !found_dst_port, which means no one was listening and we can drop.
