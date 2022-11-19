@@ -7,3 +7,4 @@ mod dpdk_inline;
 pub use dpdk_inline::{DpdkInlineChunnel, DpdkInlineCn, DpdkInlineReqChunnel};
 
 mod switcher;
+pub use switcher::*;
