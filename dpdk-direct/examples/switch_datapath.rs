@@ -5,7 +5,6 @@ use futures_util::Stream;
 use futures_util::{future::Either, TryStreamExt};
 use quanta::Instant;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use structopt::StructOpt;
 use tracing::{debug, debug_span, error, info, info_span, instrument, trace};
@@ -28,10 +27,16 @@ struct Opt {
     ip_addr: Option<std::net::Ipv4Addr>,
 
     #[structopt(short, long)]
-    datapath_cfg: std::path::PathBuf,
+    config: std::path::PathBuf,
+
+    #[structopt(long)]
+    datapath_choice: DpdkDatapathChoice,
 
     #[structopt(short, long)]
-    init_dp_choice: DpdkDatapathChoice,
+    swap_delay_msgs: usize,
+
+    #[structopt(short, long)]
+    swap_to: DpdkDatapathChoice,
 }
 
 fn main() -> Result<(), Report> {
@@ -39,7 +44,7 @@ fn main() -> Result<(), Report> {
     tracing_subscriber::fmt::init();
     let mut opt = Opt::from_args();
 
-    match &mut opt.init_dp_choice {
+    match &mut opt.datapath_choice {
         DpdkDatapathChoice::Inline {
             ref mut num_threads,
         } if *num_threads == 0 => {
@@ -57,12 +62,11 @@ fn main() -> Result<(), Report> {
             "Dpdk Inline Chunnel Test - Client"
         );
 
-        let ch = DpdkDatapath::new(opt.datapath_cfg, opt.init_dp_choice)?;
-        let ch = Arc::new(Mutex::new(ch));
+        let mut ch = DpdkDatapath::new(opt.config, opt.datapath_choice)?;
 
         let mut jhs = Vec::with_capacity(opt.threads);
         for thread in 1..opt.threads {
-            let ch = Arc::clone(&ch);
+            let mut ch = ch.clone();
             let jh = std::thread::spawn(move || {
                 let thread_span = debug_span!("thread", ?thread);
                 let _thread_span_g = thread_span.enter();
@@ -72,11 +76,7 @@ fn main() -> Result<(), Report> {
                     .enable_all()
                     .build()?;
                 rt.block_on(async move {
-                    let cn = {
-                        let mut ch_g = ch.lock().unwrap();
-                        ch_g.connect(remote_addr).await?
-                    };
-
+                    let cn = ch.connect(remote_addr).await?;
                     client(cn, opt.num_msgs / opt.threads, interarrival, remote_addr).await
                 })?;
                 Ok::<_, Report>(thread)
@@ -91,11 +91,7 @@ fn main() -> Result<(), Report> {
             .enable_all()
             .build()?;
         rt.block_on(async move {
-            let cn = {
-                let mut ch_g = ch.lock().unwrap();
-                ch_g.connect(remote_addr).await?
-            };
-
+            let cn = ch.connect(remote_addr).await?;
             client(cn, opt.num_msgs / opt.threads, interarrival, remote_addr).await
         })?;
         std::mem::drop(thread_span_g);
@@ -117,25 +113,19 @@ fn main() -> Result<(), Report> {
     } else {
         let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, opt.port));
         info!(?local_addr, "Dpdk Inline Chunnel Test - Server");
-        let ch = DpdkDatapath::new(opt.datapath_cfg, opt.init_dp_choice)?;
-        let ch = DpdkReqDatapath::from(ch);
-        let ch = Arc::new(Mutex::new(ch));
+        let ch = DpdkDatapath::new(opt.config, opt.datapath_choice)?;
+        let mut ch = DpdkReqDatapath::from(ch);
 
         for thread in 1..opt.threads {
             debug!(?thread, "spawning thread");
-            let ch = Arc::clone(&ch);
+            let mut ch = ch.clone();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
                 rt.block_on(async move {
-                    let cn_stream_fut = {
-                        let mut ch_g = ch.lock().unwrap();
-                        ch_g.listen(local_addr)
-                    };
-
                     debug!(?thread, "awaiting stream future");
-                    let stream = match cn_stream_fut.await {
+                    let stream = match ch.listen(local_addr).await {
                         Err(err) => {
                             error!(?err, "failed to get connection stream");
                             return Err(err);
@@ -153,12 +143,8 @@ fn main() -> Result<(), Report> {
             .build()?;
         rt.block_on(async move {
             debug!(thread = 0, "using main tokio thread");
-            let stream_fut = {
-                let mut ch_g = ch.lock().unwrap();
-                ch_g.listen(local_addr)
-            };
-
-            let stream = stream_fut
+            let stream = ch
+                .listen(local_addr)
                 .await
                 .wrap_err("failed to get connection stream")?;
             server(stream, 0).await
