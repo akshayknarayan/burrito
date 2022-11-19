@@ -1,13 +1,14 @@
-use ahash::{HashMap, HashSet};
+use ahash::HashMap;
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{
     bindings::{get_lcore_id, get_lcore_map},
     wrapper::{affinitize_thread, FlowSteeringHandle},
 };
+use eui48::MacAddress;
 use flume::{Receiver, Sender};
-use futures_util::future::ready;
 use futures_util::Stream;
+use futures_util::{future::ready, stream::once};
 use futures_util::{future::Ready, stream::Once};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -112,8 +113,6 @@ pub struct DpdkInlineChunnel {
     // we need to manage single-queue vs rss flow steering rules based on how many flows are
     // listening on the port.
     flow_steering: Arc<Mutex<FlowSteering>>,
-    // container of active flows.
-    active_conns: Arc<Mutex<HashSet<ActiveConnection>>>,
     // once set to true, `DpdkState`s will self-destruct.
     shutdown: Arc<AtomicBool>,
 }
@@ -141,6 +140,43 @@ impl DpdkInlineChunnel {
     /// Otherwise we might run out of mempools.
     pub fn new(config_path: PathBuf, num_dpdk_threads: usize) -> Result<Self, Report> {
         let dpdks = DpdkState::new(config_path, num_dpdk_threads)?;
+        Self::do_new(dpdks, num_dpdk_threads)
+    }
+
+    pub(crate) fn get_cfg(&self) -> (Ipv4Addr, HashMap<Ipv4Addr, MacAddress>) {
+        let x = DPDK_STATE.try_with(|dpdk_cell| {
+            let dpdk_opt = dpdk_cell.borrow_mut();
+            let dpdk = dpdk_opt
+                .as_ref()
+                .ok_or(eyre!("dpdk not initialized on core"))?;
+            Ok::<_, Report>(dpdk.get_cfg())
+        });
+
+        match x {
+            Err(_) | Ok(Err(_)) => {
+                let init_g = self.initialization_state.lock().unwrap();
+                if !init_g.mempools.is_empty() {
+                    init_g.mempools[0].get_cfg()
+                } else {
+                    panic!(
+                        "Could not find either thread-local dpdk state or unclaimed dpdk state."
+                    );
+                }
+            }
+            Ok(Ok(x)) => x,
+        }
+    }
+
+    pub fn new_preconfig(
+        ip_addr: Ipv4Addr,
+        arp_table: HashMap<Ipv4Addr, MacAddress>,
+        num_dpdk_threads: usize,
+    ) -> Result<Self, Report> {
+        let dpdks = DpdkState::new_preconfig(ip_addr, arp_table, num_dpdk_threads)?;
+        Self::do_new(dpdks, num_dpdk_threads)
+    }
+
+    fn do_new(dpdks: Vec<DpdkState>, num_dpdk_threads: usize) -> Result<Self, Report> {
         let lcore_map = get_lcore_map().wrap_err("Could not fetch DPDK lcore map")?;
         debug!(?lcore_map, "got lcore map");
         ensure!(
@@ -157,18 +193,8 @@ impl DpdkInlineChunnel {
             })),
             ephemeral_ports: Arc::new(Mutex::new((4096..16_384).collect())),
             flow_steering: Default::default(),
-            active_conns: Default::default(),
             shutdown: Default::default(),
         })
-    }
-
-    fn active_connections(&self) -> Vec<ActiveConnection> {
-        self.active_conns
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|x| *x)
-            .collect()
     }
 
     fn do_shutdown(&self) {
@@ -224,11 +250,6 @@ impl DpdkInlineChunnel {
                 ActiveConnection::UnConnected { local_port } => (local_port, None),
             };
 
-            {
-                let mut active_conns = this.active_conns.lock().unwrap();
-                active_conns.insert(c);
-            } // drop active_conns lock
-
             // it's ok if the port is already taken out of ephemeral_ports as long as
             // `remote_addr` is Some(_), since there can be many connected addresses on an
             // accept() port.
@@ -268,7 +289,7 @@ impl DpdkInlineChunnel {
                         conn_closed_listener,
                         initialization_state: Arc::clone(&this.initialization_state),
                         flow_steering: Arc::clone(&this.flow_steering),
-                        active_conns: Arc::clone(&this.active_conns),
+                        conn_count: 0,
                         shutdown: Arc::clone(&this.shutdown),
                     }
                 });
@@ -283,7 +304,6 @@ impl DpdkInlineChunnel {
                     Some(new_conn_notifier.clone()),
                     Arc::clone(&this.initialization_state),
                     Some(Arc::clone(&this.ephemeral_ports)),
-                    Arc::clone(&this.active_conns),
                     Arc::clone(&this.shutdown),
                 )
                 .with_closed_notification(conn_closed_notifier.clone());
@@ -297,7 +317,6 @@ impl DpdkInlineChunnel {
                     None,
                     Arc::clone(&this.initialization_state),
                     Some(Arc::clone(&this.ephemeral_ports)),
-                    Arc::clone(&this.active_conns),
                     Arc::clone(&this.shutdown),
                 )
                 .with_flow_steering(Arc::clone(&this.flow_steering));
@@ -330,17 +349,67 @@ impl DpdkInlineChunnel {
             })
         })
     }
+
+    pub fn do_listen_non_accept(&mut self, addr: SocketAddr) -> Result<DpdkInlineCn, Report> {
+        let a = match addr {
+            SocketAddr::V4(a) => a,
+            _ => bail!("Only IPv4 is supported: {:?}", addr),
+        };
+
+        try_init_thread(self.initialization_state.as_ref()).and_then(|_| {
+            let mut ports = self.ephemeral_ports.lock().unwrap();
+            let mut found = false;
+            for i in 0..ports.len() {
+                if ports[i] == a.port() {
+                    ports.swap_remove(i);
+                    found = true;
+                    break;
+                }
+            }
+
+            ensure!(
+                found,
+                "Tried to listen on port that is already in use: {:?}",
+                a.port()
+            );
+
+            DPDK_STATE.with(|dpdk_cell| {
+                let this_lcore = get_lcore_id();
+                let mut dpdk_opt = dpdk_cell.borrow_mut();
+                let dpdk = dpdk_opt
+                    .as_mut()
+                    .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+
+                if let Err(err) = {
+                    let mut steering_g = self.flow_steering.lock().unwrap();
+                    steering_g.add_flow(dpdk, a.port())
+                } {
+                    warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
+                }
+
+                dpdk.register_flow_buffer(
+                    a.port(),
+                    SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+                );
+
+                Ok(DpdkInlineCn::new(
+                    a.port(),
+                    None,
+                    None,
+                    Arc::clone(&self.initialization_state),
+                    Some(Arc::clone(&self.ephemeral_ports)),
+                    Arc::clone(&self.shutdown),
+                )
+                .with_flow_steering(Arc::clone(&self.flow_steering)))
+            })
+        })
+    }
 }
 
 impl DatapathConnectionMigrator for DpdkInlineChunnel {
     type Conn = DpdkInlineCn;
     type Stream = futures_util::stream::Empty<Result<Self::Conn, Self::Error>>;
     type Error = Report;
-
-    /// Get a description of the currently active connections.
-    fn active_connections(&self) -> Vec<ActiveConnection> {
-        self.active_connections()
-    }
 
     fn shut_down(&mut self) -> Result<(), Report> {
         self.do_shutdown();
@@ -406,62 +475,11 @@ impl ChunnelListener for DpdkInlineChunnel {
     type Error = Report;
 
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
-        use SocketAddr::*;
-        ready(match addr {
-            V4(a) => Ok(futures_util::stream::once(ready(
-                try_init_thread(self.initialization_state.as_ref()).and_then(|_| {
-                    let mut ports = self.ephemeral_ports.lock().unwrap();
-                    let mut found = false;
-                    for i in 0..ports.len() {
-                        if ports[i] == a.port() {
-                            ports.swap_remove(i);
-                            found = true;
-                            break;
-                        }
-                    }
-
-                    ensure!(
-                        found,
-                        "Tried to listen on port that is already in use: {:?}",
-                        a.port()
-                    );
-
-                    self.active_conns.lock().unwrap().insert(ActiveConnection::UnConnected { local_port: a.port() });
-
-                    DPDK_STATE.with(|dpdk_cell| {
-                        let this_lcore = get_lcore_id();
-                        let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-
-                        if let Err(err) = {
-                            let mut steering_g = self.flow_steering.lock().unwrap();
-                            steering_g.add_flow(dpdk, a.port())
-                        } {
-                            warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
-                        }
-
-                        dpdk.register_flow_buffer(
-                            a.port(),
-                            SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
-                        );
-
-                        Ok(DpdkInlineCn::new(
-                            a.port(),
-                            None,
-                            None,
-                            Arc::clone(&self.initialization_state),
-                            Some(Arc::clone(&self.ephemeral_ports)),
-                            Arc::clone(&self.active_conns),
-                            Arc::clone(&self.shutdown),
-                        )
-                        .with_flow_steering(Arc::clone(&self.flow_steering)))
-                    })
-                }),
-            )) as _),
-            V6(a) => Err(eyre!("Only IPv4 is supported: {:?}", a)),
-        })
+        let res = self.do_listen_non_accept(addr);
+        match res {
+            Ok(r) => ready(Ok(once(ready(Ok(r))))),
+            Err(e) => ready(Err(e)),
+        }
     }
 }
 
@@ -497,7 +515,6 @@ impl ChunnelConnector for DpdkInlineChunnel {
                         warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                     }
 
-                    self.active_conns.lock().unwrap().insert(ActiveConnection::UnConnected { local_port: port });
 
                     dpdk.register_flow_buffer(
                         port,
@@ -511,8 +528,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
                             None,
                             Arc::clone(&self.initialization_state),
                             Some(Arc::clone(&self.ephemeral_ports)),
-                            Arc::clone(&self.active_conns),
-                    Arc::clone(&self.shutdown),
+                            Arc::clone(&self.shutdown),
                         ).with_flow_steering(Arc::clone(&self.flow_steering))
                     )
                 })
@@ -529,7 +545,6 @@ pub struct DpdkInlineCn {
     remote_addr: Option<SocketAddrV4>,
     new_conns: Option<Sender<SocketAddrV4>>,
     port_pool: Option<Arc<Mutex<Vec<u16>>>>,
-    active_conns: Arc<Mutex<HashSet<ActiveConnection>>>,
     flow_steering: Option<Arc<Mutex<FlowSteering>>>,
     closed: Option<Sender<()>>,
     shutdown: Arc<AtomicBool>,
@@ -589,21 +604,6 @@ impl Drop for DpdkInlineCn {
             warn!(?err, "DPDK_STATE thread local access error");
         }
 
-        let desc = if let Some(rem) = self.remote_addr {
-            ActiveConnection::Connected {
-                local_port: self.local_port,
-                remote_addr: rem,
-            }
-        } else {
-            ActiveConnection::UnConnected {
-                local_port: self.local_port,
-            }
-        };
-
-        if !self.active_conns.lock().unwrap().remove(&desc) {
-            warn!(?desc, "Active connection descriptor not found");
-        }
-
         // put our claimed port back
         if let Some(pool) = &self.port_pool {
             pool.lock().unwrap().push(self.local_port);
@@ -624,7 +624,6 @@ impl DpdkInlineCn {
         new_conns: Option<Sender<SocketAddrV4>>,
         init_state: Arc<Mutex<DpdkInitState>>,
         port_pool: Option<Arc<Mutex<Vec<u16>>>>,
-        active_conns: Arc<Mutex<HashSet<ActiveConnection>>>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -632,7 +631,6 @@ impl DpdkInlineCn {
             remote_addr,
             new_conns,
             port_pool,
-            active_conns,
             shutdown,
             flow_steering: None,
             closed: None,
@@ -796,7 +794,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
     type Connection = DpdkInlineCn;
     type Future = futures_util::future::Ready<Result<Self::Stream, Report>>;
     type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + Sync + 'static>>;
     type Error = Report;
 
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
@@ -839,7 +837,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                         conn_closed_listener,
                         initialization_state: Arc::clone(&self.0.initialization_state),
                         flow_steering: Arc::clone(&self.0.flow_steering),
-                        active_conns: Arc::clone(&self.0.active_conns),
+                        conn_count: 0,
                         shutdown: Arc::clone(&self.0.shutdown),
                     };
 
@@ -858,13 +856,9 @@ impl ChunnelListener for DpdkInlineReqChunnel {
 
 impl DatapathConnectionMigrator for DpdkInlineReqChunnel {
     type Conn = DpdkInlineCn;
-    type Stream = Pin<Box<dyn Stream<Item = Result<Self::Conn, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Conn, Self::Error>> + Send + Sync + 'static>>;
     type Error = Report;
-
-    /// Get a description of the currently active connections.
-    fn active_connections(&self) -> Vec<ActiveConnection> {
-        self.0.active_connections()
-    }
 
     fn shut_down(&mut self) -> Result<(), Report> {
         self.0.do_shutdown();
@@ -912,7 +906,7 @@ struct StreamState {
     conn_closed_listener: Receiver<()>,
     initialization_state: Arc<Mutex<DpdkInitState>>,
     flow_steering: Arc<Mutex<FlowSteering>>,
-    active_conns: Arc<Mutex<HashSet<ActiveConnection>>>,
+    conn_count: usize,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -934,10 +928,9 @@ impl Drop for StreamState {
 }
 
 impl StreamState {
-    async fn get_next(self) -> Result<Option<(DpdkInlineCn, Self)>, Report> {
+    async fn get_next(mut self) -> Result<Option<(DpdkInlineCn, Self)>, Report> {
         loop {
-            let conn_count = self.active_conns.lock().unwrap().len();
-            if conn_count == 0 {
+            if self.conn_count == 0 {
                 debug!(addr = ?self.listen_addr, "DpdkInlineReqChunnel listen stream poll for first packet");
                 loop {
                     // we initialized dpdk on this thread, so `.with` is fine instead of `.try_with`.
@@ -955,20 +948,13 @@ impl StreamState {
                     match self.new_conn_listener.try_recv() {
                         Ok(addr) => {
                             debug!(?addr, "DpdkInlineReqChunnel found first connection");
-                            self.active_conns
-                                .lock()
-                                .unwrap()
-                                .insert(ActiveConnection::Connected {
-                                    local_port: self.listen_addr.port(),
-                                    remote_addr: addr,
-                                });
+                            self.conn_count += 1;
                             let cn = DpdkInlineCn::new(
                                 self.listen_addr.port(),
                                 Some(addr),
                                 Some(self.new_conn_notifier.clone()),
                                 Arc::clone(&self.initialization_state),
                                 None,
-                                Arc::clone(&self.active_conns),
                                 Arc::clone(&self.shutdown),
                             )
                             .with_closed_notification(self.conn_closed_notifier.clone());
@@ -983,7 +969,7 @@ impl StreamState {
                 }
             } else {
                 debug!(
-                    ?conn_count,
+                    conn_count = ?self.conn_count,
                     "DpdkInlineReqChunnel listen stream wait for connection signal"
                 );
                 // When a connection closes, it lets us know so we can check whether it was the
@@ -998,13 +984,7 @@ impl StreamState {
                     // An existing conection found a new flow.
                     Either::Left((Ok(addr), _)) => {
                         debug!(?addr, "DpdkInlineReqChunnel returning new connection");
-                        self.active_conns
-                            .lock()
-                            .unwrap()
-                            .insert(ActiveConnection::Connected {
-                                local_port: self.listen_addr.port(),
-                                remote_addr: addr,
-                            });
+                        self.conn_count += 1;
                         Some(
                             DpdkInlineCn::new(
                                 self.listen_addr.port(),
@@ -1012,14 +992,16 @@ impl StreamState {
                                 Some(self.new_conn_notifier.clone()),
                                 Arc::clone(&self.initialization_state),
                                 None,
-                                Arc::clone(&self.active_conns),
                                 Arc::clone(&self.shutdown),
                             )
                             .with_closed_notification(self.conn_closed_notifier.clone()),
                         )
                     }
                     // A flow exited. We have to check if we are the only one left.
-                    Either::Right((Ok(_), _)) => None,
+                    Either::Right((Ok(_), _)) => {
+                        self.conn_count -= 1;
+                        None
+                    }
                     Either::Left((Err(err), _)) | Either::Right((Err(err), _)) => {
                         // since this loop keeps a sender, it should not be possible for the
                         // receiver to disconnect.

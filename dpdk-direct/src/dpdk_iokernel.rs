@@ -1,12 +1,14 @@
 use crate::switcher::{ActiveConnection, DatapathConnectionMigrator, LoadedConnections};
-use ahash::{HashMap, HashSet};
+use ahash::HashMap;
 use bertha::{either::Either, ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
+use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{BoundDpdkConn, DpdkConn, DpdkIoKernel, DpdkIoKernelHandle};
+use eui48::MacAddress;
 use flume::Receiver;
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::future::{ready, Ready};
+use futures_util::stream::{once, Once, Stream, StreamExt};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -42,10 +44,38 @@ fn iokernel_start(config: PathBuf) -> Result<DpdkIoKernelHandle, Report> {
     Ok(handle)
 }
 
+fn iokernel_restart(
+    ip_addr: Ipv4Addr,
+    arp_table: HashMap<Ipv4Addr, MacAddress>,
+) -> Result<DpdkIoKernelHandle, Report> {
+    let mut rt_guard = RUNTIME_HANDLE
+        .lock()
+        .expect("Runtime lock acquisition failure is critical");
+    if let Some(ref s) = *rt_guard {
+        return Ok(s.clone());
+    }
+
+    let (handle_s, handle_r) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (iokernel, handle) = DpdkIoKernel::new_configure_only(ip_addr, arp_table).unwrap();
+        handle_s.send(handle).unwrap();
+        iokernel.run();
+
+        // exit and shut down. need to clear out the out handle.
+        let mut rt_guard = RUNTIME_HANDLE
+            .lock()
+            .expect("Runtime lock acquisition failure is critical");
+        rt_guard.take();
+    });
+
+    let handle = handle_r.recv().wrap_err("Could not start DpdkIoKernel")?;
+    rt_guard.replace(handle.clone());
+    Ok(handle)
+}
+
 #[derive(Clone, Debug)]
 pub struct DpdkUdpSkChunnel {
     handle: DpdkIoKernelHandle,
-    active_conns: Arc<StdMutex<HashSet<ActiveConnection>>>,
 }
 
 struct LoadedConns {
@@ -57,23 +87,19 @@ impl DpdkUdpSkChunnel {
     pub fn new(config: impl AsRef<Path>) -> Result<Self, Report> {
         let config = config.as_ref().to_path_buf();
         let handle = iokernel_start(config)?;
-        Ok(Self {
-            handle,
-            active_conns: Default::default(),
-        })
+        Ok(Self { handle })
     }
 
-    fn new_conn(&self, cn: ActiveConnection) {
-        self.active_conns.lock().unwrap().insert(cn);
+    pub fn new_preconfig(
+        ip_addr: Ipv4Addr,
+        arp_table: HashMap<Ipv4Addr, MacAddress>,
+    ) -> Result<Self, Report> {
+        let handle = iokernel_restart(ip_addr, arp_table)?;
+        Ok(Self { handle })
     }
 
-    fn active_connections(&self) -> Vec<ActiveConnection> {
-        self.active_conns
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|x| *x)
-            .collect()
+    pub fn get_cfg(&self) -> (Ipv4Addr, HashMap<Ipv4Addr, MacAddress>) {
+        (self.handle.ip_addr(), self.handle.arp_table())
     }
 
     fn do_shutdown(&self) {
@@ -96,10 +122,7 @@ impl DpdkUdpSkChunnel {
             .map(|c| match c {
                 ActiveConnection::UnConnected { local_port } => {
                     let inner = self.handle.socket(Some(local_port))?;
-                    let cn = DpdkUdpSk {
-                        inner,
-                        active_conns: Arc::clone(&self.active_conns),
-                    };
+                    let cn = DpdkUdpSk { inner };
 
                     out.insert(c, Either::Left(cn));
                     Ok::<_, Report>(None)
@@ -128,10 +151,7 @@ impl DpdkUdpSkChunnel {
                         local_port,
                         remote_addr,
                     },
-                    Either::Right(BoundDpdkUdpSk {
-                        inner: conn,
-                        active_conns: Arc::clone(&self.active_conns),
-                    }),
+                    Either::Right(BoundDpdkUdpSk { inner: conn }),
                 );
             }
 
@@ -143,16 +163,23 @@ impl DpdkUdpSkChunnel {
             further_conns,
         })
     }
+
+    pub(crate) fn do_listen_non_accept(&mut self, addr: SocketAddr) -> Result<DpdkUdpSk, Report> {
+        let a = match addr {
+            SocketAddr::V4(a) => a,
+            _ => bail!("Only IPv4 is supported: {:?}", addr),
+        };
+
+        let inner = self.handle.socket(Some(a.port()))?;
+
+        Ok(DpdkUdpSk { inner })
+    }
 }
 
 impl DatapathConnectionMigrator for DpdkUdpSkChunnel {
     type Conn = Either<DpdkUdpSk, BoundDpdkUdpSk>;
     type Stream = futures_util::stream::Empty<Result<Self::Conn, Self::Error>>;
     type Error = Report;
-
-    fn active_connections(&self) -> Vec<ActiveConnection> {
-        self.active_connections()
-    }
 
     fn shut_down(&mut self) -> Result<(), Report> {
         self.do_shutdown();
@@ -168,6 +195,8 @@ impl DatapathConnectionMigrator for DpdkUdpSkChunnel {
             further_conns,
         } = self.load_connections(conns)?;
 
+        // `DpdkUdpSkChunnel` does not implement accept-style connections, only `DpdkUdpReqChunnel`
+        // does.
         ensure!(
             further_conns.is_empty(),
             "DpdkUdpSkChunnel should not have any accept-style connections"
@@ -183,32 +212,15 @@ impl DatapathConnectionMigrator for DpdkUdpSkChunnel {
 impl ChunnelListener for DpdkUdpSkChunnel {
     type Addr = SocketAddr;
     type Connection = DpdkUdpSk;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Future = Ready<Result<Self::Stream, Report>>;
+    type Stream = Once<Ready<Result<Self::Connection, Self::Error>>>;
     type Error = Report;
 
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
-        use SocketAddr::*;
-        match addr {
-            V4(a) => {
-                let sk = self.handle.socket(Some(a.port()));
-                self.new_conn(ActiveConnection::UnConnected {
-                    local_port: a.port(),
-                });
-                Box::pin(futures_util::future::ready(Ok(
-                    Box::pin(futures_util::stream::once(futures_util::future::ready(
-                        sk.map(|inner| DpdkUdpSk {
-                            inner,
-                            active_conns: Arc::clone(&self.active_conns),
-                        }),
-                    ))) as _,
-                )))
-            }
-            V6(a) => Box::pin(futures_util::future::ready(Err(eyre!(
-                "Only IPv4 is supported: {:?}",
-                a
-            )))),
+        let res = self.do_listen_non_accept(addr);
+        match res {
+            Ok(r) => ready(Ok(once(ready(Ok(r))))),
+            Err(e) => ready(Err(e)),
         }
     }
 }
@@ -220,26 +232,18 @@ impl ChunnelConnector for DpdkUdpSkChunnel {
     type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
-        let sk = self.handle.socket(None).map(|inner| DpdkUdpSk {
-            inner,
-            active_conns: Arc::clone(&self.active_conns),
-        });
+        let sk = self.handle.socket(None).map(|inner| DpdkUdpSk { inner });
         futures_util::future::ready(sk)
     }
 }
 
 pub struct DpdkUdpSk {
     inner: DpdkConn,
-    active_conns: Arc<StdMutex<HashSet<ActiveConnection>>>,
 }
 
-impl Drop for DpdkUdpSk {
-    fn drop(&mut self) {
-        let desc = ActiveConnection::UnConnected {
-            local_port: self.inner.get_port(),
-        };
-
-        self.active_conns.lock().unwrap().remove(&desc);
+impl DpdkUdpSk {
+    pub fn local_port(&self) -> u16 {
+        self.inner.get_port()
     }
 }
 
@@ -282,23 +286,21 @@ impl ChunnelConnection for DpdkUdpSk {
 
 pub struct BoundDpdkUdpSk {
     inner: BoundDpdkConn,
-    active_conns: Arc<StdMutex<HashSet<ActiveConnection>>>,
+}
+
+impl BoundDpdkUdpSk {
+    pub fn local_port(&self) -> u16 {
+        self.inner.port()
+    }
+
+    pub fn remote_addr(&self) -> SocketAddrV4 {
+        self.inner.remote_addr()
+    }
 }
 
 impl std::fmt::Debug for BoundDpdkUdpSk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BoundDpdkUdpSk").finish()
-    }
-}
-
-impl Drop for BoundDpdkUdpSk {
-    fn drop(&mut self) {
-        let desc = ActiveConnection::Connected {
-            local_port: self.inner.port(),
-            remote_addr: self.inner.remote_addr(),
-        };
-
-        self.active_conns.lock().unwrap().remove(&desc);
     }
 }
 
@@ -341,7 +343,7 @@ impl ChunnelListener for DpdkUdpReqChunnel {
     type Connection = BoundDpdkUdpSk;
     type Future = futures_util::future::Ready<Result<Self::Stream, Self::Error>>;
     type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + Sync + 'static>>;
     type Error = Report;
 
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
@@ -349,14 +351,11 @@ impl ChunnelListener for DpdkUdpReqChunnel {
         match addr {
             V4(a) => {
                 let sk = self.0.handle.accept(a.port());
-                let active_conns = Arc::clone(&self.0.active_conns);
                 futures_util::future::ready(sk.map(move |s| {
-                    Box::pin(s.into_stream().map(move |inner| {
-                        Ok(BoundDpdkUdpSk {
-                            inner,
-                            active_conns: Arc::clone(&active_conns),
-                        })
-                    })) as _
+                    Box::pin(
+                        s.into_stream()
+                            .map(move |inner| Ok(BoundDpdkUdpSk { inner })),
+                    ) as _
                 }))
             }
             V6(a) => futures_util::future::ready(Err(eyre!("Only IPv4 is supported: {:?}", a))),
@@ -366,12 +365,9 @@ impl ChunnelListener for DpdkUdpReqChunnel {
 
 impl DatapathConnectionMigrator for DpdkUdpReqChunnel {
     type Conn = Either<DpdkUdpSk, BoundDpdkUdpSk>;
-    type Stream = Pin<Box<dyn Stream<Item = Result<Self::Conn, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Conn, Self::Error>> + Send + Sync + 'static>>;
     type Error = Report;
-
-    fn active_connections(&self) -> Vec<ActiveConnection> {
-        self.0.active_connections()
-    }
 
     fn shut_down(&mut self) -> Result<(), Report> {
         self.0.do_shutdown();
@@ -390,15 +386,13 @@ impl DatapathConnectionMigrator for DpdkUdpReqChunnel {
         let accept_streams = further_conns
             .into_iter()
             .map(|(port, further_conns_on_port)| {
-                let active_conns = Arc::clone(&self.0.active_conns);
                 (
                     port,
-                    Box::pin(further_conns_on_port.into_stream().map(move |inner| {
-                        Ok(Either::Right(BoundDpdkUdpSk {
-                            inner,
-                            active_conns: Arc::clone(&active_conns),
-                        }))
-                    })) as _,
+                    Box::pin(
+                        further_conns_on_port
+                            .into_stream()
+                            .map(move |inner| Ok(Either::Right(BoundDpdkUdpSk { inner }))),
+                    ) as _,
                 )
             })
             .collect();

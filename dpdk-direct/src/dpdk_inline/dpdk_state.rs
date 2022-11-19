@@ -117,6 +117,28 @@ impl DpdkState {
             mbuf_pools.len() == num_dpdk_threads,
             "Not enough mempools/queues initialized for requested number of threads"
         );
+        Self::do_new(ip_addr, arp_table, mbuf_pools, nb_ports)
+    }
+
+    pub fn new_preconfig(
+        ip_addr: Ipv4Addr,
+        arp_table: HashMap<Ipv4Addr, MacAddress>,
+        num_dpdk_threads: usize,
+    ) -> Result<Vec<Self>, Report> {
+        let (mbuf_pools, nb_ports) = dpdk_configure(num_dpdk_threads)?;
+        ensure!(
+            mbuf_pools.len() == num_dpdk_threads,
+            "Not enough mempools/queues initialized for requested number of threads"
+        );
+        Self::do_new(ip_addr, arp_table, mbuf_pools, nb_ports)
+    }
+
+    fn do_new(
+        ip_addr: Ipv4Addr,
+        arp_table: HashMap<Ipv4Addr, MacAddress>,
+        mbuf_pools: Vec<*mut rte_mempool>,
+        nb_ports: u16,
+    ) -> Result<Vec<Self>, Report> {
         let port = nb_ports - 1;
 
         // what is my ethernet address (rte_ether_addr struct)
@@ -217,6 +239,10 @@ impl DpdkState {
 
     pub fn eth_stats(&self) -> Result<rte_eth_stats, Report> {
         unsafe { get_eth_stats(self.port) }
+    }
+
+    pub(crate) fn get_cfg(&self) -> (Ipv4Addr, HashMap<Ipv4Addr, MacAddress>) {
+        (self.ip_addr, self.arp_table.clone())
     }
 
     fn curr_num_stashed(&self) -> usize {
