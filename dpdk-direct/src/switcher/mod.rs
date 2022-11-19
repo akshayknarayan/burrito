@@ -310,8 +310,18 @@ pub struct DpdkReqDatapath {
     acceptors: HashMap<u16, Sender<ReqDatapathStream>>,
 }
 
+impl From<DpdkDatapath> for DpdkReqDatapath {
+    fn from(inner: DpdkDatapath) -> Self {
+        DpdkReqDatapath {
+            inner,
+            conns: Default::default(),
+            acceptors: Default::default(),
+        }
+    }
+}
+
 impl DpdkReqDatapath {
-    fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
+    pub fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
         match (
             /* from */ &self.inner.curr_datapath,
             /* to */ choice,

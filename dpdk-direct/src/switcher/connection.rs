@@ -49,9 +49,27 @@ pub struct DatapathCn {
     pub(crate) swap_barrier: Arc<RwLock<Barrier>>,
 }
 
+impl Debug for DatapathCn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatapathCn")
+            .field("inner", &self.inner)
+            .field("swap_now", &self.wait_for_datapath_swap_now)
+            .field("barrier_cnt", &self.barrier_cnt)
+            .finish()
+    }
+}
+
 unsafe impl Sync for DatapathCn {}
 
 impl DatapathCn {
+    pub fn local_port(&self) -> u16 {
+        unsafe { (&*self.inner.get()).local_port() }
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddrV4> {
+        unsafe { (&*self.inner.get()).remote_addr() }
+    }
+
     /// Check if we should swap datapaths, and maybe do so.
     ///
     /// This function is synchronous because it is perfectly ok to block the current thread on
