@@ -118,7 +118,7 @@ pub struct DpdkDatapath {
 
     curr_datapath: DatapathInner,
     // need to keep track of connections so we can send updated `DatapathCnInner`s.
-    conns: HashMap<ActiveConnection, Sender<DatapathCnInner>>,
+    conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
     wait_for_datapath_swap_now: Arc<AtomicBool>,
     barrier_count: Arc<AtomicUsize>,
     swap_barrier: Arc<RwLock<Barrier>>,
@@ -179,7 +179,8 @@ impl DpdkDatapath {
             _ => return Ok(()),
         };
 
-        let conns = self.conns.keys().copied().collect();
+        let conns_g = self.conns.lock().unwrap();
+        let conns = conns_g.keys().copied().collect();
         self.curr_datapath.shut_down()?;
 
         // we can ignore accept_streams here because we have not implemented accept() style
@@ -194,7 +195,7 @@ impl DpdkDatapath {
                 } = new_ch.load_connections(conns)?;
 
                 // now need to replace the active connections in our set of active connections.
-                for (conn_desc, sender) in &self.conns {
+                for (conn_desc, sender) in conns_g.iter() {
                     let new_conn = new_conns
                         .remove(conn_desc)
                         .ok_or(eyre!("Did not find new connection for {:?}", conn_desc))?;
@@ -218,7 +219,7 @@ impl DpdkDatapath {
                     ..
                 } = new_ch.load_connections(conns)?;
 
-                for (conn_desc, sender) in &self.conns {
+                for (conn_desc, sender) in conns_g.iter() {
                     let new_conn = new_conns
                         .remove(conn_desc)
                         .ok_or(eyre!("Did not find new connection for {:?}", conn_desc))?;
@@ -261,7 +262,7 @@ impl ChunnelConnector for DpdkDatapath {
             };
 
             let (s, r) = flume::bounded(1);
-            this.conns.insert(
+            this.conns.lock().unwrap().insert(
                 ActiveConnection::UnConnected {
                     local_port: inner.local_port(),
                 },
@@ -300,7 +301,7 @@ impl ChunnelListener for DpdkDatapath {
             };
 
             let (s, r) = flume::bounded(1);
-            this.conns.insert(
+            this.conns.lock().unwrap().insert(
                 ActiveConnection::UnConnected {
                     local_port: inner.local_port(),
                 },
@@ -327,11 +328,11 @@ impl ChunnelListener for DpdkDatapath {
 type ReqDatapathStream =
     Pin<Box<dyn Stream<Item = Result<DatapathCn, Report>> + Send + Sync + 'static>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DpdkReqDatapath {
     inner: DpdkDatapath,
     conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
-    acceptors: HashMap<u16, Sender<ReqDatapathStream>>,
+    acceptors: Arc<Mutex<HashMap<u16, Sender<ReqDatapathStream>>>>,
 }
 
 impl From<DpdkDatapath> for DpdkReqDatapath {
@@ -397,7 +398,8 @@ impl DpdkReqDatapath {
                 for (acc_port, stream) in accept_streams.drain() {
                     let st = Box::pin(stream.map_ok(DatapathCnInner::Thread)) as _;
                     let st = self.adapt_inner_stream(st);
-                    self.acceptors
+                    let acceptors_g = self.acceptors.lock().unwrap();
+                    acceptors_g
                         .get(&acc_port)
                         .ok_or(eyre!("Did not find accept stream for {:?}", acc_port))?
                         .send(st)?;
@@ -433,7 +435,8 @@ impl DpdkReqDatapath {
                 for (acc_port, stream) in accept_streams.drain() {
                     let st = Box::pin(stream.map_ok(DatapathCnInner::Inline)) as _;
                     let st = self.adapt_inner_stream(st);
-                    self.acceptors
+                    let acceptors_g = self.acceptors.lock().unwrap();
+                    acceptors_g
                         .get(&acc_port)
                         .ok_or(eyre!("Did not find accept stream for {:?}", acc_port))?
                         .send(st)?;
@@ -523,7 +526,7 @@ impl ChunnelListener for DpdkReqDatapath {
 
             // stream updater
             let (s, r) = flume::bounded(1);
-            this.acceptors.insert(addr.port(), s);
+            this.acceptors.lock().unwrap().insert(addr.port(), s);
 
             Ok(UpgradeStream {
                 inner: st,
