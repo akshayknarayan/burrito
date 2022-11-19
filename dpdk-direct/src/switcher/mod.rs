@@ -47,6 +47,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     pin::Pin,
+    str::FromStr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Barrier, Mutex, RwLock},
     task::{Context, Poll},
@@ -77,6 +78,29 @@ impl DatapathInner {
 pub enum DpdkDatapathChoice {
     Thread,
     Inline { num_threads: usize },
+}
+
+impl FromStr for DpdkDatapathChoice {
+    type Err = Report;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let l = s.to_lowercase();
+        match l.chars().next().ok_or(eyre!("got empty string"))? {
+            't' => Ok(DpdkDatapathChoice::Thread),
+            'i' => {
+                let parts: Vec<&str> = l.split(':').collect();
+                if parts.len() == 1 {
+                    Ok(DpdkDatapathChoice::Inline { num_threads: 0 })
+                } else if parts.len() == 2 {
+                    let num_threads = parts[1].parse()?;
+                    Ok(DpdkDatapathChoice::Inline { num_threads })
+                } else {
+                    Err(eyre!("unknown specifier {:?}", s))
+                }
+            }
+            x => Err(eyre!("unknown specifier {:?}", x)),
+        }
+    }
 }
 
 std::thread_local! {
