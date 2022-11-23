@@ -1,6 +1,5 @@
 use ahash::HashMap;
 use color_eyre::Report;
-use futures_util::stream::Stream;
 use std::net::SocketAddrV4;
 
 /// A single active connection. Used in `DatapathConnectionMigrator`.
@@ -13,11 +12,6 @@ pub enum ActiveConnection {
         local_port: u16,
         remote_addr: SocketAddrV4,
     },
-}
-
-pub struct LoadedConnections<Conn, Stream> {
-    pub conns: HashMap<ActiveConnection, Conn>,
-    pub accept_streams: HashMap<u16, Stream>,
 }
 
 /// Transition connections between datapaths.
@@ -35,15 +29,14 @@ pub struct LoadedConnections<Conn, Stream> {
 /// (downtime ends)
 pub trait DatapathConnectionMigrator {
     type Conn;
-    type Stream: Stream<Item = Result<Self::Conn, Self::Error>>;
     type Error;
 
     fn shut_down(&mut self) -> Result<(), Report>;
 
     /// Construct connection state (and connection objects) corresponding to the provided set of
-    /// `ActiveConnection`s. Return `Self::Stream` corresponding to future connections.
+    /// `ActiveConnection`s.
     fn load_connections(
         &mut self,
         conns: Vec<ActiveConnection>,
-    ) -> Result<LoadedConnections<Self::Conn, Self::Stream>, Self::Error>;
+    ) -> Result<HashMap<ActiveConnection, Self::Conn>, Self::Error>;
 }

@@ -9,7 +9,7 @@ use std::{
     net::{SocketAddr, SocketAddrV4},
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
-    sync::{atomic::AtomicUsize, Arc, Barrier, RwLock},
+    sync::{Arc, Barrier, RwLock},
     task::{Context, Poll},
 };
 use tracing::debug;
@@ -46,7 +46,6 @@ pub struct DatapathCn {
     pub(crate) inner: UnsafeCell<DatapathCnInner>,
     pub(crate) wait_for_datapath_swap_now: Arc<AtomicBool>,
     pub(crate) new_datapath: Receiver<DatapathCnInner>,
-    pub(crate) barrier_cnt: Arc<AtomicUsize>,
     pub(crate) swap_barrier: Arc<RwLock<Barrier>>,
 }
 
@@ -77,16 +76,6 @@ impl DatapathCn {
     /// *know* that no one is currently using references to connection types, because we just
     /// barrier-synchronized on being ready to swap. Thus, swapping the pointer is ok.
     fn maybe_swap_datapath(&self) {
-        super::THIS_THREAD_ACTIVE.with(|is_active| {
-            let mut a = is_active.borrow_mut();
-            if !*a {
-                *a = true;
-                let cnt = self.barrier_cnt.fetch_add(1, Ordering::SeqCst);
-                let mut sb = self.swap_barrier.write().unwrap();
-                *sb = Barrier::new(cnt);
-            }
-        });
-
         if self.wait_for_datapath_swap_now.load(Ordering::SeqCst) {
             // it is important to wait on the barrier here because we need to make sure that our
             // various threads are using the same datapath!

@@ -36,7 +36,7 @@ use color_eyre::{
     Report,
 };
 use eui48::MacAddress;
-use flume::{Receiver, Sender};
+use flume::Sender;
 use futures_util::{
     future::{ready, Ready},
     stream::{once, Once, Stream, TryStreamExt},
@@ -50,7 +50,6 @@ use std::{
     str::FromStr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Barrier, Mutex, RwLock},
-    task::{Context, Poll},
 };
 use tracing::debug;
 
@@ -60,8 +59,11 @@ pub use migrator::*;
 mod connection;
 pub use connection::*;
 
+mod stream;
+use stream::*;
+
 #[derive(Clone, Debug)]
-enum DatapathInner {
+pub(crate) enum DatapathInner {
     Thread(DpdkUdpSkChunnel),
     Inline(DpdkInlineChunnel),
 }
@@ -160,57 +162,65 @@ impl DpdkDatapath {
         })
     }
 
-    /// 1. Get the active connections from OldDatapath
-    /// (downtime starts)
-    /// 2. Tear down OldDatapath.
-    /// 3. Start up NewDatapath
-    /// 4. Load connection state from (1) into NewDatapath
-    /// (downtime ends)
-    pub fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
+    /// Return `true` if we need to perform a transition and `false` otherwise.
+    fn check_do_transition(&self, choice: DpdkDatapathChoice) -> bool {
         match (/* from */ &self.curr_datapath, /* to */ choice) {
             (
                 /* from */ DatapathInner::Inline(_),
                 /* to */ DpdkDatapathChoice::Thread,
-            ) => (),
-            (
+            )
+            | (
                 /* from */ DatapathInner::Thread(_),
                 /* to */ DpdkDatapathChoice::Inline { .. },
-            ) => (),
-            _ => return Ok(()),
-        };
+            ) => true,
+            _ => false,
+        }
+    }
 
-        debug!(to = ?choice, "doing swap now");
-
+    /// Start the critical section.
+    ///
+    /// safety postcondition: any thread with send/recv operations is currently waiting in
+    /// `maybe_swap_datapath` on a channel recv from us, and is thus *not* accessing DPDK state.
+    /// we are about to tear down and replace that DPDK state, so it is important no one is using it.
+    ///
+    /// what about the *current thread*? It is not sending or receiving (since it is doing
+    /// this), but on the next send/recv operation it needs to perform the swap we are about to
+    /// send it via the channel.
+    fn wait_trigger_synchronize(&self) {
+        debug!("synchronizing now");
         // we must *immediately* set this AtomicBool so that any send/recv calls on other threads
         // that occur become synchronized on the setup happening on this thread.
         self.wait_for_datapath_swap_now
             .store(true, Ordering::SeqCst);
         self.swap_barrier.read().unwrap().wait();
+        debug!("synchronized");
+    }
 
-        debug!("transition synchronized");
+    fn transition_complete(&self) {
+        self.wait_for_datapath_swap_now
+            .store(false, Ordering::SeqCst);
+        debug!("done");
+    }
 
-        // safety condition: any thread with send/recv operations is currently waiting in
-        // `maybe_swap_datapath` on a channel recv from us, and is thus *not* accessing DPDK state.
-        // we are about to tear down and replace that DPDK state, so it is important no one is using it.
-        //
-        // what about the *current thread*? It is not sending or receiving (since it is doing
-        // this), but on the next send/recv operation it needs to perform the swap we are about to
-        // give it.
+    pub fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
+        if !self.check_do_transition(choice) {
+            return Ok(());
+        }
+
+        let _transition_span_g = tracing::debug_span!("datapath_transition", ?choice).entered();
+        self.wait_trigger_synchronize();
+        // begin critical synchronized section. Other threads will exit the critical section as we
+        // send() `new_ch`s to them.
+        self.curr_datapath.shut_down()?;
 
         let conns_g = self.conns.lock().unwrap();
         let conns = conns_g.keys().copied().collect();
-        self.curr_datapath.shut_down()?;
 
-        // we can ignore accept_streams here because we have not implemented accept() style
-        // connections, so there will be no streams.
         match choice {
             DpdkDatapathChoice::Thread => {
                 let mut new_ch =
                     DpdkUdpSkChunnel::new_preconfig(self.ip_addr, self.arp_table.clone())?;
-                let LoadedConnections {
-                    conns: mut new_conns,
-                    ..
-                } = new_ch.load_connections(conns)?;
+                let mut new_conns = new_ch.load_connections(conns)?;
                 self.curr_datapath = DatapathInner::Thread(new_ch);
 
                 // now need to replace the active connections in our set of active connections.
@@ -233,10 +243,7 @@ impl DpdkDatapath {
                     self.arp_table.clone(),
                     num_threads,
                 )?;
-                let LoadedConnections {
-                    conns: mut new_conns,
-                    ..
-                } = new_ch.load_connections(conns)?;
+                let mut new_conns = new_ch.load_connections(conns)?;
                 self.curr_datapath = DatapathInner::Inline(new_ch);
 
                 for (conn_desc, sender) in conns_g.iter() {
@@ -254,9 +261,8 @@ impl DpdkDatapath {
             }
         }
 
-        self.wait_for_datapath_swap_now
-            .store(false, Ordering::SeqCst);
-        debug!("transition done");
+        // critical section over.
+        self.transition_complete();
         Ok(())
     }
 }
@@ -286,11 +292,20 @@ impl ChunnelConnector for DpdkDatapath {
                 s,
             );
 
+            THIS_THREAD_ACTIVE.with(|is_active| {
+                let mut a = is_active.borrow_mut();
+                if !*a {
+                    *a = true;
+                    let cnt = this.barrier_count.fetch_add(1, Ordering::SeqCst);
+                    let mut sb = this.swap_barrier.write().unwrap();
+                    *sb = Barrier::new(cnt);
+                }
+            });
+
             Ok(DatapathCn {
                 inner: UnsafeCell::new(inner),
                 wait_for_datapath_swap_now: Arc::clone(&this.wait_for_datapath_swap_now),
                 new_datapath: r,
-                barrier_cnt: Arc::clone(&this.barrier_count),
                 swap_barrier: Arc::clone(&this.swap_barrier),
             })
         }
@@ -325,11 +340,20 @@ impl ChunnelListener for DpdkDatapath {
                 s,
             );
 
+            THIS_THREAD_ACTIVE.with(|is_active| {
+                let mut a = is_active.borrow_mut();
+                if !*a {
+                    *a = true;
+                    let cnt = this.barrier_count.fetch_add(1, Ordering::SeqCst);
+                    let mut sb = this.swap_barrier.write().unwrap();
+                    *sb = Barrier::new(cnt);
+                }
+            });
+
             Ok(DatapathCn {
                 inner: UnsafeCell::new(inner),
                 wait_for_datapath_swap_now: Arc::clone(&this.wait_for_datapath_swap_now),
                 new_datapath: r,
-                barrier_cnt: Arc::clone(&this.barrier_count),
                 swap_barrier: Arc::clone(&this.swap_barrier),
             })
         }
@@ -345,11 +369,17 @@ impl ChunnelListener for DpdkDatapath {
 type ReqDatapathStream =
     Pin<Box<dyn Stream<Item = Result<DatapathCn, Report>> + Send + Sync + 'static>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DpdkReqDatapath {
     inner: DpdkDatapath,
     conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
-    acceptors: Arc<Mutex<HashMap<u16, Sender<ReqDatapathStream>>>>,
+    acceptors: Arc<Mutex<HashMap<u16, Vec<Sender<DatapathInner>>>>>,
+}
+
+impl Debug for DpdkReqDatapath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DpdkReqDatapath").field(&self.inner).finish()
+    }
 }
 
 impl From<DpdkDatapath> for DpdkReqDatapath {
@@ -364,127 +394,25 @@ impl From<DpdkDatapath> for DpdkReqDatapath {
 
 impl DpdkReqDatapath {
     pub fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
-        match (
-            /* from */ &self.inner.curr_datapath,
-            /* to */ choice,
-        ) {
-            (
-                /* from */ DatapathInner::Inline(_),
-                /* to */ DpdkDatapathChoice::Thread,
-            ) => (),
-            (
-                /* from */ DatapathInner::Thread(_),
-                /* to */ DpdkDatapathChoice::Inline { .. },
-            ) => (),
-            _ => return Ok(()),
-        };
-
-        let conns_g = self.conns.lock().unwrap();
-
-        let conns = conns_g.keys().copied().collect();
-        self.inner.curr_datapath.shut_down()?;
-
-        match choice {
-            DpdkDatapathChoice::Thread => {
-                let mut new_ch = DpdkUdpReqChunnel(DpdkUdpSkChunnel::new_preconfig(
-                    self.inner.ip_addr,
-                    self.inner.arp_table.clone(),
-                )?);
-                let LoadedConnections {
-                    conns: mut new_conns,
-                    mut accept_streams,
-                } = new_ch.load_connections(conns)?;
-
-                // now need to replace the active connections in our set of active connections.
-                for (conn_desc, sender) in conns_g.iter() {
-                    let new_conn = new_conns
-                        .remove(conn_desc)
-                        .ok_or(eyre!("Did not find new connection for {:?}", conn_desc))?;
-                    sender.send(DatapathCnInner::Thread(new_conn))?;
-                }
-
-                ensure!(
-                    new_conns.is_empty(),
-                    "Did not find existing connections for {:?}",
-                    new_conns
-                );
-
-                std::mem::drop(conns_g);
-
-                // accept_streams
-                for (acc_port, stream) in accept_streams.drain() {
-                    let st = Box::pin(stream.map_ok(DatapathCnInner::Thread)) as _;
-                    let st = self.adapt_inner_stream(st);
-                    let acceptors_g = self.acceptors.lock().unwrap();
-                    acceptors_g
-                        .get(&acc_port)
-                        .ok_or(eyre!("Did not find accept stream for {:?}", acc_port))?
-                        .send(st)?;
-                }
-            }
-            DpdkDatapathChoice::Inline { num_threads } => {
-                let mut new_ch = DpdkInlineChunnel::new_preconfig(
-                    self.inner.ip_addr,
-                    self.inner.arp_table.clone(),
-                    num_threads,
-                )?;
-                let LoadedConnections {
-                    conns: mut new_conns,
-                    mut accept_streams,
-                } = new_ch.load_connections(conns)?;
-
-                for (conn_desc, sender) in conns_g.iter() {
-                    let new_conn = new_conns
-                        .remove(conn_desc)
-                        .ok_or(eyre!("Did not find new connection for {:?}", conn_desc))?;
-                    sender.send(DatapathCnInner::Inline(new_conn))?;
-                }
-
-                ensure!(
-                    new_conns.is_empty(),
-                    "Did not find existing connections for {:?}",
-                    new_conns
-                );
-
-                std::mem::drop(conns_g);
-
-                // accept_streams
-                for (acc_port, stream) in accept_streams.drain() {
-                    let st = Box::pin(stream.map_ok(DatapathCnInner::Inline)) as _;
-                    let st = self.adapt_inner_stream(st);
-                    let acceptors_g = self.acceptors.lock().unwrap();
-                    acceptors_g
-                        .get(&acc_port)
-                        .ok_or(eyre!("Did not find accept stream for {:?}", acc_port))?
-                        .send(st)?;
-                }
+        self.inner.trigger_transition(choice)?;
+        for (_, senders) in self.acceptors.lock().unwrap().iter() {
+            for s in senders {
+                s.send(self.inner.curr_datapath.clone())?;
             }
         }
 
-        // we have sent on all the senders. we can now set this `AtomicBool` to true, so that once we
-        // return, all connections will check it (downtime starts at this point), receive on the
-        // channels, replace their underlying connections, (downtime ends) then use them for
-        // operations .
-        self.inner
-            .wait_for_datapath_swap_now
-            .store(true, Ordering::SeqCst);
         Ok(())
     }
 
     fn adapt_inner_stream(
-        &mut self,
         st: Pin<Box<dyn Stream<Item = Result<DatapathCnInner, Report>> + Send + Sync + 'static>>,
+        conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
+        wait_for_datapath_swap_now: Arc<AtomicBool>,
+        swap_barrier: Arc<RwLock<Barrier>>,
     ) -> ReqDatapathStream {
-        // per-item shared state
-        let conns = Arc::clone(&self.conns);
-        let wait_swap = Arc::clone(&self.inner.wait_for_datapath_swap_now);
-        let swap_barrier = Arc::clone(&self.inner.swap_barrier);
-        let barrier_cnt = Arc::clone(&self.inner.barrier_count);
-
         Box::pin(st.map_ok(move |cn| {
-            let ws = Arc::clone(&wait_swap);
+            let ws = Arc::clone(&wait_for_datapath_swap_now);
             let sb = Arc::clone(&swap_barrier);
-            let bc = Arc::clone(&barrier_cnt);
 
             // conn updater
             let (s, r) = flume::bounded(1);
@@ -502,7 +430,6 @@ impl DpdkReqDatapath {
                 inner: UnsafeCell::new(cn),
                 wait_for_datapath_swap_now: ws,
                 swap_barrier: sb,
-                barrier_cnt: bc,
                 new_datapath: r,
             }
         }))
@@ -523,15 +450,15 @@ impl ChunnelListener for DpdkReqDatapath {
         ) -> Result<UpgradeStream, Report> {
             let inner: Pin<
                 Box<dyn Stream<Item = Result<DatapathCnInner, Report>> + Send + Sync + 'static>,
-            > = match &mut this.inner.curr_datapath {
-                DatapathInner::Thread(ref mut s) => Box::pin(
+            > = match &this.inner.curr_datapath {
+                DatapathInner::Thread(ref s) => Box::pin(
                     DpdkUdpReqChunnel(s.clone())
                         .listen(addr)
                         .into_inner()?
                         .map_ok(Either::Right)
                         .map_ok(DatapathCnInner::Thread),
                 ) as _,
-                DatapathInner::Inline(ref mut s) => Box::pin(
+                DatapathInner::Inline(ref s) => Box::pin(
                     DpdkInlineReqChunnel::from(s.clone())
                         .listen(addr)
                         .into_inner()?
@@ -539,57 +466,42 @@ impl ChunnelListener for DpdkReqDatapath {
                 ) as _,
             };
 
-            let st = this.adapt_inner_stream(inner);
+            let st = DpdkReqDatapath::adapt_inner_stream(
+                inner,
+                this.conns.clone(),
+                this.inner.wait_for_datapath_swap_now.clone(),
+                this.inner.swap_barrier.clone(),
+            );
 
             // stream updater
             let (s, r) = flume::bounded(1);
-            this.acceptors.lock().unwrap().insert(addr.port(), s);
+            this.acceptors
+                .lock()
+                .unwrap()
+                .entry(addr.port())
+                .or_default()
+                .push(s);
+
+            THIS_THREAD_ACTIVE.with(|is_active| {
+                let mut a = is_active.borrow_mut();
+                if !*a {
+                    *a = true;
+                    let cnt = this.inner.barrier_count.fetch_add(1, Ordering::SeqCst);
+                    let mut sb = this.inner.swap_barrier.write().unwrap();
+                    *sb = Barrier::new(cnt);
+                }
+            });
 
             Ok(UpgradeStream {
+                port: addr.port(),
                 inner: st,
                 updates: r,
+                conns: this.conns.clone(),
                 wait_for_datapath_swap_now: Arc::clone(&this.inner.wait_for_datapath_swap_now),
                 swap_barrier: Arc::clone(&this.inner.swap_barrier),
             })
         }
 
         ready(try_listen(self, addr))
-    }
-}
-
-pub struct UpgradeStream {
-    inner: ReqDatapathStream,
-    updates: Receiver<ReqDatapathStream>,
-    wait_for_datapath_swap_now: Arc<AtomicBool>,
-    swap_barrier: Arc<RwLock<Barrier>>,
-}
-
-impl UpgradeStream {
-    fn maybe_swap_datapath(&mut self) {
-        if self.wait_for_datapath_swap_now.load(Ordering::Relaxed) {
-            let new_dp = self
-                .updates
-                .recv()
-                .expect("datapath update sender disappeared");
-            let res = self.swap_barrier.read().unwrap().wait();
-            self.inner = new_dp;
-            if res.is_leader() {
-                self.wait_for_datapath_swap_now
-                    .store(false, Ordering::Relaxed);
-            }
-        } else {
-            if let Ok(new_dp) = self.updates.try_recv() {
-                self.inner = new_dp;
-            }
-        }
-    }
-}
-
-impl Stream for UpgradeStream {
-    type Item = <ReqDatapathStream as Stream>::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.maybe_swap_datapath();
-        Pin::new(&mut self.inner).poll_next(cx)
     }
 }
