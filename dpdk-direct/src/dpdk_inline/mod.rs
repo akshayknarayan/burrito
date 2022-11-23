@@ -198,6 +198,8 @@ impl DpdkInlineChunnel {
     }
 
     fn do_shutdown(&self) {
+        self.flow_steering.lock().unwrap().0.clear();
+        self.initialization_state.lock().unwrap().mempools.clear();
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -614,6 +616,8 @@ impl Drop for DpdkInlineCn {
                 warn!(?err, "Error sending close notification to accept stream");
             }
         }
+
+        debug!(port = ?self.local_port, remote = ?self.remote_addr, "dropped DpdkInlineCn");
     }
 }
 
