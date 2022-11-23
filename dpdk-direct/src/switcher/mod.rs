@@ -52,6 +52,7 @@ use std::{
     sync::{Arc, Barrier, Mutex, RwLock},
     task::{Context, Poll},
 };
+use tracing::debug;
 
 mod migrator;
 pub use migrator::*;
@@ -129,7 +130,6 @@ impl Debug for DpdkDatapath {
         f.debug_struct("DpdkDatapath")
             .field("addr", &self.ip_addr)
             .field("datapath", &self.curr_datapath)
-            .field("swap_now", &self.wait_for_datapath_swap_now)
             .finish()
     }
 }
@@ -179,6 +179,24 @@ impl DpdkDatapath {
             _ => return Ok(()),
         };
 
+        debug!(to = ?choice, "doing swap now");
+
+        // we must *immediately* set this AtomicBool so that any send/recv calls on other threads
+        // that occur become synchronized on the setup happening on this thread.
+        self.wait_for_datapath_swap_now
+            .store(true, Ordering::SeqCst);
+        self.swap_barrier.read().unwrap().wait();
+
+        debug!("transition synchronized");
+
+        // safety condition: any thread with send/recv operations is currently waiting in
+        // `maybe_swap_datapath` on a channel recv from us, and is thus *not* accessing DPDK state.
+        // we are about to tear down and replace that DPDK state, so it is important no one is using it.
+        //
+        // what about the *current thread*? It is not sending or receiving (since it is doing
+        // this), but on the next send/recv operation it needs to perform the swap we are about to
+        // give it.
+
         let conns_g = self.conns.lock().unwrap();
         let conns = conns_g.keys().copied().collect();
         self.curr_datapath.shut_down()?;
@@ -193,6 +211,7 @@ impl DpdkDatapath {
                     conns: mut new_conns,
                     ..
                 } = new_ch.load_connections(conns)?;
+                self.curr_datapath = DatapathInner::Thread(new_ch);
 
                 // now need to replace the active connections in our set of active connections.
                 for (conn_desc, sender) in conns_g.iter() {
@@ -218,6 +237,7 @@ impl DpdkDatapath {
                     conns: mut new_conns,
                     ..
                 } = new_ch.load_connections(conns)?;
+                self.curr_datapath = DatapathInner::Inline(new_ch);
 
                 for (conn_desc, sender) in conns_g.iter() {
                     let new_conn = new_conns
@@ -234,12 +254,9 @@ impl DpdkDatapath {
             }
         }
 
-        // we have sent on all the senders. we can now set this `AtomicBool` to true, so that once we
-        // return, all connections will check it (downtime starts at this point), receive on the
-        // channels, replace their underlying connections, (downtime ends) then use them for
-        // operations .
         self.wait_for_datapath_swap_now
-            .store(true, Ordering::SeqCst);
+            .store(false, Ordering::SeqCst);
+        debug!("transition done");
         Ok(())
     }
 }

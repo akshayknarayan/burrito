@@ -12,6 +12,7 @@ use std::{
     sync::{atomic::AtomicUsize, Arc, Barrier, RwLock},
     task::{Context, Poll},
 };
+use tracing::debug;
 
 #[derive(Debug)]
 pub(crate) enum DatapathCnInner {
@@ -51,11 +52,7 @@ pub struct DatapathCn {
 
 impl Debug for DatapathCn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DatapathCn")
-            .field("inner", &self.inner)
-            .field("swap_now", &self.wait_for_datapath_swap_now)
-            .field("barrier_cnt", &self.barrier_cnt)
-            .finish()
+        f.debug_struct("DatapathCn").finish()
     }
 }
 
@@ -91,28 +88,26 @@ impl DatapathCn {
         });
 
         if self.wait_for_datapath_swap_now.load(Ordering::SeqCst) {
-            let new_dp = self
-                .new_datapath
-                .recv()
-                .expect("new datapath sender disappeared");
             // it is important to wait on the barrier here because we need to make sure that our
             // various threads are using the same datapath!
             // we take a read lock because we are using the barrier now.
             // write locks should be taken when updating the number of active threads.
-            let barrier_res = self.swap_barrier.read().unwrap().wait();
+            debug!("waiting on datapath swap barrier");
+            self.swap_barrier.read().unwrap().wait();
+
+            let new_dp = self
+                .new_datapath
+                .recv()
+                .expect("new datapath sender disappeared");
+            debug!("performing datapath swap");
             // We are swapping now!
             unsafe {
                 self.do_swap(new_dp);
             }
-
-            // one of the waiters should un-set.
-            if barrier_res.is_leader() {
-                self.wait_for_datapath_swap_now
-                    .store(true, Ordering::SeqCst);
-            }
         } else {
             // we're already using the new datapath, so we just need to do the transition.
             if let Ok(new_dp) = self.new_datapath.try_recv() {
+                debug!("performing datapath swap");
                 unsafe {
                     self.do_swap(new_dp);
                 }
