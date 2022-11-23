@@ -6,7 +6,7 @@ use futures_util::{future::Either, TryStreamExt};
 use quanta::Instant;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -208,6 +208,7 @@ async fn server(
     swap_dp: Option<ServerSwapSpec>,
 ) -> Result<(), Report> {
     let tot_recv_count: Arc<AtomicUsize> = Default::default();
+    let did_swap: Arc<AtomicBool> = Default::default();
     info!("start listening");
     stream
         .try_for_each_concurrent(None, move |cn| {
@@ -215,6 +216,7 @@ async fn server(
             let peer = cn.remote_addr();
             let tot_recv_count = tot_recv_count.clone();
             let swap_dp = swap_dp.clone();
+            let did_swap = did_swap.clone();
             async move {
                 let mut slots: Vec<_> = (0..16).map(|_| None).collect();
                 info!("new connection");
@@ -227,8 +229,9 @@ async fn server(
                     }) = swap_dp
                     {
                         let cnt = tot_recv_count.load(Ordering::Relaxed);
-                        if cnt > swap_after_msgs_num {
+                        if !did_swap.load(Ordering::Relaxed) && cnt > swap_after_msgs_num {
                             info!(?swap_to, ?cnt, "swapping datapath now");
+                            did_swap.store(true, Ordering::SeqCst);
                             ch.lock().unwrap().trigger_transition(swap_to)?;
                         }
                     }
