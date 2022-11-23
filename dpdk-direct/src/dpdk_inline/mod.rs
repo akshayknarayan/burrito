@@ -25,7 +25,7 @@ use tracing_futures::Instrument;
 mod dpdk_state;
 use dpdk_state::{DpdkState, SendMsg};
 
-use crate::switcher::{ActiveConnection, DatapathConnectionMigrator, LoadedConnections};
+use crate::switcher::{ActiveConnection, DatapathConnectionMigrator};
 
 std::thread_local! {
     static DPDK_STATE: RefCell<Option<DpdkState>> = RefCell::new(None);
@@ -52,6 +52,10 @@ impl FlowSteering {
     }
 
     pub fn remove_flow(&mut self, dpdk: &mut DpdkState, port: u16) -> Result<(), Report> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+
         let queue_id = dpdk.rx_queue_id() as u16;
         let (ref mut port_handle, ref mut queues_on_port) = self.0.entry(port).or_default();
         debug!(?port, "removing flow steering rule");
@@ -128,9 +132,10 @@ impl Debug for DpdkInlineChunnel {
     }
 }
 
-struct LoadedConns {
-    conns: HashMap<ActiveConnection, DpdkInlineCn>,
-    further_conns: HashMap<u16, StreamState>,
+impl Drop for DpdkInlineChunnel {
+    fn drop(&mut self) {
+        self.initialization_state.lock().unwrap().mempools.clear();
+    }
 }
 
 impl DpdkInlineChunnel {
@@ -199,7 +204,6 @@ impl DpdkInlineChunnel {
 
     fn do_shutdown(&self) {
         self.flow_steering.lock().unwrap().0.clear();
-        self.initialization_state.lock().unwrap().mempools.clear();
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -207,7 +211,10 @@ impl DpdkInlineChunnel {
     /// Initialize state for the given set of connection descriptors.
     ///
     /// `conns` should only be connections that should live on the current thread.
-    fn load_conns(&mut self, conns: Vec<ActiveConnection>) -> Result<LoadedConns, Report> {
+    fn load_conns(
+        &mut self,
+        conns: Vec<ActiveConnection>,
+    ) -> Result<HashMap<ActiveConnection, DpdkInlineCn>, Report> {
         let descs: Vec<_> = conns
             .iter()
             .map(|c| match c {
@@ -340,15 +347,10 @@ impl DpdkInlineChunnel {
             })?;
 
             let mut acceptors = Default::default();
-            let out: Result<_, Report> = conns
+            conns
                 .into_iter()
                 .map(|c| iter(&self, &mut acceptors, c))
-                .collect();
-
-            Ok(LoadedConns {
-                conns: out?,
-                further_conns: acceptors,
-            })
+                .collect()
         })
     }
 
@@ -410,7 +412,6 @@ impl DpdkInlineChunnel {
 
 impl DatapathConnectionMigrator for DpdkInlineChunnel {
     type Conn = DpdkInlineCn;
-    type Stream = futures_util::stream::Empty<Result<Self::Conn, Self::Error>>;
     type Error = Report;
 
     fn shut_down(&mut self) -> Result<(), Report> {
@@ -423,13 +424,8 @@ impl DatapathConnectionMigrator for DpdkInlineChunnel {
     fn load_connections(
         &mut self,
         conns: Vec<ActiveConnection>,
-    ) -> Result<LoadedConnections<Self::Conn, Self::Stream>, Self::Error> {
-        // throw out `new_conns_listener` and `conn_closed_listener`, we don't need them here.
-        let LoadedConns { conns, .. } = self.load_conns(conns)?;
-        Ok(LoadedConnections {
-            conns,
-            accept_streams: Default::default(),
-        })
+    ) -> Result<HashMap<ActiveConnection, Self::Conn>, Self::Error> {
+        self.load_conns(conns)
     }
 }
 
@@ -467,6 +463,17 @@ fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
         })
         .wrap_err(eyre!("Error accessing dpdk state thread_local"))?
         .wrap_err(eyre!("Error initializing thread-local dpdk state"))
+}
+
+fn deinit_thread() {
+    DPDK_STATE
+        .try_with(|dpdk_cell| {
+            let mut dpdk_opt = dpdk_cell.borrow_mut();
+            dpdk_opt.take();
+        })
+        // `try_with` might error if the thread has already been
+        // destructed, in which case there's no cleanup to do anyway.
+        .unwrap_or(());
 }
 
 impl ChunnelListener for DpdkInlineChunnel {
@@ -578,14 +585,7 @@ impl Drop for DpdkInlineCn {
         // type's `send()`/`recv()` calls. So, if we drop `DpdkInlineCn`, checking in its drop
         // handler is enough to decide whether to clean up the thread's `DpdkState`.
         if self.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            DPDK_STATE
-                .try_with(|dpdk_cell| {
-                    let mut dpdk_opt = dpdk_cell.borrow_mut();
-                    dpdk_opt.take();
-                })
-                // `try_with` might error if the thread has already been
-                // destructed, in which case there's no cleanup to do anyway.
-                .unwrap_or(());
+            deinit_thread();
             return;
         }
 
@@ -785,7 +785,7 @@ impl ChunnelConnection for DpdkInlineCn {
 /// connection will send on a channel when new connections are found, so we no longer need to poll
 /// independently.
 #[derive(Debug, Clone)]
-pub struct DpdkInlineReqChunnel(DpdkInlineChunnel);
+pub struct DpdkInlineReqChunnel(pub DpdkInlineChunnel);
 
 impl From<DpdkInlineChunnel> for DpdkInlineReqChunnel {
     fn from(i: DpdkInlineChunnel) -> Self {
@@ -860,8 +860,6 @@ impl ChunnelListener for DpdkInlineReqChunnel {
 
 impl DatapathConnectionMigrator for DpdkInlineReqChunnel {
     type Conn = DpdkInlineCn;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Conn, Self::Error>> + Send + Sync + 'static>>;
     type Error = Report;
 
     fn shut_down(&mut self) -> Result<(), Report> {
@@ -874,31 +872,8 @@ impl DatapathConnectionMigrator for DpdkInlineReqChunnel {
     fn load_connections(
         &mut self,
         conns: Vec<ActiveConnection>,
-    ) -> Result<LoadedConnections<Self::Conn, Self::Stream>, Self::Error> {
-        let LoadedConns {
-            conns,
-            further_conns,
-        } = self.0.load_conns(conns)?;
-
-        let accept_streams = further_conns
-            .into_iter()
-            .map(|(port, state)| {
-                (
-                    port,
-                    Box::pin(futures_util::stream::try_unfold(state, |state| {
-                        let listen_addr = state.listen_addr;
-                        state
-                            .get_next()
-                            .instrument(debug_span!("connection_listen", ?listen_addr))
-                    })) as _,
-                )
-            })
-            .collect();
-
-        Ok(LoadedConnections {
-            conns,
-            accept_streams,
-        })
+    ) -> Result<HashMap<ActiveConnection, Self::Conn>, Self::Error> {
+        self.0.load_conns(conns)
     }
 }
 
@@ -916,18 +891,24 @@ struct StreamState {
 
 impl Drop for StreamState {
     fn drop(&mut self) {
-        let this_lcore = get_lcore_id();
-        let mut steering_g = self.flow_steering.lock().unwrap();
-        if let Err(err) = DPDK_STATE.with(|dpdk_cell| {
-            let mut dpdk_opt = dpdk_cell.borrow_mut();
-            let dpdk = dpdk_opt
-                .as_mut()
-                .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-            steering_g.remove_flow(dpdk, self.listen_addr.port())?;
-            Ok::<_, Report>(())
-        }) {
-            warn!(?err, "Error updating flow steering on stream close");
+        if self.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            deinit_thread();
+        } else {
+            let this_lcore = get_lcore_id();
+            let mut steering_g = self.flow_steering.lock().unwrap();
+            if let Err(err) = DPDK_STATE.with(|dpdk_cell| {
+                let mut dpdk_opt = dpdk_cell.borrow_mut();
+                let dpdk = dpdk_opt
+                    .as_mut()
+                    .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                steering_g.remove_flow(dpdk, self.listen_addr.port())?;
+                Ok::<_, Report>(())
+            }) {
+                warn!(?err, "Error updating flow steering on stream close");
+            }
         }
+
+        debug!(listen = ?self.listen_addr, "exiting dpdk-inline stream");
     }
 }
 

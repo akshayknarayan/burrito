@@ -402,8 +402,13 @@ impl DpdkState {
                         debug!(?dst_port, ?pkt_src_addr, "created new stash for connection");
                         // signal new connection.
                         if let Some(nc) = new_conns {
-                            if let Err(err) = nc.send(pkt_src_addr) {
-                                debug!(?pkt_src_addr, ?err, "New connection channel send failed");
+                            if let Err(pkt_src_addr_err) = nc.send(pkt_src_addr) {
+                                let pkt_src_addr = pkt_src_addr_err.into_inner();
+                                debug!(
+                                    ?pkt_src_addr,
+                                    loc = "try_recv_burst",
+                                    "New connection channel send failed"
+                                );
                             }
                         }
                     } else {

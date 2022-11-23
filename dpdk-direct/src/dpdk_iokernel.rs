@@ -1,10 +1,9 @@
-use crate::switcher::{ActiveConnection, DatapathConnectionMigrator, LoadedConnections};
+use crate::switcher::{ActiveConnection, DatapathConnectionMigrator};
 use ahash::HashMap;
 use bertha::{either::Either, ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
+use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 use dpdk_wrapper::{BoundDpdkConn, DpdkConn, DpdkIoKernel, DpdkIoKernelHandle};
 use eui48::MacAddress;
-use flume::Receiver;
 use futures_util::future::{ready, Ready};
 use futures_util::stream::{once, Once, Stream, StreamExt};
 use std::future::Future;
@@ -78,11 +77,6 @@ pub struct DpdkUdpSkChunnel {
     handle: DpdkIoKernelHandle,
 }
 
-struct LoadedConns {
-    conns: HashMap<ActiveConnection, Either<DpdkUdpSk, BoundDpdkUdpSk>>,
-    further_conns: HashMap<u16, Receiver<BoundDpdkConn>>,
-}
-
 impl DpdkUdpSkChunnel {
     pub fn new(config: impl AsRef<Path>) -> Result<Self, Report> {
         let config = config.as_ref().to_path_buf();
@@ -114,7 +108,10 @@ impl DpdkUdpSkChunnel {
         }
     }
 
-    fn load_connections(&mut self, conns: Vec<ActiveConnection>) -> Result<LoadedConns, Report> {
+    fn load_connections(
+        &mut self,
+        conns: Vec<ActiveConnection>,
+    ) -> Result<HashMap<ActiveConnection, Either<DpdkUdpSk, BoundDpdkUdpSk>>, Report> {
         let mut out = HashMap::default();
         // first group by ActiveConnection type
         let acceptors: Result<HashMap<_, _>, _> = conns
@@ -158,10 +155,7 @@ impl DpdkUdpSkChunnel {
             further_conns.insert(local_port, further_conns_on_port);
         }
 
-        Ok(LoadedConns {
-            conns: out,
-            further_conns,
-        })
+        Ok(out)
     }
 
     pub(crate) fn do_listen_non_accept(&mut self, addr: SocketAddr) -> Result<DpdkUdpSk, Report> {
@@ -178,7 +172,6 @@ impl DpdkUdpSkChunnel {
 
 impl DatapathConnectionMigrator for DpdkUdpSkChunnel {
     type Conn = Either<DpdkUdpSk, BoundDpdkUdpSk>;
-    type Stream = futures_util::stream::Empty<Result<Self::Conn, Self::Error>>;
     type Error = Report;
 
     fn shut_down(&mut self) -> Result<(), Report> {
@@ -189,23 +182,8 @@ impl DatapathConnectionMigrator for DpdkUdpSkChunnel {
     fn load_connections(
         &mut self,
         conns: Vec<ActiveConnection>,
-    ) -> Result<LoadedConnections<Self::Conn, Self::Stream>, Self::Error> {
-        let LoadedConns {
-            conns,
-            further_conns,
-        } = self.load_connections(conns)?;
-
-        // `DpdkUdpSkChunnel` does not implement accept-style connections, only `DpdkUdpReqChunnel`
-        // does.
-        ensure!(
-            further_conns.is_empty(),
-            "DpdkUdpSkChunnel should not have any accept-style connections"
-        );
-
-        Ok(LoadedConnections {
-            conns,
-            accept_streams: Default::default(),
-        })
+    ) -> Result<HashMap<ActiveConnection, Self::Conn>, Self::Error> {
+        self.load_connections(conns)
     }
 }
 
@@ -365,8 +343,6 @@ impl ChunnelListener for DpdkUdpReqChunnel {
 
 impl DatapathConnectionMigrator for DpdkUdpReqChunnel {
     type Conn = Either<DpdkUdpSk, BoundDpdkUdpSk>;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Conn, Self::Error>> + Send + Sync + 'static>>;
     type Error = Report;
 
     fn shut_down(&mut self) -> Result<(), Report> {
@@ -377,29 +353,7 @@ impl DatapathConnectionMigrator for DpdkUdpReqChunnel {
     fn load_connections(
         &mut self,
         conns: Vec<ActiveConnection>,
-    ) -> Result<LoadedConnections<Self::Conn, Self::Stream>, Self::Error> {
-        let LoadedConns {
-            conns,
-            further_conns,
-        } = self.0.load_connections(conns)?;
-
-        let accept_streams = further_conns
-            .into_iter()
-            .map(|(port, further_conns_on_port)| {
-                (
-                    port,
-                    Box::pin(
-                        further_conns_on_port
-                            .into_stream()
-                            .map(move |inner| Ok(Either::Right(BoundDpdkUdpSk { inner }))),
-                    ) as _,
-                )
-            })
-            .collect();
-
-        Ok(LoadedConnections {
-            conns,
-            accept_streams,
-        })
+    ) -> Result<HashMap<ActiveConnection, Self::Conn>, Self::Error> {
+        self.0.load_connections(conns)
     }
 }

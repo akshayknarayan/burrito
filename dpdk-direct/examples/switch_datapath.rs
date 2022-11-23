@@ -148,10 +148,17 @@ fn main() -> Result<(), Report> {
         info!(?local_addr, "Dpdk Inline Chunnel Test - Server");
         let ch = DpdkDatapath::new(opt.config, opt.datapath_choice)?;
         let mut ch = DpdkReqDatapath::from(ch);
+        let swap_spec = ServerSwapSpec {
+            swap_after_msgs_num: opt.swap_delay_msgs,
+            swap_to: opt.swap_to,
+            ch: Arc::new(Mutex::new(ch.clone())),
+            did_swap: Default::default(),
+        };
 
         for thread in 1..opt.threads {
             debug!(?thread, "spawning thread");
             let mut ch = ch.clone();
+            let swap_spec = swap_spec.clone();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -166,7 +173,7 @@ fn main() -> Result<(), Report> {
                         Ok(s) => s,
                     };
 
-                    server(stream, thread, None).await
+                    server(stream, thread, Some(swap_spec)).await
                 })
             });
         }
@@ -180,16 +187,7 @@ fn main() -> Result<(), Report> {
                 .listen(local_addr)
                 .await
                 .wrap_err("failed to get connection stream")?;
-            server(
-                stream,
-                0,
-                Some(ServerSwapSpec {
-                    swap_after_msgs_num: opt.swap_delay_msgs,
-                    swap_to: opt.swap_to,
-                    ch: Arc::new(Mutex::new(ch)),
-                }),
-            )
-            .await
+            server(stream, 0, Some(swap_spec)).await
         })
     }
 }
@@ -199,16 +197,16 @@ struct ServerSwapSpec {
     swap_after_msgs_num: usize,
     swap_to: DpdkDatapathChoice,
     ch: Arc<Mutex<DpdkReqDatapath>>,
+    did_swap: Arc<AtomicBool>,
 }
 
-#[instrument(skip(stream), level = "info", err)]
+#[instrument(skip(stream, swap_dp), level = "info", err)]
 async fn server(
     stream: impl Stream<Item = Result<DatapathCn, Report>> + Send + 'static,
     thread_idx: usize,
     swap_dp: Option<ServerSwapSpec>,
 ) -> Result<(), Report> {
     let tot_recv_count: Arc<AtomicUsize> = Default::default();
-    let did_swap: Arc<AtomicBool> = Default::default();
     info!("start listening");
     stream
         .try_for_each_concurrent(None, move |cn| {
@@ -216,36 +214,36 @@ async fn server(
             let peer = cn.remote_addr();
             let tot_recv_count = tot_recv_count.clone();
             let swap_dp = swap_dp.clone();
-            let did_swap = did_swap.clone();
             async move {
                 let mut slots: Vec<_> = (0..16).map(|_| None).collect();
                 info!("new connection");
-                let mut recv_count = 0;
                 loop {
                     if let Some(ServerSwapSpec {
                         swap_after_msgs_num,
                         swap_to,
-                        ref ch,
-                    }) = swap_dp
+                        ch,
+                        did_swap,
+                    }) = &swap_dp
                     {
                         let cnt = tot_recv_count.load(Ordering::Relaxed);
-                        if !did_swap.load(Ordering::Relaxed) && cnt > swap_after_msgs_num {
+                        if !did_swap.load(Ordering::Relaxed) && cnt > *swap_after_msgs_num {
                             info!(?swap_to, ?cnt, "swapping datapath now");
                             did_swap.store(true, Ordering::SeqCst);
-                            ch.lock().unwrap().trigger_transition(swap_to)?;
+                            ch.lock().unwrap().trigger_transition(*swap_to)?;
                         }
                     }
 
                     let msgs = cn.recv(&mut slots[..]).await?;
+                    let mut recv_count = 0;
                     let echoes = msgs.iter_mut().map_while(|m| {
                         let x = m.take()?;
                         recv_count += 1;
-                        tot_recv_count.fetch_add(1, Ordering::SeqCst);
                         trace!(?x, ?recv_count, "got msg");
                         Some(x)
                     });
                     cn.send(echoes).await?;
-                    debug!(?recv_count, "received message burst");
+                    tot_recv_count.fetch_add(recv_count, Ordering::SeqCst);
+                    debug!(?tot_recv_count, ?recv_count, "received message burst");
                 }
             }
             .instrument(info_span!("connection", ?port, ?peer))
