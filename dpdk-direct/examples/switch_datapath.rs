@@ -423,10 +423,7 @@ impl AsyncSpinTimer {
                 }
             }
 
-            let elapsed = self.clk.now() - self.last_return.unwrap();
-            if elapsed > self.interarrival {
-                self.deficit += elapsed - self.interarrival;
-            }
+            self.deficit += self.clk.now() - self.last_return.unwrap();
         }
     }
 }

@@ -284,7 +284,7 @@ impl AsyncSpinTimer {
 
             if num_ticks > 0 {
                 self.last_return = Some(self.clk.now());
-                return num_ticks;
+                return std::cmp::min(num_ticks, 32);
             }
 
             if self.last_return.is_none() {
@@ -305,10 +305,7 @@ impl AsyncSpinTimer {
                 }
             }
 
-            let elapsed = self.clk.now() - self.last_return.unwrap();
-            if elapsed > self.interarrival {
-                self.deficit += elapsed - self.interarrival;
-            }
+            self.deficit += self.clk.now() - self.last_return.unwrap();
         }
     }
 }
