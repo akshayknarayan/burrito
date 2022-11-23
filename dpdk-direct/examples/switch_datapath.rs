@@ -13,6 +13,7 @@ use std::time::Duration;
 use structopt::StructOpt;
 use tracing::{debug, debug_span, error, info, info_span, instrument, trace};
 use tracing_futures::Instrument;
+use tracing_subscriber::prelude::*;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "Switch datapaths test")]
@@ -45,7 +46,13 @@ struct Opt {
 
 fn main() -> Result<(), Report> {
     color_eyre::install()?;
-    tracing_subscriber::fmt::init();
+    let subscriber = tracing_subscriber::registry();
+    let subscriber = subscriber
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_error::ErrorLayer::default());
+    let d = tracing::Dispatch::new(subscriber);
+    d.init();
     let mut opt = Opt::from_args();
 
     match &mut opt.datapath_choice {
