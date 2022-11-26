@@ -16,37 +16,63 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Barrier, Mutex, RwLock},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub struct UpgradeStream {
-    pub(crate) port: u16,
-    pub(crate) inner: ReqDatapathStream,
-    pub(crate) updates: Receiver<DatapathInner>,
-    pub(crate) conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
-    pub(crate) wait_for_datapath_swap_now: Arc<AtomicBool>,
-    pub(crate) swap_barrier: Arc<RwLock<Barrier>>,
+    port: u16,
+    inner: ReqDatapathStream,
+    updates: Receiver<DatapathInner>,
+    conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
+    wait_for_datapath_swap_now: Arc<AtomicBool>,
+    swap_barrier: Arc<RwLock<Barrier>>,
+    thread_wakers: Arc<Mutex<Vec<Option<Waker>>>>,
+    poisoned: bool,
 }
 
 impl UpgradeStream {
+    pub(crate) fn new(
+        port: u16,
+        inner: ReqDatapathStream,
+        updates: Receiver<DatapathInner>,
+        conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
+        wait_for_datapath_swap_now: Arc<AtomicBool>,
+        swap_barrier: Arc<RwLock<Barrier>>,
+        thread_wakers: Arc<Mutex<Vec<Option<Waker>>>>,
+    ) -> Self {
+        Self {
+            port,
+            inner,
+            updates,
+            conns,
+            wait_for_datapath_swap_now,
+            swap_barrier,
+            thread_wakers,
+            poisoned: false,
+        }
+    }
+
     fn maybe_swap_datapath(&mut self) -> Result<(), Report> {
         let swap_now = self.wait_for_datapath_swap_now.load(Ordering::SeqCst);
         let new_dp = if !swap_now {
             match self.updates.try_recv() {
-                Err(_) => return Ok(()), // common case - no work to do.
+                Err(flume::TryRecvError::Empty) => return Ok(()), // common case - no work to do.
+                Err(flume::TryRecvError::Disconnected) => {
+                    panic!("datapath update sender disappeared")
+                }
                 Ok(new_dp) => new_dp,
             }
         } else {
-            debug!("waiting on datapath swap barrier");
+            debug!(loc = "UpgradeStream", "waiting on datapath swap barrier");
             self.swap_barrier.read().unwrap().wait();
-
             self.updates
                 .recv()
                 .wrap_err(eyre!("stream update wait on port {}", self.port))
                 .expect("datapath update sender disappeared")
         };
 
+        debug!(?new_dp, "performing datapath stream swap");
         // now we construct a new stream.
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, self.port));
         let inner: Pin<
@@ -67,15 +93,17 @@ impl UpgradeStream {
             ) as _,
         };
 
+        debug!("datapath stream swap adapt_inner");
         let st = DpdkReqDatapath::adapt_inner_stream(
             inner,
             self.conns.clone(),
             self.wait_for_datapath_swap_now.clone(),
             self.swap_barrier.clone(),
+            self.thread_wakers.clone(),
         );
 
-        debug!("performing datapath swap");
         self.inner = st;
+        debug!("datapath stream swap done");
         Ok(())
     }
 }
@@ -85,9 +113,19 @@ impl Stream for UpgradeStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Err(err) = self.maybe_swap_datapath() {
+            warn!(?err, "maybe_swap_datapath errored");
+            self.poisoned = true;
             return Poll::Ready(Some(Err(err)));
+        } else if self.poisoned {
+            return Poll::Ready(None);
         }
 
-        Pin::new(&mut self.inner).poll_next(cx)
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(r) => Poll::Ready(r),
+            Poll::Pending => {
+                super::store_thread_waker(&self.thread_wakers, cx.waker().clone());
+                Poll::Pending
+            }
+        }
     }
 }

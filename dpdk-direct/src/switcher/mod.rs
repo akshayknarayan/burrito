@@ -41,6 +41,7 @@ use futures_util::{
     future::{ready, Ready},
     stream::{once, Once, Stream, TryStreamExt},
 };
+use std::task::Waker;
 use std::{
     cell::{RefCell, UnsafeCell},
     fmt::Debug,
@@ -107,7 +108,37 @@ impl FromStr for DpdkDatapathChoice {
 }
 
 std::thread_local! {
-    static THIS_THREAD_ACTIVE: RefCell<bool> = RefCell::new(false);
+    static THIS_THREAD_ID: RefCell<Option<usize>> = RefCell::new(None);
+}
+
+fn update_thread_idx_and_count(
+    barrier_count: &Arc<AtomicUsize>,
+    swap_barrier: &Arc<RwLock<Barrier>>,
+) {
+    THIS_THREAD_ID.with(|is_active| {
+        let mut a = is_active.borrow_mut();
+        if a.is_none() {
+            let cnt = barrier_count.fetch_add(1, Ordering::SeqCst);
+            *a = Some(cnt);
+            let mut sb = swap_barrier.write().unwrap();
+            *sb = Barrier::new(cnt);
+        }
+    });
+}
+
+fn try_get_thread_id() -> Option<usize> {
+    THIS_THREAD_ID.with(|active| *active.borrow())
+}
+
+fn store_thread_waker(tw: &Arc<Mutex<Vec<Option<Waker>>>>, waker: Waker) {
+    // store a waker so we can wake this task when we want to do a swap.
+    let thread_idx = try_get_thread_id().expect("thread not initialized");
+    let mut wakers_g = tw.lock().unwrap();
+    while wakers_g.len() <= thread_idx {
+        wakers_g.push(None);
+    }
+
+    wakers_g[thread_idx] = Some(waker);
 }
 
 /// A base-level chunnel able to dynamically switch between dpdk-thread and dpdk-inline datapaths.
@@ -125,6 +156,7 @@ pub struct DpdkDatapath {
     wait_for_datapath_swap_now: Arc<AtomicBool>,
     barrier_count: Arc<AtomicUsize>,
     swap_barrier: Arc<RwLock<Barrier>>,
+    swap_wakers: Arc<Mutex<Vec<Option<Waker>>>>,
 }
 
 impl Debug for DpdkDatapath {
@@ -159,6 +191,7 @@ impl DpdkDatapath {
             wait_for_datapath_swap_now: Default::default(),
             barrier_count: Arc::new(1usize.into()),
             swap_barrier: Arc::new(RwLock::new(Barrier::new(1))),
+            swap_wakers: Default::default(),
         })
     }
 
@@ -192,6 +225,12 @@ impl DpdkDatapath {
         // that occur become synchronized on the setup happening on this thread.
         self.wait_for_datapath_swap_now
             .store(true, Ordering::SeqCst);
+        for o_w in self.swap_wakers.lock().unwrap().drain(..) {
+            if let Some(w) = o_w {
+                w.wake();
+            }
+        }
+
         self.swap_barrier.read().unwrap().wait();
         debug!("synchronized");
     }
@@ -215,6 +254,7 @@ impl DpdkDatapath {
 
         let conns_g = self.conns.lock().unwrap();
         let conns = conns_g.keys().copied().collect();
+        debug!(?conns, "current connections");
 
         match choice {
             DpdkDatapathChoice::Thread => {
@@ -222,6 +262,9 @@ impl DpdkDatapath {
                     DpdkUdpSkChunnel::new_preconfig(self.ip_addr, self.arp_table.clone())?;
                 let mut new_conns = new_ch.load_connections(conns)?;
                 self.curr_datapath = DatapathInner::Thread(new_ch);
+
+                let ncs: Vec<_> = new_conns.keys().copied().collect();
+                debug!(new_conns = ?ncs, "loaded connections");
 
                 // now need to replace the active connections in our set of active connections.
                 for (conn_desc, sender) in conns_g.iter() {
@@ -292,21 +335,13 @@ impl ChunnelConnector for DpdkDatapath {
                 s,
             );
 
-            THIS_THREAD_ACTIVE.with(|is_active| {
-                let mut a = is_active.borrow_mut();
-                if !*a {
-                    *a = true;
-                    let cnt = this.barrier_count.fetch_add(1, Ordering::SeqCst);
-                    let mut sb = this.swap_barrier.write().unwrap();
-                    *sb = Barrier::new(cnt);
-                }
-            });
-
+            update_thread_idx_and_count(&this.barrier_count, &this.swap_barrier);
             Ok(DatapathCn {
                 inner: UnsafeCell::new(inner),
                 wait_for_datapath_swap_now: Arc::clone(&this.wait_for_datapath_swap_now),
                 new_datapath: r,
                 swap_barrier: Arc::clone(&this.swap_barrier),
+                thread_wakers: Arc::clone(&this.swap_wakers),
             })
         }
 
@@ -340,21 +375,13 @@ impl ChunnelListener for DpdkDatapath {
                 s,
             );
 
-            THIS_THREAD_ACTIVE.with(|is_active| {
-                let mut a = is_active.borrow_mut();
-                if !*a {
-                    *a = true;
-                    let cnt = this.barrier_count.fetch_add(1, Ordering::SeqCst);
-                    let mut sb = this.swap_barrier.write().unwrap();
-                    *sb = Barrier::new(cnt);
-                }
-            });
-
+            update_thread_idx_and_count(&this.barrier_count, &this.swap_barrier);
             Ok(DatapathCn {
                 inner: UnsafeCell::new(inner),
                 wait_for_datapath_swap_now: Arc::clone(&this.wait_for_datapath_swap_now),
                 new_datapath: r,
                 swap_barrier: Arc::clone(&this.swap_barrier),
+                thread_wakers: Arc::clone(&this.swap_wakers),
             })
         }
 
@@ -372,7 +399,6 @@ type ReqDatapathStream =
 #[derive(Clone)]
 pub struct DpdkReqDatapath {
     inner: DpdkDatapath,
-    conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
     acceptors: Arc<Mutex<HashMap<u16, Vec<Sender<DatapathInner>>>>>,
 }
 
@@ -386,7 +412,6 @@ impl From<DpdkDatapath> for DpdkReqDatapath {
     fn from(inner: DpdkDatapath) -> Self {
         DpdkReqDatapath {
             inner,
-            conns: Default::default(),
             acceptors: Default::default(),
         }
     }
@@ -409,10 +434,12 @@ impl DpdkReqDatapath {
         conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
         wait_for_datapath_swap_now: Arc<AtomicBool>,
         swap_barrier: Arc<RwLock<Barrier>>,
+        thread_wakers: Arc<Mutex<Vec<Option<Waker>>>>,
     ) -> ReqDatapathStream {
         Box::pin(st.map_ok(move |cn| {
             let ws = Arc::clone(&wait_for_datapath_swap_now);
             let sb = Arc::clone(&swap_barrier);
+            let tw = Arc::clone(&thread_wakers);
 
             // conn updater
             let (s, r) = flume::bounded(1);
@@ -431,6 +458,7 @@ impl DpdkReqDatapath {
                 wait_for_datapath_swap_now: ws,
                 swap_barrier: sb,
                 new_datapath: r,
+                thread_wakers: tw,
             }
         }))
     }
@@ -468,9 +496,10 @@ impl ChunnelListener for DpdkReqDatapath {
 
             let st = DpdkReqDatapath::adapt_inner_stream(
                 inner,
-                this.conns.clone(),
+                this.inner.conns.clone(),
                 this.inner.wait_for_datapath_swap_now.clone(),
                 this.inner.swap_barrier.clone(),
+                this.inner.swap_wakers.clone(),
             );
 
             // stream updater
@@ -481,25 +510,16 @@ impl ChunnelListener for DpdkReqDatapath {
                 .entry(addr.port())
                 .or_default()
                 .push(s);
-
-            THIS_THREAD_ACTIVE.with(|is_active| {
-                let mut a = is_active.borrow_mut();
-                if !*a {
-                    *a = true;
-                    let cnt = this.inner.barrier_count.fetch_add(1, Ordering::SeqCst);
-                    let mut sb = this.inner.swap_barrier.write().unwrap();
-                    *sb = Barrier::new(cnt);
-                }
-            });
-
-            Ok(UpgradeStream {
-                port: addr.port(),
-                inner: st,
-                updates: r,
-                conns: this.conns.clone(),
-                wait_for_datapath_swap_now: Arc::clone(&this.inner.wait_for_datapath_swap_now),
-                swap_barrier: Arc::clone(&this.inner.swap_barrier),
-            })
+            update_thread_idx_and_count(&this.inner.barrier_count, &this.inner.swap_barrier);
+            Ok(UpgradeStream::new(
+                addr.port(),
+                st,
+                r,
+                this.inner.conns.clone(),
+                Arc::clone(&this.inner.wait_for_datapath_swap_now),
+                Arc::clone(&this.inner.swap_barrier),
+                Arc::clone(&this.inner.swap_wakers),
+            ))
         }
 
         ready(try_listen(self, addr))

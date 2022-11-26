@@ -9,8 +9,8 @@ use std::{
     net::{SocketAddr, SocketAddrV4},
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, Barrier, RwLock},
-    task::{Context, Poll},
+    sync::{Arc, Barrier, Mutex, RwLock},
+    task::{Context, Poll, Waker},
 };
 use tracing::debug;
 
@@ -47,6 +47,7 @@ pub struct DatapathCn {
     pub(crate) wait_for_datapath_swap_now: Arc<AtomicBool>,
     pub(crate) new_datapath: Receiver<DatapathCnInner>,
     pub(crate) swap_barrier: Arc<RwLock<Barrier>>,
+    pub(crate) thread_wakers: Arc<Mutex<Vec<Option<Waker>>>>,
 }
 
 impl Debug for DatapathCn {
@@ -75,33 +76,34 @@ impl DatapathCn {
     /// When all threads are ready to swap (and thus won't try to perform DPDK operations), we
     /// *know* that no one is currently using references to connection types, because we just
     /// barrier-synchronized on being ready to swap. Thus, swapping the pointer is ok.
-    fn maybe_swap_datapath(&self) {
-        if self.wait_for_datapath_swap_now.load(Ordering::SeqCst) {
+    fn maybe_swap_datapath(&self) -> bool {
+        let swap_now = self.wait_for_datapath_swap_now.load(Ordering::SeqCst);
+        let new_dp = if !swap_now {
+            match self.new_datapath.try_recv() {
+                Err(flume::TryRecvError::Empty) => return false, // common case - no work to do.
+                Err(flume::TryRecvError::Disconnected) => {
+                    panic!("datapath update sender disappeared");
+                }
+                Ok(new_dp) => new_dp,
+            }
+        } else {
             // it is important to wait on the barrier here because we need to make sure that our
             // various threads are using the same datapath!
             // we take a read lock because we are using the barrier now.
             // write locks should be taken when updating the number of active threads.
-            debug!("waiting on datapath swap barrier");
+            debug!(loc = "DatapathCn", "waiting on datapath swap barrier");
             self.swap_barrier.read().unwrap().wait();
 
-            let new_dp = self
-                .new_datapath
+            self.new_datapath
                 .recv()
-                .expect("new datapath sender disappeared");
-            debug!("performing datapath swap");
-            // We are swapping now!
-            unsafe {
-                self.do_swap(new_dp);
-            }
-        } else {
-            // we're already using the new datapath, so we just need to do the transition.
-            if let Ok(new_dp) = self.new_datapath.try_recv() {
-                debug!("performing datapath swap");
-                unsafe {
-                    self.do_swap(new_dp);
-                }
-            }
-        }
+                .expect("new datapath sender disappeared")
+        };
+
+        let port = self.local_port();
+        let remote_addr = self.remote_addr();
+        debug!(?port, ?remote_addr, "performing datapath swap");
+        unsafe { self.do_swap(new_dp) };
+        true
     }
 
     unsafe fn do_swap(&self, new_dp: DatapathCnInner) {
@@ -140,6 +142,22 @@ impl<'cn> Future for DatapathCnSendFuture<'cn> {
     }
 }
 
+/// Recv future implementation that can change inner implementation if the datapath was changed.
+///
+/// This must check for a new datapath on every poll because the datapath could have changed while
+/// the internal future had been active but had yielded. So, the next time this future is polled,
+/// if we go back to the same inner future, we would end up using the now-defunct datapath.
+///
+/// This does not apply to `DatapathCnSendFuture` because `send()` futures complete quickly, so
+/// they won't be concurrent with a datapath swap.
+///
+/// ###SAFETY
+/// This future implementation stores a `*mut Option<(SocketAddr, Vec<u8>)>` which is a pointer to
+/// the receive message buffer. We need to keep this around because if the datapath changes, we
+/// need to create a new `recv()` future and the old one will have claimed our receive message
+/// buffer. Keeping it around is safe because we only re-materialize the buffer when we need to
+/// make a new `recv()` inner future, and we only do that if we are about to drop the old future
+/// which was using the slice.
 struct DatapathCnRecvFuture<'cn, 'buf> {
     inner: Pin<
         Box<
@@ -148,27 +166,58 @@ struct DatapathCnRecvFuture<'cn, 'buf> {
                 + 'cn,
         >,
     >,
+    msgs_buf_ptr: *mut Option<(SocketAddr, Vec<u8>)>,
+    msgs_buf_len: usize,
+    cn: &'cn DatapathCn,
 }
+
+unsafe impl<'cn, 'buf> Send for DatapathCnRecvFuture<'cn, 'buf> {}
 
 impl<'cn, 'buf> DatapathCnRecvFuture<'cn, 'buf>
 where
     'buf: 'cn,
 {
-    fn new(s: &'cn DatapathCnInner, msgs_buf: &'buf mut [Option<(SocketAddr, Vec<u8>)>]) -> Self {
+    fn new(s: &'cn DatapathCn, msgs_buf: &'buf mut [Option<(SocketAddr, Vec<u8>)>]) -> Self {
+        let inner = unsafe { &*s.inner.get() };
+        let msgs_buf_ptr = msgs_buf.as_mut_ptr();
+        let msgs_buf_len = msgs_buf.len();
         Self {
-            inner: match s {
-                DatapathCnInner::Thread(s) => s.recv(msgs_buf),
-                DatapathCnInner::Inline(s) => s.recv(msgs_buf),
+            inner: match inner {
+                DatapathCnInner::Thread(i) => i.recv(msgs_buf),
+                DatapathCnInner::Inline(i) => i.recv(msgs_buf),
             },
+            msgs_buf_ptr,
+            msgs_buf_len,
+            cn: s,
         }
     }
 }
 
-impl<'cn, 'buf> Future for DatapathCnRecvFuture<'cn, 'buf> {
+impl<'cn, 'buf> Future for DatapathCnRecvFuture<'cn, 'buf>
+where
+    'buf: 'cn,
+{
     type Output = Result<&'buf mut [Option<(SocketAddr, Vec<u8>)>], Report>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner).poll(cx)
+        let swapped = self.cn.maybe_swap_datapath();
+        if swapped {
+            let cn: &'cn _ = unsafe { std::mem::transmute(&*self.cn.inner.get()) };
+            let new_msgs_buf: &'buf mut [_] =
+                unsafe { std::slice::from_raw_parts_mut(self.msgs_buf_ptr, self.msgs_buf_len) };
+            self.inner = match cn {
+                DatapathCnInner::Thread(i) => i.recv(new_msgs_buf),
+                DatapathCnInner::Inline(i) => i.recv(new_msgs_buf),
+            };
+        }
+
+        match Pin::new(&mut self.inner).poll(cx) {
+            Poll::Ready(r) => Poll::Ready(r),
+            Poll::Pending => {
+                super::store_thread_waker(&self.cn.thread_wakers, cx.waker().clone());
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -197,10 +246,6 @@ impl ChunnelConnection for DatapathCn {
     where
         'buf: 'cn,
     {
-        self.maybe_swap_datapath();
-        unsafe {
-            let inner = &*self.inner.get();
-            Box::pin(DatapathCnRecvFuture::new(inner, msgs_buf))
-        }
+        Box::pin(DatapathCnRecvFuture::new(self, msgs_buf))
     }
 }

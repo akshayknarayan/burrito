@@ -465,6 +465,17 @@ fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
         .wrap_err(eyre!("Error initializing thread-local dpdk state"))
 }
 
+fn deinit_thread() {
+    DPDK_STATE
+        .try_with(|dpdk_cell| {
+            let mut dpdk_opt = dpdk_cell.borrow_mut();
+            dpdk_opt.take();
+        })
+        // `try_with` might error if the thread has already been
+        // destructed, in which case there's no cleanup to do anyway.
+        .unwrap_or(());
+}
+
 impl ChunnelListener for DpdkInlineChunnel {
     type Addr = SocketAddr;
     type Connection = DpdkInlineCn;
@@ -574,14 +585,7 @@ impl Drop for DpdkInlineCn {
         // type's `send()`/`recv()` calls. So, if we drop `DpdkInlineCn`, checking in its drop
         // handler is enough to decide whether to clean up the thread's `DpdkState`.
         if self.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            DPDK_STATE
-                .try_with(|dpdk_cell| {
-                    let mut dpdk_opt = dpdk_cell.borrow_mut();
-                    dpdk_opt.take();
-                })
-                // `try_with` might error if the thread has already been
-                // destructed, in which case there's no cleanup to do anyway.
-                .unwrap_or(());
+            deinit_thread();
             return;
         }
 
@@ -887,18 +891,24 @@ struct StreamState {
 
 impl Drop for StreamState {
     fn drop(&mut self) {
-        let this_lcore = get_lcore_id();
-        let mut steering_g = self.flow_steering.lock().unwrap();
-        if let Err(err) = DPDK_STATE.with(|dpdk_cell| {
-            let mut dpdk_opt = dpdk_cell.borrow_mut();
-            let dpdk = dpdk_opt
-                .as_mut()
-                .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-            steering_g.remove_flow(dpdk, self.listen_addr.port())?;
-            Ok::<_, Report>(())
-        }) {
-            warn!(?err, "Error updating flow steering on stream close");
+        if self.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            deinit_thread();
+        } else {
+            let this_lcore = get_lcore_id();
+            let mut steering_g = self.flow_steering.lock().unwrap();
+            if let Err(err) = DPDK_STATE.with(|dpdk_cell| {
+                let mut dpdk_opt = dpdk_cell.borrow_mut();
+                let dpdk = dpdk_opt
+                    .as_mut()
+                    .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                steering_g.remove_flow(dpdk, self.listen_addr.port())?;
+                Ok::<_, Report>(())
+            }) {
+                warn!(?err, "Error updating flow steering on stream close");
+            }
         }
+
+        debug!(listen = ?self.listen_addr, "exiting dpdk-inline stream");
     }
 }
 
