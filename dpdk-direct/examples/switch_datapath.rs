@@ -42,6 +42,9 @@ struct Opt {
 
     #[structopt(long)]
     swap_to: DpdkDatapathChoice,
+
+    #[structopt(long)]
+    closed_loop: bool,
 }
 
 fn main() -> Result<(), Report> {
@@ -56,6 +59,15 @@ fn main() -> Result<(), Report> {
     let mut opt = Opt::from_args();
 
     match &mut opt.datapath_choice {
+        DpdkDatapathChoice::Inline {
+            ref mut num_threads,
+        } if *num_threads == 0 => {
+            *num_threads = opt.threads;
+        }
+        _ => (),
+    }
+
+    match &mut opt.swap_to {
         DpdkDatapathChoice::Inline {
             ref mut num_threads,
         } if *num_threads == 0 => {
@@ -88,14 +100,18 @@ fn main() -> Result<(), Report> {
                     .build()?;
                 let res = rt.block_on(async move {
                     let cn = ch.connect(remote_addr).await?;
-                    client(
-                        cn,
-                        opt.num_msgs / opt.threads,
-                        interarrival,
-                        remote_addr,
-                        None,
-                    )
-                    .await
+                    if opt.closed_loop {
+                        closed_loop_client(cn, opt.num_msgs / opt.threads, remote_addr, None).await
+                    } else {
+                        open_loop_client(
+                            cn,
+                            opt.num_msgs / opt.threads,
+                            interarrival,
+                            remote_addr,
+                            None,
+                        )
+                        .await
+                    }
                 })?;
                 Ok::<_, Report>((thread, res))
             });
@@ -110,18 +126,32 @@ fn main() -> Result<(), Report> {
             .build()?;
         let res = rt.block_on(async move {
             let cn = ch.connect(remote_addr).await?;
-            client(
-                cn,
-                opt.num_msgs / opt.threads,
-                interarrival,
-                remote_addr,
-                Some(ClientSwapSpec {
-                    swap_after_msgs_num: opt.swap_delay_msgs,
-                    swap_to: opt.swap_to,
-                    ch,
-                }),
-            )
-            .await
+            if opt.closed_loop {
+                closed_loop_client(
+                    cn,
+                    opt.num_msgs / opt.threads,
+                    remote_addr,
+                    Some(ClientSwapSpec {
+                        swap_after_msgs_num: opt.swap_delay_msgs,
+                        swap_to: opt.swap_to,
+                        ch,
+                    }),
+                )
+                .await
+            } else {
+                open_loop_client(
+                    cn,
+                    opt.num_msgs / opt.threads,
+                    interarrival,
+                    remote_addr,
+                    Some(ClientSwapSpec {
+                        swap_after_msgs_num: opt.swap_delay_msgs,
+                        swap_to: opt.swap_to,
+                        ch,
+                    }),
+                )
+                .await
+            }
         })?;
         std::mem::drop(thread_span_g);
 
@@ -229,7 +259,10 @@ async fn server(
                         if !did_swap.load(Ordering::Relaxed) && cnt > *swap_after_msgs_num {
                             info!(?swap_to, ?cnt, "swapping datapath now");
                             did_swap.store(true, Ordering::SeqCst);
-                            ch.lock().unwrap().trigger_transition(*swap_to)?;
+                            if let Err(err) = ch.lock().unwrap().trigger_transition(*swap_to) {
+                                error!(?err, "trigger_transition failed");
+                                return Err(err);
+                            }
                         }
                     }
 
@@ -258,8 +291,122 @@ struct ClientSwapSpec {
     ch: DpdkDatapath,
 }
 
+fn handle_received(
+    remote_addr: SocketAddr,
+    ms: &mut [Option<(SocketAddr, Vec<u8>)>],
+    rs: &mut [Option<Duration>],
+    start: quanta::Instant,
+    clk: &quanta::Clock,
+) -> Result<usize, Report> {
+    let elapsed = clk.now().duration_since(start);
+    // return cumulative ack and number of drops.
+    ms.iter_mut()
+        .map_while(Option::take)
+        .try_fold(0, |cnt, msg| {
+            ensure!(
+                msg.0 == remote_addr,
+                "received response from unexpected address"
+            );
+
+            let msg_seq = u32::from_le_bytes(msg.1[0..4].try_into().unwrap()) as usize;
+            ensure!(
+                msg_seq < rs.len(),
+                "received out-of-bounds seq number echo {}",
+                msg_seq,
+            );
+
+            ensure!(
+                rs[msg_seq].is_none(),
+                "received duplicate echo packet {}",
+                msg_seq
+            );
+
+            trace!(?msg_seq, "received");
+            rs[msg_seq] = Some(elapsed);
+            Ok(cnt + 1)
+        })
+}
+
+#[instrument(skip(num_msgs, remote_addr), level = "info", err)]
+async fn closed_loop_client(
+    cn: DatapathCn,
+    num_msgs: usize,
+    remote_addr: SocketAddr,
+    mut swap_dp: Option<ClientSwapSpec>,
+) -> Result<Vec<Option<Duration>>, Report> {
+    let mut slots: Vec<_> = (0..16).map(|_| None).collect();
+    let mut msgs = (0..num_msgs).map(|i| {
+        let seq_bytes: [u8; 4] = (i as u32).to_le_bytes();
+        let mut payload = vec![0; 32];
+        payload[0..4].copy_from_slice(&seq_bytes[..]);
+        (remote_addr, payload)
+    });
+
+    let mut snd_msg_count = 0;
+    let mut batch = Vec::with_capacity(16);
+    let mut recvs: Vec<Option<Duration>> = (0..num_msgs).map(|_| None).collect();
+    let mut recv_cnt = 0usize;
+    let clk = quanta::Clock::new();
+
+    info!("starting");
+    let mut swapped = false;
+    let start = clk.now();
+
+    while snd_msg_count < num_msgs {
+        if let Some(ClientSwapSpec {
+            swap_after_msgs_num,
+            swap_to,
+            ch,
+        }) = &mut swap_dp
+        {
+            if !swapped && snd_msg_count >= *swap_after_msgs_num {
+                // called *non-concurrently* with send/recv.
+                info!(?swap_to, "swapping datapath now");
+                ch.trigger_transition(*swap_to)?;
+                swapped = true;
+            }
+        }
+
+        for _ in 0..8 {
+            if let Some(msg) = msgs.next() {
+                batch.push(msg);
+                snd_msg_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        let ms = match tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            cn.recv(&mut slots[..]),
+        )
+        .await
+        {
+            Ok(ms) => ms?,
+            Err(_) => {
+                continue;
+            }
+        };
+        let cnt = handle_received(remote_addr, ms, &mut recvs[..], start, &clk)?;
+        recv_cnt += cnt;
+        debug!(?cnt, ?recv_cnt, "received burst");
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(1), cn.recv(&mut slots[..])).await {
+        Ok(ms) => {
+            let cnt = handle_received(remote_addr, ms?, &mut recvs[..], start, &clk)?;
+            recv_cnt += cnt;
+            debug!(?cnt, ?recv_cnt, "received burst");
+        }
+        Err(_) => (),
+    };
+
+    info!(?recv_cnt, "done");
+    Ok(recvs)
+}
+
 #[instrument(skip(num_msgs, interarrival, remote_addr), level = "info", err)]
-async fn client(
+async fn open_loop_client(
     cn: DatapathCn,
     num_msgs: usize,
     interarrival: Duration,
@@ -280,42 +427,6 @@ async fn client(
     let mut recvs: Vec<Option<Duration>> = (0..num_msgs).map(|_| None).collect();
     let mut recv_cnt = 0usize;
     let clk = quanta::Clock::new();
-
-    fn handle_received(
-        remote_addr: SocketAddr,
-        ms: &mut [Option<(SocketAddr, Vec<u8>)>],
-        rs: &mut [Option<Duration>],
-        start: quanta::Instant,
-        clk: &quanta::Clock,
-    ) -> Result<usize, Report> {
-        let elapsed = clk.now().duration_since(start);
-        // return cumulative ack and number of drops.
-        ms.iter_mut()
-            .map_while(Option::take)
-            .try_fold(0, |cnt, msg| {
-                ensure!(
-                    msg.0 == remote_addr,
-                    "received response from unexpected address"
-                );
-
-                let msg_seq = u32::from_le_bytes(msg.1[0..4].try_into().unwrap()) as usize;
-                ensure!(
-                    msg_seq < rs.len(),
-                    "received out-of-bounds seq number echo {}",
-                    msg_seq,
-                );
-
-                ensure!(
-                    rs[msg_seq].is_none(),
-                    "received duplicate echo packet {}",
-                    msg_seq
-                );
-
-                trace!(?msg_seq, "received");
-                rs[msg_seq] = Some(elapsed);
-                Ok(cnt + 1)
-            })
-    }
 
     info!("starting");
     let mut swapped = false;
