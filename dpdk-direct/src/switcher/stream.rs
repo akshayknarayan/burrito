@@ -93,7 +93,6 @@ impl UpgradeStream {
             ) as _,
         };
 
-        debug!("datapath stream swap adapt_inner");
         let st = DpdkReqDatapath::adapt_inner_stream(
             inner,
             self.conns.clone(),
