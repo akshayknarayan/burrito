@@ -1,6 +1,7 @@
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{ensure, Report, WrapErr};
 use dpdk_direct::{DatapathCn, DpdkDatapath, DpdkDatapathChoice, DpdkReqDatapath};
+use flume::{Receiver, Sender};
 use futures_util::Stream;
 use futures_util::{future::Either, TryStreamExt};
 use quanta::Instant;
@@ -148,11 +149,13 @@ fn main() -> Result<(), Report> {
         info!(?local_addr, "Dpdk Inline Chunnel Test - Server");
         let ch = DpdkDatapath::new(opt.config, opt.datapath_choice)?;
         let mut ch = DpdkReqDatapath::from(ch);
-        let swap_spec = ServerSwapSpec {
+        let (swap_trigger_s, swap_trigger_r) = flume::bounded(1);
+        let mut swap_spec = ServerSwapSpec {
             swap_after_msgs_num: opt.swap_delay_msgs,
             swap_to: opt.swap_to,
-            ch: Arc::new(Mutex::new(ch.clone())),
             did_swap: Default::default(),
+            swap_trigger: swap_trigger_s,
+            inner: None,
         };
 
         for thread in 1..opt.threads {
@@ -173,7 +176,7 @@ fn main() -> Result<(), Report> {
                         Ok(s) => s,
                     };
 
-                    server(stream, thread, Some(swap_spec)).await
+                    server(stream, thread, swap_spec).await
                 })
             });
         }
@@ -187,68 +190,114 @@ fn main() -> Result<(), Report> {
                 .listen(local_addr)
                 .await
                 .wrap_err("failed to get connection stream")?;
-            server(stream, 0, Some(swap_spec)).await
+            swap_spec.inner = Some(ServerSwapSwapperSpec {
+                ch: Arc::new(Mutex::new(ch)),
+                swap_now_receiver: swap_trigger_r,
+            });
+            server(stream, 0, swap_spec).await
         })
     }
+}
+
+#[derive(Debug, Clone)]
+struct ServerSwapSwapperSpec {
+    ch: Arc<Mutex<DpdkReqDatapath>>,
+    swap_now_receiver: Receiver<()>,
 }
 
 #[derive(Debug, Clone)]
 struct ServerSwapSpec {
     swap_after_msgs_num: usize,
     swap_to: DpdkDatapathChoice,
-    ch: Arc<Mutex<DpdkReqDatapath>>,
     did_swap: Arc<AtomicBool>,
+    swap_trigger: Sender<()>,
+    inner: Option<ServerSwapSwapperSpec>,
 }
 
 #[instrument(skip(stream, swap_dp), level = "info", err)]
 async fn server(
     stream: impl Stream<Item = Result<DatapathCn, Report>> + Send + 'static,
     thread_idx: usize,
-    swap_dp: Option<ServerSwapSpec>,
+    mut swap_dp: ServerSwapSpec,
 ) -> Result<(), Report> {
     let tot_recv_count: Arc<AtomicUsize> = Default::default();
     info!("start listening");
-    stream
-        .try_for_each_concurrent(None, move |cn| {
-            let port = cn.local_port();
-            let peer = cn.remote_addr();
-            let tot_recv_count = tot_recv_count.clone();
-            let swap_dp = swap_dp.clone();
-            async move {
-                let mut slots: Vec<_> = (0..16).map(|_| None).collect();
-                info!("new connection");
-                loop {
-                    if let Some(ServerSwapSpec {
-                        swap_after_msgs_num,
-                        swap_to,
-                        ch,
-                        did_swap,
-                    }) = &swap_dp
-                    {
-                        let cnt = tot_recv_count.load(Ordering::Relaxed);
-                        if !did_swap.load(Ordering::Relaxed) && cnt > *swap_after_msgs_num {
-                            info!(?swap_to, ?cnt, "swapping datapath now");
-                            did_swap.store(true, Ordering::SeqCst);
-                            ch.lock().unwrap().trigger_transition(*swap_to)?;
-                        }
-                    }
+    let maybe_transition_fut = match swap_dp {
+        ServerSwapSpec {
+            inner: ref mut swapper @ Some(_),
+            swap_to,
+            ..
+        } => {
+            let ServerSwapSwapperSpec {
+                ch,
+                swap_now_receiver,
+            } = swapper.take().unwrap();
+            Some(async move {
+                swap_now_receiver
+                    .recv_async()
+                    .await
+                    .expect("swap trigger sender should not drop");
+                ch.lock()
+                    .unwrap()
+                    .trigger_transition(swap_to)
+                    .wrap_err("Error triggering transition")
+            })
+        }
+        _ => None,
+    };
 
-                    let msgs = cn.recv(&mut slots[..]).await?;
-                    let mut recv_count = 0;
-                    let echoes = msgs.iter_mut().map_while(|m| {
-                        let x = m.take()?;
-                        recv_count += 1;
-                        trace!(?x, ?recv_count, "got msg");
-                        Some(x)
-                    });
-                    cn.send(echoes).await?;
-                    tot_recv_count.fetch_add(recv_count, Ordering::SeqCst);
-                    debug!(?tot_recv_count, ?recv_count, "received message burst");
+    let srv_fut = stream.try_for_each_concurrent(None, move |cn| {
+        let port = cn.local_port();
+        let peer = cn.remote_addr();
+        let tot_recv_count = tot_recv_count.clone();
+        let swap_dp = swap_dp.clone();
+        async move {
+            let mut slots: Vec<_> = (0..16).map(|_| None).collect();
+            info!("new connection");
+            loop {
+                let ServerSwapSpec {
+                    swap_after_msgs_num,
+                    swap_to,
+                    did_swap,
+                    swap_trigger,
+                    ..
+                } = &swap_dp;
+                let cnt = tot_recv_count.load(Ordering::Relaxed);
+                if !did_swap.load(Ordering::Relaxed) && cnt > *swap_after_msgs_num {
+                    info!(?swap_to, ?cnt, "swapping datapath now");
+                    did_swap.store(true, Ordering::SeqCst);
+                    swap_trigger.send_async(()).await?;
                 }
+
+                let msgs = cn.recv(&mut slots[..]).await?;
+                let mut recv_count = 0;
+                let echoes = msgs.iter_mut().map_while(|m| {
+                    let x = m.take()?;
+                    recv_count += 1;
+                    trace!(?x, ?recv_count, "got msg");
+                    Some(x)
+                });
+                cn.send(echoes).await?;
+                tot_recv_count.fetch_add(recv_count, Ordering::SeqCst);
+                debug!(?tot_recv_count, ?recv_count, "received message burst");
             }
-            .instrument(info_span!("connection", ?port, ?peer))
-        })
-        .await
+        }
+        .instrument(info_span!("connection", ?port, ?peer))
+    });
+
+    tokio::pin!(srv_fut);
+    if let Some(transition_fut) = maybe_transition_fut {
+        tokio::pin!(transition_fut);
+        match futures_util::future::select(transition_fut, srv_fut).await {
+            Either::Left((transition_result, srv_fut)) => {
+                transition_result?;
+                srv_fut.await
+            }
+            Either::Right((srv_fut_result, _)) => srv_fut_result,
+        }
+    } else {
+        srv_fut.await
+    }
 }
 
 #[derive(Debug)]
