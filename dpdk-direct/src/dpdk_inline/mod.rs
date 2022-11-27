@@ -177,7 +177,8 @@ impl DpdkInlineChunnel {
         arp_table: HashMap<Ipv4Addr, MacAddress>,
         num_dpdk_threads: usize,
     ) -> Result<Self, Report> {
-        let dpdks = DpdkState::new_preconfig(ip_addr, arp_table, num_dpdk_threads)?;
+        let dpdks = DpdkState::new_preconfig(ip_addr, arp_table, num_dpdk_threads)
+            .wrap_err("Could not initialize DPDK state")?;
         Self::do_new(dpdks, num_dpdk_threads)
     }
 
