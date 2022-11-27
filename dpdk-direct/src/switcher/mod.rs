@@ -32,7 +32,7 @@ use crate::{DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpS
 use ahash::HashMap;
 use bertha::{ChunnelConnector, ChunnelListener, Either};
 use color_eyre::{
-    eyre::{ensure, eyre},
+    eyre::{ensure, eyre, WrapErr},
     Report,
 };
 use eui48::MacAddress;
@@ -259,7 +259,8 @@ impl DpdkDatapath {
         match choice {
             DpdkDatapathChoice::Thread => {
                 let mut new_ch =
-                    DpdkUdpSkChunnel::new_preconfig(self.ip_addr, self.arp_table.clone())?;
+                    DpdkUdpSkChunnel::new_preconfig(self.ip_addr, self.arp_table.clone())
+                        .wrap_err("Initializing dpdk-thread chunnel")?;
                 let mut new_conns = new_ch.load_connections(conns)?;
                 self.curr_datapath = DatapathInner::Thread(new_ch);
 
@@ -285,7 +286,8 @@ impl DpdkDatapath {
                     self.ip_addr,
                     self.arp_table.clone(),
                     num_threads,
-                )?;
+                )
+                .wrap_err("initializing dpdk-inline chunnel")?;
                 let mut new_conns = new_ch.load_connections(conns)?;
                 self.curr_datapath = DatapathInner::Inline(new_ch);
 
