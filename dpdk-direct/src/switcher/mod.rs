@@ -264,9 +264,6 @@ impl DpdkDatapath {
                 let mut new_conns = new_ch.load_connections(conns)?;
                 self.curr_datapath = DatapathInner::Thread(new_ch);
 
-                let ncs: Vec<_> = new_conns.keys().copied().collect();
-                debug!(new_conns = ?ncs, "loaded connections");
-
                 // now need to replace the active connections in our set of active connections.
                 for (conn_desc, sender) in conns_g.iter() {
                     let new_conn = new_conns
@@ -288,6 +285,9 @@ impl DpdkDatapath {
                     num_threads,
                 )
                 .wrap_err("initializing dpdk-inline chunnel")?;
+                // TODO this is wrong. it will load all the connections on the local thread, but
+                // what we want to do is distribute the new connections to the threads on which
+                // they already live.
                 let mut new_conns = new_ch.load_connections(conns)?;
                 self.curr_datapath = DatapathInner::Inline(new_ch);
 

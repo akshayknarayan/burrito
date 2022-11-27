@@ -83,6 +83,7 @@ impl DatapathCn {
                 Err(flume::TryRecvError::Empty) => return false, // common case - no work to do.
                 Err(flume::TryRecvError::Disconnected) => {
                     panic!("datapath update sender disappeared");
+                    // TODO need to distribute among threads?
                 }
                 Ok(new_dp) => new_dp,
             }
