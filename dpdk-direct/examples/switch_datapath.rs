@@ -45,6 +45,9 @@ struct Opt {
 
     #[structopt(long)]
     closed_loop: bool,
+
+    #[structopt(long, short)]
+    out_file: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<(), Report> {
@@ -155,8 +158,10 @@ fn main() -> Result<(), Report> {
         })?;
         std::mem::drop(thread_span_g);
 
+        let mut all = Vec::with_capacity(opt.num_msgs);
         let t0_tot = res.len();
-        let t0_done = res.into_iter().filter(Option::is_some).count();
+        let t0_done = res.iter().filter(|x| x.1.is_some()).count();
+        all.extend(res.into_iter());
         let done_span = debug_span!("wait_done");
         info!(thread = 0, completed = ?t0_done, dropped = ?(t0_tot - t0_done), "client done");
         let _done_span_g = done_span.enter();
@@ -165,10 +170,26 @@ fn main() -> Result<(), Report> {
                 Ok(r) => {
                     let (thread, res) = r?;
                     let t_tot = res.len();
-                    let t_done = res.into_iter().filter(Option::is_some).count();
+                    let t_done = res.iter().filter(|x| x.1.is_some()).count();
+                    all.extend(res.into_iter());
                     info!(?thread, completed = ?t_done, dropped = ?(t_tot - t_done), "client done");
                 }
                 Err(e) => std::panic::resume_unwind(e),
+            }
+        }
+
+        if let Some(ofp) = opt.out_file {
+            all.sort_by_key(|k| k.0);
+            use std::io::prelude::*;
+            let mut f = std::fs::File::create(&ofp)?;
+            writeln!(&mut f, "send_time_us maybe_rtt_us")?;
+            for (send, rtt) in all {
+                writeln!(
+                    &mut f,
+                    "{} {}",
+                    send.as_micros(),
+                    rtt.map(|r| r.as_micros()).unwrap_or(0)
+                )?;
             }
         }
 
@@ -294,11 +315,11 @@ struct ClientSwapSpec {
 fn handle_received(
     remote_addr: SocketAddr,
     ms: &mut [Option<(SocketAddr, Vec<u8>)>],
-    rs: &mut [Option<Duration>],
+    rs: &mut [(Duration, Option<Duration>)],
     start: quanta::Instant,
     clk: &quanta::Clock,
 ) -> Result<usize, Report> {
-    let elapsed = clk.now().duration_since(start);
+    let now = clk.now().duration_since(start);
     // return cumulative ack and number of drops.
     ms.iter_mut()
         .map_while(Option::take)
@@ -316,13 +337,14 @@ fn handle_received(
             );
 
             ensure!(
-                rs[msg_seq].is_none(),
+                rs[msg_seq].1.is_none(),
                 "received duplicate echo packet {}",
                 msg_seq
             );
 
-            trace!(?msg_seq, "received");
-            rs[msg_seq] = Some(elapsed);
+            let elapsed = now - rs[msg_seq].0;
+            trace!(?msg_seq, ?elapsed, "received");
+            rs[msg_seq].1 = Some(elapsed);
             Ok(cnt + 1)
         })
 }
@@ -333,18 +355,18 @@ async fn closed_loop_client(
     num_msgs: usize,
     remote_addr: SocketAddr,
     mut swap_dp: Option<ClientSwapSpec>,
-) -> Result<Vec<Option<Duration>>, Report> {
+) -> Result<Vec<(Duration, Option<Duration>)>, Report> {
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
     let mut msgs = (0..num_msgs).map(|i| {
         let seq_bytes: [u8; 4] = (i as u32).to_le_bytes();
         let mut payload = vec![0; 32];
         payload[0..4].copy_from_slice(&seq_bytes[..]);
-        (remote_addr, payload)
+        (i, (remote_addr, payload))
     });
 
     let mut snd_msg_count = 0;
     let mut batch = Vec::with_capacity(16);
-    let mut recvs: Vec<Option<Duration>> = (0..num_msgs).map(|_| None).collect();
+    let mut recvs: Vec<(Duration, Option<Duration>)> = Vec::with_capacity(num_msgs);
     let mut recv_cnt = 0usize;
     let clk = quanta::Clock::new();
 
@@ -367,14 +389,19 @@ async fn closed_loop_client(
             }
         }
 
+        let send_time = clk.now().duration_since(start).as_micros() as u64;
         for _ in 0..8 {
-            if let Some(msg) = msgs.next() {
+            if let Some((seq, msg)) = msgs.next() {
+                ensure!(recvs.len() == seq, "Recv tracking buffer out of sync");
+                recvs.push((Duration::from_micros(send_time), None));
                 batch.push(msg);
                 snd_msg_count += 1;
             } else {
                 break;
             }
         }
+
+        cn.send(batch.drain(..)).await?;
 
         let ms = match tokio::time::timeout(
             std::time::Duration::from_millis(50),
@@ -391,6 +418,8 @@ async fn closed_loop_client(
         recv_cnt += cnt;
         debug!(?cnt, ?recv_cnt, "received burst");
     }
+
+    debug!("last recv");
 
     match tokio::time::timeout(std::time::Duration::from_secs(1), cn.recv(&mut slots[..])).await {
         Ok(ms) => {
@@ -412,19 +441,19 @@ async fn open_loop_client(
     interarrival: Duration,
     remote_addr: SocketAddr,
     mut swap_dp: Option<ClientSwapSpec>,
-) -> Result<Vec<Option<Duration>>, Report> {
+) -> Result<Vec<(Duration, Option<Duration>)>, Report> {
     let mut ticker = AsyncSpinTimer::new(interarrival);
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
     let mut msgs = (0..num_msgs).map(|i| {
         let seq_bytes: [u8; 4] = (i as u32).to_le_bytes();
         let mut payload = vec![0; 32];
         payload[0..4].copy_from_slice(&seq_bytes[..]);
-        (remote_addr, payload)
+        (i, (remote_addr, payload))
     });
 
     let mut snd_msg_count = 0;
     let mut batch = Vec::with_capacity(16);
-    let mut recvs: Vec<Option<Duration>> = (0..num_msgs).map(|_| None).collect();
+    let mut recvs: Vec<(Duration, Option<Duration>)> = Vec::with_capacity(num_msgs);
     let mut recv_cnt = 0usize;
     let clk = quanta::Clock::new();
 
@@ -450,8 +479,11 @@ async fn open_loop_client(
         tokio::pin!(t);
         match futures_util::future::select(t, cn.recv(&mut slots[..])).await {
             Either::Left((mut num_msgs, _)) => {
+                let send_time = clk.now().duration_since(start).as_micros() as u64;
                 while num_msgs > 0 {
-                    if let Some(msg) = msgs.next() {
+                    if let Some((seq, msg)) = msgs.next() {
+                        ensure!(recvs.len() == seq, "Recv tracking buffer out of sync");
+                        recvs.push((Duration::from_micros(send_time), None));
                         batch.push(msg);
                         num_msgs -= 1;
                         snd_msg_count += 1;
