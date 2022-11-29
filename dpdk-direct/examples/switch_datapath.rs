@@ -182,14 +182,12 @@ fn main() -> Result<(), Report> {
             all.sort_by_key(|k| k.0);
             use std::io::prelude::*;
             let mut f = std::fs::File::create(&ofp)?;
-            writeln!(&mut f, "send_time_us maybe_rtt_us")?;
-            for (send, rtt) in all {
-                writeln!(
-                    &mut f,
-                    "{} {}",
-                    send.as_micros(),
-                    rtt.map(|r| r.as_micros()).unwrap_or(0)
-                )?;
+            writeln!(&mut f, "send_time_us maybe_recv_time maybe_rtt_us")?;
+            for (send, rcv) in all {
+                let (recv_time, rtt) = rcv
+                    .map(|(rcv_time, rtt)| (rcv_time.as_micros(), rtt.as_micros()))
+                    .unwrap_or((0, 0));
+                writeln!(&mut f, "{} {} {}", send.as_micros(), recv_time, rtt,)?;
             }
         }
 
@@ -315,12 +313,11 @@ struct ClientSwapSpec {
 fn handle_received(
     remote_addr: SocketAddr,
     ms: &mut [Option<(SocketAddr, Vec<u8>)>],
-    rs: &mut [(Duration, Option<Duration>)],
+    rs: &mut [(Duration, Option<(Duration, Duration)>)],
     start: quanta::Instant,
     clk: &quanta::Clock,
 ) -> Result<usize, Report> {
     let now = clk.now().duration_since(start);
-    // return cumulative ack and number of drops.
     ms.iter_mut()
         .map_while(Option::take)
         .try_fold(0, |cnt, msg| {
@@ -344,7 +341,7 @@ fn handle_received(
 
             let elapsed = now - rs[msg_seq].0;
             trace!(?msg_seq, ?elapsed, "received");
-            rs[msg_seq].1 = Some(elapsed);
+            rs[msg_seq].1 = Some((now, elapsed));
             Ok(cnt + 1)
         })
 }
@@ -355,7 +352,7 @@ async fn closed_loop_client(
     num_msgs: usize,
     remote_addr: SocketAddr,
     mut swap_dp: Option<ClientSwapSpec>,
-) -> Result<Vec<(Duration, Option<Duration>)>, Report> {
+) -> Result<Vec<(Duration, Option<(Duration, Duration)>)>, Report> {
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
     let mut msgs = (0..num_msgs).map(|i| {
         let seq_bytes: [u8; 4] = (i as u32).to_le_bytes();
@@ -366,13 +363,15 @@ async fn closed_loop_client(
 
     let mut snd_msg_count = 0;
     let mut batch = Vec::with_capacity(16);
-    let mut recvs: Vec<(Duration, Option<Duration>)> = Vec::with_capacity(num_msgs);
+    let mut recvs: Vec<(Duration, Option<(Duration, Duration)>)> = Vec::with_capacity(num_msgs);
     let mut recv_cnt = 0usize;
     let clk = quanta::Clock::new();
 
     info!("starting");
     let mut swapped = false;
     let start = clk.now();
+
+    let mut inflight_seqs = [0usize; 8];
 
     while snd_msg_count < num_msgs {
         if let Some(ClientSwapSpec {
@@ -390,9 +389,10 @@ async fn closed_loop_client(
         }
 
         let send_time = clk.now().duration_since(start).as_micros() as u64;
-        for _ in 0..8 {
+        for i in 0..8 {
             if let Some((seq, msg)) = msgs.next() {
                 ensure!(recvs.len() == seq, "Recv tracking buffer out of sync");
+                inflight_seqs[i] = seq;
                 recvs.push((Duration::from_micros(send_time), None));
                 batch.push(msg);
                 snd_msg_count += 1;
@@ -404,13 +404,18 @@ async fn closed_loop_client(
         cn.send(batch.drain(..)).await?;
 
         let ms = match tokio::time::timeout(
-            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(300),
             cn.recv(&mut slots[..]),
         )
         .await
         {
             Ok(ms) => ms?,
             Err(_) => {
+                debug!("timed out burst");
+                for seq in inflight_seqs {
+                    recvs[seq].1 = Some((Duration::from_secs(0), Duration::from_secs(0)));
+                }
+
                 continue;
             }
         };
@@ -441,7 +446,7 @@ async fn open_loop_client(
     interarrival: Duration,
     remote_addr: SocketAddr,
     mut swap_dp: Option<ClientSwapSpec>,
-) -> Result<Vec<(Duration, Option<Duration>)>, Report> {
+) -> Result<Vec<(Duration, Option<(Duration, Duration)>)>, Report> {
     let mut ticker = AsyncSpinTimer::new(interarrival);
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
     let mut msgs = (0..num_msgs).map(|i| {
@@ -453,7 +458,7 @@ async fn open_loop_client(
 
     let mut snd_msg_count = 0;
     let mut batch = Vec::with_capacity(16);
-    let mut recvs: Vec<(Duration, Option<Duration>)> = Vec::with_capacity(num_msgs);
+    let mut recvs: Vec<(Duration, Option<(Duration, Duration)>)> = Vec::with_capacity(num_msgs);
     let mut recv_cnt = 0usize;
     let clk = quanta::Clock::new();
 
