@@ -10,6 +10,7 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 lazy_static::lazy_static! {
@@ -119,7 +120,10 @@ impl DpdkUdpSkChunnel {
             .map(|c| match c {
                 ActiveConnection::UnConnected { local_port } => {
                     let inner = self.handle.socket(Some(local_port))?;
-                    let cn = DpdkUdpSk { inner };
+                    let cn = DpdkUdpSk {
+                        inner,
+                        drain_first_recv: Some(Default::default()),
+                    };
 
                     out.insert(c, Either::Left(cn));
                     Ok::<_, Report>(None)
@@ -148,7 +152,10 @@ impl DpdkUdpSkChunnel {
                         local_port,
                         remote_addr,
                     },
-                    Either::Right(BoundDpdkUdpSk { inner: conn }),
+                    Either::Right(BoundDpdkUdpSk {
+                        inner: conn,
+                        drain_first_recv: Some(Default::default()),
+                    }),
                 );
             }
 
@@ -166,7 +173,10 @@ impl DpdkUdpSkChunnel {
 
         let inner = self.handle.socket(Some(a.port()))?;
 
-        Ok(DpdkUdpSk { inner })
+        Ok(DpdkUdpSk {
+            inner,
+            drain_first_recv: None,
+        })
     }
 }
 
@@ -210,13 +220,17 @@ impl ChunnelConnector for DpdkUdpSkChunnel {
     type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
-        let sk = self.handle.socket(None).map(|inner| DpdkUdpSk { inner });
+        let sk = self.handle.socket(None).map(|inner| DpdkUdpSk {
+            inner,
+            drain_first_recv: None,
+        });
         futures_util::future::ready(sk)
     }
 }
 
 pub struct DpdkUdpSk {
     inner: DpdkConn,
+    drain_first_recv: Option<AtomicBool>,
 }
 
 impl DpdkUdpSk {
@@ -258,12 +272,19 @@ impl ChunnelConnection for DpdkUdpSk {
     where
         'buf: 'cn,
     {
+        if let Some(ref o) = self.drain_first_recv {
+            if let Ok(_) = o.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) {
+                return Box::pin(async move { self.inner.recv_async_batch_drain(msgs_buf).await });
+            }
+        }
+
         Box::pin(async move { self.inner.recv_async_batch(msgs_buf).await })
     }
 }
 
 pub struct BoundDpdkUdpSk {
     inner: BoundDpdkConn,
+    drain_first_recv: Option<AtomicBool>,
 }
 
 impl BoundDpdkUdpSk {
@@ -309,6 +330,12 @@ impl ChunnelConnection for BoundDpdkUdpSk {
     where
         'buf: 'cn,
     {
+        if let Some(ref o) = self.drain_first_recv {
+            if let Ok(_) = o.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) {
+                return Box::pin(async move { self.inner.recv_async_batch_drain(msgs_buf).await });
+            }
+        }
+
         Box::pin(async move { self.inner.recv_async_batch(msgs_buf).await })
     }
 }
@@ -330,10 +357,12 @@ impl ChunnelListener for DpdkUdpReqChunnel {
             V4(a) => {
                 let sk = self.0.handle.accept(a.port());
                 futures_util::future::ready(sk.map(move |s| {
-                    Box::pin(
-                        s.into_stream()
-                            .map(move |inner| Ok(BoundDpdkUdpSk { inner })),
-                    ) as _
+                    Box::pin(s.into_stream().map(move |inner| {
+                        Ok(BoundDpdkUdpSk {
+                            inner,
+                            drain_first_recv: None,
+                        })
+                    })) as _
                 }))
             }
             V6(a) => futures_util::future::ready(Err(eyre!("Only IPv4 is supported: {:?}", a))),
