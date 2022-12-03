@@ -404,7 +404,7 @@ async fn closed_loop_client(
         cn.send(batch.drain(..)).await?;
 
         let ms = match tokio::time::timeout(
-            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(500),
             cn.recv(&mut slots[..]),
         )
         .await
