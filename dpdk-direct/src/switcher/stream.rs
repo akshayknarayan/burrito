@@ -1,78 +1,29 @@
-use super::{DatapathInner, ReqDatapathStream};
-use crate::{
-    ActiveConnection, DatapathCnInner, DpdkInlineReqChunnel, DpdkReqDatapath, DpdkUdpReqChunnel,
-};
-use ahash::HashMap;
-use bertha::{ChunnelListener, Either};
+use super::ReqDatapathStream;
 use color_eyre::Report;
-use flume::{Receiver, Sender};
-use futures_util::stream::Stream;
+use flume::Receiver;
 use futures_util::TryStreamExt;
-use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
-};
-use tracing::debug;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub struct UpgradeStream {
-    port: u16,
-    inner: ReqDatapathStream,
-    updates: Receiver<DatapathInner>,
-    conns: Arc<StdMutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
+    inner: Arc<Mutex<ReqDatapathStream>>,
+    pause_update: Receiver<()>,
 }
 
 impl UpgradeStream {
-    pub(crate) fn new(
-        port: u16,
-        inner: ReqDatapathStream,
-        updates: Receiver<DatapathInner>,
-        conns: Arc<StdMutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
-    ) -> Self {
+    pub(crate) fn new(inner: Arc<Mutex<ReqDatapathStream>>, pause_update: Receiver<()>) -> Self {
         Self {
-            port,
             inner,
-            updates,
-            conns,
+            pause_update,
         }
     }
 
-    pub async fn next(mut self) -> Result<Option<(super::DatapathCn, Self)>, Report> {
+    pub async fn next(self) -> Result<Option<(super::DatapathCn, Self)>, Report> {
         let cn = loop {
-            match futures_util::future::select(self.updates.recv_async(), self.inner.try_next())
-                .await
-            {
-                futures_util::future::Either::Left((new_dp, _)) => {
-                    let new_dp = new_dp.expect("datapath transition sender disappeared");
-                    debug!(?new_dp, "performing datapath stream swap");
-                    // now we construct a new stream.
-                    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, self.port));
-                    let inner: Pin<
-                        Box<
-                            dyn Stream<Item = Result<DatapathCnInner, Report>>
-                                + Send
-                                + Sync
-                                + 'static,
-                        >,
-                    > = match new_dp {
-                        DatapathInner::Thread(s) => Box::pin(
-                            DpdkUdpReqChunnel(s)
-                                .listen(addr)
-                                .into_inner()?
-                                .map_ok(Either::Right)
-                                .map_ok(DatapathCnInner::Thread),
-                        ) as _,
-                        DatapathInner::Inline(s) => Box::pin(
-                            DpdkInlineReqChunnel::from(s)
-                                .listen(addr)
-                                .into_inner()?
-                                .map_ok(DatapathCnInner::Inline),
-                        ) as _,
-                    };
-
-                    let st = DpdkReqDatapath::adapt_inner_stream(inner, self.conns.clone());
-                    self.inner = st;
-                    debug!("datapath stream swap done");
+            let rcv = Box::pin(async { self.inner.lock().await.try_next().await });
+            match futures_util::future::select(self.pause_update.recv_async(), rcv).await {
+                futures_util::future::Either::Left((r, _)) => {
+                    r.expect("datapath transition sender disappeared");
                 }
                 futures_util::future::Either::Right((cn, _)) => {
                     break cn?;

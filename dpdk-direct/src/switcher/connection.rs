@@ -10,7 +10,6 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Mutex;
-use tracing::debug;
 
 #[derive(Debug)]
 pub(crate) enum DatapathCnInner {
@@ -42,7 +41,7 @@ impl DatapathCnInner {
 /// be called concurrently with `send`/`recv`.
 pub struct DatapathCn {
     pub(crate) inner: Arc<Mutex<DatapathCnInner>>,
-    pub(crate) new_datapath: Receiver<DatapathCnInner>,
+    pub(crate) new_datapath: Receiver<()>,
     pub(crate) local_port: u16,
     pub(crate) remote_addr: Option<SocketAddrV4>,
 }
@@ -75,12 +74,6 @@ impl ChunnelConnection for DatapathCn {
         <B as IntoIterator>::IntoIter: Send,
     {
         Box::pin(async move {
-            if let Ok(new_dp) = self.new_datapath.try_recv() {
-                debug!("applying upgraded semantics (send)");
-                let mut inner_g = self.inner.lock().await;
-                *inner_g = new_dp;
-            }
-
             let inner_g = self.inner.lock().await;
             match *inner_g {
                 DatapathCnInner::Thread(ref s) => s.send(burst).await,
@@ -128,12 +121,9 @@ impl ChunnelConnection for DatapathCn {
 
                         break Ok(&mut msgs_buf[..slot_idx]);
                     }
-                    future::Either::Right((new_dp, recvr)) => {
-                        debug!("performing datapath connection swap");
-                        std::mem::drop(recvr); // cancel the future and drop, so its lock on inner is dropped.
-                        let mut inner = self.inner.lock().await;
-                        *inner = new_dp.expect("datapath transition sender disappeared");
-                        debug!("swapped datapath connection");
+                    future::Either::Right((r, _)) => {
+                        r?;
+                        // cancel the future and drop, so its lock on inner is dropped.
                     }
                 }
             }

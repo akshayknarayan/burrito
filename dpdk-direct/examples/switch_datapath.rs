@@ -281,7 +281,8 @@ async fn server(
                         if !did_swap.load(Ordering::Relaxed) && cnt > *swap_after_msgs_num {
                             info!(?swap_to, ?cnt, "swapping datapath now");
                             did_swap.store(true, Ordering::SeqCst);
-                            if let Err(err) = ch.lock().unwrap().trigger_transition(*swap_to) {
+                            if let Err(err) = ch.lock().unwrap().trigger_transition(*swap_to).await
+                            {
                                 error!(?err, "trigger_transition failed");
                                 return Err(err);
                             }
@@ -386,7 +387,7 @@ async fn closed_loop_client(
             if !swapped && snd_msg_count >= *swap_after_msgs_num {
                 // called *non-concurrently* with send/recv.
                 info!(?swap_to, "swapping datapath now");
-                ch.trigger_transition(*swap_to)?;
+                ch.trigger_transition(*swap_to).await?;
                 swapped = true;
             }
         }
@@ -478,7 +479,7 @@ async fn open_loop_client(
             if !swapped && snd_msg_count >= *swap_after_msgs_num {
                 // called *non-concurrently* with send/recv.
                 info!(?swap_to, "swapping datapath now");
-                ch.trigger_transition(*swap_to)?;
+                ch.trigger_transition(*swap_to).await?;
                 swapped = true;
             }
         }
