@@ -41,17 +41,15 @@ use futures_util::{
     future::{ready, Ready},
     stream::{once, Once, Stream, TryStreamExt},
 };
-use std::task::Waker;
 use std::{
-    cell::{RefCell, UnsafeCell},
     fmt::Debug,
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     pin::Pin,
     str::FromStr,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::{Arc, Barrier, Mutex, RwLock},
+    sync::{Arc, Mutex as StdMutex},
 };
+use tokio::sync::Mutex;
 use tracing::debug;
 
 mod migrator;
@@ -107,40 +105,6 @@ impl FromStr for DpdkDatapathChoice {
     }
 }
 
-std::thread_local! {
-    static THIS_THREAD_ID: RefCell<Option<usize>> = RefCell::new(None);
-}
-
-fn update_thread_idx_and_count(
-    barrier_count: &Arc<AtomicUsize>,
-    swap_barrier: &Arc<RwLock<Barrier>>,
-) {
-    THIS_THREAD_ID.with(|is_active| {
-        let mut a = is_active.borrow_mut();
-        if a.is_none() {
-            let cnt = barrier_count.fetch_add(1, Ordering::SeqCst);
-            *a = Some(cnt);
-            let mut sb = swap_barrier.write().unwrap();
-            *sb = Barrier::new(cnt);
-        }
-    });
-}
-
-fn try_get_thread_id() -> Option<usize> {
-    THIS_THREAD_ID.with(|active| *active.borrow())
-}
-
-fn store_thread_waker(tw: &Arc<Mutex<Vec<Option<Waker>>>>, waker: Waker) {
-    // store a waker so we can wake this task when we want to do a swap.
-    let thread_idx = try_get_thread_id().expect("thread not initialized");
-    let mut wakers_g = tw.lock().unwrap();
-    while wakers_g.len() <= thread_idx {
-        wakers_g.push(None);
-    }
-
-    wakers_g[thread_idx] = Some(waker);
-}
-
 /// A base-level chunnel able to dynamically switch between dpdk-thread and dpdk-inline datapaths.
 ///
 /// To trigger a switch, call `trigger_transition`. `DpdkDatapath` can be cloned to enable later calling
@@ -152,11 +116,7 @@ pub struct DpdkDatapath {
 
     curr_datapath: DatapathInner,
     // need to keep track of connections so we can send updated `DatapathCnInner`s.
-    conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
-    wait_for_datapath_swap_now: Arc<AtomicBool>,
-    barrier_count: Arc<AtomicUsize>,
-    swap_barrier: Arc<RwLock<Barrier>>,
-    swap_wakers: Arc<Mutex<Vec<Option<Waker>>>>,
+    conns: Arc<StdMutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
 }
 
 impl Debug for DpdkDatapath {
@@ -188,10 +148,6 @@ impl DpdkDatapath {
             arp_table,
             curr_datapath,
             conns: Default::default(),
-            wait_for_datapath_swap_now: Default::default(),
-            barrier_count: Arc::new(1usize.into()),
-            swap_barrier: Arc::new(RwLock::new(Barrier::new(1))),
-            swap_wakers: Default::default(),
         })
     }
 
@@ -210,46 +166,13 @@ impl DpdkDatapath {
         }
     }
 
-    /// Start the critical section.
-    ///
-    /// safety postcondition: any thread with send/recv operations is currently waiting in
-    /// `maybe_swap_datapath` on a channel recv from us, and is thus *not* accessing DPDK state.
-    /// we are about to tear down and replace that DPDK state, so it is important no one is using it.
-    ///
-    /// what about the *current thread*? It is not sending or receiving (since it is doing
-    /// this), but on the next send/recv operation it needs to perform the swap we are about to
-    /// send it via the channel.
-    fn wait_trigger_synchronize(&self) {
-        debug!("synchronizing now");
-        // we must *immediately* set this AtomicBool so that any send/recv calls on other threads
-        // that occur become synchronized on the setup happening on this thread.
-        self.wait_for_datapath_swap_now
-            .store(true, Ordering::SeqCst);
-        for o_w in self.swap_wakers.lock().unwrap().drain(..) {
-            if let Some(w) = o_w {
-                w.wake();
-            }
-        }
-
-        self.swap_barrier.read().unwrap().wait();
-        debug!("synchronized");
-    }
-
-    fn transition_complete(&self) {
-        self.wait_for_datapath_swap_now
-            .store(false, Ordering::SeqCst);
-        debug!("done");
-    }
-
     pub fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
         if !self.check_do_transition(choice) {
             return Ok(());
         }
 
         let _transition_span_g = tracing::debug_span!("datapath_transition", ?choice).entered();
-        self.wait_trigger_synchronize();
-        // begin critical synchronized section. Other threads will exit the critical section as we
-        // send() `new_ch`s to them.
+
         self.curr_datapath.shut_down()?;
 
         let conns_g = self.conns.lock().unwrap();
@@ -306,8 +229,6 @@ impl DpdkDatapath {
             }
         }
 
-        // critical section over.
-        self.transition_complete();
         Ok(())
     }
 }
@@ -337,13 +258,13 @@ impl ChunnelConnector for DpdkDatapath {
                 s,
             );
 
-            update_thread_idx_and_count(&this.barrier_count, &this.swap_barrier);
+            let local_port = inner.local_port();
+            let remote_addr = inner.remote_addr();
             Ok(DatapathCn {
-                inner: UnsafeCell::new(inner),
-                wait_for_datapath_swap_now: Arc::clone(&this.wait_for_datapath_swap_now),
+                inner: Arc::new(Mutex::new(inner)),
                 new_datapath: r,
-                swap_barrier: Arc::clone(&this.swap_barrier),
-                thread_wakers: Arc::clone(&this.swap_wakers),
+                local_port,
+                remote_addr,
             })
         }
 
@@ -377,13 +298,13 @@ impl ChunnelListener for DpdkDatapath {
                 s,
             );
 
-            update_thread_idx_and_count(&this.barrier_count, &this.swap_barrier);
+            let local_port = inner.local_port();
+            let remote_addr = inner.remote_addr();
             Ok(DatapathCn {
-                inner: UnsafeCell::new(inner),
-                wait_for_datapath_swap_now: Arc::clone(&this.wait_for_datapath_swap_now),
+                inner: Arc::new(Mutex::new(inner)),
                 new_datapath: r,
-                swap_barrier: Arc::clone(&this.swap_barrier),
-                thread_wakers: Arc::clone(&this.swap_wakers),
+                local_port,
+                remote_addr,
             })
         }
 
@@ -401,7 +322,7 @@ type ReqDatapathStream =
 #[derive(Clone)]
 pub struct DpdkReqDatapath {
     inner: DpdkDatapath,
-    acceptors: Arc<Mutex<HashMap<u16, Vec<Sender<DatapathInner>>>>>,
+    acceptors: Arc<StdMutex<HashMap<u16, Vec<Sender<DatapathInner>>>>>,
 }
 
 impl Debug for DpdkReqDatapath {
@@ -433,16 +354,9 @@ impl DpdkReqDatapath {
 
     fn adapt_inner_stream(
         st: Pin<Box<dyn Stream<Item = Result<DatapathCnInner, Report>> + Send + Sync + 'static>>,
-        conns: Arc<Mutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
-        wait_for_datapath_swap_now: Arc<AtomicBool>,
-        swap_barrier: Arc<RwLock<Barrier>>,
-        thread_wakers: Arc<Mutex<Vec<Option<Waker>>>>,
+        conns: Arc<StdMutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
     ) -> ReqDatapathStream {
         Box::pin(st.map_ok(move |cn| {
-            let ws = Arc::clone(&wait_for_datapath_swap_now);
-            let sb = Arc::clone(&swap_barrier);
-            let tw = Arc::clone(&thread_wakers);
-
             // conn updater
             let (s, r) = flume::bounded(1);
             conns.lock().unwrap().insert(
@@ -455,12 +369,13 @@ impl DpdkReqDatapath {
                 s,
             );
 
+            let local_port = cn.local_port();
+            let remote_addr = cn.remote_addr();
             DatapathCn {
-                inner: UnsafeCell::new(cn),
-                wait_for_datapath_swap_now: ws,
-                swap_barrier: sb,
+                inner: Arc::new(Mutex::new(cn)),
                 new_datapath: r,
-                thread_wakers: tw,
+                local_port,
+                remote_addr,
             }
         }))
     }
@@ -471,13 +386,15 @@ impl ChunnelListener for DpdkReqDatapath {
     type Addr = SocketAddr;
     type Connection = DatapathCn;
     type Error = Report;
-    type Stream = UpgradeStream;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
 
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
         fn try_listen(
             this: &mut DpdkReqDatapath,
             addr: SocketAddr,
-        ) -> Result<UpgradeStream, Report> {
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DatapathCn, Report>> + Send + 'static>>, Report>
+        {
             let inner: Pin<
                 Box<dyn Stream<Item = Result<DatapathCnInner, Report>> + Send + Sync + 'static>,
             > = match &this.inner.curr_datapath {
@@ -496,13 +413,7 @@ impl ChunnelListener for DpdkReqDatapath {
                 ) as _,
             };
 
-            let st = DpdkReqDatapath::adapt_inner_stream(
-                inner,
-                this.inner.conns.clone(),
-                this.inner.wait_for_datapath_swap_now.clone(),
-                this.inner.swap_barrier.clone(),
-                this.inner.swap_wakers.clone(),
-            );
+            let st = DpdkReqDatapath::adapt_inner_stream(inner, this.inner.conns.clone());
 
             // stream updater
             let (s, r) = flume::bounded(1);
@@ -512,16 +423,11 @@ impl ChunnelListener for DpdkReqDatapath {
                 .entry(addr.port())
                 .or_default()
                 .push(s);
-            update_thread_idx_and_count(&this.inner.barrier_count, &this.inner.swap_barrier);
-            Ok(UpgradeStream::new(
-                addr.port(),
-                st,
-                r,
-                this.inner.conns.clone(),
-                Arc::clone(&this.inner.wait_for_datapath_swap_now),
-                Arc::clone(&this.inner.swap_barrier),
-                Arc::clone(&this.inner.swap_wakers),
-            ))
+            let us = UpgradeStream::new(addr.port(), st, r, this.inner.conns.clone());
+            Ok(Box::pin(futures_util::stream::try_unfold(
+                us,
+                UpgradeStream::next,
+            )))
         }
 
         ready(try_listen(self, addr))
