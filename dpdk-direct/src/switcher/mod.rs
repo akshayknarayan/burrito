@@ -39,11 +39,12 @@ use eui48::MacAddress;
 use flume::Sender;
 use futures_util::{
     future::{ready, Ready},
-    stream::{once, Once, Stream, TryStreamExt},
+    stream::{once, FuturesUnordered, Once, Stream, TryStreamExt},
+    StreamExt,
 };
 use std::{
     fmt::Debug,
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::Path,
     pin::Pin,
     str::FromStr,
@@ -116,7 +117,7 @@ pub struct DpdkDatapath {
 
     curr_datapath: DatapathInner,
     // need to keep track of connections so we can send updated `DatapathCnInner`s.
-    conns: Arc<StdMutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
+    conns: Arc<StdMutex<HashMap<ActiveConnection, (Arc<Mutex<DatapathCnInner>>, Sender<()>)>>>,
 }
 
 impl Debug for DpdkDatapath {
@@ -166,7 +167,7 @@ impl DpdkDatapath {
         }
     }
 
-    pub fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
+    pub async fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
         if !self.check_do_transition(choice) {
             return Ok(());
         }
@@ -178,27 +179,34 @@ impl DpdkDatapath {
         let conns_g = self.conns.lock().unwrap();
         let conns = conns_g.keys().copied().collect();
         debug!(?conns, "current connections");
-
+        let conn_handles_futs: futures_util::stream::FuturesUnordered<_> = conns_g
+            .iter()
+            .map(|(c, (cn_mutex, preemptor))| async move {
+                preemptor.send(()).unwrap();
+                (c, cn_mutex.lock().await)
+            })
+            .collect();
+        let mut conn_handles: HashMap<_, _> = conn_handles_futs.collect().await;
         match choice {
             DpdkDatapathChoice::Thread => {
                 let mut new_ch =
                     DpdkUdpSkChunnel::new_preconfig(self.ip_addr, self.arp_table.clone())
                         .wrap_err("Initializing dpdk-thread chunnel")?;
-                let mut new_conns = new_ch.load_connections(conns)?;
+                let new_conns = new_ch.load_connections(conns)?;
                 self.curr_datapath = DatapathInner::Thread(new_ch);
 
                 // now need to replace the active connections in our set of active connections.
-                for (conn_desc, sender) in conns_g.iter() {
-                    let new_conn = new_conns
-                        .remove(conn_desc)
-                        .ok_or(eyre!("Did not find new connection for {:?}", conn_desc))?;
-                    sender.send(DatapathCnInner::Thread(new_conn))?;
+                for (conn_desc, new_conn) in new_conns {
+                    let mut guard = conn_handles
+                        .remove(&conn_desc)
+                        .ok_or(eyre!("Did not find connection for {:?}", conn_desc))?;
+                    *guard = DatapathCnInner::Thread(new_conn);
                 }
 
                 ensure!(
-                    new_conns.is_empty(),
+                    conn_handles.is_empty(),
                     "Did not find existing connections for {:?}",
-                    new_conns
+                    conn_handles.keys().copied().collect::<Vec<_>>(),
                 );
             }
             DpdkDatapathChoice::Inline { num_threads } => {
@@ -211,20 +219,20 @@ impl DpdkDatapath {
                 // TODO this is wrong. it will load all the connections on the local thread, but
                 // what we want to do is distribute the new connections to the threads on which
                 // they already live.
-                let mut new_conns = new_ch.load_connections(conns)?;
+                let new_conns = new_ch.load_connections(conns)?;
                 self.curr_datapath = DatapathInner::Inline(new_ch);
 
-                for (conn_desc, sender) in conns_g.iter() {
-                    let new_conn = new_conns
-                        .remove(conn_desc)
-                        .ok_or(eyre!("Did not find new connection for {:?}", conn_desc))?;
-                    sender.send(DatapathCnInner::Inline(new_conn))?;
+                for (conn_desc, new_conn) in new_conns {
+                    let mut guard = conn_handles
+                        .remove(&conn_desc)
+                        .ok_or(eyre!("Did not find connection for {:?}", conn_desc))?;
+                    *guard = DatapathCnInner::Inline(new_conn);
                 }
 
                 ensure!(
-                    new_conns.is_empty(),
+                    conn_handles.is_empty(),
                     "Did not find existing connections for {:?}",
-                    new_conns
+                    conn_handles.keys().copied().collect::<Vec<_>>(),
                 );
             }
         }
@@ -250,18 +258,18 @@ impl ChunnelConnector for DpdkDatapath {
                 }
             };
 
-            let (s, r) = flume::bounded(1);
-            this.conns.lock().unwrap().insert(
-                ActiveConnection::UnConnected {
-                    local_port: inner.local_port(),
-                },
-                s,
-            );
-
             let local_port = inner.local_port();
             let remote_addr = inner.remote_addr();
+
+            let inner = Arc::new(Mutex::new(inner));
+
+            let (s, r) = flume::bounded(1);
+            this.conns.lock().unwrap().insert(
+                ActiveConnection::UnConnected { local_port },
+                (inner.clone(), s),
+            );
             Ok(DatapathCn {
-                inner: Arc::new(Mutex::new(inner)),
+                inner,
                 new_datapath: r,
                 local_port,
                 remote_addr,
@@ -290,18 +298,17 @@ impl ChunnelListener for DpdkDatapath {
                 }
             };
 
-            let (s, r) = flume::bounded(1);
-            this.conns.lock().unwrap().insert(
-                ActiveConnection::UnConnected {
-                    local_port: inner.local_port(),
-                },
-                s,
-            );
-
             let local_port = inner.local_port();
             let remote_addr = inner.remote_addr();
+            let inner = Arc::new(Mutex::new(inner));
+
+            let (s, r) = flume::bounded(1);
+            this.conns.lock().unwrap().insert(
+                ActiveConnection::UnConnected { local_port },
+                (inner.clone(), s),
+            );
             Ok(DatapathCn {
-                inner: Arc::new(Mutex::new(inner)),
+                inner,
                 new_datapath: r,
                 local_port,
                 remote_addr,
@@ -322,7 +329,7 @@ type ReqDatapathStream =
 #[derive(Clone)]
 pub struct DpdkReqDatapath {
     inner: DpdkDatapath,
-    acceptors: Arc<StdMutex<HashMap<u16, Vec<Sender<DatapathInner>>>>>,
+    acceptors: Arc<StdMutex<HashMap<u16, Vec<(Sender<()>, Arc<Mutex<ReqDatapathStream>>)>>>>,
 }
 
 impl Debug for DpdkReqDatapath {
@@ -341,12 +348,42 @@ impl From<DpdkDatapath> for DpdkReqDatapath {
 }
 
 impl DpdkReqDatapath {
-    pub fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
-        self.inner.trigger_transition(choice)?;
-        for (_, senders) in self.acceptors.lock().unwrap().iter() {
-            for s in senders {
-                s.send(self.inner.curr_datapath.clone())?;
+    pub async fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
+        let acceptors_g = self.acceptors.lock().unwrap();
+        let update_guards_futs = FuturesUnordered::new();
+        for (p, senders) in acceptors_g.iter() {
+            for (s, mux) in senders {
+                s.send(())?;
+                update_guards_futs.push(async { (*p, mux.lock().await) });
             }
+        }
+        let update_guards: Vec<_> = update_guards_futs.collect().await;
+        self.inner.trigger_transition(choice).await?;
+        for (port, mut g) in update_guards {
+            debug!(?self.inner.curr_datapath, "performing datapath stream swap");
+            // now we construct a new stream.
+            let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+            let inner: Pin<
+                Box<dyn Stream<Item = Result<DatapathCnInner, Report>> + Send + Sync + 'static>,
+            > = match self.inner.curr_datapath {
+                DatapathInner::Thread(ref s) => Box::pin(
+                    DpdkUdpReqChunnel(s.clone())
+                        .listen(addr)
+                        .into_inner()?
+                        .map_ok(Either::Right)
+                        .map_ok(DatapathCnInner::Thread),
+                ) as _,
+                DatapathInner::Inline(ref s) => Box::pin(
+                    DpdkInlineReqChunnel::from(s.clone())
+                        .listen(addr)
+                        .into_inner()?
+                        .map_ok(DatapathCnInner::Inline),
+                ) as _,
+            };
+
+            let st = DpdkReqDatapath::adapt_inner_stream(inner, self.inner.conns.clone());
+            *g = st;
+            debug!("datapath stream swap done");
         }
 
         Ok(())
@@ -354,25 +391,26 @@ impl DpdkReqDatapath {
 
     fn adapt_inner_stream(
         st: Pin<Box<dyn Stream<Item = Result<DatapathCnInner, Report>> + Send + Sync + 'static>>,
-        conns: Arc<StdMutex<HashMap<ActiveConnection, Sender<DatapathCnInner>>>>,
+        conns: Arc<StdMutex<HashMap<ActiveConnection, (Arc<Mutex<DatapathCnInner>>, Sender<()>)>>>,
     ) -> ReqDatapathStream {
         Box::pin(st.map_ok(move |cn| {
+            let local_port = cn.local_port();
+            let remote_addr = cn.remote_addr();
+
+            let cn = Arc::new(Mutex::new(cn));
             // conn updater
             let (s, r) = flume::bounded(1);
             conns.lock().unwrap().insert(
                 ActiveConnection::Connected {
-                    local_port: cn.local_port(),
-                    remote_addr: cn
-                        .remote_addr()
+                    local_port,
+                    remote_addr: remote_addr
                         .expect("expected remote address for accept-style connection"),
                 },
-                s,
+                (cn.clone(), s),
             );
 
-            let local_port = cn.local_port();
-            let remote_addr = cn.remote_addr();
             DatapathCn {
-                inner: Arc::new(Mutex::new(cn)),
+                inner: cn,
                 new_datapath: r,
                 local_port,
                 remote_addr,
@@ -413,7 +451,10 @@ impl ChunnelListener for DpdkReqDatapath {
                 ) as _,
             };
 
-            let st = DpdkReqDatapath::adapt_inner_stream(inner, this.inner.conns.clone());
+            let st = Arc::new(Mutex::new(DpdkReqDatapath::adapt_inner_stream(
+                inner,
+                this.inner.conns.clone(),
+            )));
 
             // stream updater
             let (s, r) = flume::bounded(1);
@@ -422,8 +463,8 @@ impl ChunnelListener for DpdkReqDatapath {
                 .unwrap()
                 .entry(addr.port())
                 .or_default()
-                .push(s);
-            let us = UpgradeStream::new(addr.port(), st, r, this.inner.conns.clone());
+                .push((s, st.clone()));
+            let us = UpgradeStream::new(st, r);
             Ok(Box::pin(futures_util::stream::try_unfold(
                 us,
                 UpgradeStream::next,
