@@ -182,8 +182,11 @@ impl DpdkDatapath {
         let conn_handles_futs: futures_util::stream::FuturesUnordered<_> = conns_g
             .iter()
             .map(|(c, (cn_mutex, preemptor))| async move {
-                preemptor.send(()).unwrap();
-                (c, cn_mutex.lock().await)
+                // TODO XXX race condition on lock vs re-lock after the send.
+                // the re-lock case deadlocks.
+                let (send_res, g) = futures_util::join!(preemptor.send_async(()), cn_mutex.lock());
+                send_res.unwrap();
+                (c, g)
             })
             .collect();
         let mut conn_handles: HashMap<_, _> = conn_handles_futs.collect().await;
@@ -353,11 +356,16 @@ impl DpdkReqDatapath {
         let update_guards_futs = FuturesUnordered::new();
         for (p, senders) in acceptors_g.iter() {
             for (s, mux) in senders {
-                s.send(())?;
-                update_guards_futs.push(async { (*p, mux.lock().await) });
+                update_guards_futs.push(async {
+                    let (send_res, g) = futures_util::join!(s.send_async(()), mux.lock());
+                    send_res.unwrap();
+                    (*p, g)
+                });
             }
         }
+        debug!("locking streams");
         let update_guards: Vec<_> = update_guards_futs.collect().await;
+        debug!("locked streams");
         self.inner.trigger_transition(choice).await?;
         for (port, mut g) in update_guards {
             debug!(?self.inner.curr_datapath, "performing datapath stream swap");
