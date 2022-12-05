@@ -735,6 +735,52 @@ def intel_devbind(machines, datapath):
             agenda.subtask("correct driver already bound")
         agenda.subtask(f"[{conn.addr}] done")
 
+def connect_machines(cfg):
+    agenda.task(f"Checking for connection vs experiment ip")
+    ips = [cfg['machines']['server']] + cfg['machines']['clients']
+    agenda.task(f"connecting to {ips}")
+    machines, commits = zip(*[check_machine(ip) for ip in ips])
+    # check all the commits are equal
+    if not all(c == commits[0] for c in commits):
+        agenda.subfailure(f"not all commits equal: {commits}")
+        raise Exception("Commits mismatched on machines")
+    return machines
+
+def setup_all(machines, cfg, args, setup_fn):
+    agenda.task("building...")
+    setups = [threading.Thread(target=setup_fn, args=(m, outdir, cfg['exp']['datapath'], args.dpdk_driver)) for m in machines]
+    [t.start() for t in setups]
+    [t.join() for t in setups]
+    if not thread_ok:
+        agenda.failure("Something went wrong")
+        raise Exception("setup error")
+    agenda.task("...done building")
+
+    ms = [cfg['machines']['server']] + cfg['machines']['clients']
+    for m in ms:
+        for x in machines:
+            if x.addr == m['exp']:
+                x.mac = m['mac']
+                break
+
+    if 'intel' == args.dpdk_driver and any('dpdk' in d for d in cfg['exp']['datapath']):
+        intel_setup(machines)
+
+    # copy config file to outdir
+    shutil.copy2(args.config, args.outdir)
+
+    dpdk_driver = args.dpdk_driver
+    if 'intel' == args.dpdk_driver:
+        intel_devbind(machines, 'kernel')
+
+    agenda.task("writing configuration files")
+    if 'shenango_channel' in cfg['exp']['datapath']:
+        for m in machines:
+            write_shenango_config(m)
+    if any('dpdk' in d for d in cfg['exp']['datapath']):
+        for m in machines:
+            write_dpdk_config(m, cfg['machines'], cfg['cfg']['lcores'])
+
 ### Sample config
 ### [machines]
 ### server = { access = "127.0.0.1", alt = "192.168.1.6", exp = "10.1.1.6", mac = "f4:52:14:76:98:a0" } # pd6
@@ -743,6 +789,12 @@ def intel_devbind(machines, datapath):
 ###     { access = "192.168.1.4", exp = "10.1.1.4", mac = "f4:52:14:76:a4:80" }, # pd4
 ###     { access = "192.168.1.5", exp = "10.1.1.5", mac = "f4:52:14:76:98:30" }, # pd5
 ### ]
+###
+### [cfg]
+### lcores = "1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31"
+###
+### [cfg.client]
+### num-threads = 8
 ###
 ### [exp]
 ### wrk = ["./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"]
@@ -804,14 +856,7 @@ if __name__ == '__main__':
             agenda.failure("Skip-negotiation must be bool")
             sys.exit(1)
 
-    agenda.task(f"Checking for connection vs experiment ip")
-    ips = [cfg['machines']['server']] + cfg['machines']['clients']
-    agenda.task(f"connecting to {ips}")
-    machines, commits = zip(*[check_machine(ip) for ip in ips])
-    # check all the commits are equal
-    if not all(c == commits[0] for c in commits):
-        agenda.subfailure(f"not all commits equal: {commits}")
-        sys.exit(1)
+    machines = connect_machines(cfg)
 
     found_local = False
     for m in machines:
@@ -826,39 +871,7 @@ if __name__ == '__main__':
         subprocess.run(f"mkdir -p {args.outdir}", shell=True)
 
     # build
-    agenda.task("building burrito...")
-    setups = [threading.Thread(target=setup_machine, args=(m, outdir, cfg['exp']['datapath'], args.dpdk_driver)) for m in machines]
-    [t.start() for t in setups]
-    [t.join() for t in setups]
-    if not thread_ok:
-        agenda.failure("Something went wrong")
-        sys.exit(1)
-    agenda.task("...done building burrito")
-
-    ms = [cfg['machines']['server']] + cfg['machines']['clients']
-    for m in ms:
-        for x in machines:
-            if x.addr == m['exp']:
-                x.mac = m['mac']
-                break
-
-    if 'intel' == args.dpdk_driver and any('dpdk' in d for d in cfg['exp']['datapath']):
-        intel_setup(machines)
-
-    # copy config file to outdir
-    shutil.copy2(args.config, args.outdir)
-
-    dpdk_driver = args.dpdk_driver
-    if 'intel' == args.dpdk_driver:
-        intel_devbind(machines, 'kernel')
-
-    agenda.task("writing configuration files")
-    if 'shenango_channel' in cfg['exp']['datapath']:
-        for m in machines:
-            write_shenango_config(m)
-    if any('dpdk' in d for d in cfg['exp']['datapath']):
-        for m in machines:
-            write_dpdk_config(m, cfg['machines'], cfg['cfg']['lcores'])
+    setup_all(machines, cfg, args, setup_machine)
 
     for w in cfg['exp']['wrk']:
         for conn in machines:
