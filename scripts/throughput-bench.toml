@@ -1,12 +1,18 @@
 [machines]
-server = { access = "192.168.1.6", exp = "10.1.1.6" }
+server = { access = "130.127.133.195", user = "akshayn", alt = "130.127.133.195", exp = "10.10.1.2", mac = "3c:fd:fe:55:48:da" } # node-0
 clients = [
-  { access = "127.0.0.1", exp = "10.1.1.2" }
+    { access = "130.127.133.229", user = "akshayn", alt = "130.127.133.229", exp = "10.10.1.1", mac = "3c:fd:fe:55:48:3a" }, # node-1
 ]
+
+[cfg]
+lcores = "1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31"
+
+[cfg.client]
+num-threads = 8
 
 [exp]
 num_clients = [1,2,4,8,16,32,64,128]
 file_size = [50000000]
-datapath = ['kernel', 'dpdk', 'shenango', 'shenangort']
+datapath = ['kernel', 'dpdkthread', 'dpdkmulti']
 iters = 10
 bertha = [true, false]
