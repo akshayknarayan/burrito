@@ -220,8 +220,15 @@ impl ChunnelListener for UdpReqChunnel {
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
-            let sk = tokio::net::UdpSocket::bind(a)
-                .await
+            let sk = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            sk.set_reuse_port(true)?;
+            sk.set_nonblocking(true)?;
+            sk.bind(&a.into())?;
+            let sk = tokio::net::UdpSocket::from_std(sk.into())
                 .wrap_err(eyre!("socket bind failed on {:?}", a))?;
             let sk = crate::util::AddrSteer::new(UdpSk::new(sk));
             Ok(sk.steer(UdpConn::new))
