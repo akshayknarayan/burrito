@@ -22,7 +22,7 @@ ahash = "0.8"
 quanta = "0.10"
 
 [dev-dependencies]
-tracing-subscriber = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 structopt = "0.3"

@@ -1,4 +1,4 @@
-use ahash::AHashMap as HashMap;
+use ahash::HashMap;
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{
     bindings::*,
