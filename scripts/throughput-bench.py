@@ -21,12 +21,12 @@ def start_server(conn, outf, variant='kernel', use_bertha=False):
     elif 'dpdk' in variant:
         cfg = "--cfg dpdk.config"
     elif 'kernel' in variant:
-        cfg = ""
+        cfg = "--cfg dpdk.config"
     else:
         raise Exception("unknown datapath")
 
     no_bertha = '--no-bertha' if not use_bertha else ''
-    time.sleep(2)
+    time.sleep(5)
     ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/throughput-bench -p 4242 --datapath {variant} {no_bertha} {cfg} server",
             wd="~/burrito",
             sudo=True,
@@ -37,7 +37,7 @@ def start_server(conn, outf, variant='kernel', use_bertha=False):
     check(ok, "spawn server", conn.addr)
     agenda.subtask("wait for server check")
     time.sleep(8)
-    conn.check_proc(f"throughput", f"{outf}.err")
+    conn.check_proc(f"throughput", [f"burrito/{outf}.err", f"burrito/{outf}.out"])
 
 def run_client(conn, server, num_clients, file_size, variant, use_bertha, outf):
     conn.run("sudo pkill -INT throughput")
@@ -48,7 +48,7 @@ def run_client(conn, server, num_clients, file_size, variant, use_bertha, outf):
     elif 'dpdk' in variant:
         cfg = "--cfg dpdk.config"
     elif 'kernel' in variant:
-        cfg = ""
+        cfg = "--cfg dpdk.config"
     else:
         raise Exception("unknown datapath")
 
@@ -105,7 +105,7 @@ def do_exp(iter_num,
         m.run(f"rm -rf {outdir}", wd="~/burrito")
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
-    if not overwrite and os.path.exists(f"{outf}.data"):
+    if not overwrite and os.path.exists(f"{outf}-{machines[1].addr}.data"):
         agenda.task(f"skipping: {outf}.data")
         return True
     else:
@@ -143,39 +143,43 @@ def do_exp(iter_num,
         machines[0].run("sudo pkill -INT iokerneld")
 
     agenda.task("get server files")
-    if not machines[0].is_local:
-        machines[0].get(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
-        machines[0].get(f"~/burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+    try:
+        if not machines[0].is_local:
+            machines[0].get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
+            machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+    except Exception as e:
+        agenda.subfailure(f"Could not get file {server_prefix}.[out,err] from client: {e}")
 
-    def get_files(num):
+
+    def get_files():
         fn = c.get
         if c.is_local:
             agenda.subtask(f"Use get_local: {c.host}")
             fn = get_local
 
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
+        agenda.subtask(f"getting {outf}-{c.addr}.err")
         fn(
-            f"burrito/{outf}{num}.err",
-            local=f"{outf}{num}-{c.addr}.err",
+            f"burrito/{outf}.err",
+            local=f"{outf}-{c.addr}.err",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.out")
+        agenda.subtask(f"getting {outf}-{c.addr}.out")
         fn(
-            f"burrito/{outf}{num}.out",
-            local=f"{outf}{num}-{c.addr}.out",
+            f"burrito/{outf}.out",
+            local=f"{outf}-{c.addr}.out",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.data")
+        agenda.subtask(f"getting {outf}-{c.addr}.data")
         fn(
-            f"burrito/{outf}{num}.data",
-            local=f"{outf}{num}-{c.addr}.data",
+            f"burrito/{outf}.data",
+            local=f"{outf}-{c.addr}.data",
             preserve_mode=False,
         )
 
     agenda.task("get client files")
     for c in machines[1:]:
         try:
-            get_files(0)
+            get_files()
         except Exception as e:
             agenda.subfailure(f"At least one file missing for {c}: {e}")
 
@@ -208,12 +212,12 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         needed_features = []
         for d in datapaths:
             if 'dpdk' in d:
-                if dpdk_driver == 'mlx' and 'cx3_mlx' not in needed_features:
+                if dpdk_driver == 'mlx' and 'dpdk-direct/cx3_mlx' not in needed_features:
                     needed_features.append('dpdk-direct/cx3_mlx')
-                elif dpdk_driver == 'intel' and 'xl710_intel' not in needed_features:
+                elif dpdk_driver == 'intel' and 'dpdk-direct/xl710_intel' not in needed_features:
                     needed_features.append('dpdk-direct/xl710_intel')
         agenda.subtask(f"building throughput-bench features={needed_features}")
-        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\"", wd = "~/burrito/throughput-bench")
+        ok = conn.run(f"~/.cargo/bin/cargo +nightly build --release --features=\"{','.join(needed_features)}\"", wd = "~/burrito/throughput-bench")
         check(ok, "throughput-bench build", conn.addr)
         return conn
     except Exception as e:

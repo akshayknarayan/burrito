@@ -97,17 +97,18 @@ class ConnectionWrapper(Connection):
         res = self.run(f"which {prog}")
         return res.exited == 0
 
-    def check_proc(self, proc_name, proc_out):
+    def check_proc(self, proc_name, proc_outs):
         res = self.run(f"pgrep {proc_name}")
         if res.exited != 0:
             agenda.subfailure(f'failed to find running process with name \"{proc_name}\" on {self.addr}')
-            res = self.run(f'tail {proc_out}')
-            if res.exited == 0:
-                print(res.command)
-                print(res.stdout)
-            else:
-                print(res)
-            sys.exit(1)
+            for proc_out in proc_outs:
+                res = self.run(f'tail {proc_out}')
+                if res.exited == 0:
+                    print(res.command)
+                    print(res.stdout)
+                else:
+                    print(res)
+            raise Exception("Process did not start correctly")
 
 
     def check_file(self, grep, where):
@@ -356,7 +357,7 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     check(ok, "spawn server", conn.addr)
     agenda.subtask("wait for kvserver check")
     time.sleep(8)
-    conn.check_proc(f"kvserver", f"{outf}.err")
+    conn.check_proc(f"kvserver", [f"burrito/{outf}.err", f"burrito/{outf}.out"])
 
 def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
@@ -751,6 +752,8 @@ def connect_machines(cfg):
     return machines
 
 def setup_all(machines, cfg, args, setup_fn):
+    global thread_ok
+    thread_ok = True
     agenda.task("building...")
     setups = [threading.Thread(target=setup_fn, args=(m, args.outdir, cfg['exp']['datapath'] if 'datapath' in cfg['exp'] else [], args.dpdk_driver)) for m in machines]
     [t.start() for t in setups]
