@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::sync::RwLock as Mutex;
 
 #[derive(Debug)]
 pub(crate) enum DatapathCnInner {
@@ -74,7 +74,7 @@ impl ChunnelConnection for DatapathCn {
         <B as IntoIterator>::IntoIter: Send,
     {
         Box::pin(async move {
-            let inner_g = self.inner.lock().await;
+            let inner_g = self.inner.read().await;
             match *inner_g {
                 DatapathCnInner::Thread(ref s) => s.send(burst).await,
                 DatapathCnInner::Inline(ref s) => s.send(burst).await,
@@ -95,7 +95,7 @@ impl ChunnelConnection for DatapathCn {
             loop {
                 let slots_borrow = &mut slots;
                 let recv_fut = async move {
-                    let inner_g = self.inner.lock().await;
+                    let inner_g = self.inner.read().await;
                     match *inner_g {
                         DatapathCnInner::Thread(ref s) => s.recv(slots_borrow).await,
                         DatapathCnInner::Inline(ref s) => s.recv(slots_borrow).await,
