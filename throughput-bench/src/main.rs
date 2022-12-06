@@ -109,7 +109,7 @@ fn main() -> Result<(), Report> {
                     let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk-thread chunnel")?;
                     run_clients(ch, cl, port)?
                 }
-                "dpdkmulti" => {
+                "dpdkinline" => {
                     let ch = DpdkInlineChunnel::new(cfg, 4).wrap_err("make dpdk-multi chunnel")?;
                     run_clients(ch, cl, port)?
                 }
@@ -274,14 +274,13 @@ where
     let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
     'cn: loop {
         let ms = cn.recv(&mut slots).await?;
+        last_recv_time = Instant::now();
         for (_, r) in ms.iter_mut().map_while(Option::take) {
             tot_bytes += r.len();
             trace!(?tot_bytes, "received part");
             if r[0] == 1 {
                 cn.send(std::iter::once((addr, r))).await?;
                 break 'cn;
-            } else {
-                last_recv_time = Instant::now();
             }
         }
     }
