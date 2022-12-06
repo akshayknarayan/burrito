@@ -16,7 +16,7 @@ use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
 
 #[derive(Debug, StructOpt)]
-#[structopt(name = "Switch datapaths test")]
+#[structopt(name = "Switch datapaths microbenchmark")]
 struct Opt {
     #[structopt(short, long)]
     port: u16,
@@ -26,10 +26,6 @@ struct Opt {
 
     #[structopt(short, long)]
     threads: usize,
-
-    /// If specified, this is a client. Otherwise it is a server.
-    #[structopt(short, long)]
-    ip_addr: Option<std::net::Ipv4Addr>,
 
     #[structopt(short, long)]
     config: std::path::PathBuf,
@@ -45,6 +41,13 @@ struct Opt {
 
     #[structopt(long)]
     closed_loop: bool,
+
+    /// If specified, this is a client. Otherwise it is a server.
+    #[structopt(long)]
+    ip_addr: Option<std::net::Ipv4Addr>,
+
+    #[structopt(long, default_value = "1000")]
+    interarrival_us: u64,
 
     #[structopt(long, short)]
     out_file: Option<std::path::PathBuf>,
@@ -81,7 +84,7 @@ fn main() -> Result<(), Report> {
 
     if let Some(addr) = opt.ip_addr {
         let remote_addr = SocketAddr::V4(SocketAddrV4::new(addr, opt.port));
-        let interarrival = std::time::Duration::from_micros(100);
+        let interarrival = std::time::Duration::from_micros(opt.interarrival_us);
         info!(
             ?remote_addr,
             ?interarrival,
