@@ -328,9 +328,9 @@ where
                     [Some((a, msg))] if msg[..8] == [1, 2, 3, 4, 5, 6, 7, 8] => {
                         (*a, std::mem::take(msg))
                     }
-                    _ => {
-                        debug!("bad client request");
-                        bail!("bad connection");
+                    msg => {
+                        warn!(?msg, "bad client request");
+                        bail!("bad connection: {:?}", msg);
                     }
                 };
 
