@@ -12,7 +12,7 @@ import toml
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
 
-def start_server(conn, outf, variant='kernel', use_bertha=False):
+def start_server(conn, outf, variant='kernel', use_bertha=False, extra_cfg=None):
     conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -25,9 +25,20 @@ def start_server(conn, outf, variant='kernel', use_bertha=False):
     else:
         raise Exception("unknown datapath")
 
+    if extra_cfg is not None:
+        extra_args = ' '.join(f"--{key}={extra_cfg[key]}" for key in extra_cfg)
+    else:
+        extra_args = ""
+
     no_bertha = '--no-bertha' if not use_bertha else ''
     time.sleep(5)
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/throughput-bench -p 4242 --datapath {variant} {no_bertha} {cfg} server",
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/throughput-bench \
+        -p 4242 \
+        --datapath {variant} \
+        {no_bertha} \
+        {cfg} \
+        {extra_args} \
+        server",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -39,7 +50,7 @@ def start_server(conn, outf, variant='kernel', use_bertha=False):
     time.sleep(8)
     conn.check_proc(f"throughput", [f"burrito/{outf}.err", f"burrito/{outf}.out"])
 
-def run_client(conn, server, num_clients, file_size, variant, use_bertha, outf):
+def run_client(conn, server, num_clients, file_size, variant, use_bertha, extra_cfg, outf):
     conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -53,6 +64,11 @@ def run_client(conn, server, num_clients, file_size, variant, use_bertha, outf):
         raise Exception("unknown datapath")
 
     no_bertha = '--no-bertha' if not use_bertha else ''
+    if extra_cfg is not None:
+        extra_args = ' '.join(f"--{key}={extra_cfg[key]}" for key in extra_cfg)
+    else:
+        extra_args = ""
+
     time.sleep(2)
     agenda.subtask(f"client starting -> {outf}.out")
     ok = conn.run(
@@ -61,6 +77,7 @@ def run_client(conn, server, num_clients, file_size, variant, use_bertha, outf):
         --datapath {variant} \
         {cfg} \
         {no_bertha} \
+        {extra_args} \
         client \
         --addr {server} \
         --download-size {file_size} \
@@ -77,6 +94,7 @@ def run_client(conn, server, num_clients, file_size, variant, use_bertha, outf):
     agenda.subtask("client done")
 
 def do_exp(iter_num,
+    cfg=None,
     outdir=None,
     machines=None,
     file_size=None,
@@ -117,7 +135,7 @@ def do_exp(iter_num,
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    start_server(machines[0], server_prefix, variant=datapath, use_bertha=use_bertha)
+    start_server(machines[0], server_prefix, variant=datapath, use_bertha=use_bertha, extra_cfg=cfg.server if cfg is not None else None)
     time.sleep(7)
 
     # others are clients
@@ -129,6 +147,7 @@ def do_exp(iter_num,
             file_size,
             datapath,
             use_bertha,
+            cfg.client if cfg is not None else None,
             outf,
         ),
     ) for m in machines[1:]]

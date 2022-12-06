@@ -10,7 +10,7 @@ use bertha::{
 use color_eyre::eyre::{bail, Report, WrapErr};
 use dpdk_direct::{DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use dpdk_wrapper::DpdkIoKernel;
-use futures_util::stream::TryStreamExt;
+use futures_util::stream::{FuturesUnordered, TryStreamExt};
 use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
@@ -35,6 +35,9 @@ struct Opt {
 
     #[structopt(long)]
     no_bertha: bool,
+
+    #[structopt(long)]
+    num_threads: usize,
 
     #[structopt(subcommand)]
     mode: Mode,
@@ -73,6 +76,7 @@ fn main() -> Result<(), Report> {
         cfg,
         port,
         datapath,
+        num_threads,
         no_bertha,
         mode,
     } = Opt::from_args();
@@ -96,7 +100,7 @@ fn main() -> Result<(), Report> {
             match datapath.as_str() {
                 "dpdkthread" => {
                     let rt = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(4)
+                        .worker_threads(num_threads)
                         .enable_all()
                         .build()?;
                     rt.block_on(run_clients_no_bertha(cl, port, cfg))?
@@ -107,19 +111,20 @@ fn main() -> Result<(), Report> {
             match datapath.as_str() {
                 "dpdkthread" => {
                     let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk-thread chunnel")?;
-                    run_clients(ch, cl, port)?
+                    run_clients(ch, cl, port, num_threads)?
                 }
                 "dpdkinline" => {
-                    let ch = DpdkInlineChunnel::new(cfg, 4).wrap_err("make dpdk-multi chunnel")?;
-                    run_clients(ch, cl, port)?
+                    let ch = DpdkInlineChunnel::new(cfg, num_threads)
+                        .wrap_err("make dpdk-multi chunnel")?;
+                    run_clients(ch, cl, port, num_threads)?
                 }
                 "shenango" => {
                     let ch = ShenangoUdpSkChunnel::new(cfg);
-                    run_clients(ch, cl, port)?
+                    run_clients(ch, cl, port, num_threads)?
                 }
                 "kernel" => {
                     let ch = UdpSkChunnel;
-                    run_clients(ch, cl, port)?
+                    run_clients(ch, cl, port, num_threads)?
                 }
                 d => {
                     bail!("unknown datapath {:?}", d);
@@ -160,7 +165,7 @@ fn main() -> Result<(), Report> {
             match datapath.as_ref() {
                 "dpdkthread" => {
                     let rt = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(4)
+                        .worker_threads(num_threads)
                         .enable_all()
                         .build()?;
                     rt.block_on(run_server_no_bertha(port, cfg))?;
@@ -172,21 +177,21 @@ fn main() -> Result<(), Report> {
                 "dpdkthread" => {
                     let ch = DpdkUdpSkChunnel::new(cfg)?;
                     let ch = DpdkUdpReqChunnel(ch);
-                    run_server(ch, port, 4)?;
+                    run_server(ch, port, num_threads)?;
                 }
                 "dpdkinline" => {
-                    let ch = DpdkInlineChunnel::new(cfg, 4)?;
+                    let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
                     let ch = DpdkInlineReqChunnel::from(ch);
-                    run_server(ch, port, 4)?;
+                    run_server(ch, port, num_threads)?;
                 }
                 "shenango" => {
                     let ch = ShenangoUdpSkChunnel::new(cfg);
                     let ch = ShenangoUdpReqChunnel(ch);
-                    run_server(ch, port, 4)?;
+                    run_server(ch, port, num_threads)?;
                 }
                 "kernel" => {
                     let ch = UdpReqChunnel;
-                    run_server(ch, port, 4)?;
+                    run_server(ch, port, num_threads)?;
                 }
                 d => {
                     bail!("unknown datapath {:?}", d);
@@ -198,7 +203,12 @@ fn main() -> Result<(), Report> {
     Ok(())
 }
 
-fn run_clients<C, Cn, E>(ctr: C, c: Client, port: u16) -> Result<(usize, Duration), Report>
+fn run_clients<C, Cn, E>(
+    ctr: C,
+    c: Client,
+    port: u16,
+    num_threads: usize,
+) -> Result<(usize, Duration), Report>
 where
     C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = E>
         + Clone
@@ -210,29 +220,64 @@ where
 {
     let addr = SocketAddr::from(SocketAddrV4::new(c.addr, port));
 
-    let clients: Vec<_> = (0..c.num_clients)
-        .map(|i| {
-            let ctr = ctr.clone();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(
-                    run_client(ctr, addr, c.download_size).instrument(info_span!("client", ?i)),
-                )
+    let client_threads: Vec<_> = if c.num_clients > num_threads {
+        let clients_per_thread = c.num_clients / num_threads;
+        let mut remainder = c.num_clients - (num_threads * clients_per_thread);
+        (0..num_threads)
+            .map(|thread| {
+                let ctr = ctr.clone();
+                let num_thread_clients = if remainder > 0 {
+                    remainder -= 1;
+                    clients_per_thread + 1
+                } else {
+                    clients_per_thread
+                };
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    let ctr = ctr.clone();
+                    rt.block_on(async move {
+                        let futs: FuturesUnordered<_> = (0..num_thread_clients)
+                            .map(|tclient| {
+                                run_client(ctr.clone(), addr, c.download_size)
+                                    .instrument(info_span!("client", ?thread, ?tclient))
+                            })
+                            .collect();
+                        Ok::<_, Report>(futs.try_collect().await?)
+                    })
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        (0..c.num_clients)
+            .map(|thread| {
+                let ctr = ctr.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    rt.block_on(async move {
+                        let res = run_client(ctr, addr, c.download_size)
+                            .instrument(info_span!("client", ?thread))
+                            .await?;
+                        Ok(vec![res])
+                    })
+                })
+            })
+            .collect()
+    };
 
-    let joined: Vec<Result<(usize, Duration), Report>> = clients
+    let joined: Vec<Result<Vec<(usize, Duration)>, Report>> = client_threads
         .into_iter()
         .map(|jh| jh.join().expect("thread paniced"))
         .collect();
     let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
         .into_iter()
-        .collect::<Result<Vec<(usize, Duration)>, _>>()
+        .collect::<Result<Vec<Vec<(usize, Duration)>>, _>>()
         .wrap_err("failed running one or more clients")?
         .into_iter()
+        .flat_map(|x| x)
         .unzip();
     let tot_bytes = tot_bytes.into_iter().sum();
     let elapsed = durs.into_iter().max().unwrap();
@@ -270,7 +315,7 @@ where
     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
     req.extend((download_size as u64).to_le_bytes());
     cn.send(std::iter::once((addr, req))).await?;
-    let mut last_recv_time = Instant::now();
+    let mut last_recv_time;
     let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
     'cn: loop {
         let ms = cn.recv(&mut slots).await?;
