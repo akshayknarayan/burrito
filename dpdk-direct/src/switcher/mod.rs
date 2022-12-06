@@ -50,7 +50,7 @@ use std::{
     str::FromStr,
     sync::{Arc, Mutex as StdMutex},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
 mod migrator;
@@ -117,7 +117,7 @@ pub struct DpdkDatapath {
 
     curr_datapath: DatapathInner,
     // need to keep track of connections so we can send updated `DatapathCnInner`s.
-    conns: Arc<StdMutex<HashMap<ActiveConnection, (Arc<Mutex<DatapathCnInner>>, Sender<()>)>>>,
+    conns: Arc<StdMutex<HashMap<ActiveConnection, (Arc<RwLock<DatapathCnInner>>, Sender<()>)>>>,
 }
 
 impl Debug for DpdkDatapath {
@@ -184,7 +184,7 @@ impl DpdkDatapath {
             .map(|(c, (cn_mutex, preemptor))| async move {
                 // TODO XXX race condition on lock vs re-lock after the send.
                 // the re-lock case deadlocks.
-                let (send_res, g) = futures_util::join!(preemptor.send_async(()), cn_mutex.lock());
+                let (send_res, g) = futures_util::join!(preemptor.send_async(()), cn_mutex.write());
                 send_res.unwrap();
                 (c, g)
             })
@@ -264,7 +264,7 @@ impl ChunnelConnector for DpdkDatapath {
             let local_port = inner.local_port();
             let remote_addr = inner.remote_addr();
 
-            let inner = Arc::new(Mutex::new(inner));
+            let inner = Arc::new(RwLock::new(inner));
 
             let (s, r) = flume::bounded(1);
             this.conns.lock().unwrap().insert(
@@ -303,7 +303,7 @@ impl ChunnelListener for DpdkDatapath {
 
             let local_port = inner.local_port();
             let remote_addr = inner.remote_addr();
-            let inner = Arc::new(Mutex::new(inner));
+            let inner = Arc::new(RwLock::new(inner));
 
             let (s, r) = flume::bounded(1);
             this.conns.lock().unwrap().insert(
@@ -399,13 +399,13 @@ impl DpdkReqDatapath {
 
     fn adapt_inner_stream(
         st: Pin<Box<dyn Stream<Item = Result<DatapathCnInner, Report>> + Send + Sync + 'static>>,
-        conns: Arc<StdMutex<HashMap<ActiveConnection, (Arc<Mutex<DatapathCnInner>>, Sender<()>)>>>,
+        conns: Arc<StdMutex<HashMap<ActiveConnection, (Arc<RwLock<DatapathCnInner>>, Sender<()>)>>>,
     ) -> ReqDatapathStream {
         Box::pin(st.map_ok(move |cn| {
             let local_port = cn.local_port();
             let remote_addr = cn.remote_addr();
 
-            let cn = Arc::new(Mutex::new(cn));
+            let cn = Arc::new(RwLock::new(cn));
             // conn updater
             let (s, r) = flume::bounded(1);
             conns.lock().unwrap().insert(
