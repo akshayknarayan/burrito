@@ -135,7 +135,7 @@ def do_exp(iter_num,
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    start_server(machines[0], server_prefix, variant=datapath, use_bertha=use_bertha, extra_cfg=cfg.server if cfg is not None else None)
+    start_server(machines[0], server_prefix, variant=datapath, use_bertha=use_bertha, extra_cfg=cfg['server'] if cfg is not None else None)
     time.sleep(7)
 
     # others are clients
@@ -147,7 +147,7 @@ def do_exp(iter_num,
             file_size,
             datapath,
             use_bertha,
-            cfg.client if cfg is not None else None,
+            cfg['client'] if cfg is not None else None,
             outf,
         ),
     ) for m in machines[1:]]
@@ -322,12 +322,13 @@ if __name__ == '__main__':
     for d in cfg['exp']['datapath']:
         if 'intel' == args.dpdk_driver:
             intel_devbind(machines, d)
-        if d == 'dpdk' or d == 'shenango':
+        if d == 'dpdkinline' or d == 'shenango':
             for use_bertha in cfg['exp']['bertha']:
                 for fs in cfg['exp']['file_size']:
                     for nc in cfg['exp']['num_clients']:
                         for i in range(int(cfg['exp']['iters'])):
                             do_exp(i,
+                                    cfg=cfg['cfg'],
                                     outdir=outdir,
                                     machines=machines,
                                     num_clients=nc,
@@ -341,6 +342,7 @@ if __name__ == '__main__':
                 for nc in cfg['exp']['num_clients']:
                     for i in range(int(cfg['exp']['iters'])):
                         do_exp(i,
+                                cfg=cfg['cfg'],
                                 outdir=outdir,
                                 machines=machines,
                                 num_clients=nc,
