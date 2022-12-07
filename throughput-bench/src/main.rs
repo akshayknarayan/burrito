@@ -8,9 +8,13 @@ use bertha::{
     ChunnelConnection, ChunnelConnector, ChunnelListener,
 };
 use color_eyre::eyre::{bail, Report, WrapErr};
-use dpdk_direct::{DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
-use dpdk_wrapper::DpdkIoKernel;
-use futures_util::stream::{FuturesUnordered, TryStreamExt};
+use dpdk_direct::{
+    DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel,
+};
+use futures_util::{
+    stream::{FuturesUnordered, TryStreamExt},
+    Stream,
+};
 use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
@@ -98,13 +102,7 @@ fn main() -> Result<(), Report> {
 
         let (tot_bytes, elapsed) = if no_bertha {
             match datapath.as_str() {
-                "dpdkthread" => {
-                    let rt = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(num_threads)
-                        .enable_all()
-                        .build()?;
-                    rt.block_on(run_clients_no_bertha(cl, port, cfg))?
-                }
+                "dpdkinline" => run_clients_no_bertha(cl, port, cfg, num_threads)?,
                 _ => bail!("no_bertha with non-dpdk not implemented"),
             }
         } else {
@@ -163,12 +161,8 @@ fn main() -> Result<(), Report> {
     } else {
         if no_bertha {
             match datapath.as_ref() {
-                "dpdkthread" => {
-                    let rt = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(num_threads)
-                        .enable_all()
-                        .build()?;
-                    rt.block_on(run_server_no_bertha(port, cfg))?;
+                "dpdkinline" => {
+                    run_server_no_bertha(port, cfg, num_threads)?;
                 }
                 _ => bail!("non-dpdk no-bertha not implemented"),
             }
@@ -297,8 +291,6 @@ where
 {
     info!(?addr, ?download_size, "starting client");
     let stack = bertha::util::Nothing::<()>::default();
-    let mut tot_bytes = 0;
-    let start = Instant::now();
 
     // 1. connect
     let cn = ctr
@@ -311,28 +303,12 @@ where
         .wrap_err("negotiation failed")?;
     trace!("got connection");
 
-    // 2. get bytes
-    let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
-    req.extend((download_size as u64).to_le_bytes());
-    cn.send(std::iter::once((addr, req))).await?;
-    let mut last_recv_time;
-    let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
-    'cn: loop {
-        let ms = cn.recv(&mut slots).await?;
-        last_recv_time = Instant::now();
-        for (_, r) in ms.iter_mut().map_while(Option::take) {
-            tot_bytes += r.len();
-            trace!(?tot_bytes, "received part");
-            if r[0] == 1 {
-                cn.send(std::iter::once((addr, r))).await?;
-                break 'cn;
-            }
-        }
-    }
+    let addr4 = match addr {
+        SocketAddr::V4(a) => a,
+        _ => bail!("wrong addr"),
+    };
 
-    let elapsed = last_recv_time - start;
-    info!(?tot_bytes, ?elapsed, "done");
-    Ok((tot_bytes, elapsed))
+    run_client_inner(cn, addr4, download_size).await
 }
 
 fn run_server<L, Cn, E>(listener: L, port: u16, threads: usize) -> Result<(), Report>
@@ -365,58 +341,7 @@ where
                 .wrap_err("negotiate_server")?;
 
             tokio::pin!(st);
-            st.try_for_each_concurrent(None, |cn| async move {
-                let mut slots = [None; 1];
-                let ms = cn.recv(&mut slots).await?;
-                let (a, msg) = match ms {
-                    [Some((a, msg))] if msg[..8] == [1, 2, 3, 4, 5, 6, 7, 8] => {
-                        (*a, std::mem::take(msg))
-                    }
-                    msg => {
-                        warn!(?msg, "bad client request");
-                        bail!("bad connection: {:?}", msg);
-                    }
-                };
-
-                let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
-                let start = Instant::now();
-                info!(?remaining, ?a, "starting send");
-                while remaining > 0 {
-                    let bufs = (0..16).map_while(|_| {
-                        if remaining > 0 {
-                            let this_send_size = std::cmp::min(1460, remaining);
-                            remaining -= this_send_size;
-                            Some((a, vec![0u8; this_send_size as usize]))
-                        } else {
-                            None
-                        }
-                    });
-                    cn.send(bufs).await?;
-                }
-
-                info!(elapsed = ?start.elapsed(), ?a, "done sending");
-                // fin
-                cn.send(std::iter::once((a, vec![1u8]))).await?;
-                let mut f = cn.recv(&mut slots);
-                loop {
-                    match futures_util::future::select(
-                        f,
-                        Box::pin(tokio::time::sleep(Duration::from_millis(1))),
-                    )
-                    .await
-                    {
-                        futures_util::future::Either::Left((_, _)) => break,
-                        futures_util::future::Either::Right((_, rem)) => {
-                            cn.send(std::iter::once((a, vec![1u8]))).await?;
-                            f = rem;
-                        }
-                    }
-                }
-
-                info!(elapsed = ?start.elapsed(), ?a, "exiting");
-                Ok::<_, Report>(())
-            })
-            .await?;
+            server_thread_inner(st).await?;
             unreachable!() // negotiate_server never returns None
         })
     }
@@ -430,40 +355,76 @@ where
     server_thread(listener, port)
 }
 
-async fn run_clients_no_bertha(
+fn run_clients_no_bertha(
     c: Client,
     port: u16,
     cfg: std::path::PathBuf,
+    num_threads: usize,
 ) -> Result<(usize, Duration), Report> {
-    let addr = SocketAddrV4::new(c.addr, port);
-    info!(?addr, "starting clients");
-    let (handle_s, handle_r) = flume::bounded(1);
-    std::thread::spawn(move || {
-        let (iokernel, handle) = DpdkIoKernel::new(cfg).unwrap();
-        handle_s.send(handle).unwrap();
-        iokernel.run();
-    });
-    let handle = handle_r.recv().wrap_err("Could not start DpdkIoKernel")?;
+    let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
+    let addr4 = SocketAddrV4::new(c.addr, port);
+    let addr = SocketAddr::V4(addr4);
 
-    let clients: futures_util::stream::FuturesUnordered<_> = (0..c.num_clients)
-        .map(|i| {
-            let res = handle.socket(None);
-            tokio::spawn(async move {
-                Ok(run_client_no_bertha(res?, addr, c.download_size)
-                    .instrument(info_span!("client", ?i))
-                    .await?)
+    let client_threads: Vec<_> = if c.num_clients > num_threads {
+        let clients_per_thread = c.num_clients / num_threads;
+        let mut remainder = c.num_clients - (num_threads * clients_per_thread);
+        (0..num_threads)
+            .map(|thread| {
+                let ch = ch.clone();
+                let num_thread_clients = if remainder > 0 {
+                    remainder -= 1;
+                    clients_per_thread + 1
+                } else {
+                    clients_per_thread
+                };
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    let ch = ch.clone();
+                    rt.block_on(async move {
+                        let futs: FuturesUnordered<_> =
+                            (0..num_thread_clients)
+                                .map(|tclient| { let mut ch = ch.clone(); async move {
+                                    let cn = ch.connect(addr).into_inner()?;
+                                    run_client_inner(cn, addr4, c.download_size)
+                                        .instrument(info_span!("client", ?thread, ?tclient)).await
+                                }})
+                                .collect();
+                        Ok::<_, Report>(futs.try_collect().await?)
+                    })
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        (0..c.num_clients)
+            .map(|thread| {
+                let mut ch = ch.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    let cn = ch.connect(addr).into_inner()?;
+                    let res = rt.block_on(
+                        run_client_inner(cn, addr4, c.download_size)
+                            .instrument(info_span!("client", ?thread)),
+                    )?;
+                    Ok(vec![res])
+                })
+            })
+            .collect()
+    };
 
-    let joined: Vec<Result<(usize, Duration), Report>> = clients
-        .try_collect()
-        .await
-        .wrap_err("failed running one or more clients")?;
+    let joined: Vec<Result<Vec<(usize, Duration)>, Report>> = client_threads
+        .into_iter()
+        .map(|jh| jh.join().expect("thread paniced"))
+        .collect();
     let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
         .into_iter()
-        .collect::<Result<Vec<(usize, Duration)>, _>>()?
+        .collect::<Result<Vec<Vec<(usize, Duration)>>, _>>()
+        .wrap_err("failed running one or more clients")?
         .into_iter()
+        .flat_map(|x| x)
         .unzip();
     let tot_bytes = tot_bytes.into_iter().sum();
     let elapsed = durs.into_iter().max().unwrap();
@@ -471,30 +432,30 @@ async fn run_clients_no_bertha(
     Ok((tot_bytes, elapsed))
 }
 
-async fn run_client_no_bertha(
-    cn: dpdk_wrapper::DpdkConn,
+async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
+    cn: C,
     addr: SocketAddrV4,
     download_size: usize,
 ) -> Result<(usize, Duration), Report> {
     info!(?addr, ?download_size, "starting client");
-    let addr = SocketAddr::V4(addr);
-    let mut tot_bytes = 0;
-    let start = Instant::now();
 
-    // 2. get bytes
+    let mut tot_bytes = 0;
     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
     req.extend((download_size as u64).to_le_bytes());
-    cn.send_async(addr, req).await?;
-    let mut last_recv_time = Instant::now();
-    loop {
-        let (_, r) = cn.recv_async().await?;
-        tot_bytes += r.len();
-        trace!(?tot_bytes, "received part");
-        if r[0] == 1 {
-            cn.send_async(addr, r).await?;
-            break;
-        } else {
-            last_recv_time = Instant::now();
+    cn.send(std::iter::once((SocketAddr::V4(addr), req))).await?;
+    let start = Instant::now();
+    let mut last_recv_time;
+    let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
+    'cn: loop {
+        let ms = cn.recv(&mut slots).await?;
+        last_recv_time = Instant::now();
+        for (_, r) in ms.iter_mut().map_while(Option::take) {
+            tot_bytes += r.len();
+            trace!(?tot_bytes, "received part");
+            if r[0] == 1 {
+                cn.send(std::iter::once((SocketAddr::V4(addr), r))).await?;
+                break 'cn;
+            }
         }
     }
 
@@ -503,58 +464,96 @@ async fn run_client_no_bertha(
     Ok((tot_bytes, elapsed))
 }
 
-async fn run_server_no_bertha(port: u16, cfg: std::path::PathBuf) -> Result<(), Report> {
-    info!(?port, "starting server");
-    let (handle_s, handle_r) = flume::bounded(1);
-    std::thread::spawn(move || {
-        let (iokernel, handle) = DpdkIoKernel::new(cfg).unwrap();
-        handle_s.send(handle).unwrap();
-        iokernel.run();
-    });
-    let handle = handle_r.recv().wrap_err("Could not start DpdkIoKernel")?;
-    let st = handle.accept(port)?;
-    loop {
-        let cn = st.recv_async().await?;
-        tokio::spawn(async move {
-            let (a, msg) = cn.recv_async().await?;
-            if &msg[..8] != [1, 2, 3, 4, 5, 6, 7, 8] {
-                debug!("bad client request");
-                bail!("bad connection");
-            }
+fn run_server_no_bertha(
+    port: u16,
+    cfg: std::path::PathBuf,
+    num_threads: usize,
+) -> Result<(), Report> {
+    let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
+    let ch = DpdkInlineReqChunnel::from(ch);
 
-            let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
-            let start = Instant::now();
-            info!(?remaining, ?a, "starting send");
-            while remaining > 0 {
-                let this_send_size = std::cmp::min(1460, remaining);
-                let buf = vec![0u8; this_send_size as usize];
-                cn.send_async(buf).await?;
-                remaining -= this_send_size;
-            }
+    fn server_thread(mut ch: DpdkInlineReqChunnel, port: u16) -> Result<(), Report> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            let st = ch
+                .listen(SocketAddr::from(SocketAddrV4::new(
+                    std::net::Ipv4Addr::UNSPECIFIED,
+                    port,
+                )))
+                .into_inner()?;
+            tokio::pin!(st);
+            server_thread_inner(st).await?;
+            unreachable!() // negotiate_server never returns None
+        })
+    }
 
-            info!(elapsed = ?start.elapsed(), ?a, "done sending");
-            // fin
-            cn.send_async(vec![1u8]).await?;
-            let mut f = Box::pin(cn.recv_async());
-            loop {
-                match futures_util::future::select(
-                    f,
-                    Box::pin(tokio::time::sleep(Duration::from_millis(1))),
-                )
-                .await
-                {
-                    futures_util::future::Either::Left((_, _)) => break,
-                    futures_util::future::Either::Right((_, rem)) => {
-                        cn.send_async(vec![1u8]).await?;
-                        f = rem;
-                    }
+    info!(?port, ?num_threads, "starting server");
+    for _ in 1..num_threads {
+        let ch = ch.clone();
+        std::thread::spawn(move || server_thread(ch, port));
+    }
+
+    server_thread(ch, port)
+}
+
+async fn server_thread_inner<
+    S: Stream<Item = Result<C, Report>> + Unpin,
+    C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>,
+>(
+    st: S,
+) -> Result<(), Report> {
+    st.try_for_each_concurrent(None, |cn| async move {
+        let mut slots = [None; 1];
+        let ms = cn.recv(&mut slots).await?;
+        let (a, msg) = match ms {
+            [Some((a, msg))] if msg[..8] == [1, 2, 3, 4, 5, 6, 7, 8] => (*a, std::mem::take(msg)),
+            msg => {
+                warn!(?msg, "bad client request");
+                bail!("bad connection: {:?}", msg);
+            }
+        };
+
+        let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
+        let start = Instant::now();
+        info!(?remaining, ?a, "starting send");
+        while remaining > 0 {
+            let bufs = (0..16).map_while(|_| {
+                if remaining > 0 {
+                    let this_send_size = std::cmp::min(1460, remaining);
+                    remaining -= this_send_size;
+                    Some((a, vec![0u8; this_send_size as usize]))
+                } else {
+                    None
+                }
+            });
+            cn.send(bufs).await?;
+        }
+
+        info!(elapsed = ?start.elapsed(), ?a, "done sending");
+        // fin
+        cn.send(std::iter::once((a, vec![1u8]))).await?;
+        let mut f = cn.recv(&mut slots);
+        loop {
+            match futures_util::future::select(
+                f,
+                Box::pin(tokio::time::sleep(Duration::from_millis(1))),
+            )
+            .await
+            {
+                futures_util::future::Either::Left((_, _)) => break,
+                futures_util::future::Either::Right((_, rem)) => {
+                    cn.send(std::iter::once((a, vec![1u8]))).await?;
+                    f = rem;
                 }
             }
+        }
 
-            info!(elapsed = ?start.elapsed(), ?a, "exiting");
-            Ok::<_, Report>(())
-        });
-    }
+        info!(elapsed = ?start.elapsed(), ?a, "exiting");
+        Ok::<_, Report>(())
+    })
+    .await
 }
 
 fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
