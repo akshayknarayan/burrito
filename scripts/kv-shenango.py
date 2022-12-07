@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-from kv import check_machine, setup_machine, get_local, check, get_timeout_local
+from kv import connect_machines, setup_all, get_local, check, get_timeout_local, write_cfg
 import agenda
 import argparse
 import os
@@ -19,18 +19,7 @@ host_gateway 10.1.1.1
 runtime_kthreads 6
 runtime_spininng_kthreads 6
 runtime_guaranteed_kthreads 6"""
-    from random import randint
-    fname = randint(1,1000)
-    fname = f"{fname}.config"
-    with open(f"{fname}", 'w') as f:
-        f.write(shenango_config)
-
-    agenda.subtask(f"{conn.addr} shenango config file: {fname}")
-    if not conn.local:
-        agenda.subtask(f"{conn.addr} shenango config file: {fname}")
-        conn.put(f"{fname}", "~/burrito/host.config")
-    else:
-        subprocess.run(f"rm -f host.config && cp {fname} host.config", shell=True)
+    write_cfg(conn, shenango_config, 'shenango')
 
 def start_server(conn, outf, shards=1, skip_negotiation=False, no_chunnels=False):
     conn.run("sudo pkill -INT kvserver")
@@ -76,6 +65,7 @@ def run_client(conn, server, interarrival, poisson_arrivals, skip_negotiation, n
         while skip_negotiation > 0:
             skip_neg += f' --skip-negotiation={4242 + skip_negotiation} '
             skip_negotiation -= 1
+        shards_arg = ''
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
     ok = conn.run(f"RUST_LOG=info ./target/release/ycsb-shenango-raw{nochunnels} \
             --addr {server}:4242 \
@@ -283,6 +273,36 @@ def do_exp(iter_num,
     agenda.task("done")
     return True
 
+def setup_machine(conn, outdir, datapaths, dpdk_driver):
+    agenda.task(f"[{conn.addr}] setup machine")
+    try:
+        agenda.subtask(f"[{conn.addr}] make outdir {outdir}")
+        ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
+        check(ok, "mk outdir", conn.addr)
+
+        # dpdk dependencies, rust, and docker
+        ok = conn.run("bash scripts/install-kv-deps.sh", wd="~/burrito")
+        check(ok, "install dependencies", conn.addr)
+
+        agenda.subtask(f"[{conn.addr}] building shenango")
+        # need to compile iokerneld
+        ok = conn.run("make", wd = "~/burrito/shenango-chunnel/caladan")
+        check(ok, "build shenango", conn.addr)
+
+        ok = conn.run("./scripts/setup_machine.sh", wd = "~/burrito/shenango-chunnel/caladan")
+        check(ok, "shenango setup-machine", conn.addr)
+
+        agenda.subtask(f"building kvserver-shenango")
+        ok = conn.run(f"~/.cargo/bin/cargo build --release", wd = "~/burrito/shenango-bertha")
+        check(ok, "shenango-bertha build", conn.addr)
+
+        return conn
+    except Exception as e:
+        agenda.failure(f"[{conn.addr}] setup_machine failed: {e}")
+        global thread_ok
+        thread_ok = False
+        raise e
+
 ### Sample config
 ### [machines]
 ### server = { access = "127.0.0.1", alt = "192.168.1.2", exp = "10.1.1.2" }
@@ -300,6 +320,8 @@ def do_exp(iter_num,
 ### shards = [4]
 ###
 if __name__ == '__main__':
+    global thread_ok
+    thread_ok = True
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--outdir', type=str, required=True)
@@ -347,32 +369,19 @@ if __name__ == '__main__':
                 agenda.failure(f"Unsupported shardtype {t}")
                 sys.exit(1)
 
-    agenda.task(f"Checking for connection vs experiment ip")
-    ips = [cfg['machines']['server']] + cfg['machines']['clients']
-    agenda.task(f"connecting to {ips}")
-    machines, commits = zip(*[check_machine(ip) for ip in ips])
-    # check all the commits are equal
-    if not all(c == commits[0] for c in commits):
-        agenda.subfailure(f"not all commits equal: {commits}")
-        sys.exit(1)
+    machines = connect_machines(cfg)
 
     for m in machines:
         if m.host in ['127.0.0.1', '::1', 'localhost']:
             agenda.subtask(f"Local conn: {m.host}/{m.addr}")
-            m.local = True
+            m.is_local = True
         else:
-            m.local = False
+            m.is_local = False
 
     # build
-    agenda.task("building burrito...")
-    thread_ok = True
-    setups = [threading.Thread(target=setup_machine, args=(m,outdir)) for m in machines]
-    [t.start() for t in setups]
-    [t.join() for t in setups]
-    if not thread_ok:
-        agenda.failure("Something went wrong")
-        sys.exit(1)
-    agenda.task("...done building burrito")
+    # shenango is mlx only
+    args.dpdk_driver = 'mlx'
+    setup_all(machines, cfg, args, setup_machine)
 
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)

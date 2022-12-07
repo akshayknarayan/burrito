@@ -1,0 +1,26 @@
+# This config uses pd{3-6}.csail.mit.edu.
+
+[machines]
+server = { access = "127.0.0.1", user = "akshayn", alt = "192.168.1.6", exp = "10.1.1.6", mac = "f4:52:14:76:98:a0" } # pd6
+clients = [
+    { access = "192.168.1.3", user = "akshayn", alt = "192.168.1.3", exp = "10.1.1.3", mac = "f4:52:14:76:a1:a0" }, # pd3
+    { access = "192.168.1.4", user = "akshayn", alt = "192.168.1.4", exp = "10.1.1.4", mac = "f4:52:14:76:a4:80" }, # pd4
+    { access = "192.168.1.5", user = "akshayn", alt = "192.168.1.5", exp = "10.1.1.5", mac = "f4:52:14:76:98:30" }, # pd5
+]
+
+# pd2: mac = "f4:52:14:76:98:10"
+# pd3: mac = "f4:52:14:76:a1:a0"
+# pd4: mac = "f4:52:14:76:a4:80"
+# pd5: mac = "f4:52:14:76:98:30"
+# pd6: mac = "f4:52:14:76:98:a0"
+# pd7: mac = "f4:52:14:76:a4:40"
+# pd8: mac = "f4:52:14:76:a4:90"
+# pd9: mac = "f4:52:14:76:a4:70"
+
+[exp]
+wrk = ["./kvstore-ycsb/ycsbc-mock/workloadb-4.access"]
+load = [10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000, 180000, 200000]
+poisson-arrivals = [true]
+shardtype = ["client"]
+shards = [4]
+no-chunnels = [true, false]
