@@ -474,7 +474,8 @@ impl ChunnelConnection for DpdkInlineCn {
                                 ensure!(msg.port == local_port, "Port mismatch");
                                 if let Some((ref mut addr, ref mut payload)) = msgs_buf[slot_idx] {
                                     *addr = SocketAddr::V4(msg.addr);
-                                    payload.copy_from_slice(msg.get_buf());
+                                    payload.clear();
+                                    payload.extend_from_slice(msg.get_buf());
                                 } else {
                                     msgs_buf[slot_idx] =
                                         Some((SocketAddr::V4(msg.addr), msg.get_buf().to_vec()));
