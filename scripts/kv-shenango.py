@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-from kv import ConnectionWrapper, check_machine, setup_machine, get_local, check, get_timeout_local
+from kv import check_machine, setup_machine, get_local, check, get_timeout_local
 import agenda
 import argparse
 import os

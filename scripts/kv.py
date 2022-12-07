@@ -196,14 +196,15 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         check(ok, "install dependencies", conn.addr)
 
         if 'shenango_channel' in datapaths:
-            agenda.subtask("[{conn.addr}] building shenango")
+            agenda.subtask(f"[{conn.addr}] building shenango")
             # need to compile iokerneld
             ok = conn.run("make", wd = "~/burrito/shenango-chunnel/caladan")
             check(ok, "build shenango", conn.addr)
 
             ok = conn.run("./scripts/setup_machine.sh", wd = "~/burrito/shenango-chunnel/caladan")
             check(ok, "shenango setup-machine", conn.addr)
-        elif any('dpdk' in d for d in datapaths):
+
+        if any('dpdk' in d for d in datapaths):
             ok = conn.run("./usertools/dpdk-hugepages.py -p 2M --setup 10G", wd = "~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
             check(ok, "reserve hugepages", conn.addr)
 
@@ -769,6 +770,7 @@ def setup_all(machines, cfg, args, setup_fn):
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
 
+    global dpdk_driver
     dpdk_driver = args.dpdk_driver
     if 'intel' == args.dpdk_driver:
         intel_devbind(machines, 'kernel')

@@ -1,19 +1,32 @@
+# This config uses pd{3-6}.csail.mit.edu.
+
 [machines]
-server = { access = "127.0.0.1", alt = "192.168.1.2", exp = "10.1.1.2" }
+server = { access = "127.0.0.1", user = "akshayn", alt = "192.168.1.6", exp = "10.1.1.6", mac = "f4:52:14:76:98:a0" } # pd6
 clients = [
-    { access = "192.168.1.5", exp = "10.1.1.5" },
-    { access = "192.168.1.6", exp = "10.1.1.6" },
-    { access = "192.168.1.7", exp = "10.1.1.7" },
-    { access = "192.168.1.8", exp = "10.1.1.8" },
-    { access = "192.168.1.9", exp = "10.1.1.9" },
+    { access = "192.168.1.3", user = "akshayn", alt = "192.168.1.3", exp = "10.1.1.3", mac = "f4:52:14:76:a1:a0" }, # pd3
+    { access = "192.168.1.4", user = "akshayn", alt = "192.168.1.4", exp = "10.1.1.4", mac = "f4:52:14:76:a4:80" }, # pd4
+    { access = "192.168.1.5", user = "akshayn", alt = "192.168.1.5", exp = "10.1.1.5", mac = "f4:52:14:76:98:30" }, # pd5
 ]
 
+# pd2: mac = "f4:52:14:76:98:10"
+# pd3: mac = "f4:52:14:76:a1:a0"
+# pd4: mac = "f4:52:14:76:a4:80"
+# pd5: mac = "f4:52:14:76:98:30"
+# pd6: mac = "f4:52:14:76:98:a0"
+# pd7: mac = "f4:52:14:76:a4:40"
+# pd8: mac = "f4:52:14:76:a4:90"
+# pd9: mac = "f4:52:14:76:a4:70"
+
+[cfg]
+lcores = "0,1,2,3,4"
+
+[cfg.client]
+num-threads = 4
+
 [exp]
-wrk = ["./kvstore-ycsb/ycsbc-mock/wrkloadbunf1-4.access"]
-datapath = ['kernel', 'shenango_channel', 'dpdk']
+wrk = ["./kvstore-ycsb/ycsbc-mock/workloadb-4.access"]
+datapath = ['shenango_channel', 'dpdkthread', 'kernel', 'dpdkmulti']
 load = [10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000, 180000, 200000]
 poisson-arrivals = [true]
 shardtype = ["client"]
 shards = [4]
-negotiation = [true, false]
-no-chunnels = [true]

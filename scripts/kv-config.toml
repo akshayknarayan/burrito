@@ -1,13 +1,10 @@
+# This config uses cloudlab machines. The ip addresses probably need to be replaced.
+
 [machines]
 server = { access = "130.127.133.231", user = "akshayn", alt = "130.127.133.231", exp = "10.10.1.2", mac = "3c:fd:fe:56:72:22" } # node-0
 clients = [
     { access = "130.127.133.236", user = "akshayn", alt = "130.127.133.236", exp = "10.10.1.1", mac = "3c:fd:fe:55:fe:62" }, # node-1
 ]
-
-# pd2: mac = "f4:52:14:76:98:10"
-# pd7: mac = "f4:52:14:76:a4:40"
-# pd8: mac = "f4:52:14:76:a4:90"
-# pd9: mac = "f4:52:14:76:a4:70"
 
 [cfg]
 lcores = "1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31"
@@ -17,7 +14,7 @@ num-threads = 8
 
 [exp]
 wrk = ["./kvstore-ycsb/ycsbc-mock/workloadb-4.access", "./kvstore-ycsb/ycsbc-mock/workloadb-8.access"]
-datapath = ['dpdkmulti', 'dpdkthread', 'kernel']
+datapath = ['dpdkthread', 'kernel', 'dpdkmulti']
 load = [10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000, 180000, 200000]
 poisson-arrivals = [true]
 shardtype = ["client", "server"]
