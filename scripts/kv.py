@@ -11,6 +11,9 @@ import threading
 import time
 import toml
 
+global thread_ok
+thread_ok = True
+
 class ConnectionWrapper(Connection):
     def __init__(self, addr, user=None, port=None):
         super().__init__(
@@ -749,9 +752,10 @@ def connect_machines(cfg):
 
 def setup_all(machines, cfg, args, setup_fn):
     agenda.task("building...")
-    setups = [threading.Thread(target=setup_fn, args=(m, outdir, cfg['exp']['datapath'], args.dpdk_driver)) for m in machines]
+    setups = [threading.Thread(target=setup_fn, args=(m, args.outdir, cfg['exp']['datapath'] if 'datapath' in cfg['exp'] else [], args.dpdk_driver)) for m in machines]
     [t.start() for t in setups]
     [t.join() for t in setups]
+    global thread_ok
     if not thread_ok:
         agenda.failure("Something went wrong")
         raise Exception("setup error")
@@ -764,7 +768,7 @@ def setup_all(machines, cfg, args, setup_fn):
                 x.mac = m['mac']
                 break
 
-    if 'intel' == args.dpdk_driver and any('dpdk' in d for d in cfg['exp']['datapath']):
+    if 'intel' == args.dpdk_driver and 'datapath' in cfg['exp'] and any('dpdk' in d for d in cfg['exp']['datapath']):
         intel_setup(machines)
 
     # copy config file to outdir
@@ -776,7 +780,7 @@ def setup_all(machines, cfg, args, setup_fn):
         intel_devbind(machines, 'kernel')
 
     agenda.task("writing configuration files")
-    if 'shenango_channel' in cfg['exp']['datapath']:
+    if any('shenango' in d for d in cfg['exp']['datapath']):
         for m in machines:
             write_shenango_config(m)
     if any('dpdk' in d for d in cfg['exp']['datapath']):
@@ -806,8 +810,6 @@ def setup_all(machines, cfg, args, setup_fn):
 ### shardtype = ["client"]
 ### shards = [4]
 if __name__ == '__main__':
-    global thread_ok
-    thread_ok = True
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--outdir', type=str, required=True)
