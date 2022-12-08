@@ -8,9 +8,7 @@ use bertha::{
     ChunnelConnection, ChunnelConnector, ChunnelListener,
 };
 use color_eyre::eyre::{bail, Report, WrapErr};
-use dpdk_direct::{
-    DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel,
-};
+use dpdk_direct::{DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use futures_util::{
     stream::{FuturesUnordered, TryStreamExt},
     Stream,
@@ -102,7 +100,14 @@ fn main() -> Result<(), Report> {
 
         let (tot_bytes, elapsed) = if no_bertha {
             match datapath.as_str() {
-                "dpdkinline" => run_clients_no_bertha(cl, port, cfg, num_threads)?,
+                "dpdkinline" => {
+                    let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
+                    run_clients_no_bertha(ch, cl, port, num_threads)?
+                }
+                "kernel" => {
+                    let ch = UdpSkChunnel;
+                    run_clients_no_bertha(ch, cl, port, num_threads)?
+                }
                 _ => bail!("no_bertha with non-dpdk not implemented"),
             }
         } else {
@@ -162,7 +167,13 @@ fn main() -> Result<(), Report> {
         if no_bertha {
             match datapath.as_ref() {
                 "dpdkinline" => {
-                    run_server_no_bertha(port, cfg, num_threads)?;
+                    let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
+                    let ch = DpdkInlineReqChunnel::from(ch);
+                    run_server_no_bertha(ch, port, num_threads)?;
+                }
+                "kernel" => {
+                    let ch = UdpReqChunnel;
+                    run_server_no_bertha(ch, port, num_threads)?;
                 }
                 _ => bail!("non-dpdk no-bertha not implemented"),
             }
@@ -355,13 +366,20 @@ where
     server_thread(listener, port)
 }
 
-fn run_clients_no_bertha(
+fn run_clients_no_bertha<C, Cn>(
+    ch: C,
     c: Client,
     port: u16,
-    cfg: std::path::PathBuf,
     num_threads: usize,
-) -> Result<(usize, Duration), Report> {
-    let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
+) -> Result<(usize, Duration), Report>
+where
+    C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = Report>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+{
     let addr4 = SocketAddrV4::new(c.addr, port);
     let addr = SocketAddr::V4(addr4);
 
@@ -383,14 +401,17 @@ fn run_clients_no_bertha(
                         .build()?;
                     let ch = ch.clone();
                     rt.block_on(async move {
-                        let futs: FuturesUnordered<_> =
-                            (0..num_thread_clients)
-                                .map(|tclient| { let mut ch = ch.clone(); async move {
-                                    let cn = ch.connect(addr).into_inner()?;
+                        let futs: FuturesUnordered<_> = (0..num_thread_clients)
+                            .map(|tclient| {
+                                let mut ch = ch.clone();
+                                async move {
+                                    let cn = ch.connect(addr).await?;
                                     run_client_inner(cn, addr4, c.download_size)
-                                        .instrument(info_span!("client", ?thread, ?tclient)).await
-                                }})
-                                .collect();
+                                        .instrument(info_span!("client", ?thread, ?tclient))
+                                        .await
+                                }
+                            })
+                            .collect();
                         Ok::<_, Report>(futs.try_collect().await?)
                     })
                 })
@@ -404,11 +425,12 @@ fn run_clients_no_bertha(
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
-                    let cn = ch.connect(addr).into_inner()?;
-                    let res = rt.block_on(
+                    let res = rt.block_on(async move {
+                        let cn = ch.connect(addr).await?;
                         run_client_inner(cn, addr4, c.download_size)
-                            .instrument(info_span!("client", ?thread)),
-                    )?;
+                            .instrument(info_span!("client", ?thread))
+                            .await
+                    })?;
                     Ok(vec![res])
                 })
             })
@@ -442,7 +464,8 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     let mut tot_bytes = 0;
     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
     req.extend((download_size as u64).to_le_bytes());
-    cn.send(std::iter::once((SocketAddr::V4(addr), req))).await?;
+    cn.send(std::iter::once((SocketAddr::V4(addr), req)))
+        .await?;
     let start = Instant::now();
     let mut last_recv_time;
     let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
@@ -464,15 +487,19 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     Ok((tot_bytes, elapsed))
 }
 
-fn run_server_no_bertha(
-    port: u16,
-    cfg: std::path::PathBuf,
-    num_threads: usize,
-) -> Result<(), Report> {
-    let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
-    let ch = DpdkInlineReqChunnel::from(ch);
-
-    fn server_thread(mut ch: DpdkInlineReqChunnel, port: u16) -> Result<(), Report> {
+fn run_server_no_bertha<L, Cn>(ch: L, port: u16, num_threads: usize) -> Result<(), Report>
+where
+    L: ChunnelListener<Addr = SocketAddr, Connection = Cn, Error = Report> + Clone + Send + 'static,
+    Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+{
+    fn server_thread<L, Cn>(mut ch: L, port: u16) -> Result<(), Report>
+    where
+        L: ChunnelListener<Addr = SocketAddr, Connection = Cn, Error = Report>
+            + Clone
+            + Send
+            + 'static,
+        Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+    {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -482,7 +509,7 @@ fn run_server_no_bertha(
                     std::net::Ipv4Addr::UNSPECIFIED,
                     port,
                 )))
-                .into_inner()?;
+                .await?;
             tokio::pin!(st);
             server_thread_inner(st).await?;
             unreachable!() // negotiate_server never returns None

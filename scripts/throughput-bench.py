@@ -322,7 +322,7 @@ if __name__ == '__main__':
     for d in cfg['exp']['datapath']:
         if 'intel' == args.dpdk_driver:
             intel_devbind(machines, d)
-        if d == 'dpdkinline' or d == 'shenango':
+        if d == 'dpdkinline' or d == 'shenango' or d == 'kernel':
             for use_bertha in cfg['exp']['bertha']:
                 for fs in cfg['exp']['file_size']:
                     for nc in cfg['exp']['num_clients']:
