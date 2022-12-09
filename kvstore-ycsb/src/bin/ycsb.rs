@@ -6,9 +6,9 @@ use futures_util::{
 };
 use kvstore::{bin::Datapath, KvClient, KvClientBuilder};
 use kvstore_ycsb::{
-    const_paced_ops_stream, dump_tracing, ops, poisson_paced_ops_stream, write_results, Op,
+    const_paced_ops_stream, dump_tracing, group_by_client, ops, poisson_paced_ops_stream,
+    write_results, Op,
 };
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;

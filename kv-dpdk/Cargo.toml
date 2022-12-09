@@ -1,0 +1,27 @@
+[package]
+name = "kv-dpdk"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+cx3_mlx = ["dpdk-direct/cx3_mlx"]
+xl710_intel = ["dpdk-direct/xl710_intel"]
+
+[dependencies]
+bertha = { path = "../bertha" }
+dpdk-direct = { path = "../dpdk-direct" }
+kvstore-ycsb = { path = "../kvstore-ycsb" }
+kvstore = { path = "../kvstore" }
+structopt = "0.3"
+tokio = {version = "1", features = ["rt"] }
+tracing = "0.1"
+tracing-futures = "0.2"
+tracing-subscriber = "0.3"
+tracing-timing  = "0.6"
+tracing-error  = "0.2"
+color-eyre = "0.6"
+quanta = "0.10"
+bincode = "1"
+futures-util = "0.3"
+flume = "0.10"

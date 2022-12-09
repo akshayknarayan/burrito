@@ -10,6 +10,7 @@ members = [
     "rpcbench",
     "shenango-chunnel",
     "dpdk-direct",
+    "kv-dpdk",
     "test-util",
     "xdp-shard",
     "az-queues",
