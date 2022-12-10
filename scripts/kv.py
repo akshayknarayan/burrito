@@ -233,6 +233,12 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         agenda.subtask(f"building ycsb features={needed_features}")
         ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features[1:])}\" --bin=\"ycsb\"", wd = "~/burrito/kvstore-ycsb")
         check(ok, "ycsb build", conn.addr)
+
+        if 'dpdkmulti' in datapaths:
+            needed_features = [f for f in needed_features if f == 'xl710_intel' or f == 'cx3_mlx']
+            agenda.subtask(f"building kv-dpdk features={needed_features}")
+            ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\"", wd = "~/burrito/kv-dpdk")
+            check(ok, "kv-dpdk build", conn.addr)
         return conn
     except Exception as e:
         agenda.failure(f"[{conn.addr}] setup_machine failed: {e}")
@@ -373,7 +379,7 @@ def start_server_no_chunnels(conn, outf, no_chunnels, shards=1):
     ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/kvserver-dpdk \
             --addr {conn.addr}:4242 \
             --num-shards {shards} \
-            --cfg=dpdk.cfg \
+            --cfg=dpdk.config \
             {no_chunnels_arg}",
             wd="~/burrito",
             sudo=True,
