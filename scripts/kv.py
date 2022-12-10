@@ -335,7 +335,7 @@ def get_timeout_remote(conn, wrkfile, interarrival_us) -> int:
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/build/lib/x86_64-linux-gnu"
 
-def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, skip_negotiation=False):
+def start_server(conn, redis_addr, outf, datapath='kernel', shards=1, skip_negotiation=False):
     conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
@@ -364,6 +364,23 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     agenda.subtask("wait for kvserver check")
     time.sleep(8)
     conn.check_proc(f"kvserver", [f"burrito/{outf}.err", f"burrito/{outf}.out"])
+
+def start_server_no_chunnels(conn, outf, shards=1):
+    conn.run("sudo pkill -INT kvserver")
+    conn.run("sudo pkill -INT iokerneld")
+    time.sleep(2)
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/kvserver-dpdk --addr {conn.addr}:4242 --num-shards {shards} --cfg=dpdk.cfg",
+            wd="~/burrito",
+            sudo=True,
+            background=True,
+            stdout=f"{outf}.out",
+            stderr=f"{outf}.err",
+            )
+    check(ok, "spawn server", conn.addr)
+    agenda.subtask("wait for kvserver check")
+    time.sleep(8)
+    conn.check_proc(f"kvserver", f"{outf}.err")
+
 
 def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
@@ -447,6 +464,44 @@ def start_redis(machine):
     agenda.subtask(f"Started redis on {machine.host}")
     return f"{machine.alt}:6379"
 
+def run_client_no_chunnels(conn, cfg_client, server, num_shards, interarrival, poisson_arrivals, outf, wrkfile):
+    conn.run("sudo pkill -INT iokerneld")
+    poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
+    timeout = None
+    try:
+        timeout = get_timeout_local(wrkfile, interarrival)
+    except:
+        try:
+            timeout = get_timeout_remote(conn, wrkfile, interarrival)
+        except Exception as e:
+            global thread_ok
+            thread_ok = False
+            raise e
+
+    extra_cfg = ' '.join(f"--{key}={cfg_client[key]}" for key in cfg_client)
+
+    time.sleep(2)
+    agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/ycsb-dpdk \
+            --addr {server}:4242 \
+            --num-shards {num_shards} \
+            -i {interarrival} \
+            --accesses {wrkfile} \
+            --out-file={outf}0.data \
+            --config dpdk.config \
+            {extra_cfg} \
+            {poisson_arg} \
+            --skip-loads",
+        wd="~/burrito",
+        sudo=True,
+        stdout=f"{outf}0.out",
+        stderr=f"{outf}0.err",
+        timeout=timeout,
+        )
+    check(ok, "client", conn.addr)
+    agenda.subtask("client done")
+    pass
+
 def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0):
     conn.run("sudo pkill -INT iokerneld")
 
@@ -503,6 +558,41 @@ def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, ski
             agenda.subtask(f"loads client done: {time.time() - loads_start} s")
             break
 
+def run_loads_no_chunnels(conn, cfg_client, server, num_shards, outf, wrkfile):
+    conn.run("sudo pkill -INT iokerneld")
+    extra_cfg = ' '.join(f"--{key}={cfg_client[key]}" for key in cfg_client)
+
+    while True:
+        time.sleep(2)
+        loads_start = time.time()
+        agenda.subtask(f"loads client starting")
+        ok = None
+        try:
+            ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/ycsb-dpdk \
+                    --addr {server}:4242 \
+                    -i 1000 \
+                    --accesses {wrkfile} \
+                    --num-shards {num_shards} \
+                    --config dpdk.config \
+                    {extra_cfg} \
+                    --loads-only",
+                wd="~/burrito",
+                sudo=True,
+                stdout=f"{outf}-loads.out",
+                stderr=f"{outf}-loads.err",
+                timeout=30,
+                )
+        except:
+            agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
+        finally:
+            conn.run("sudo pkill -INT iokerneld")
+        if ok is None or ok.exited != 0:
+            agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
+            continue
+        else:
+            agenda.subtask(f"loads client done: {time.time() - loads_start} s")
+            break
+
 def do_exp(iter_num,
     outdir=None,
     machines=None,
@@ -515,6 +605,7 @@ def do_exp(iter_num,
     wrkload=None,
     overwrite=None,
     cfg_client=None,
+    no_chunnels=False,
 ):
     assert(
         outdir is not None and
@@ -529,10 +620,15 @@ def do_exp(iter_num,
         overwrite is not None
     )
 
+    if no_chunnels and (datapath != 'dpdkmulti' or shardtype != 'client'):
+        agenda.task("skipping: no_chunnels mode supported only for dpdkmulti + client sharding")
+        return
+
     wrkname = wrkload.split("/")[-1].split(".")[0]
     noneg = '_noneg' if skip_negotiation else ''
-    server_prefix = f"{outdir}/{datapath}{noneg}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-kvserver"
-    outf = f"{outdir}/{datapath}{noneg}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-client"
+    nochunnels = '_nochunnels' if no_chunnels else ''
+    server_prefix = f"{outdir}/{datapath}{noneg}{nochunnels}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-kvserver"
+    outf = f"{outdir}/{datapath}{noneg}{nochunnels}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-client"
 
     for m in machines:
         if m.is_local:
@@ -542,7 +638,7 @@ def do_exp(iter_num,
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
     if not overwrite and os.path.exists(f"{outf}0-{machines[1].addr}.data"):
-        agenda.task(f"skipping: server = {machines[0].addr}, datapath = {datapath}, skip_negotiation = {skip_negotiation} num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
+        agenda.task(f"skipping: server = {machines[0].addr}, datapath = {datapath}, skip_negotiation = {skip_negotiation}, no_chunnels = {no_chunnels}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s")
         return True
     else:
         agenda.task(f"running: {outf}0-{machines[1].addr}.data")
@@ -553,19 +649,32 @@ def do_exp(iter_num,
     interarrival_secs = num_client_threads * len(machines[1:]) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
 
-    redis_addr = start_redis(machines[0])
-    time.sleep(5)
+    if not no_chunnels:
+        redis_addr = start_redis(machines[0])
+        time.sleep(5)
+    else:
+        redis_addr = ""
+
     server_addr = machines[0].addr
     agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    redis_port = redis_addr.split(":")[-1]
-    start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, datapath=datapath, shards=num_shards, skip_negotiation=skip_negotiation)
-    time.sleep(5)
+    if no_chunnels:
+        start_server_no_chunnels(machines[0], server_prefix, shards=num_shards)
+        time.sleep(5)
+    else:
+        redis_port = redis_addr.split(":")[-1]
+        start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, datapath=datapath, shards=num_shards, skip_negotiation=skip_negotiation)
+        time.sleep(5)
+
     # prime the server with loads
     agenda.task("doing loads")
-    run_loads(machines[1], cfg_client, server_addr, datapath, redis_addr, outf, wrkload, skip_negotiation=num_shards if skip_negotiation else 0)
+    if no_chunnels:
+        run_loads_no_chunnels(machines[1], cfg_client, server_addr, num_shards, outf, wrkload)
+    else:
+        run_loads(machines[1], cfg_client, server_addr, datapath, redis_addr, outf, wrkload, skip_negotiation=num_shards if skip_negotiation else 0)
+
     try:
         machines[1].get(f"burrito/{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
         machines[1].get(f"burrito/{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
@@ -574,20 +683,33 @@ def do_exp(iter_num,
 
     # others are clients
     agenda.task("starting clients")
-    clients = [threading.Thread(target=run_client, args=(
-            m,
-            cfg_client,
-            server_addr,
-            redis_addr,
-            interarrival_us,
-            poisson_arrivals,
-            datapath,
-            shardtype,
-            num_shards if skip_negotiation else 0,
-            outf,
-            wrkload
-        ),
-    ) for m in machines[1:]]
+    if no_chunnels:
+        clients = [threading.Thread(target=run_client_no_chunnels, args=(
+                m,
+                cfg_client,
+                server_addr,
+                num_shards,
+                interarrival_us,
+                poisson_arrivals,
+                outf,
+                wrkload
+            ),
+        ) for m in machines[1:]]
+    else:
+        clients = [threading.Thread(target=run_client, args=(
+                m,
+                cfg_client,
+                server_addr,
+                redis_addr,
+                interarrival_us,
+                poisson_arrivals,
+                datapath,
+                shardtype,
+                num_shards if skip_negotiation else 0,
+                outf,
+                wrkload
+            ),
+        ) for m in machines[1:]]
 
     [t.start() for t in clients]
     [t.join() for t in clients]
@@ -872,6 +994,14 @@ if __name__ == '__main__':
             agenda.failure("Skip-negotiation must be bool")
             sys.exit(1)
 
+    if 'no-chunnels' not in cfg['exp']:
+        agenda.subfailure("no-chunnels not found, using default false")
+        cfg['exp']['no-chunnels'] = [False]
+    for t in cfg['exp']['no-chunnels']:
+        if t not in [True,False]:
+            agenda.failure("no-chunnels must be bool")
+            sys.exit(1)
+
     machines = connect_machines(cfg)
 
     found_local = False
@@ -903,24 +1033,26 @@ if __name__ == '__main__':
         if 'intel' == args.dpdk_driver:
             intel_devbind(machines, dp)
 
-        for neg in cfg['exp']['negotiation']:
-            for w in cfg['exp']['wrk']:
-                for s in cfg['exp']['shards']:
-                    for t in cfg['exp']['shardtype']:
-                        for p in cfg['exp']['poisson-arrivals']:
-                            for o in ops_per_sec:
-                                do_exp(0,
-                                    outdir=outdir,
-                                    machines=machines,
-                                    num_shards=s,
-                                    shardtype=t,
-                                    ops_per_sec=o,
-                                    datapath=dp,
-                                    poisson_arrivals=p,
-                                    skip_negotiation=not neg,
-                                    wrkload=w,
-                                    overwrite=args.overwrite,
-                                    cfg_client=cfg['cfg']['client'],
-                                )
+        for noch in cfg['exp']['no-chunnels']:
+            for neg in cfg['exp']['negotiation']:
+                for w in cfg['exp']['wrk']:
+                    for s in cfg['exp']['shards']:
+                        for t in cfg['exp']['shardtype']:
+                            for p in cfg['exp']['poisson-arrivals']:
+                                for o in ops_per_sec:
+                                    do_exp(0,
+                                        outdir=outdir,
+                                        machines=machines,
+                                        num_shards=s,
+                                        shardtype=t,
+                                        ops_per_sec=o,
+                                        datapath=dp,
+                                        poisson_arrivals=p,
+                                        skip_negotiation=not neg,
+                                        wrkload=w,
+                                        overwrite=args.overwrite,
+                                        cfg_client=cfg['cfg']['client'],
+                                        no_chunnels=noch,
+                                    )
 
     agenda.task("done")
