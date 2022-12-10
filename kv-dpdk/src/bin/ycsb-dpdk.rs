@@ -448,7 +448,9 @@ impl RawKvClient {
                     for buf in ms.iter_mut().map_while(Option::take) {
                         let msg: Msg = bincode::deserialize(&buf[..]).unwrap();
                         let id = msg.id();
-                        inflight_g.remove(&id).unwrap().send(msg).unwrap();
+                        if let Some(s) = inflight_g.remove(&id) {
+                            s.send(msg).unwrap();
+                        }
                     }
                 }
                 // sender won't drop
