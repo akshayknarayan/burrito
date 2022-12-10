@@ -30,4 +30,4 @@ load = [10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000, 18000
 poisson-arrivals = [true]
 shardtype = ["client"]
 shards = [4]
-no-chunnels = [true, false]
+no-chunnels = ['full', 'conns', 'off']

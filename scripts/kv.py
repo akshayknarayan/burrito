@@ -365,11 +365,16 @@ def start_server(conn, redis_addr, outf, datapath='kernel', shards=1, skip_negot
     time.sleep(8)
     conn.check_proc(f"kvserver", [f"burrito/{outf}.err", f"burrito/{outf}.out"])
 
-def start_server_no_chunnels(conn, outf, shards=1):
+def start_server_no_chunnels(conn, outf, no_chunnels, shards=1):
     conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/kvserver-dpdk --addr {conn.addr}:4242 --num-shards {shards} --cfg=dpdk.cfg",
+    no_chunnels_arg = '--conns' if no_chunnels == 'conns' else ''
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/kvserver-dpdk \
+            --addr {conn.addr}:4242 \
+            --num-shards {shards} \
+            --cfg=dpdk.cfg \
+            {no_chunnels_arg}",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -620,13 +625,19 @@ def do_exp(iter_num,
         overwrite is not None
     )
 
-    if no_chunnels and (datapath != 'dpdkmulti' or shardtype != 'client'):
+    if (no_chunnels != 'off' and no_chunnels != False) and (datapath != 'dpdkmulti' or shardtype != 'client'):
         agenda.task("skipping: no_chunnels mode supported only for dpdkmulti + client sharding")
         return
 
     wrkname = wrkload.split("/")[-1].split(".")[0]
     noneg = '_noneg' if skip_negotiation else ''
-    nochunnels = '_nochunnels' if no_chunnels else ''
+    if no_chunnels == 'full' or no_chunnels == True:
+       nochunnels  = '_nochunnels'
+    elif no_chunnels == 'conns':
+       nochunnels = '_nochunnels_conns'
+    else:
+       nochunnels = ''
+
     server_prefix = f"{outdir}/{datapath}{noneg}{nochunnels}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-kvserver"
     outf = f"{outdir}/{datapath}{noneg}{nochunnels}-{num_shards}-{shardtype}shard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-client"
 
@@ -660,8 +671,8 @@ def do_exp(iter_num,
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    if no_chunnels:
-        start_server_no_chunnels(machines[0], server_prefix, shards=num_shards)
+    if len(nochunnels) > 0:
+        start_server_no_chunnels(machines[0], server_prefix, no_chunnels, shards=num_shards)
         time.sleep(5)
     else:
         redis_port = redis_addr.split(":")[-1]
@@ -998,8 +1009,8 @@ if __name__ == '__main__':
         agenda.subfailure("no-chunnels not found, using default false")
         cfg['exp']['no-chunnels'] = [False]
     for t in cfg['exp']['no-chunnels']:
-        if t not in [True,False]:
-            agenda.failure("no-chunnels must be bool")
+        if t not in [True,False,'full','conns','off']:
+            agenda.failure("invalid no-chunnels value")
             sys.exit(1)
 
     machines = connect_machines(cfg)
