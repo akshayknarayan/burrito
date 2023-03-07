@@ -104,6 +104,10 @@ fn main() -> Result<(), Report> {
                     let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
                     run_clients_no_bertha(ch, cl, port, num_threads)?
                 }
+                "dpdkthread" => {
+                    let ch = DpdkUdpSkChunnel::new(cfg)?;
+                    run_clients_no_bertha(ch, cl, port, num_threads)?
+                }
                 "kernel" => {
                     let ch = UdpSkChunnel;
                     run_clients_no_bertha(ch, cl, port, num_threads)?
@@ -169,6 +173,11 @@ fn main() -> Result<(), Report> {
                 "dpdkinline" => {
                     let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
                     let ch = DpdkInlineReqChunnel::from(ch);
+                    run_server_no_bertha(ch, port, num_threads)?;
+                }
+                "dpdkthread" => {
+                    let ch = DpdkUdpSkChunnel::new(cfg)?;
+                    let ch = DpdkUdpReqChunnel(ch);
                     run_server_no_bertha(ch, port, num_threads)?;
                 }
                 "kernel" => {
