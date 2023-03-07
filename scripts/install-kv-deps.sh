@@ -13,9 +13,12 @@ sudo apt install -y  \
     libhiredis-dev
 
 # install latest stable rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > ./rustup.sh
-sh ./rustup.sh -y
-rm ./rustup.sh
+if ! command -v cargo &> /dev/null 
+then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > ./rustup.sh
+    sh ./rustup.sh -y
+    rm ./rustup.sh
+fi
 
 # docker
 sudo apt install -y ca-certificates curl gnupg lsb-release 
