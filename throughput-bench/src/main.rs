@@ -21,7 +21,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
-use tracing::{info, info_span, trace, warn};
+use tracing::{debug, info, info_span, trace, warn};
 use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
@@ -58,6 +58,9 @@ struct Client {
 
     #[structopt(long)]
     download_size: usize,
+
+    #[structopt(long)]
+    packet_size: usize,
 
     #[structopt(long)]
     out_file: Option<std::path::PathBuf>,
@@ -106,6 +109,7 @@ fn main() -> Result<(), Report> {
 
     if let Mode::Client(mut cl) = mode {
         let download_size = cl.download_size;
+        let packet_size = cl.packet_size;
         let num_clients = cl.num_clients;
         let of = cl.out_file.take();
 
@@ -158,28 +162,30 @@ fn main() -> Result<(), Report> {
         };
 
         let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
-        info!(?num_clients, ?download_size, rate_mbps=?(rate / 1e6), "finished");
+        info!(?num_clients, ?download_size, ?packet_size, rate_mbps=?(rate / 1e6), "finished");
         if let Some(of) = of {
             use std::io::Write;
             let mut f = std::fs::File::create(of)?;
             writeln!(
                 &mut f,
-                "num_clients,download_size,tot_bytes,elapsed_us,rate_bps"
+                "num_clients,download_size,packet_size,tot_bytes,elapsed_us,rate_bps"
             )?;
             writeln!(
                 &mut f,
-                "{:?},{:?},{:?},{:?},{:?}",
+                "{:?},{:?},{:?},{:?},{:?},{:?}",
                 num_clients,
                 download_size,
+                packet_size,
                 tot_bytes,
                 elapsed.as_micros(),
                 rate
             )?;
         } else {
             println!(
-                "num_clients={:?},download_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
+                "num_clients={:?},download_size={:?},packet_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
                 num_clients,
                 download_size,
+                packet_size,
                 tot_bytes,
                 elapsed.as_micros(),
                 rate
@@ -279,7 +285,7 @@ where
                     rt.block_on(async move {
                         let futs: FuturesUnordered<_> = (0..num_thread_clients)
                             .map(|tclient| {
-                                run_client(ctr.clone(), addr, c.download_size)
+                                run_client(ctr.clone(), addr, c.download_size, c.packet_size)
                                     .instrument(info_span!("client", ?thread, ?tclient))
                             })
                             .collect();
@@ -297,7 +303,7 @@ where
                         .enable_all()
                         .build()?;
                     rt.block_on(async move {
-                        let res = run_client(ctr, addr, c.download_size)
+                        let res = run_client(ctr, addr, c.download_size, c.packet_size)
                             .instrument(info_span!("client", ?thread))
                             .await?;
                         Ok(vec![res])
@@ -328,13 +334,14 @@ async fn run_client<C, Cn, E>(
     mut ctr: C,
     addr: SocketAddr,
     download_size: usize,
+    packet_size: usize,
 ) -> Result<(usize, Duration), Report>
 where
     C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = E> + Send + Sync + 'static,
     Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
     E: Into<Report> + Send + Sync + 'static,
 {
-    info!(?addr, ?download_size, "starting client");
+    info!(?addr, ?download_size, ?packet_size, "starting client");
     let stack = bertha::util::Nothing::<()>::default();
 
     // 1. connect
@@ -353,7 +360,7 @@ where
         _ => bail!("wrong addr"),
     };
 
-    run_client_inner(cn, addr4, download_size).await
+    run_client_inner(cn, addr4, download_size, packet_size).await
 }
 
 fn run_server<L, Cn, E>(listener: L, port: u16, threads: usize) -> Result<(), Report>
@@ -440,7 +447,7 @@ where
                                 let mut ch = ch.clone();
                                 async move {
                                     let cn = ch.connect(addr).await?;
-                                    run_client_inner(cn, addr4, c.download_size)
+                                    run_client_inner(cn, addr4, c.download_size, c.packet_size)
                                         .instrument(info_span!("client", ?thread, ?tclient))
                                         .await
                                 }
@@ -461,7 +468,7 @@ where
                         .build()?;
                     let res = rt.block_on(async move {
                         let cn = ch.connect(addr).await?;
-                        run_client_inner(cn, addr4, c.download_size)
+                        run_client_inner(cn, addr4, c.download_size, c.packet_size)
                             .instrument(info_span!("client", ?thread))
                             .await
                     })?;
@@ -492,12 +499,14 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     cn: C,
     addr: SocketAddrV4,
     download_size: usize,
+    packet_size: usize,
 ) -> Result<(usize, Duration), Report> {
-    info!(?addr, ?download_size, "starting client");
+    info!(?addr, ?download_size, ?packet_size, "starting client");
 
     let mut tot_bytes = 0;
     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
     req.extend((download_size as u64).to_le_bytes());
+    req.extend((packet_size as u64).to_le_bytes());
     cn.send(std::iter::once((SocketAddr::V4(addr), req)))
         .await?;
     let start = Instant::now();
@@ -577,12 +586,22 @@ async fn server_thread_inner<
         };
 
         let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
+        let pkt_size = u64::from_le_bytes(msg[16..24].try_into().unwrap());
+        if pkt_size < 64 || pkt_size > 1460 {
+            debug!("bad client request");
+            bail!(
+                "bad client request: remaining {:?}, pkt_size {:?}",
+                remaining,
+                pkt_size
+            );
+        }
+
         let start = Instant::now();
         info!(?remaining, ?a, "starting send");
         while remaining > 0 {
             let bufs = (0..16).map_while(|_| {
                 if remaining > 0 {
-                    let this_send_size = std::cmp::min(1460, remaining);
+                    let this_send_size = std::cmp::min(pkt_size, remaining);
                     remaining -= this_send_size;
                     Some((a, vec![0u8; this_send_size as usize]))
                 } else {
@@ -623,9 +642,9 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
     use shenango_bertha::ChunnelConnection;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use tracing::debug;
     if let Mode::Client(mut cl) = mode {
         let download_size = cl.download_size;
+        let packet_size = cl.packet_size;
         let num_clients = cl.num_clients;
         let of = cl.out_file.take();
         let addr = SocketAddrV4::new(cl.addr, port);
@@ -663,6 +682,7 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
                     req.extend((download_size as u64).to_le_bytes());
                     req.extend((cl.num_clients as u32).to_le_bytes());
+                    req.extend((packet_size as u32).to_le_bytes());
                     cn.send((addr, req.clone()))?;
                     let mut start = Instant::now();
 
@@ -759,20 +779,21 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
             info!(?tot_bytes, ?elapsed, "all clients done");
 
             let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
-            info!(?num_clients, ?download_size, rate_mbps=?(rate / 1e6), "finished");
+            info!(?num_clients, ?download_size, ?packet_size, rate_mbps=?(rate / 1e6), "finished");
             if let Some(of) = of {
                 use std::io::Write;
                 let mut f = std::fs::File::create(of).unwrap();
                 writeln!(
                     &mut f,
-                    "num_clients,download_size,tot_bytes,elapsed_us,rate_bps"
+                    "num_clients,download_size,packet_size,tot_bytes,elapsed_us,rate_bps"
                 )
                 .unwrap();
                 writeln!(
                     &mut f,
-                    "{:?},{:?},{:?},{:?},{:?}",
+                    "{:?},{:?},{:?},{:?},{:?},{:?}",
                     num_clients,
                     download_size,
+                    packet_size,
                     tot_bytes,
                     elapsed.as_micros(),
                     rate
@@ -780,9 +801,10 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                 .unwrap();
             } else {
                 println!(
-                    "num_clients={:?},download_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
+                    "num_clients={:?},download_size={:?},packet_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
                     num_clients,
                     download_size,
+                    packet_size,
                     tot_bytes,
                     elapsed.as_micros(),
                     rate
@@ -818,8 +840,9 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
                     let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
                     let num_clients = u32::from_le_bytes(msg[16..20].try_into().unwrap()) as usize;
+                    let pkt_size = u64::from_le_bytes(msg[20..28].try_into().unwrap());
 
-                    if num_clients == 0 {
+                    if num_clients == 0 || pkt_size < 64 || pkt_size > 1460 {
                         debug!("bad client request");
                         return;
                     }
@@ -846,9 +869,9 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     wg.wait();
 
                     let start = Instant::now();
-                    info!(?remaining, ?a, "starting send");
+                    info!(?remaining, ?pkt_size, ?a, "starting send");
                     while remaining > 0 {
-                        let this_send_size = std::cmp::min(1460, remaining);
+                        let this_send_size = std::cmp::min(pkt_size, remaining);
                         let buf = vec![0u8; this_send_size as usize];
                         if let Err(e) = cn.send((a, buf)) {
                             trace!(?e, "write errored");
@@ -909,9 +932,9 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
     use shenango::udp;
     use std::sync::Arc;
-    use tracing::debug;
     if let Mode::Client(mut cl) = mode {
         let download_size = cl.download_size;
+        let packet_size = cl.packet_size;
         let num_clients = cl.num_clients;
         let of = cl.out_file.take();
         let addr = SocketAddrV4::new(cl.addr, port);
@@ -939,6 +962,7 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     // 2. get bytes
                     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
                     req.extend((download_size as u64).to_le_bytes());
+                    req.extend((packet_size as u64).to_le_bytes());
                     cn.write_to(&req, addr)?;
 
                     const RECV: u32 = 1;
@@ -1013,20 +1037,21 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
             info!(?tot_bytes, ?elapsed, "all clients done");
 
             let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
-            info!(?num_clients, ?download_size, rate_mbps=?(rate / 1e6), "finished");
+            info!(?num_clients, ?download_size, ?packet_size, rate_mbps=?(rate / 1e6), "finished");
             if let Some(of) = of {
                 use std::io::Write;
                 let mut f = std::fs::File::create(of).unwrap();
                 writeln!(
                     &mut f,
-                    "num_clients,download_size,tot_bytes,elapsed_us,rate_bps"
+                    "num_clients,download_size,packet_size,tot_bytes,elapsed_us,rate_bps"
                 )
                 .unwrap();
                 writeln!(
                     &mut f,
-                    "{:?},{:?},{:?},{:?},{:?}",
+                    "{:?},{:?},{:?},{:?},{:?},{:?}",
                     num_clients,
                     download_size,
+                    packet_size,
                     tot_bytes,
                     elapsed.as_micros(),
                     rate
@@ -1034,9 +1059,10 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                 .unwrap();
             } else {
                 println!(
-                    "num_clients={:?},download_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
+                    "num_clients={:?},download_size={:?},packet_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
                     num_clients,
                     download_size,
+                    packet_size,
                     tot_bytes,
                     elapsed.as_micros(),
                     rate
@@ -1065,10 +1091,17 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                 }
 
                 let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
+                let pkt_size = u64::from_le_bytes(msg[16..24].try_into().unwrap());
+
+                if pkt_size < 64 || pkt_size > 1460 {
+                    debug!("bad client request");
+                    return;
+                }
+
                 let start = Instant::now();
                 info!(?remaining, ?a, "starting send");
                 while remaining > 0 {
-                    let this_send_size = std::cmp::min(1460, remaining);
+                    let this_send_size = std::cmp::min(pkt_size, remaining);
                     let buf = vec![0u8; this_send_size as usize];
                     if let Err(e) = cn.write_to(&buf, a) {
                         trace!(?e, "write errored");
@@ -1090,7 +1123,7 @@ fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                 let cn2 = cn.clone();
                 shenango::thread::spawn(move || {
                     let _recv_trigger = recv_trigger;
-                    let mut buf = [0u8; 1024];
+                    let mut buf = [0u8; 1500];
                     if let Err(e) = cn.recv(&mut buf) {
                         warn!(?e, "recv errored");
                     }

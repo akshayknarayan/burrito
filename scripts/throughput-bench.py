@@ -50,7 +50,7 @@ def start_server(conn, outf, variant='kernel', use_bertha=False, extra_cfg=None)
     time.sleep(8)
     conn.check_proc(f"throughput", [f"burrito/{outf}.err", f"burrito/{outf}.out"])
 
-def run_client(conn, server, num_clients, file_size, variant, use_bertha, extra_cfg, outf):
+def run_client(conn, server, num_clients, file_size, packet_size, variant, use_bertha, extra_cfg, outf):
     conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -81,6 +81,7 @@ def run_client(conn, server, num_clients, file_size, variant, use_bertha, extra_
         client \
         --addr {server} \
         --download-size {file_size} \
+        --packet-size {packet_size} \
         --num-clients {num_clients} \
         --out-file={outf}.data",
         sudo=True,
@@ -98,6 +99,7 @@ def do_exp(iter_num,
     outdir=None,
     machines=None,
     file_size=None,
+    packet_size=None,
     num_clients=None,
     datapath=None,
     use_bertha=False,
@@ -107,14 +109,15 @@ def do_exp(iter_num,
         outdir is not None and
         machines is not None and
         file_size is not None and
+        packet_size is not None and
         num_clients is not None and
         datapath is not None and
         overwrite is not None
     )
 
     nobertha = '_nobertha' if not use_bertha else ''
-    server_prefix = f"{outdir}/{datapath}{nobertha}-num_clients={num_clients}-file_size={file_size}-{iter_num}-tbench_server"
-    outf = f"{outdir}/{datapath}{nobertha}-num_clients={num_clients}-file_size={file_size}-{iter_num}-tbench_client"
+    server_prefix = f"{outdir}/{datapath}{nobertha}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_server"
+    outf = f"{outdir}/{datapath}{nobertha}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_client"
 
     for m in machines:
         if m.local:
@@ -131,7 +134,7 @@ def do_exp(iter_num,
 
     time.sleep(2)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, use_bertha = {use_bertha}, num_clients = {num_clients} file_size = {file_size}")
+    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, use_bertha = {use_bertha}, num_clients = {num_clients} file_size = {file_size} packet_size = {packet_size}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
@@ -145,6 +148,7 @@ def do_exp(iter_num,
             server_addr,
             num_clients,
             file_size,
+            packet_size,
             datapath,
             use_bertha,
             cfg['client'] if cfg is not None else None,
@@ -269,6 +273,7 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
 ### [exp]
 ### num_clients = [1, 2, 4, 8, 16, 32, 64, 128]
 ### file_size = [50000000]
+### packet_size = [1460]
 ### datapath = ['dpdk', 'shenango']
 ###
 if __name__ == '__main__':
@@ -302,6 +307,9 @@ if __name__ == '__main__':
     if 'file_size' not in cfg['exp']:
         agenda.failure("Need file_size")
         sys.exit(1)
+    if 'packet_size' not in cfg['exp']:
+        agenda.failure("Need packet_size")
+        sys.exit(1)
     if 'datapath' not in cfg['exp']:
         cfg['exp']['datapath'] = ['dpdk']
     for t in cfg['exp']['datapath']:
@@ -331,6 +339,23 @@ if __name__ == '__main__':
         if d == 'dpdkinline' or d == 'shenango' or d == 'kernel':
             for use_bertha in cfg['exp']['bertha']:
                 for fs in cfg['exp']['file_size']:
+                    for ps in cfg['exp']['packet_size']:
+                        for nc in cfg['exp']['num_clients']:
+                            for i in range(int(cfg['exp']['iters'])):
+                                do_exp(i,
+                                        cfg=cfg['cfg'],
+                                        outdir=outdir,
+                                        machines=machines,
+                                        num_clients=nc,
+                                        file_size=fs,
+                                        packet_size=ps,
+                                        datapath=d,
+                                        use_bertha=use_bertha,
+                                        overwrite=args.overwrite
+                                        )
+        else:
+            for fs in cfg['exp']['file_size']:
+                for ps in cfg['exp']['packet_size']:
                     for nc in cfg['exp']['num_clients']:
                         for i in range(int(cfg['exp']['iters'])):
                             do_exp(i,
@@ -339,23 +364,10 @@ if __name__ == '__main__':
                                     machines=machines,
                                     num_clients=nc,
                                     file_size=fs,
+                                    packet_size=ps,
                                     datapath=d,
-                                    use_bertha=use_bertha,
+                                    use_bertha=True,
                                     overwrite=args.overwrite
                                     )
-        else:
-            for fs in cfg['exp']['file_size']:
-                for nc in cfg['exp']['num_clients']:
-                    for i in range(int(cfg['exp']['iters'])):
-                        do_exp(i,
-                                cfg=cfg['cfg'],
-                                outdir=outdir,
-                                machines=machines,
-                                num_clients=nc,
-                                file_size=fs,
-                                datapath=d,
-                                use_bertha=True,
-                                overwrite=args.overwrite
-                                )
 
     agenda.task("done")
