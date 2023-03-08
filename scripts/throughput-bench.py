@@ -284,6 +284,7 @@ if __name__ == '__main__':
     parser.add_argument('--outdir', type=str, required=True)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--dpdk_driver', type=str, choices=['mlx', 'intel'],  required=False)
+    parser.add_argument('--setup_only', action='store_true',  required=False)
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")
     cfg = toml.load(args.config)
@@ -332,6 +333,9 @@ if __name__ == '__main__':
         subprocess.run(f"mkdir -p {args.outdir}", shell=True)
 
     setup_all(machines, cfg, args, setup_machine)
+    if args.setup_only:
+        agenda.task("setup done")
+        sys.exit(0)
 
     for d in cfg['exp']['datapath']:
         if 'intel' == args.dpdk_driver:
