@@ -758,7 +758,6 @@ def setup_all(machines, cfg, args, setup_fn):
     setups = [threading.Thread(target=setup_fn, args=(m, args.outdir, cfg['exp']['datapath'] if 'datapath' in cfg['exp'] else [], args.dpdk_driver)) for m in machines]
     [t.start() for t in setups]
     [t.join() for t in setups]
-    global thread_ok
     if not thread_ok:
         agenda.failure("Something went wrong")
         raise Exception("setup error")
