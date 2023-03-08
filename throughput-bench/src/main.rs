@@ -8,24 +8,27 @@ use bertha::{
     ChunnelConnection, ChunnelConnector, ChunnelListener,
 };
 use color_eyre::eyre::{bail, Report, WrapErr};
+#[cfg(feature = "dpdk-direct")]
 use dpdk_direct::{DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use futures_util::{
     stream::{FuturesUnordered, TryStreamExt},
     Stream,
 };
+#[cfg(feature = "shenango-chunnel")]
 use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+#[cfg(any(feature = "use_shenango", feature = "dpdk-direct"))]
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
-use tracing::{debug, info, info_span, trace, warn};
+use tracing::{info, info_span, trace, warn};
 use tracing_error::ErrorLayer;
 use tracing_futures::Instrument;
 use tracing_subscriber::prelude::*;
 
 #[derive(Debug, Clone, StructOpt)]
 struct Opt {
+    #[cfg(any(feature = "use_shenango", feature = "dpdk-direct"))]
     #[structopt(long)]
     cfg: PathBuf,
 
@@ -75,6 +78,7 @@ fn main() -> Result<(), Report> {
     d.init();
     color_eyre::install()?;
     let Opt {
+        #[cfg(any(feature = "use_shenango", feature = "dpdk-direct"))]
         cfg,
         port,
         datapath,
@@ -83,14 +87,21 @@ fn main() -> Result<(), Report> {
         mode,
     } = Opt::from_args();
 
-    if no_bertha && datapath == "shenango" {
-        shenango_nobertha(cfg, port, mode);
-        unreachable!();
+    #[cfg(feature = "use_shenango")]
+    {
+        if no_bertha && datapath == "shenango" {
+            shenango_nobertha(cfg, port, mode);
+            unreachable!();
+        } else if datapath == "shenangort" {
+            shenangort_bertha(cfg, port, mode);
+            unreachable!();
+        }
     }
-
-    if datapath == "shenangort" {
-        shenangort_bertha(cfg, port, mode);
-        unreachable!();
+    #[cfg(not(feature = "use_shenango"))]
+    {
+        if datapath.contains("shenango") {
+            bail!("`shenango_direct` feature not enabled");
+        }
     }
 
     if let Mode::Client(mut cl) = mode {
@@ -100,10 +111,12 @@ fn main() -> Result<(), Report> {
 
         let (tot_bytes, elapsed) = if no_bertha {
             match datapath.as_str() {
+                #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
                     let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
                     run_clients_no_bertha(ch, cl, port, num_threads)?
                 }
+                #[cfg(feature = "dpdk-direct")]
                 "dpdkthread" => {
                     let ch = DpdkUdpSkChunnel::new(cfg)?;
                     run_clients_no_bertha(ch, cl, port, num_threads)?
@@ -112,19 +125,24 @@ fn main() -> Result<(), Report> {
                     let ch = UdpSkChunnel;
                     run_clients_no_bertha(ch, cl, port, num_threads)?
                 }
-                _ => bail!("no_bertha with non-dpdk not implemented"),
+                #[cfg(not(feature = "dpdk-direct"))]
+                x if x.contains("dpdk") => bail!("`dpdk-direct` feature not enabled"),
+                x => bail!("no_bertha mode not implemented for {}", x),
             }
         } else {
             match datapath.as_str() {
+                #[cfg(feature = "dpdk-direct")]
                 "dpdkthread" => {
                     let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk-thread chunnel")?;
                     run_clients(ch, cl, port, num_threads)?
                 }
+                #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
                     let ch = DpdkInlineChunnel::new(cfg, num_threads)
                         .wrap_err("make dpdk-multi chunnel")?;
                     run_clients(ch, cl, port, num_threads)?
                 }
+                #[cfg(feature = "use_shenango")]
                 "shenango" => {
                     let ch = ShenangoUdpSkChunnel::new(cfg);
                     run_clients(ch, cl, port, num_threads)?
@@ -133,9 +151,9 @@ fn main() -> Result<(), Report> {
                     let ch = UdpSkChunnel;
                     run_clients(ch, cl, port, num_threads)?
                 }
-                d => {
-                    bail!("unknown datapath {:?}", d);
-                }
+                #[cfg(not(feature = "dpdk-direct"))]
+                x if x.contains("dpdk") => bail!("`dpdk-direct` feature not enabled"),
+                d => bail!("unknown datapath {:?}", d),
             }
         };
 
@@ -170,11 +188,13 @@ fn main() -> Result<(), Report> {
     } else {
         if no_bertha {
             match datapath.as_ref() {
+                #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
                     let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
                     let ch = DpdkInlineReqChunnel::from(ch);
                     run_server_no_bertha(ch, port, num_threads)?;
                 }
+                #[cfg(feature = "dpdk-direct")]
                 "dpdkthread" => {
                     let ch = DpdkUdpSkChunnel::new(cfg)?;
                     let ch = DpdkUdpReqChunnel(ch);
@@ -184,20 +204,25 @@ fn main() -> Result<(), Report> {
                     let ch = UdpReqChunnel;
                     run_server_no_bertha(ch, port, num_threads)?;
                 }
-                _ => bail!("non-dpdk no-bertha not implemented"),
+                #[cfg(not(feature = "dpdk-direct"))]
+                x if x.contains("dpdk") => bail!("`dpdk-direct` feature not enabled"),
+                x => bail!("no_bertha mode not implemented for {}", x),
             }
         } else {
             match datapath.as_str() {
+                #[cfg(feature = "dpdk-direct")]
                 "dpdkthread" => {
                     let ch = DpdkUdpSkChunnel::new(cfg)?;
                     let ch = DpdkUdpReqChunnel(ch);
                     run_server(ch, port, num_threads)?;
                 }
+                #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
                     let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
                     let ch = DpdkInlineReqChunnel::from(ch);
                     run_server(ch, port, num_threads)?;
                 }
+                #[cfg(feature = "use_shenango")]
                 "shenango" => {
                     let ch = ShenangoUdpSkChunnel::new(cfg);
                     let ch = ShenangoUdpReqChunnel(ch);
@@ -207,9 +232,9 @@ fn main() -> Result<(), Report> {
                     let ch = UdpReqChunnel;
                     run_server(ch, port, num_threads)?;
                 }
-                d => {
-                    bail!("unknown datapath {:?}", d);
-                }
+                #[cfg(not(feature = "dpdk-direct"))]
+                x if x.contains("dpdk") => bail!("`dpdk-direct` feature not enabled"),
+                d => bail!("unknown datapath {:?}", d),
             }
         }
     }
@@ -592,10 +617,13 @@ async fn server_thread_inner<
     .await
 }
 
+#[cfg(feature = "use_shenango")]
 fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
     use shenango::udp;
     use shenango_bertha::ChunnelConnection;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tracing::debug;
     if let Mode::Client(mut cl) = mode {
         let download_size = cl.download_size;
         let num_clients = cl.num_clients;
@@ -877,8 +905,11 @@ fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
     }
 }
 
+#[cfg(feature = "use_shenango")]
 fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
     use shenango::udp;
+    use std::sync::Arc;
+    use tracing::debug;
     if let Mode::Client(mut cl) = mode {
         let download_size = cl.download_size;
         let num_clients = cl.num_clients;

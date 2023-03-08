@@ -231,10 +231,16 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         needed_features = []
         for d in datapaths:
             if 'dpdk' in d:
+                if 'dpdk-direct' not in needed_features:
+                    needed_features.append('dpdk-direct')
                 if dpdk_driver == 'mlx' and 'dpdk-direct/cx3_mlx' not in needed_features:
                     needed_features.append('dpdk-direct/cx3_mlx')
                 elif dpdk_driver == 'intel' and 'dpdk-direct/xl710_intel' not in needed_features:
                     needed_features.append('dpdk-direct/xl710_intel')
+            if 'shenango' in d:
+                if 'use_shenango' not in needed_features:
+                    needed_features.append('use_shenango')
+
         agenda.subtask(f"building throughput-bench features={needed_features}")
         ok = conn.run(f"~/.cargo/bin/cargo +nightly build --release --features=\"{','.join(needed_features)}\"", wd = "~/burrito/throughput-bench")
         check(ok, "throughput-bench build", conn.addr)

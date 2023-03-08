@@ -1,15 +1,17 @@
 [package]
 name = "throughput-bench"
 version = "0.1.0"
+authors = ["Akshay Narayan <akshayn@icsi.berkeley.edu>"]
 edition = "2021"
+
+[features]
+default = []
+cx3_mlx = ["dpdk-direct?/cx3_mlx"]
+xl710_intel = ["dpdk-direct?/xl710_intel"]
+use_shenango = ["shenango", "shenango-bertha", "shenango-chunnel"]
 
 [dependencies]
 bertha = { path = "../bertha" }
-dpdk-direct = { path = "../dpdk-direct" }
-dpdk-wrapper = { path = "../dpdk-direct/dpdk-wrapper" }
-shenango-chunnel = { path = "../shenango-chunnel" }
-shenango = { path = "../shenango-chunnel/caladan/bindings/rust" }
-shenango-bertha = { path = "../shenango-bertha" }
 flume = "0.10"
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
@@ -20,3 +22,7 @@ tracing-error = "0.2"
 tracing-futures = "0.2"
 structopt = "0.3"
 rand = "0.8"
+dpdk-direct = { path = "../dpdk-direct", optional = true}
+shenango-chunnel = { path = "../shenango-chunnel", optional = true }
+shenango = { path = "../shenango-chunnel/caladan/bindings/rust", optional = true }
+shenango-bertha = { path = "../shenango-bertha", optional = true }
