@@ -250,7 +250,13 @@ where
                     continue;
                 }
             }
-            _ => unreachable!(),
+            _ => {
+                // there has been some serialization error that led this message to deserialize
+                // successfully, but to a message type that is nonsensical. treat this as a
+                // deserialization error.
+                debug!(err = %format!("{:#?}", e), ?buf, "Discarding message");
+                continue;
+            }
         }
     }
 }
