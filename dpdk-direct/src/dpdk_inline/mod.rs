@@ -19,10 +19,10 @@ use tracing::{debug, debug_span, error, info, trace, trace_span, warn};
 use tracing_futures::Instrument;
 
 mod dpdk_state;
-use dpdk_state::{DpdkState, SendMsg};
+pub use dpdk_state::{DpdkState, Msg, SendMsg};
 
 std::thread_local! {
-    static DPDK_STATE: RefCell<Option<DpdkState>> = RefCell::new(None);
+    pub static DPDK_STATE: RefCell<Option<DpdkState>> = RefCell::new(None);
 }
 
 #[derive(Default)]
@@ -253,11 +253,6 @@ impl ChunnelConnector for DpdkInlineChunnel {
 
     fn connect(&mut self, _addr: Self::Addr) -> Self::Future {
         ready((|| {
-            //let remote_addr = match addr {
-            //    SocketAddr::V4(a) => a,
-            //    SocketAddr::V6(a) => bail!("Only Ipv4 addresses supported: {:?}", a),
-            //};
-
             try_init_thread(self.initialization_state.as_ref()).and_then(|_| {
                 DPDK_STATE.with(|dpdk_cell| {
                     let this_lcore = get_lcore_id();
