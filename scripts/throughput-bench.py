@@ -12,7 +12,7 @@ import toml
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
 
-def start_server(conn, outf, variant='kernel', use_bertha=False, extra_cfg=None):
+def start_server(conn, outf, variant='kernel', use_bertha='full', extra_cfg=None):
     conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -30,7 +30,7 @@ def start_server(conn, outf, variant='kernel', use_bertha=False, extra_cfg=None)
     else:
         extra_args = ""
 
-    no_bertha = '--no-bertha' if not use_bertha else ''
+    no_bertha = f'--no-bertha={use_bertha}'
     time.sleep(5)
     ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/throughput-bench \
         -p 4242 \
@@ -63,7 +63,7 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
     else:
         raise Exception("unknown datapath")
 
-    no_bertha = '--no-bertha' if not use_bertha else ''
+    no_bertha = f'--no-bertha={use_bertha}'
     if extra_cfg is not None:
         extra_args = ' '.join(f"--{key}={extra_cfg[key]}" for key in extra_cfg)
     else:
@@ -102,7 +102,7 @@ def do_exp(iter_num,
     packet_size=None,
     num_clients=None,
     datapath=None,
-    use_bertha=False,
+    use_bertha='full',
     overwrite=None
 ):
     assert(
@@ -115,9 +115,8 @@ def do_exp(iter_num,
         overwrite is not None
     )
 
-    nobertha = '_nobertha' if not use_bertha else ''
-    server_prefix = f"{outdir}/{datapath}{nobertha}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_server"
-    outf = f"{outdir}/{datapath}{nobertha}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_client"
+    server_prefix = f"{outdir}/{datapath}_{use_bertha}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_server"
+    outf = f"{outdir}/{datapath}_{use_bertha}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_client"
 
     for m in machines:
         if m.local:
@@ -299,8 +298,8 @@ if __name__ == '__main__':
     if 'bertha' not in cfg['exp']:
         cfg['exp']['bertha'] = [True]
     for t in cfg['exp']['bertha']:
-        if t not in [True,False]:
-            agenda.failure("No bertha must be bool")
+        if t not in ['full', 'berthaconn', 'raw']:
+            agenda.failure("Unknown no_bertha mode")
             sys.exit(1)
     if 'num_clients' not in cfg['exp']:
         agenda.failure("Need num_clients")
@@ -340,24 +339,7 @@ if __name__ == '__main__':
     for d in cfg['exp']['datapath']:
         if 'intel' == args.dpdk_driver:
             intel_devbind(machines, d)
-        if d == 'dpdkinline' or d == 'shenango' or d == 'kernel':
-            for use_bertha in cfg['exp']['bertha']:
-                for fs in cfg['exp']['file_size']:
-                    for ps in cfg['exp']['packet_size']:
-                        for nc in cfg['exp']['num_clients']:
-                            for i in range(int(cfg['exp']['iters'])):
-                                do_exp(i,
-                                        cfg=cfg['cfg'],
-                                        outdir=outdir,
-                                        machines=machines,
-                                        num_clients=nc,
-                                        file_size=fs,
-                                        packet_size=ps,
-                                        datapath=d,
-                                        use_bertha=use_bertha,
-                                        overwrite=args.overwrite
-                                        )
-        else:
+        for use_bertha in cfg['exp']['bertha']:
             for fs in cfg['exp']['file_size']:
                 for ps in cfg['exp']['packet_size']:
                     for nc in cfg['exp']['num_clients']:
@@ -370,7 +352,7 @@ if __name__ == '__main__':
                                     file_size=fs,
                                     packet_size=ps,
                                     datapath=d,
-                                    use_bertha=True,
+                                    use_bertha=use_bertha,
                                     overwrite=args.overwrite
                                     )
 
