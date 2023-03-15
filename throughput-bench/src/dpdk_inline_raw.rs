@@ -123,10 +123,7 @@ async fn run_client(
         .wrap_err("connector failed")?;
 
     let local_port = cn.local_port();
-    let remote_addr = cn
-        .remote_addr()
-        .ok_or_else(|| eyre!("Connection was not connected to remote address"))?;
-    ensure!(remote_addr == addr, "Addresses mismatched");
+    let remote_addr = addr;
     let this_lcore = dpdk_direct::get_lcore_id();
     info!(
         ?remote_addr,
