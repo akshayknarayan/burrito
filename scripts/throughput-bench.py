@@ -88,6 +88,7 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
         wd="~/burrito",
         stdout=f"{outf}.out",
         stderr=f"{outf}.err",
+        timeout=180,
         )
     check(ok, "throughput-bench", conn.addr)
     if 'shenango' in variant:
@@ -124,6 +125,10 @@ def do_exp(iter_num,
             continue
         m.run(f"rm -rf {outdir}", wd="~/burrito")
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
+
+    if (datapath == 'shenango' and use_bertha == 'full'):
+        agenda.task(f"skipping: {outf}.data")
+        return True
 
     if not overwrite and os.path.exists(f"{outf}-{machines[1].addr}.data"):
         agenda.task(f"skipping: {outf}.data")
