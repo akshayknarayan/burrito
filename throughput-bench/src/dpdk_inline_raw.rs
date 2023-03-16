@@ -320,22 +320,13 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
         info!(elapsed = ?start.elapsed(), ?a, "done sending");
 
         // fin
-        fn send_fin(local_port: u16, a: SocketAddrV4, this_lcore: u32) -> Result<(), Report> {
-            DPDK_STATE
-                .try_with(|dpdk_cell| {
-                    let mut dpdk_opt = dpdk_cell.borrow_mut();
-                    let dpdk = dpdk_opt
-                        .as_mut()
-                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                    dpdk.send_burst(std::iter::once(SendMsg {
-                        src_port: local_port,
-                        to_addr: a,
-                        buf: vec![1u8],
-                    }))?;
-                    Ok(())
-                })
-                .map_err(Into::into)
-                .and_then(|x| x)
+        fn send_fin(dpdk: &mut DpdkState, local_port: u16, a: SocketAddrV4) -> Result<(), Report> {
+            dpdk.send_burst(std::iter::once(SendMsg {
+                src_port: local_port,
+                to_addr: a,
+                buf: vec![1u8],
+            }))?;
+            Ok(())
         }
 
         fn recv_one(
@@ -352,7 +343,16 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
             }
         }
 
-        send_fin(local_port, a, this_lcore)?;
+        DPDK_STATE
+            .try_with(|dpdk_cell| {
+                let mut dpdk_opt = dpdk_cell.borrow_mut();
+                let dpdk = dpdk_opt
+                    .as_mut()
+                    .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                send_fin(dpdk, local_port, a)
+            })
+            .map_err(Into::into)
+            .and_then(|x| x)?;
         let start = Instant::now();
         loop {
             let res = DPDK_STATE
@@ -364,7 +364,7 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                     match recv_one(dpdk, local_port, remote_addr) {
                         Ok(Some(_)) => Ok(Some(())),
                         Ok(None) if start.elapsed() >= Duration::from_millis(1) => {
-                            send_fin(local_port, a, this_lcore)?;
+                            send_fin(dpdk, local_port, a)?;
                             Ok(None)
                         }
                         Ok(None) => Ok(None),

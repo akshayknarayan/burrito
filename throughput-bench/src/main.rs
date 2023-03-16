@@ -162,7 +162,7 @@ fn validate_message(ms: &[u8]) -> Result<(u64, u64), Report> {
     let remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
     let pkt_size = u64::from_le_bytes(msg[16..24].try_into().unwrap());
     if pkt_size < 64 || pkt_size > 1460 {
-        debug!("bad client request");
+        debug!(?pkt_size, "bad client request");
         bail!(
             "bad client request: remaining {:?}, pkt_size {:?}",
             remaining,
