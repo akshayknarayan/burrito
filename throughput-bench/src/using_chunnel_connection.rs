@@ -268,14 +268,26 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
     req.extend((download_size as u64).to_le_bytes());
     req.extend((packet_size as u64).to_le_bytes());
-    cn.send(std::iter::once((SocketAddr::V4(addr), req)))
+    cn.send(std::iter::once((SocketAddr::V4(addr), req.clone())))
         .await?;
     let start = Instant::now();
-    let mut last_recv_time;
+    let mut last_recv_time = None;
     let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
     'cn: loop {
-        let ms = cn.recv(&mut slots).await?;
-        last_recv_time = Instant::now();
+        let ms = if last_recv_time.is_none() {
+            match tokio::time::timeout(Duration::from_millis(10), cn.recv(&mut slots)).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    cn.send(std::iter::once((SocketAddr::V4(addr), req.clone())))
+                        .await?;
+                    continue;
+                }
+            }
+        } else {
+            cn.recv(&mut slots).await?
+        };
+
+        last_recv_time = Some(Instant::now());
         for (_, r) in ms.iter_mut().map_while(Option::take) {
             tot_bytes += r.len();
             trace!(?tot_bytes, "received part");
@@ -286,7 +298,7 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
         }
     }
 
-    let elapsed = last_recv_time - start;
+    let elapsed = last_recv_time.unwrap() - start;
     info!(?tot_bytes, ?elapsed, "done");
     Ok((tot_bytes, elapsed))
 }

@@ -139,24 +139,26 @@ async fn run_client(
     req.extend((download_size as u64).to_le_bytes());
     req.extend((packet_size as u64).to_le_bytes());
 
+    let req = SendMsg {
+        src_port: local_port,
+        to_addr: remote_addr,
+        buf: req,
+    };
+
     DPDK_STATE
         .try_with(|dpdk_cell| {
             let mut dpdk_opt = dpdk_cell.borrow_mut();
             let dpdk = dpdk_opt
                 .as_mut()
                 .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-            dpdk.send_burst(std::iter::once(SendMsg {
-                src_port: local_port,
-                to_addr: remote_addr,
-                buf: req,
-            }))?;
+            dpdk.send_burst(std::iter::once(req.clone()))?;
             Ok::<_, Report>(())
         })
         .map_err(Into::into)
         .and_then(|x| x)?;
 
     let start = Instant::now();
-    let mut last_recv_time;
+    let mut last_recv_time: Option<Instant> = None;
     let mut slots: [Option<Msg>; 16] = (0..16)
         .map(|_| None)
         .collect::<Vec<_>>()
@@ -172,7 +174,6 @@ async fn run_client(
                         .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
                     let ms =
                         dpdk.try_recv_burst(Some((local_port, Some(remote_addr))), None, None)?;
-                    //slots[..ms.len()].copy_from_slice(ms);
                     for (m, slot) in ms.iter_mut().map_while(Option::take).zip(slots.iter_mut()) {
                         *slot = Some(m);
                     }
@@ -181,9 +182,23 @@ async fn run_client(
                 .map_err(Into::into)
                 .and_then(|x| x)?;
             if nr > 0 {
-                last_recv_time = Instant::now();
+                last_recv_time = Some(Instant::now());
                 break 'recv nr;
             } else {
+                if last_recv_time.is_none() && start.elapsed() > Duration::from_millis(10) {
+                    DPDK_STATE
+                        .try_with(|dpdk_cell| {
+                            let mut dpdk_opt = dpdk_cell.borrow_mut();
+                            let dpdk = dpdk_opt
+                                .as_mut()
+                                .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                            dpdk.send_burst(std::iter::once(req.clone()))?;
+                            Ok::<_, Report>(())
+                        })
+                        .map_err(Into::into)
+                        .and_then(|x| x)?;
+                }
+
                 tokio::task::yield_now().await;
             }
         };
@@ -213,7 +228,7 @@ async fn run_client(
         }
     }
 
-    let elapsed = last_recv_time - start;
+    let elapsed = last_recv_time.unwrap() - start;
     info!(?tot_bytes, ?elapsed, "done");
     Ok((tot_bytes, elapsed))
 }
