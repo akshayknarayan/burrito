@@ -6,8 +6,8 @@ use dpdk_wrapper::{
     utils::{parse_cfg, AddressInfo, HeaderInfo, TOTAL_HEADER_SIZE},
     wrapper::*,
 };
-use eui48::MacAddress;
 use flume::Sender;
+use macaddr::MacAddr6 as MacAddress;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tracing::{debug, trace, warn};
@@ -108,9 +108,9 @@ impl DpdkState {
 
         // what is my ethernet address (rte_ether_addr struct)
         let my_eth = get_my_macaddr(port)?;
-        let eth_addr = MacAddress::from_bytes(&my_eth.addr_bytes).wrap_err("Parse mac address")?;
+        let eth_addr: MacAddress = my_eth.addr_bytes.into();
         let eth_addr_raw = rte_ether_addr {
-            addr_bytes: eth_addr.to_array(),
+            addr_bytes: eth_addr.into_array(),
         };
 
         let octets = ip_addr.octets();
@@ -282,7 +282,7 @@ impl DpdkState {
             // opportunistically update arp
             self.arp_table
                 .entry(pkt_src_ip)
-                .or_insert_with(|| MacAddress::from_bytes(&src_ether.addr_bytes).unwrap());
+                .or_insert_with(|| src_ether.addr_bytes.into());
             let pkt_src_addr = SocketAddrV4::new(pkt_src_ip, src_port);
 
             let msg = Msg {
@@ -440,7 +440,7 @@ impl DpdkState {
             // opportunistically update arp
             self.arp_table
                 .entry(pkt_src_ip)
-                .or_insert_with(|| MacAddress::from_bytes(&src_ether.addr_bytes).unwrap());
+                .or_insert_with(|| src_ether.addr_bytes.into());
             let pkt_src_addr = SocketAddrV4::new(pkt_src_ip, src_port);
 
             num_valid += 1;
