@@ -159,6 +159,7 @@ async fn run_client(
 
     let start = Instant::now();
     let mut last_recv_time: Option<Instant> = None;
+    let mut req_try = 1;
     let mut slots: [Option<Msg>; 16] = (0..16)
         .map(|_| None)
         .collect::<Vec<_>>()
@@ -184,21 +185,20 @@ async fn run_client(
             if nr > 0 {
                 last_recv_time = Some(Instant::now());
                 break 'recv nr;
-            } else {
-                if last_recv_time.is_none() && start.elapsed() > Duration::from_millis(10) {
-                    DPDK_STATE
-                        .try_with(|dpdk_cell| {
-                            let mut dpdk_opt = dpdk_cell.borrow_mut();
-                            let dpdk = dpdk_opt
-                                .as_mut()
-                                .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                            dpdk.send_burst(std::iter::once(req.clone()))?;
-                            Ok::<_, Report>(())
-                        })
-                        .map_err(Into::into)
-                        .and_then(|x| x)?;
-                }
-
+            } else if last_recv_time.is_none() && start.elapsed() > Duration::from_millis(10) {
+                debug!(?req_try, "retransmitting request");
+                req_try += 1;
+                DPDK_STATE
+                    .try_with(|dpdk_cell| {
+                        let mut dpdk_opt = dpdk_cell.borrow_mut();
+                        let dpdk = dpdk_opt
+                            .as_mut()
+                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        dpdk.send_burst(std::iter::once(req.clone()))?;
+                        Ok::<_, Report>(())
+                    })
+                    .map_err(Into::into)
+                    .and_then(|x| x)?;
                 tokio::task::yield_now().await;
             }
         };
