@@ -267,7 +267,7 @@ dpdk_driver = None
 def write_dpdk_config(conn, machines, lcores):
     search = None
     if dpdk_driver == 'mlx':
-        search = 'drv=mlx'
+        search = 'drv=mlx.*Active'
     elif dpdk_driver == 'intel':
         search = 'drv=igb'
     else:
