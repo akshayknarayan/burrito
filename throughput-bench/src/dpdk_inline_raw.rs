@@ -7,7 +7,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
-use tracing::{debug, info, info_span, trace, warn};
+use tracing::{debug, debug_span, info, info_span, trace, warn};
 
 use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn, DpdkInlineReqChunnel};
 use dpdk_direct::{DpdkState, Msg, SendMsg, DPDK_STATE};
@@ -243,7 +243,7 @@ pub fn run_server(cfg: PathBuf, port: u16, threads: usize) -> Result<(), Report>
     let ch = DpdkInlineChunnel::new(cfg, threads)?;
     let ch = DpdkInlineReqChunnel::from(ch);
 
-    fn server_thread(mut ch: DpdkInlineReqChunnel, port: u16) -> Result<(), Report> {
+    fn server_thread(mut ch: DpdkInlineReqChunnel, port: u16, thread: usize) -> Result<(), Report> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -255,18 +255,20 @@ pub fn run_server(cfg: PathBuf, port: u16, threads: usize) -> Result<(), Report>
                 )))
                 .await?;
             tokio::pin!(st);
-            server_thread_inner(st).await?;
+            server_thread_inner(st)
+                .instrument(debug_span!("server_thread", ?thread))
+                .await?;
             unreachable!()
         })
     }
 
     info!(?port, ?threads, "starting server");
-    for _ in 1..threads {
+    for i in 1..threads {
         let ch = ch.clone();
-        std::thread::spawn(move || server_thread(ch, port));
+        std::thread::spawn(move || server_thread(ch, port, i));
     }
 
-    server_thread(ch, port)
+    server_thread(ch, port, 0)
 }
 
 // We are going to use the Stream for connection setup and handling, but we are then going to
@@ -384,7 +386,9 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                     send_fin(dpdk, local_port, a)
                 })
                 .map_err(Into::into)
-                .and_then(|x| x)?;
+                .and_then(|x| x)
+                .wrap_err("sending fin")?;
+            debug!("waiting for fin ack");
             let start = Instant::now();
             loop {
                 tokio::task::yield_now().await;
@@ -397,7 +401,7 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                         match recv_one(dpdk, local_port, remote_addr, new_conns.as_ref()) {
                             Ok(Some(_)) => Ok(Some(())),
                             Ok(None) if start.elapsed() >= Duration::from_millis(1) => {
-                                send_fin(dpdk, local_port, a)?;
+                                send_fin(dpdk, local_port, a).wrap_err("sending fin")?;
                                 Ok(None)
                             }
                             Ok(None) => Ok(None),
@@ -408,7 +412,8 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                         }
                     })
                     .map_err(Into::into)
-                    .and_then(|x| x)?;
+                    .and_then(|x| x)
+                    .wrap_err("fin-ack wait loop")?;
                 if let Some(_) = res {
                     break;
                 }
