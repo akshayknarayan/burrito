@@ -285,6 +285,8 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
             .expect("Connection was not connected to remote address");
         let new_conns: Option<Sender<_>> = cn.new_conn_signaller().cloned();
         async move {
+            // move cn into future.
+            let _cn = cn;
             let (a, (mut remaining, pkt_size)) = loop {
                 let ret = DPDK_STATE
                     .try_with(|dpdk_cell| {
