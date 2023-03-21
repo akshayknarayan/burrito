@@ -2,7 +2,7 @@ use super::{Client, Mode};
 use bertha::{ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use flume::Sender;
-use futures_util::{stream::FuturesUnordered, Stream, TryStreamExt};
+use futures_util::{future::TryFutureExt, stream::FuturesUnordered, Stream, TryStreamExt};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -417,7 +417,11 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
             info!(elapsed = ?start.elapsed(), ?a, "exiting");
             Ok::<_, Report>(())
         }
-        .instrument(info_span!("client connection", ?remote_addr))
+        .instrument(info_span!("client_conn", ?remote_addr))
+        .map_err(move |err| {
+            warn!(?err, ?remote_addr, "client conn errored");
+            err
+        })
     })
     .await
 }
