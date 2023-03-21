@@ -393,6 +393,10 @@ impl DpdkInlineCn {
     pub fn remote_addr(&self) -> Option<SocketAddrV4> {
         self.remote_addr
     }
+
+    pub fn new_conn_signaller(&self) -> Option<&Sender<SocketAddrV4>> {
+        self.new_conns.as_ref()
+    }
 }
 
 impl ChunnelConnection for DpdkInlineCn {

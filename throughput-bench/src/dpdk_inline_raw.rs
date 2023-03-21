@@ -1,12 +1,13 @@
 use super::{Client, Mode};
 use bertha::{ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
+use flume::Sender;
 use futures_util::{stream::FuturesUnordered, Stream, TryStreamExt};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
-use tracing::{debug, info, info_span, trace};
+use tracing::{debug, info, info_span, trace, warn};
 
 use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn, DpdkInlineReqChunnel};
 use dpdk_direct::{DpdkState, Msg, SendMsg, DPDK_STATE};
@@ -157,7 +158,7 @@ async fn run_client(
         .map_err(Into::into)
         .and_then(|x| x)?;
 
-    let start = Instant::now();
+    let mut start = Instant::now();
     let mut last_recv_time: Option<Instant> = None;
     let mut req_try = 1;
     let mut slots: [Option<Msg>; 16] = (0..16)
@@ -167,6 +168,7 @@ async fn run_client(
         .unwrap();
     'cn: loop {
         let num_received = 'recv: loop {
+            tokio::task::yield_now().await;
             let nr = DPDK_STATE
                 .try_with(|dpdk_cell| {
                     let mut dpdk_opt = dpdk_cell.borrow_mut();
@@ -183,11 +185,16 @@ async fn run_client(
                 .map_err(Into::into)
                 .and_then(|x| x)?;
             if nr > 0 {
+                if last_recv_time.is_none() {
+                    debug!(?req_try, "got first response");
+                }
+
                 last_recv_time = Some(Instant::now());
                 break 'recv nr;
-            } else if last_recv_time.is_none() && start.elapsed() > Duration::from_millis(10) {
+            } else if last_recv_time.is_none() && start.elapsed() > Duration::from_millis(50) {
                 debug!(?req_try, "retransmitting request");
                 req_try += 1;
+                start = Instant::now();
                 DPDK_STATE
                     .try_with(|dpdk_cell| {
                         let mut dpdk_opt = dpdk_cell.borrow_mut();
@@ -199,7 +206,6 @@ async fn run_client(
                     })
                     .map_err(Into::into)
                     .and_then(|x| x)?;
-                tokio::task::yield_now().await;
             }
         };
 
@@ -269,136 +275,149 @@ pub fn run_server(cfg: PathBuf, port: u16, threads: usize) -> Result<(), Report>
 async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Unpin>(
     st: S,
 ) -> Result<(), Report> {
-    st.try_for_each_concurrent(None, |cn| async move {
+    st.try_for_each_concurrent(None, |cn| {
         let this_lcore = dpdk_direct::get_lcore_id();
         let local_port = cn.local_port();
         let remote_addr = cn
             .remote_addr()
-            .ok_or_else(|| eyre!("Connection was not connected to remote address"))?;
+            .expect("Connection was not connected to remote address");
+        let new_conns: Option<Sender<_>> = cn.new_conn_signaller().cloned();
+        async move {
+            let (a, (mut remaining, pkt_size)) = loop {
+                let ret = DPDK_STATE
+                    .try_with(|dpdk_cell| {
+                        let mut dpdk_opt = dpdk_cell.borrow_mut();
+                        let dpdk = dpdk_opt
+                            .as_mut()
+                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        let msgs = dpdk.try_recv_burst(
+                            Some((local_port, Some(remote_addr))),
+                            new_conns.as_ref(),
+                            Some(1),
+                        )?;
 
-        let (a, (mut remaining, pkt_size)) = loop {
-            let ret = DPDK_STATE
-                .try_with(|dpdk_cell| {
-                    let mut dpdk_opt = dpdk_cell.borrow_mut();
-                    let dpdk = dpdk_opt
-                        .as_mut()
-                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                    let msgs =
-                        dpdk.try_recv_burst(Some((local_port, Some(remote_addr))), None, Some(1))?;
-
-                    if let Some(msg) = msgs.iter_mut().map_while(Option::take).next() {
-                        ensure!(msg.port == local_port, "Port mismatch");
-                        // message validation.
-                        Ok(Some((msg.addr, super::validate_message(msg.get_buf())?)))
-                    } else {
-                        Ok(None)
-                    }
-                })
-                .map_err(Into::into)
-                .and_then(|x| x)?;
-            if let Some(x) = ret {
-                debug!(req = ?x, "got request");
-                break Ok::<_, Report>(x);
-            } else {
-                tokio::task::yield_now().await;
+                        if let Some(msg) = msgs.iter_mut().map_while(Option::take).next() {
+                            ensure!(msg.port == local_port, "Port mismatch");
+                            // message validation.
+                            Ok(Some((msg.addr, super::validate_message(msg.get_buf())?)))
+                        } else {
+                            Ok(None)
+                        }
+                    })
+                    .map_err(Into::into)
+                    .and_then(|x| x)?;
+                if let Some(x) = ret {
+                    debug!(req = ?x, "got request");
+                    break Ok::<_, Report>(x);
+                } else {
+                    tokio::task::yield_now().await;
+                }
             }
-        }
-        .wrap_err(eyre!("Error waiting for request"))?;
+            .wrap_err(eyre!("Error waiting for request"))?;
 
-        let start = Instant::now();
-        info!(?remaining, ?pkt_size, ?a, "starting send");
-        while remaining > 0 {
+            let start = Instant::now();
+            info!(?remaining, ?pkt_size, ?a, "starting send");
+            while remaining > 0 {
+                tokio::task::yield_now().await;
+                DPDK_STATE
+                    .try_with(|dpdk_cell| {
+                        let mut dpdk_opt = dpdk_cell.borrow_mut();
+                        let dpdk = dpdk_opt
+                            .as_mut()
+                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        dpdk.send_burst((0..16).map_while(|_| {
+                            if remaining > 0 {
+                                let this_send_size = std::cmp::min(pkt_size, remaining);
+                                remaining -= this_send_size;
+                                Some(SendMsg {
+                                    src_port: local_port,
+                                    to_addr: remote_addr,
+                                    buf: vec![0u8; this_send_size as usize],
+                                })
+                            } else {
+                                None
+                            }
+                        }))?;
+                        Ok::<_, Report>(())
+                    })
+                    .map_err(Into::into)
+                    .and_then(|x| x)?;
+            }
+            info!(elapsed = ?start.elapsed(), ?a, "done sending");
+
+            // fin
+            fn send_fin(
+                dpdk: &mut DpdkState,
+                local_port: u16,
+                a: SocketAddrV4,
+            ) -> Result<(), Report> {
+                dpdk.send_burst(std::iter::once(SendMsg {
+                    src_port: local_port,
+                    to_addr: a,
+                    buf: vec![1u8],
+                }))?;
+                Ok(())
+            }
+
+            fn recv_one(
+                dpdk: &mut DpdkState,
+                local_port: u16,
+                remote_addr: SocketAddrV4,
+                new_conns: Option<&Sender<SocketAddrV4>>,
+            ) -> Result<Option<()>, Report> {
+                let msgs =
+                    dpdk.try_recv_burst(Some((local_port, Some(remote_addr))), new_conns, Some(1))?;
+                if let Some(msg) = msgs.iter_mut().map_while(Option::take).next() {
+                    ensure!(msg.port == local_port, "Port mismatch");
+                    Ok(Some(()))
+                } else {
+                    Ok(None)
+                }
+            }
+
             DPDK_STATE
                 .try_with(|dpdk_cell| {
                     let mut dpdk_opt = dpdk_cell.borrow_mut();
                     let dpdk = dpdk_opt
                         .as_mut()
                         .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                    dpdk.send_burst((0..16).map_while(|_| {
-                        if remaining > 0 {
-                            let this_send_size = std::cmp::min(pkt_size, remaining);
-                            remaining -= this_send_size;
-                            Some(SendMsg {
-                                src_port: local_port,
-                                to_addr: remote_addr,
-                                buf: vec![0u8; this_send_size as usize],
-                            })
-                        } else {
-                            None
-                        }
-                    }))?;
-                    Ok::<_, Report>(())
+                    send_fin(dpdk, local_port, a)
                 })
                 .map_err(Into::into)
                 .and_then(|x| x)?;
-        }
-        info!(elapsed = ?start.elapsed(), ?a, "done sending");
-
-        // fin
-        fn send_fin(dpdk: &mut DpdkState, local_port: u16, a: SocketAddrV4) -> Result<(), Report> {
-            dpdk.send_burst(std::iter::once(SendMsg {
-                src_port: local_port,
-                to_addr: a,
-                buf: vec![1u8],
-            }))?;
-            Ok(())
-        }
-
-        fn recv_one(
-            dpdk: &mut DpdkState,
-            local_port: u16,
-            remote_addr: SocketAddrV4,
-        ) -> Result<Option<()>, Report> {
-            let msgs = dpdk.try_recv_burst(Some((local_port, Some(remote_addr))), None, Some(1))?;
-            if let Some(msg) = msgs.iter_mut().map_while(Option::take).next() {
-                ensure!(msg.port == local_port, "Port mismatch");
-                Ok(Some(()))
-            } else {
-                Ok(None)
-            }
-        }
-
-        DPDK_STATE
-            .try_with(|dpdk_cell| {
-                let mut dpdk_opt = dpdk_cell.borrow_mut();
-                let dpdk = dpdk_opt
-                    .as_mut()
-                    .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                send_fin(dpdk, local_port, a)
-            })
-            .map_err(Into::into)
-            .and_then(|x| x)?;
-        let start = Instant::now();
-        loop {
-            let res = DPDK_STATE
-                .try_with(|dpdk_cell| {
-                    let mut dpdk_opt = dpdk_cell.borrow_mut();
-                    let dpdk = dpdk_opt
-                        .as_mut()
-                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                    match recv_one(dpdk, local_port, remote_addr) {
-                        Ok(Some(_)) => Ok(Some(())),
-                        Ok(None) if start.elapsed() >= Duration::from_millis(1) => {
-                            send_fin(dpdk, local_port, a)?;
-                            Ok(None)
-                        }
-                        Ok(None) => Ok(None),
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    }
-                })
-                .map_err(Into::into)
-                .and_then(|x| x)?;
-            if let Some(_) = res {
-                break;
-            } else {
+            let start = Instant::now();
+            loop {
                 tokio::task::yield_now().await;
+                let res = DPDK_STATE
+                    .try_with(|dpdk_cell| {
+                        let mut dpdk_opt = dpdk_cell.borrow_mut();
+                        let dpdk = dpdk_opt
+                            .as_mut()
+                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        match recv_one(dpdk, local_port, remote_addr, new_conns.as_ref()) {
+                            Ok(Some(_)) => Ok(Some(())),
+                            Ok(None) if start.elapsed() >= Duration::from_millis(1) => {
+                                send_fin(dpdk, local_port, a)?;
+                                Ok(None)
+                            }
+                            Ok(None) => Ok(None),
+                            Err(err) => {
+                                warn!(?err, "Error trying to receive fin ack");
+                                return Err(err).wrap_err("receiving fin ack");
+                            }
+                        }
+                    })
+                    .map_err(Into::into)
+                    .and_then(|x| x)?;
+                if let Some(_) = res {
+                    break;
+                }
             }
-        }
 
-        info!(elapsed = ?start.elapsed(), ?a, "exiting");
-        Ok::<_, Report>(())
+            info!(elapsed = ?start.elapsed(), ?a, "exiting");
+            Ok::<_, Report>(())
+        }
+        .instrument(info_span!("client connection", ?remote_addr))
     })
     .await
 }
