@@ -191,7 +191,7 @@ async fn run_client(
 
                 last_recv_time = Some(Instant::now());
                 break 'recv nr;
-            } else if last_recv_time.is_none() && start.elapsed() > Duration::from_millis(50) {
+            } else if last_recv_time.is_none() && start.elapsed() > Duration::from_millis(100) {
                 debug!(?req_try, "retransmitting request");
                 req_try += 1;
                 start = Instant::now();
