@@ -274,6 +274,10 @@ pub fn run_server(cfg: PathBuf, port: u16, threads: usize) -> Result<(), Report>
 // We are going to use the Stream for connection setup and handling, but we are then going to
 // ignore the connection object and call methods directly on the thread local DpdkState it has set
 // up.
+//
+// Because we are skipping negotiation, there is no natural synchronization point. The stream
+// implementation will not try to create new connections either, since it has already returned one.
+// We thus have to periodically try receiving during the send.
 async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Unpin>(
     st: S,
 ) -> Result<(), Report> {
@@ -287,6 +291,7 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
         async move {
             // move cn into future.
             let _cn = cn;
+            // this loop has a recv in it.
             let (a, (mut remaining, pkt_size)) = loop {
                 let ret = DPDK_STATE
                     .try_with(|dpdk_cell| {
@@ -322,6 +327,20 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
             let start = Instant::now();
             info!(?remaining, ?pkt_size, ?a, "starting send");
             while remaining > 0 {
+                // this loop has no recv, so we do a stash-only one.
+                DPDK_STATE
+                    .try_with(|dpdk_cell| {
+                        let mut dpdk_opt = dpdk_cell.borrow_mut();
+                        let dpdk = dpdk_opt
+                            .as_mut()
+                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        dpdk.try_recv_burst_stash_only(new_conns.as_ref())?;
+                        Ok::<_, Report>(())
+                    })
+                    .map_err(Into::into)
+                    .and_then(|x| x)?;
+                // we yield afterwards so that the stream future can process the potential new
+                // connection.
                 tokio::task::yield_now().await;
                 DPDK_STATE
                     .try_with(|dpdk_cell| {
@@ -392,6 +411,7 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                 .wrap_err("sending fin")?;
             debug!("waiting for fin ack");
             let start = Instant::now();
+            // this loop has a recv in it.
             loop {
                 tokio::task::yield_now().await;
                 let res = DPDK_STATE
