@@ -158,7 +158,8 @@ async fn run_client(
         .map_err(Into::into)
         .and_then(|x| x)?;
 
-    let mut start = Instant::now();
+    let start = Instant::now();
+    let mut retx_time = Instant::now();
     let mut last_recv_time: Option<Instant> = None;
     let mut req_try = 1;
     let mut slots: [Option<Msg>; 16] = (0..16)
@@ -191,10 +192,10 @@ async fn run_client(
 
                 last_recv_time = Some(Instant::now());
                 break 'recv nr;
-            } else if last_recv_time.is_none() && start.elapsed() > Duration::from_millis(100) {
+            } else if last_recv_time.is_none() && retx_time.elapsed() > Duration::from_millis(100) {
                 debug!(?req_try, "retransmitting request");
                 req_try += 1;
-                start = Instant::now();
+                retx_time = Instant::now();
                 DPDK_STATE
                     .try_with(|dpdk_cell| {
                         let mut dpdk_opt = dpdk_cell.borrow_mut();

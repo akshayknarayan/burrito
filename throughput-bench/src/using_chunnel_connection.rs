@@ -290,7 +290,7 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     req.extend((packet_size as u64).to_le_bytes());
     cn.send(std::iter::once((SocketAddr::V4(addr), req.clone())))
         .await?;
-    let mut start = Instant::now();
+    let start = Instant::now();
     let mut last_recv_time = None;
     let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
     'cn: loop {
@@ -300,7 +300,6 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
                 Err(_) => {
                     cn.send(std::iter::once((SocketAddr::V4(addr), req.clone())))
                         .await?;
-                    start = Instant::now();
                     continue;
                 }
             }
