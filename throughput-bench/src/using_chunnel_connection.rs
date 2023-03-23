@@ -295,9 +295,10 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
     'cn: loop {
         let ms = if last_recv_time.is_none() {
-            match tokio::time::timeout(Duration::from_millis(10), cn.recv(&mut slots)).await {
+            match tokio::time::timeout(Duration::from_millis(100), cn.recv(&mut slots)).await {
                 Ok(r) => r?,
                 Err(_) => {
+                    debug!("retransmitting request");
                     cn.send(std::iter::once((SocketAddr::V4(addr), req.clone())))
                         .await?;
                     continue;

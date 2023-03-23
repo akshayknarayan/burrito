@@ -10,7 +10,7 @@ import threading
 import time
 import toml
 
-dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
+dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/build/lib/x86_64-linux-gnu"
 
 def start_server(conn, outf, variant='kernel', use_bertha='full', extra_cfg=None):
     conn.run("sudo pkill -INT throughput")
@@ -32,7 +32,7 @@ def start_server(conn, outf, variant='kernel', use_bertha='full', extra_cfg=None
 
     no_bertha = f'--no-bertha={use_bertha}'
     time.sleep(5)
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/throughput-bench \
+    ok = conn.run(f"RUST_LOG=debug {dpdk_ld_var} ./target/release/throughput-bench \
         -p 4242 \
         --datapath {variant} \
         {no_bertha} \
@@ -72,7 +72,7 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
     time.sleep(2)
     agenda.subtask(f"client starting -> {outf}.out")
     ok = conn.run(
-        f"RUST_LOG=info {dpdk_ld_var}  ./target/release/throughput-bench \
+        f"RUST_LOG=debug {dpdk_ld_var}  ./target/release/throughput-bench \
         -p 4242 \
         --datapath {variant} \
         {cfg} \

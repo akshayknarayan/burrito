@@ -435,6 +435,12 @@ impl ChunnelConnection for DpdkInlineCn {
                             buf,
                         }
                     }))?;
+
+                    // If a stream returns a connection which then only sends things without
+                    // calling recv(), no new connections would be discovered. To prevent this, add
+                    // a call to try_recv_burst_stash_only here.
+                    dpdk.try_recv_burst_stash_only(self.new_conns.as_ref())
+                        .wrap_err("try_recv_burst_stash_only after send")?;
                     Ok(())
                 })
                 .map_err(Into::into)

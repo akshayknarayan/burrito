@@ -56,7 +56,7 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                         let sleep_trigger = p.trigger(TIME);
                         shenango::thread::spawn(move || {
                             let _sleep_trigger = sleep_trigger;
-                            shenango::time::sleep(Duration::from_millis(5));
+                            shenango::time::sleep(Duration::from_millis(100));
                         });
 
                         debug!(elapsed = ?start.elapsed(), ?i, "waiting");
