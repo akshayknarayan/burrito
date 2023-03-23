@@ -6,7 +6,9 @@ use futures_util::{
     Stream,
 };
 use std::net::{SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Barrier;
 use tracing::{info, info_span, trace, warn};
 use tracing_futures::Instrument;
 
@@ -26,6 +28,7 @@ where
     E: Into<Report> + Send + Sync + 'static,
 {
     let addr = SocketAddr::from(SocketAddrV4::new(c.addr, port));
+    let start_barrier = Arc::new(Barrier::new(c.num_clients));
 
     let client_threads: Vec<_> = if c.num_clients > num_threads {
         let clients_per_thread = c.num_clients / num_threads;
@@ -33,6 +36,7 @@ where
         (0..num_threads)
             .map(|thread| {
                 let ctr = ctr.clone();
+                let start_barrier = start_barrier.clone();
                 let num_thread_clients = if remainder > 0 {
                     remainder -= 1;
                     clients_per_thread + 1
@@ -44,11 +48,23 @@ where
                         .enable_all()
                         .build()?;
                     let ctr = ctr.clone();
+                    let start_barrier = start_barrier.clone();
                     rt.block_on(async move {
                         let futs: FuturesUnordered<_> = (0..num_thread_clients)
                             .map(|tclient| {
-                                run_client(ctr.clone(), addr, c.download_size, c.packet_size)
-                                    .instrument(info_span!("client", ?thread, ?tclient))
+                                let start_barrier = start_barrier.clone();
+                                run_client(
+                                    ctr.clone(),
+                                    addr,
+                                    c.download_size,
+                                    c.packet_size,
+                                    start_barrier,
+                                )
+                                .instrument(info_span!(
+                                    "client",
+                                    ?thread,
+                                    ?tclient
+                                ))
                             })
                             .collect();
                         Ok::<_, Report>(futs.try_collect().await?)
@@ -60,14 +76,16 @@ where
         (0..c.num_clients)
             .map(|thread| {
                 let ctr = ctr.clone();
+                let start_barrier = start_barrier.clone();
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
                     rt.block_on(async move {
-                        let res = run_client(ctr, addr, c.download_size, c.packet_size)
-                            .instrument(info_span!("client", ?thread))
-                            .await?;
+                        let res =
+                            run_client(ctr, addr, c.download_size, c.packet_size, start_barrier)
+                                .instrument(info_span!("client", ?thread))
+                                .await?;
                         Ok(vec![res])
                     })
                 })
@@ -97,6 +115,7 @@ async fn run_client<C, Cn, E>(
     addr: SocketAddr,
     download_size: usize,
     packet_size: usize,
+    start_barrier: Arc<Barrier>,
 ) -> Result<(usize, Duration), Report>
 where
     C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = E> + Send + Sync + 'static,
@@ -122,6 +141,7 @@ where
         _ => bail!("wrong addr"),
     };
 
+    start_barrier.wait().await;
     run_client_inner(cn, addr4, download_size, packet_size).await
 }
 
@@ -270,7 +290,7 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     req.extend((packet_size as u64).to_le_bytes());
     cn.send(std::iter::once((SocketAddr::V4(addr), req.clone())))
         .await?;
-    let start = Instant::now();
+    let mut start = Instant::now();
     let mut last_recv_time = None;
     let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
     'cn: loop {
@@ -280,6 +300,7 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
                 Err(_) => {
                     cn.send(std::iter::once((SocketAddr::V4(addr), req.clone())))
                         .await?;
+                    start = Instant::now();
                     continue;
                 }
             }
