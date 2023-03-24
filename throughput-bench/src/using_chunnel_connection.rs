@@ -1,5 +1,5 @@
 use crate::Client;
-use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
+use bertha::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{bail, Report, WrapErr};
 use futures_util::{
     stream::{FuturesUnordered, TryStreamExt},
@@ -8,9 +8,102 @@ use futures_util::{
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{
+    future::{ready, Future, Ready},
+    pin::Pin,
+};
 use tokio::sync::Barrier;
 use tracing::{debug, debug_span, info, trace, warn};
 use tracing_futures::Instrument;
+
+// we want a Chunnel implementation that reads the data at runtime, but does nothing else. this
+// represents the overhead of having a chunnel there at all.
+#[derive(Debug, Clone, Default)]
+struct NoOpChunnel;
+
+impl bertha::negotiate::Negotiate for NoOpChunnel {
+    type Capability = ();
+    fn guid() -> u64 {
+        0x8c7bda3445c93fcb
+    }
+}
+
+struct NoOpChunnelCn<C>(C);
+
+impl<D, InC> Chunnel<InC> for NoOpChunnel
+where
+    InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    D: Read + Send + Sync + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = NoOpChunnelCn<InC>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        ready(Ok(NoOpChunnelCn(cn)))
+    }
+}
+
+trait Read {
+    fn read(&self) -> &[u8];
+}
+
+impl Read for Vec<u8> {
+    fn read(&self) -> &[u8] {
+        &self[..]
+    }
+}
+impl<T> Read for (T, Vec<u8>) {
+    fn read(&self) -> &[u8] {
+        &self.1[..]
+    }
+}
+
+impl<D, C> ChunnelConnection for NoOpChunnelCn<C>
+where
+    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    D: Read + Send + Sync + 'static,
+{
+    type Data = D;
+
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.0.send(burst.into_iter().map(|data| {
+            let arr = data.read();
+            if !arr.is_empty() {
+                // just read the first byte
+                std::hint::black_box(arr[0]);
+            }
+
+            data
+        }))
+    }
+
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        Box::pin(async move {
+            let msgs = self.0.recv(msgs_buf).await?;
+            for ms in msgs.iter() {
+                if let Some(ref m) = ms {
+                    std::hint::black_box(m.read()[0]);
+                }
+            }
+
+            Ok(msgs)
+        })
+    }
+}
 
 pub(crate) fn run_clients<C, Cn, E>(
     ctr: C,
