@@ -5,7 +5,9 @@ use flume::Sender;
 use futures_util::{future::TryFutureExt, stream::FuturesUnordered, Stream, TryStreamExt};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Barrier;
 use tracing::Instrument;
 use tracing::{debug, debug_span, info, info_span, trace, warn};
 
@@ -46,6 +48,7 @@ fn run_clients(
 ) -> Result<(usize, Duration), Report> {
     let addr = SocketAddrV4::new(c.addr, port);
     let ctr = DpdkInlineChunnel::new(cfg, num_threads)?;
+    let start_barrier = Arc::new(Barrier::new(c.num_clients));
 
     let client_threads: Vec<_> = if c.num_clients > num_threads {
         let clients_per_thread = c.num_clients / num_threads;
@@ -53,6 +56,7 @@ fn run_clients(
         (0..num_threads)
             .map(|thread| {
                 let ctr = ctr.clone();
+                let start_barrier = start_barrier.clone();
                 let num_thread_clients = if remainder > 0 {
                     remainder -= 1;
                     clients_per_thread + 1
@@ -64,11 +68,23 @@ fn run_clients(
                         .enable_all()
                         .build()?;
                     let ctr = ctr.clone();
+                    let start_barrier = start_barrier.clone();
                     rt.block_on(async move {
                         let futs: FuturesUnordered<_> = (0..num_thread_clients)
                             .map(|tclient| {
-                                run_client(ctr.clone(), addr, c.download_size, c.packet_size)
-                                    .instrument(info_span!("client", ?thread, ?tclient))
+                                let start_barrier = start_barrier.clone();
+                                run_client(
+                                    ctr.clone(),
+                                    addr,
+                                    c.download_size,
+                                    c.packet_size,
+                                    start_barrier,
+                                )
+                                .instrument(info_span!(
+                                    "client",
+                                    ?thread,
+                                    ?tclient
+                                ))
                             })
                             .collect();
                         Ok::<_, Report>(futs.try_collect().await?)
@@ -80,14 +96,16 @@ fn run_clients(
         (0..c.num_clients)
             .map(|thread| {
                 let ctr = ctr.clone();
+                let start_barrier = start_barrier.clone();
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
                     rt.block_on(async move {
-                        let res = run_client(ctr, addr, c.download_size, c.packet_size)
-                            .instrument(info_span!("client", ?thread))
-                            .await?;
+                        let res =
+                            run_client(ctr, addr, c.download_size, c.packet_size, start_barrier)
+                                .instrument(info_span!("client", ?thread))
+                                .await?;
                         Ok(vec![res])
                     })
                 })
@@ -117,6 +135,7 @@ async fn run_client(
     addr: SocketAddrV4,
     download_size: usize,
     packet_size: usize,
+    start_barrier: Arc<Barrier>,
 ) -> Result<(usize, Duration), Report> {
     let cn: DpdkInlineCn = ctr
         .connect(SocketAddr::V4(addr))
@@ -146,6 +165,7 @@ async fn run_client(
         buf: req,
     };
 
+    start_barrier.wait().await;
     DPDK_STATE
         .try_with(|dpdk_cell| {
             let mut dpdk_opt = dpdk_cell.borrow_mut();

@@ -392,6 +392,7 @@ async fn server_thread_inner<
                 }
             });
             cn.send(bufs).await?;
+            tokio::task::yield_now().await;
         }
 
         info!(elapsed = ?start.elapsed(), ?a, "done sending");
