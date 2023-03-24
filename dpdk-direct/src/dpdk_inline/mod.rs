@@ -34,13 +34,19 @@ impl FlowSteering {
         // 1. if port_handle is Some, it's always getting dropped and replaced
         //    here. we need to drop first to clear the old rule.
         std::mem::drop(port_handle.take());
+
         // 2. add to queues_on_port and make the new rule.
         queues_on_port.push(dpdk.rx_queue_id() as _);
         queues_on_port.sort();
-        let flow_handle = dpdk.register_flow_steering(port, &queues_on_port[..])?;
 
-        // 3. save the flow_handle.
-        *port_handle = Some(flow_handle);
+        // TODO XXX on mlx5, we turn off flow rule rss between a set of queues, since when we turn
+        // it on all packets go to a single queue.
+        if cfg!(not(feature = "cx4_mlx")) || queues_on_port.len() < 2 {
+            let flow_handle = dpdk.register_flow_steering(port, &queues_on_port[..])?;
+
+            // 3. save the flow_handle.
+            *port_handle = Some(flow_handle);
+        }
 
         Ok(())
     }
@@ -62,7 +68,7 @@ impl FlowSteering {
         }
 
         ensure!(found, "queue not registered on port");
-        if queues_on_port.is_empty() {
+        if (cfg!(feature = "cx4_mlx") && queues_on_port.len() > 1) || queues_on_port.is_empty() {
             return Ok(());
         }
 

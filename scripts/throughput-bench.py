@@ -241,8 +241,10 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
             if 'dpdk' in d:
                 if 'dpdk-direct' not in needed_features:
                     needed_features.append('dpdk-direct')
-                if dpdk_driver == 'mlx' and 'dpdk-direct/cx3_mlx' not in needed_features:
+                if dpdk_driver == 'mlx4' and 'dpdk-direct/cx3_mlx' not in needed_features:
                     needed_features.append('dpdk-direct/cx3_mlx')
+                elif dpdk_driver == 'mlx5' and 'dpdk-direct/cx4_mlx' not in needed_features:
+                    needed_features.append('dpdk-direct/cx4_mlx')
                 elif dpdk_driver == 'intel' and 'dpdk-direct/xl710_intel' not in needed_features:
                     needed_features.append('dpdk-direct/xl710_intel')
             if 'shenango' in d:
@@ -287,7 +289,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--outdir', type=str, required=True)
     parser.add_argument('--overwrite', action='store_true')
-    parser.add_argument('--dpdk_driver', type=str, choices=['mlx', 'intel'],  required=False)
+    parser.add_argument('--dpdk_driver', type=str, choices=['mlx4', 'mlx5', 'intel'],  required=False)
     parser.add_argument('--setup_only', action='store_true',  required=False)
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")

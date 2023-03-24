@@ -220,8 +220,10 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
             elif 'dpdk' in d:
                 if 'dpdk-direct' not in needed_features:
                     needed_features.append('dpdk-direct')
-                if dpdk_driver == 'mlx' and 'cx3_mlx' not in needed_features:
+                if dpdk_driver == 'mlx4' and 'cx3_mlx' not in needed_features:
                     needed_features.append('cx3_mlx')
+                if dpdk_driver == 'mlx5' and 'cx4_mlx' not in needed_features:
+                    needed_features.append('cx4_mlx')
                 elif dpdk_driver == 'intel' and 'xl710_intel' not in needed_features:
                     needed_features.append('xl710_intel')
         agenda.subtask(f"building kvserver features={needed_features}")
@@ -266,7 +268,7 @@ runtime_guaranteed_kthreads 2
 dpdk_driver = None
 def write_dpdk_config(conn, machines, lcores):
     search = None
-    if dpdk_driver == 'mlx':
+    if 'mlx' in dpdk_driver:
         search = 'drv=mlx.*Active'
     elif dpdk_driver == 'intel':
         search = 'drv=igb'

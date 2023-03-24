@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 cx3_mlx = ["dpdk-wrapper/cx3_mlx"]
+cx4_mlx = ["cx3_mlx"]
 xl710_intel = ["dpdk-wrapper/xl710_intel"]
 
 [dependencies]

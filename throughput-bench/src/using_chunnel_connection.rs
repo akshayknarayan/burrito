@@ -9,7 +9,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Barrier;
-use tracing::{info, info_span, trace, warn};
+use tracing::{debug, info, info_span, trace, warn};
 use tracing_futures::Instrument;
 
 pub(crate) fn run_clients<C, Cn, E>(
