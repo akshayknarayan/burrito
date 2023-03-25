@@ -361,7 +361,7 @@ impl ChunnelConnection for ShenangoUdpSk {
                 .incoming
                 .recv_async()
                 .await
-                .wrap_err(eyre!("All senders dropped"))?;
+                .wrap_err("All senders dropped")?;
             msgs_buf[0] = Some((SocketAddr::V4(a), d));
             let mut slot_idx = 1;
             if slot_idx >= msgs_buf.len() {

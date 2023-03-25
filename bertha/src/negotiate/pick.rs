@@ -132,7 +132,7 @@ pub(crate) fn check_touched<T: Pick>(
 where
     T::Picked: Debug,
 {
-    let pr = t.pick(pairs).wrap_err(eyre!("pick failed"))?;
+    let pr = t.pick(pairs).wrap_err("pick failed")?;
     let touched = &pr.touched_cap_guids;
     let pairs: Vec<_> = pr
         .filtered_pairs
@@ -223,7 +223,7 @@ where
                     });
                 }
                 Ok(_) => eyre!("first choice pick left no options"),
-                Err(e) => e.wrap_err(eyre!("first choice pick erred")),
+                Err(e) => e.wrap_err("first choice pick erred"),
             };
 
             match check_touched(second_pick, offer_pairs) {
@@ -237,9 +237,7 @@ where
                     touched_cap_guids,
                 }),
                 Ok(_) => Err(eyre!("both select sides not satisfied").wrap_err(first_err)),
-                Err(e) => Err(e
-                    .wrap_err(eyre!("second choice pick erred"))
-                    .wrap_err(first_err)),
+                Err(e) => Err(e.wrap_err("second choice pick erred").wrap_err(first_err)),
             }
         }
 

@@ -32,7 +32,7 @@ def start_server(conn, outf, variant='kernel', use_bertha='full', extra_cfg=None
 
     no_bertha = f'--no-bertha={use_bertha}'
     time.sleep(5)
-    ok = conn.run(f"RUST_LOG=debug {dpdk_ld_var} ./target/release/throughput-bench \
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} perf record -g ./target/release/throughput-bench \
         -p 4242 \
         --datapath {variant} \
         {no_bertha} \

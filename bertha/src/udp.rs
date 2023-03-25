@@ -38,7 +38,7 @@ impl ChunnelListener for UdpSkChunnel {
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
         Box::pin(async move {
             let sk = tokio::net::UdpSocket::bind(a)
-                .map(move |sk| Ok(UdpSk::new(sk.wrap_err(eyre!("Bind to {}", a))?)));
+                .map(move |sk| Ok(UdpSk::new(sk.wrap_err_with(|| eyre!("Bind to {}", a))?)));
             Ok(Box::pin(futures_util::stream::once(sk)) as _)
         })
     }
@@ -229,7 +229,7 @@ impl ChunnelListener for UdpReqChunnel {
             sk.set_nonblocking(true)?;
             sk.bind(&a.into())?;
             let sk = tokio::net::UdpSocket::from_std(sk.into())
-                .wrap_err(eyre!("socket bind failed on {:?}", a))?;
+                .wrap_err_with(|| eyre!("socket bind failed on {:?}", a))?;
             let sk = crate::util::AddrSteer::new(UdpSk::new(sk));
             Ok(sk.steer(UdpConn::new))
         })
@@ -267,7 +267,7 @@ where
     let d = recv
         .recv_async()
         .await
-        .wrap_err(eyre!("Nothing more to receive"))?;
+        .wrap_err("Nothing more to receive")?;
     msgs_buf[0] = Some(d);
 
     let mut num_received = 1;

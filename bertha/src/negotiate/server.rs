@@ -377,8 +377,7 @@ where
         stack: new_stack,
         filtered_pairs,
         ..
-    } = super::pick::check_touched(stack, valid_pairs)
-        .wrap_err(eyre!("error monomorphizing stack"))?;
+    } = super::pick::check_touched(stack, valid_pairs).wrap_err("error monomorphizing stack")?;
     assert!(!filtered_pairs.is_empty());
     let (client_choices, mut server_choices): (Vec<_>, Vec<_>) = filtered_pairs.into_iter().unzip();
     let server_choice = server_choices.pop().unwrap();

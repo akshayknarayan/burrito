@@ -166,7 +166,7 @@ fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
 
                 // affinitize
                 affinitize_thread(core_id as _)
-                    .wrap_err(eyre!("affinitizing thread to lcore {:?}", core_id))?;
+                    .wrap_err_with(|| eyre!("affinitizing thread to lcore {:?}", core_id))?;
 
                 //let remaining_qids: Vec<_> = init_state_g
                 //    .mempools
@@ -184,8 +184,8 @@ fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
 
             Ok::<_, Report>(())
         })
-        .wrap_err(eyre!("Error accessing dpdk state thread_local"))?
-        .wrap_err(eyre!("Error initializing thread-local dpdk state"))
+        .wrap_err("Error accessing dpdk state thread_local")?
+        .wrap_err("Error initializing thread-local dpdk state")
 }
 
 impl ChunnelListener for DpdkInlineChunnel {
@@ -573,7 +573,7 @@ impl ChunnelListener for DpdkInlineReqChunnel {
                             let mut dpdk_opt = dpdk_cell.borrow_mut();
                             let dpdk = dpdk_opt
                                 .as_mut()
-                                .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                                .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
                             if let Err(err) = steering_g.add_flow(dpdk, a.port()) {
                                 warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                             }
@@ -646,9 +646,9 @@ impl StreamState {
                     DPDK_STATE.with(|dpdk_cell| {
                         let this_lcore = get_lcore_id();
                         let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
+                            eyre!("dpdk not initialized on core {:?}", this_lcore)
+                        })?;
 
                         dpdk.try_recv_burst_stash_only(Some(&self.sender))?;
                         Ok::<_, Report>(())

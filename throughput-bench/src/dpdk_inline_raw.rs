@@ -122,7 +122,7 @@ fn run_clients(
         .collect::<Result<Vec<Vec<(usize, Duration)>>, _>>()
         .wrap_err("failed running one or more clients")?
         .into_iter()
-        .flat_map(|x| x)
+        .flatten()
         .unzip();
     let tot_bytes = tot_bytes.into_iter().sum();
     let elapsed = durs.into_iter().max().unwrap();
@@ -171,7 +171,7 @@ async fn run_client(
             let mut dpdk_opt = dpdk_cell.borrow_mut();
             let dpdk = dpdk_opt
                 .as_mut()
-                .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
             dpdk.send_burst(std::iter::once(req.clone()))?;
             Ok::<_, Report>(())
         })
@@ -195,7 +195,7 @@ async fn run_client(
                     let mut dpdk_opt = dpdk_cell.borrow_mut();
                     let dpdk = dpdk_opt
                         .as_mut()
-                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
                     let ms =
                         dpdk.try_recv_burst(Some((local_port, Some(remote_addr))), None, None)?;
                     for (m, slot) in ms.iter_mut().map_while(Option::take).zip(slots.iter_mut()) {
@@ -219,9 +219,9 @@ async fn run_client(
                 DPDK_STATE
                     .try_with(|dpdk_cell| {
                         let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
+                            eyre!("dpdk not initialized on core {:?}", this_lcore)
+                        })?;
                         dpdk.send_burst(std::iter::once(req.clone()))?;
                         Ok::<_, Report>(())
                     })
@@ -238,9 +238,9 @@ async fn run_client(
                 DPDK_STATE
                     .try_with(|dpdk_cell| {
                         let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
+                            eyre!("dpdk not initialized on core {:?}", this_lcore)
+                        })?;
                         dpdk.send_burst(std::iter::once(SendMsg {
                             src_port: local_port,
                             to_addr: remote_addr,
@@ -317,9 +317,9 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                 let ret = DPDK_STATE
                     .try_with(|dpdk_cell| {
                         let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
+                            eyre!("dpdk not initialized on core {:?}", this_lcore)
+                        })?;
                         let msgs = dpdk.try_recv_burst(
                             Some((local_port, Some(remote_addr))),
                             new_conns.as_ref(),
@@ -343,7 +343,7 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                     tokio::task::yield_now().await;
                 }
             }
-            .wrap_err(eyre!("Error waiting for request"))?;
+            .wrap_err("Error waiting for request")?;
 
             let start = Instant::now();
             info!(?remaining, ?pkt_size, ?a, "starting send");
@@ -352,9 +352,9 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                 DPDK_STATE
                     .try_with(|dpdk_cell| {
                         let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
+                            eyre!("dpdk not initialized on core {:?}", this_lcore)
+                        })?;
                         dpdk.try_recv_burst_stash_only(new_conns.as_ref())?;
                         Ok::<_, Report>(())
                     })
@@ -366,9 +366,9 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                 DPDK_STATE
                     .try_with(|dpdk_cell| {
                         let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
+                            eyre!("dpdk not initialized on core {:?}", this_lcore)
+                        })?;
                         dpdk.send_burst((0..16).map_while(|_| {
                             if remaining > 0 {
                                 let this_send_size = std::cmp::min(pkt_size, remaining);
@@ -424,7 +424,7 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                     let mut dpdk_opt = dpdk_cell.borrow_mut();
                     let dpdk = dpdk_opt
                         .as_mut()
-                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
                     send_fin(dpdk, local_port, a)
                 })
                 .map_err(Into::into)
@@ -438,9 +438,9 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
                 let res = DPDK_STATE
                     .try_with(|dpdk_cell| {
                         let mut dpdk_opt = dpdk_cell.borrow_mut();
-                        let dpdk = dpdk_opt
-                            .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
+                            eyre!("dpdk not initialized on core {:?}", this_lcore)
+                        })?;
                         match recv_one(dpdk, local_port, remote_addr, new_conns.as_ref()) {
                             Ok(Some(_)) => Ok(Some(())),
                             Ok(None) if start.elapsed() >= Duration::from_millis(1) => {

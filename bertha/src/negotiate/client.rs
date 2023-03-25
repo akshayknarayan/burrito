@@ -105,7 +105,7 @@ impl<A: Serialize + DeserializeOwned + Clone + Debug + Eq + Hash + Send + Sync +
             Into<Report> + Send + Sync + 'static,
         <S as Pick>::Picked: Debug,
     {
-        let returned_error: ZeroRttNegotiationError = returned_error.downcast().wrap_err(eyre!("Renegotation only works with an error returned from a connection returned by negotiate_zero_rtt"))?;
+        let returned_error: ZeroRttNegotiationError = returned_error.downcast().wrap_err("Renegotation only works with an error returned from a connection returned by negotiate_zero_rtt")?;
         let nonces = match returned_error {
             ZeroRttNegotiationError::NotAccepted(nonces) => nonces,
             e => bail!(eyre!("Non-negotiation error: {}", e)),
@@ -171,7 +171,7 @@ where
                 for p in picked {
                     let p2 = p.clone();
                     match super::apply::check_apply(stack.clone(), p)
-                        .wrap_err(eyre!("Could not apply received impls to stack"))
+                        .wrap_err("Could not apply received impls to stack")
                     {
                         Ok(ApplyResult {
                             applied: ns,
@@ -192,9 +192,8 @@ where
                     }
                 }
 
-                let (mut applied, nonce) = applied.ok_or_else(|| {
-                    apply_err.wrap_err(eyre!("All received options failed to apply"))
-                })?;
+                let (mut applied, nonce) = applied
+                    .ok_or_else(|| apply_err.wrap_err("All received options failed to apply"))?;
                 debug!(?applied, "applied to stack");
                 let inform_picked_nonce_buf = bincode::serialize(&NegotiateMsg::ServerNonce {
                     addr: bincode::serialize(&addr)?,
@@ -370,10 +369,12 @@ where
         if rbuf.is_empty() {
             Ok(NegotiateMsg::ServerReply(Ok(vec![])))
         } else {
-            bincode::deserialize(&rbuf).wrap_err(eyre!(
-                "Could not deserialize negotiate_server response: {:?}",
-                rbuf
-            ))
+            bincode::deserialize(&rbuf).wrap_err_with(|| {
+                eyre!(
+                    "Could not deserialize negotiate_server response: {:?}",
+                    rbuf
+                )
+            })
         }
     }
 }

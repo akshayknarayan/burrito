@@ -121,7 +121,7 @@ impl ChunnelConnection for UnixSk {
                     self.sk
                         .send_to(&data, &addr)
                         .await
-                        .wrap_err(eyre!("unixsk send to address: {:?}", &addr))?;
+                        .wrap_err_with(|| eyre!("unixsk send to address: {:?}", &addr))?;
                     sent += 1;
                 }
 

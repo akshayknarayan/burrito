@@ -182,11 +182,13 @@ impl DpdkState {
         } else {
             unsafe { setup_flow_steering_rss(self.port, local_port, queues) }
         }
-        .wrap_err(eyre!(
-            "Could not register flow steering for port {:?} to queues {:?}",
-            local_port,
-            queues
-        ))
+        .wrap_err_with(|| {
+            eyre!(
+                "Could not register flow steering for port {:?} to queues {:?}",
+                local_port,
+                queues
+            )
+        })
     }
 
     pub fn eth_stats(&self) -> Result<rte_eth_stats, Report> {

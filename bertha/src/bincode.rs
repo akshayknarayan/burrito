@@ -80,12 +80,7 @@ where
             async move {
                 let b: Result<Vec<_>, Report> = burst
                     .into_iter()
-                    .map(|(a, d)| {
-                        Ok((
-                            a,
-                            bincode::serialize(&d).wrap_err(eyre!("serialize error"))?,
-                        ))
-                    })
+                    .map(|(a, d)| Ok((a, bincode::serialize(&d).wrap_err("serialize error")?)))
                     .collect();
                 self.inner.send(b?).await
             }
@@ -120,11 +115,13 @@ where
                     // The main obstacle is what we do in the `None` case. The bytes are there, but
                     // using them would make assumptions about Option's memory layout and thus be
                     // UB.
-                    let data = bincode::deserialize(&buf.1[..]).wrap_err(eyre!(
-                        "deserialize failed: {:?} -> {:?}",
-                        buf.1,
-                        std::any::type_name::<D>()
-                    ))?;
+                    let data = bincode::deserialize(&buf.1[..]).wrap_err_with(|| {
+                        eyre!(
+                            "deserialize failed: {:?} -> {:?}",
+                            buf.1,
+                            std::any::type_name::<D>()
+                        )
+                    })?;
                     *slot = Some((buf.0, data));
                     ret_len += 1;
                 }
@@ -224,7 +221,7 @@ where
                     .zip(msgs_buf.iter_mut())
                 {
                     let data = base64::decode(&buf.1[..])
-                        .wrap_err(eyre!("base64 decode failed: {:?}", buf.1))?;
+                        .wrap_err_with(|| eyre!("base64 decode failed: {:?}", buf.1))?;
                     *slot = Some((buf.0, data));
                     len += 1;
                 }

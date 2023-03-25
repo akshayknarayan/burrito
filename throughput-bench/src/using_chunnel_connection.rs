@@ -102,7 +102,7 @@ where
         .collect::<Result<Vec<Vec<(usize, Duration)>>, _>>()
         .wrap_err("failed running one or more clients")?
         .into_iter()
-        .flat_map(|x| x)
+        .flatten()
         .unzip();
     let tot_bytes = tot_bytes.into_iter().sum();
     let elapsed = durs.into_iter().max().unwrap();
@@ -268,7 +268,7 @@ where
         .collect::<Result<Vec<Vec<(usize, Duration)>>, _>>()
         .wrap_err("failed running one or more clients")?
         .into_iter()
-        .flat_map(|x| x)
+        .flatten()
         .unzip();
     let tot_bytes = tot_bytes.into_iter().sum();
     let elapsed = durs.into_iter().max().unwrap();
