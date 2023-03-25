@@ -27,7 +27,7 @@ members = [
 ]
 
 [profile.release]
-#debug = true
+debug = true
 lto = true
 
 [profile.release.package.kvstore]
