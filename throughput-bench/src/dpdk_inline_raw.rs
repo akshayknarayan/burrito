@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Barrier;
 use tracing::Instrument;
-use tracing::{debug, debug_span, info, info_span, trace, warn};
+use tracing::{debug, debug_span, info, trace, warn};
 
 use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn, DpdkInlineReqChunnel};
 use dpdk_direct::{DpdkState, Msg, SendMsg, DPDK_STATE};
@@ -80,7 +80,7 @@ fn run_clients(
                                     c.packet_size,
                                     start_barrier,
                                 )
-                                .instrument(info_span!(
+                                .instrument(debug_span!(
                                     "client",
                                     ?thread,
                                     ?tclient
@@ -104,7 +104,7 @@ fn run_clients(
                     rt.block_on(async move {
                         let res =
                             run_client(ctr, addr, c.download_size, c.packet_size, start_barrier)
-                                .instrument(info_span!("client", ?thread))
+                                .instrument(debug_span!("client", ?thread))
                                 .await?;
                         Ok(vec![res])
                     })
@@ -465,7 +465,7 @@ async fn server_thread_inner<S: Stream<Item = Result<DpdkInlineCn, Report>> + Un
             info!(elapsed = ?start.elapsed(), ?a, "exiting");
             Ok::<_, Report>(())
         }
-        .instrument(info_span!("client_conn", ?remote_addr))
+        .instrument(debug_span!("client_conn", ?remote_addr))
         .map_err(move |err| {
             warn!(?err, ?remote_addr, "client conn errored");
             err

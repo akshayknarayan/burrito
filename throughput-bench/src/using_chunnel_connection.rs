@@ -9,7 +9,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Barrier;
-use tracing::{debug, info, info_span, trace, warn};
+use tracing::{debug, debug_span, info, trace, warn};
 use tracing_futures::Instrument;
 
 pub(crate) fn run_clients<C, Cn, E>(
@@ -60,7 +60,7 @@ where
                                     c.packet_size,
                                     start_barrier,
                                 )
-                                .instrument(info_span!(
+                                .instrument(debug_span!(
                                     "client",
                                     ?thread,
                                     ?tclient
@@ -84,7 +84,7 @@ where
                     rt.block_on(async move {
                         let res =
                             run_client(ctr, addr, c.download_size, c.packet_size, start_barrier)
-                                .instrument(info_span!("client", ?thread))
+                                .instrument(debug_span!("client", ?thread))
                                 .await?;
                         Ok(vec![res])
                     })
@@ -170,7 +170,7 @@ where
                 .map_err(Into::into)?;
             let stack = bertha::util::Nothing::<()>::default();
             let st = bertha::negotiate::negotiate_server(stack, st)
-                .instrument(info_span!("negotiate_server"))
+                .instrument(debug_span!("negotiate_server"))
                 .await
                 .wrap_err("negotiate_server")?;
 
@@ -229,7 +229,7 @@ where
                                 async move {
                                     let cn = ch.connect(addr).await?;
                                     run_client_inner(cn, addr4, c.download_size, c.packet_size)
-                                        .instrument(info_span!("client", ?thread, ?tclient))
+                                        .instrument(debug_span!("client", ?thread, ?tclient))
                                         .await
                                 }
                             })
@@ -250,7 +250,7 @@ where
                     let res = rt.block_on(async move {
                         let cn = ch.connect(addr).await?;
                         run_client_inner(cn, addr4, c.download_size, c.packet_size)
-                            .instrument(info_span!("client", ?thread))
+                            .instrument(debug_span!("client", ?thread))
                             .await
                     })?;
                     Ok(vec![res])
