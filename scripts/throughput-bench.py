@@ -72,7 +72,7 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
     time.sleep(2)
     agenda.subtask(f"client starting -> {outf}.out")
     ok = conn.run(
-        f"RUST_LOG=debug {dpdk_ld_var}  ./target/release/throughput-bench \
+        f"RUST_LOG=info {dpdk_ld_var} ./target/release/throughput-bench \
         -p 4242 \
         --datapath {variant} \
         {cfg} \
