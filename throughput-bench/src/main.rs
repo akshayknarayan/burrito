@@ -4,7 +4,7 @@
 //! each download m bytes.
 
 use bertha::udp::{UdpReqChunnel, UdpSkChunnel};
-use color_eyre::eyre::{bail, Report, WrapErr};
+use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 #[cfg(feature = "dpdk-direct")]
 use dpdk_direct::{DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 #[cfg(feature = "shenango-chunnel")]
@@ -29,19 +29,20 @@ mod using_chunnel_connection;
 
 #[derive(Clone, Copy, Debug)]
 enum BerthaNess {
-    Full,
+    Full { stack_depth: usize },
     UsingChunnelConnection,
     Raw,
 }
 
 impl BerthaNess {
-    fn is_full(&self) -> bool {
+    fn try_get_stack_depth(&self) -> Result<usize, ()> {
         match self {
-            BerthaNess::Full => true,
-            _ => false,
+            BerthaNess::Full { stack_depth } => Ok(*stack_depth),
+            _ => Err(()),
         }
     }
 
+    #[cfg(any(feature = "use_shenango", feature = "dpdk-direct"))]
     fn is_raw(&self) -> bool {
         match self {
             BerthaNess::Raw => true,
@@ -53,11 +54,17 @@ impl BerthaNess {
 impl std::str::FromStr for BerthaNess {
     type Err = Report;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s.to_lowercase().as_str() {
-            "full" | "false" => BerthaNess::Full,
-            "berthaconn" | "true" => BerthaNess::UsingChunnelConnection,
-            "raw" => BerthaNess::Raw,
-            x => bail!("unknown use_bertha specifier {}", x),
+        let lower = s.to_lowercase();
+        let parts: Vec<_> = lower.split(':').collect();
+        Ok(match &parts[..] {
+            ["full", depth] | ["false", depth] => BerthaNess::Full {
+                stack_depth: depth
+                    .parse()
+                    .wrap_err_with(|| eyre!("could not parse stack depth: {:?}", depth))?,
+            },
+            ["berthaconn"] | ["true"] => BerthaNess::UsingChunnelConnection,
+            ["raw"] => BerthaNess::Raw,
+            x => bail!("unknown use_bertha specifier {:?}", x),
         })
     }
 }
@@ -221,7 +228,7 @@ fn main() -> Result<(), Report> {
         let num_clients = cl.num_clients;
         let of = cl.out_file.take();
 
-        let (tot_bytes, elapsed) = if !no_bertha.is_full() {
+        let (tot_bytes, elapsed) = if no_bertha.try_get_stack_depth().is_err() {
             match datapath.as_str() {
                 #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
@@ -242,26 +249,27 @@ fn main() -> Result<(), Report> {
                 x => bail!("no_bertha mode not implemented for {}", x),
             }
         } else {
+            let stack_depth = no_bertha.try_get_stack_depth().unwrap();
             match datapath.as_str() {
                 #[cfg(feature = "dpdk-direct")]
                 "dpdkthread" => {
                     let ch = DpdkUdpSkChunnel::new(cfg).wrap_err("make dpdk-thread chunnel")?;
-                    using_chunnel_connection::run_clients(ch, cl, port, num_threads)?
+                    using_chunnel_connection::run_clients(ch, cl, port, num_threads, stack_depth)?
                 }
                 #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
                     let ch = DpdkInlineChunnel::new(cfg, num_threads)
                         .wrap_err("make dpdk-multi chunnel")?;
-                    using_chunnel_connection::run_clients(ch, cl, port, num_threads)?
+                    using_chunnel_connection::run_clients(ch, cl, port, num_threads, stack_depth)?
                 }
                 #[cfg(feature = "use_shenango")]
                 "shenango" => {
                     let ch = ShenangoUdpSkChunnel::new(cfg);
-                    using_chunnel_connection::run_clients(ch, cl, port, num_threads)?
+                    using_chunnel_connection::run_clients(ch, cl, port, num_threads, stack_depth)?
                 }
                 "kernel" => {
                     let ch = UdpSkChunnel;
-                    using_chunnel_connection::run_clients(ch, cl, port, num_threads)?
+                    using_chunnel_connection::run_clients(ch, cl, port, num_threads, stack_depth)?
                 }
                 #[cfg(not(feature = "dpdk-direct"))]
                 x if x.contains("dpdk") => bail!("`dpdk-direct` feature not enabled"),
@@ -278,7 +286,36 @@ fn main() -> Result<(), Report> {
             packet_size,
         )?;
     } else {
-        if !no_bertha.is_full() {
+        // server
+        if let Ok(stack_depth) = no_bertha.try_get_stack_depth() {
+            match datapath.as_str() {
+                #[cfg(feature = "dpdk-direct")]
+                "dpdkthread" => {
+                    let ch = DpdkUdpSkChunnel::new(cfg)?;
+                    let ch = DpdkUdpReqChunnel(ch);
+                    using_chunnel_connection::run_server(ch, port, num_threads, stack_depth)?;
+                }
+                #[cfg(feature = "dpdk-direct")]
+                "dpdkinline" => {
+                    let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
+                    let ch = DpdkInlineReqChunnel::from(ch);
+                    using_chunnel_connection::run_server(ch, port, num_threads, stack_depth)?;
+                }
+                #[cfg(feature = "use_shenango")]
+                "shenango" => {
+                    let ch = ShenangoUdpSkChunnel::new(cfg);
+                    let ch = ShenangoUdpReqChunnel(ch);
+                    using_chunnel_connection::run_server(ch, port, num_threads, stack_depth)?;
+                }
+                "kernel" => {
+                    let ch = UdpReqChunnel;
+                    using_chunnel_connection::run_server(ch, port, num_threads, stack_depth)?;
+                }
+                #[cfg(not(feature = "dpdk-direct"))]
+                x if x.contains("dpdk") => bail!("`dpdk-direct` feature not enabled"),
+                d => bail!("unknown datapath {:?}", d),
+            }
+        } else {
             match datapath.as_ref() {
                 #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
@@ -299,34 +336,6 @@ fn main() -> Result<(), Report> {
                 #[cfg(not(feature = "dpdk-direct"))]
                 x if x.contains("dpdk") => bail!("`dpdk-direct` feature not enabled"),
                 x => bail!("no_bertha mode not implemented for {}", x),
-            }
-        } else {
-            match datapath.as_str() {
-                #[cfg(feature = "dpdk-direct")]
-                "dpdkthread" => {
-                    let ch = DpdkUdpSkChunnel::new(cfg)?;
-                    let ch = DpdkUdpReqChunnel(ch);
-                    using_chunnel_connection::run_server(ch, port, num_threads)?;
-                }
-                #[cfg(feature = "dpdk-direct")]
-                "dpdkinline" => {
-                    let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
-                    let ch = DpdkInlineReqChunnel::from(ch);
-                    using_chunnel_connection::run_server(ch, port, num_threads)?;
-                }
-                #[cfg(feature = "use_shenango")]
-                "shenango" => {
-                    let ch = ShenangoUdpSkChunnel::new(cfg);
-                    let ch = ShenangoUdpReqChunnel(ch);
-                    using_chunnel_connection::run_server(ch, port, num_threads)?;
-                }
-                "kernel" => {
-                    let ch = UdpReqChunnel;
-                    using_chunnel_connection::run_server(ch, port, num_threads)?;
-                }
-                #[cfg(not(feature = "dpdk-direct"))]
-                x if x.contains("dpdk") => bail!("`dpdk-direct` feature not enabled"),
-                d => bail!("unknown datapath {:?}", d),
             }
         }
     }

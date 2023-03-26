@@ -1,5 +1,5 @@
 use crate::Client;
-use bertha::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener};
+use bertha::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList};
 use color_eyre::eyre::{bail, Report, WrapErr};
 use futures_util::{
     stream::{FuturesUnordered, TryStreamExt},
@@ -16,21 +16,19 @@ use tokio::sync::Barrier;
 use tracing::{debug, debug_span, info, trace, warn};
 use tracing_futures::Instrument;
 
-// we want a Chunnel implementation that reads the data at runtime, but does nothing else. this
-// represents the overhead of having a chunnel there at all.
+/// we want a Chunnel implementation that reads the data at runtime, but does nothing else. this
+/// represents the overhead of having a chunnel there at all.
 #[derive(Debug, Clone, Default)]
-struct NoOpChunnel;
+struct NoOpChunnel<const UNIQ: u64>;
 
-impl bertha::negotiate::Negotiate for NoOpChunnel {
+impl<const UNIQ: u64> bertha::negotiate::Negotiate for NoOpChunnel<UNIQ> {
     type Capability = ();
     fn guid() -> u64 {
-        0x8c7bda3445c93fcb
+        0x8c7bda3445c93fcb + UNIQ
     }
 }
 
-struct NoOpChunnelCn<C>(C);
-
-impl<D, InC> Chunnel<InC> for NoOpChunnel
+impl<const UNIQ: u64, D, InC> Chunnel<InC> for NoOpChunnel<UNIQ>
 where
     InC: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Read + Send + Sync + 'static,
@@ -58,6 +56,9 @@ impl<T> Read for (T, Vec<u8>) {
         &self.1[..]
     }
 }
+
+#[derive(Debug, Clone)]
+struct NoOpChunnelCn<C>(C);
 
 impl<D, C> ChunnelConnection for NoOpChunnelCn<C>
 where
@@ -110,6 +111,7 @@ pub(crate) fn run_clients<C, Cn, E>(
     c: Client,
     port: u16,
     num_threads: usize,
+    stack_depth: usize,
 ) -> Result<(usize, Duration), Report>
 where
     C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = E>
@@ -123,68 +125,73 @@ where
     let addr = SocketAddr::from(SocketAddrV4::new(c.addr, port));
     let start_barrier = Arc::new(Barrier::new(c.num_clients));
 
-    let client_threads: Vec<_> = if c.num_clients > num_threads {
-        let clients_per_thread = c.num_clients / num_threads;
-        let mut remainder = c.num_clients - (num_threads * clients_per_thread);
-        (0..num_threads)
-            .map(|thread| {
-                let ctr = ctr.clone();
-                let start_barrier = start_barrier.clone();
-                let num_thread_clients = if remainder > 0 {
-                    remainder -= 1;
-                    clients_per_thread + 1
-                } else {
-                    clients_per_thread
-                };
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
+    let client_threads: Vec<_> =
+        if c.num_clients > num_threads {
+            let clients_per_thread = c.num_clients / num_threads;
+            let mut remainder = c.num_clients - (num_threads * clients_per_thread);
+            (0..num_threads)
+                .map(|thread| {
                     let ctr = ctr.clone();
                     let start_barrier = start_barrier.clone();
-                    rt.block_on(async move {
-                        let futs: FuturesUnordered<_> = (0..num_thread_clients)
-                            .map(|tclient| {
-                                let start_barrier = start_barrier.clone();
-                                run_client(
-                                    ctr.clone(),
-                                    addr,
-                                    c.download_size,
-                                    c.packet_size,
-                                    start_barrier,
-                                )
-                                .instrument(debug_span!(
-                                    "client",
-                                    ?thread,
-                                    ?tclient
-                                ))
-                            })
-                            .collect();
-                        Ok::<_, Report>(futs.try_collect().await?)
+                    let num_thread_clients = if remainder > 0 {
+                        remainder -= 1;
+                        clients_per_thread + 1
+                    } else {
+                        clients_per_thread
+                    };
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        let ctr = ctr.clone();
+                        let start_barrier = start_barrier.clone();
+                        rt.block_on(async move {
+                            let futs: FuturesUnordered<_> =
+                                (0..num_thread_clients)
+                                    .map(|tclient| {
+                                        let start_barrier = start_barrier.clone();
+                                        run_client(
+                                            ctr.clone(),
+                                            stack_depth,
+                                            addr,
+                                            c.download_size,
+                                            c.packet_size,
+                                            start_barrier,
+                                        )
+                                        .instrument(debug_span!("client", ?thread, ?tclient))
+                                    })
+                                    .collect();
+                            Ok::<_, Report>(futs.try_collect().await?)
+                        })
                     })
                 })
-            })
-            .collect()
-    } else {
-        (0..c.num_clients)
-            .map(|thread| {
-                let ctr = ctr.clone();
-                let start_barrier = start_barrier.clone();
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-                    rt.block_on(async move {
-                        let res =
-                            run_client(ctr, addr, c.download_size, c.packet_size, start_barrier)
-                                .instrument(debug_span!("client", ?thread))
-                                .await?;
-                        Ok(vec![res])
+                .collect()
+        } else {
+            (0..c.num_clients)
+                .map(|thread| {
+                    let ctr = ctr.clone();
+                    let start_barrier = start_barrier.clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        rt.block_on(async move {
+                            let res = run_client(
+                                ctr,
+                                stack_depth,
+                                addr,
+                                c.download_size,
+                                c.packet_size,
+                                start_barrier,
+                            )
+                            .instrument(debug_span!("client", ?thread))
+                            .await?;
+                            Ok(vec![res])
+                        })
                     })
                 })
-            })
-            .collect()
-    };
+                .collect()
+        };
 
     let joined: Vec<Result<Vec<(usize, Duration)>, Report>> = client_threads
         .into_iter()
@@ -205,6 +212,7 @@ where
 
 async fn run_client<C, Cn, E>(
     mut ctr: C,
+    stack_depth: usize,
     addr: SocketAddr,
     download_size: usize,
     packet_size: usize,
@@ -215,70 +223,130 @@ where
     Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
     E: Into<Report> + Send + Sync + 'static,
 {
-    info!(?addr, ?download_size, ?packet_size, "starting client");
-    let stack = bertha::util::Nothing::<()>::default();
+    macro_rules! client_with_stack {
+        ($stack: expr) => {{
+            info!(?addr, ?download_size, ?packet_size, "starting client");
+            // 1. connect
+            let cn = ctr
+                .connect(addr)
+                .await
+                .map_err(Into::into)
+                .wrap_err("connector failed")?;
+            let cn = bertha::negotiate_client($stack, cn, addr)
+                .await
+                .wrap_err("negotiation failed")?;
+            trace!("got connection");
 
-    // 1. connect
-    let cn = ctr
-        .connect(addr)
-        .await
-        .map_err(Into::into)
-        .wrap_err("connector failed")?;
-    let cn = bertha::negotiate_client(stack, cn, addr)
-        .await
-        .wrap_err("negotiation failed")?;
-    trace!("got connection");
+            let addr4 = match addr {
+                SocketAddr::V4(a) => a,
+                _ => bail!("wrong addr"),
+            };
 
-    let addr4 = match addr {
-        SocketAddr::V4(a) => a,
-        _ => bail!("wrong addr"),
-    };
+            start_barrier.wait().await;
+            run_client_inner(cn, addr4, download_size, packet_size).await
+        }};
+    }
 
-    start_barrier.wait().await;
-    run_client_inner(cn, addr4, download_size, packet_size).await
+    match stack_depth {
+        0 => client_with_stack!(bertha::util::Nothing::<()>::default()),
+        1 => client_with_stack!(NoOpChunnel::<0>),
+        2 => client_with_stack!(CxList::from(NoOpChunnel::<0>).wrap(NoOpChunnel::<1>)),
+        3 => {
+            client_with_stack!(CxList::from(NoOpChunnel::<0>)
+                .wrap(NoOpChunnel::<1>)
+                .wrap(NoOpChunnel::<2>))
+        }
+        4 => {
+            client_with_stack!(CxList::from(NoOpChunnel::<0>)
+                .wrap(NoOpChunnel::<1>)
+                .wrap(NoOpChunnel::<2>)
+                .wrap(NoOpChunnel::<3>))
+        }
+        5 => {
+            client_with_stack!(CxList::from(NoOpChunnel::<0>)
+                .wrap(NoOpChunnel::<1>)
+                .wrap(NoOpChunnel::<2>)
+                .wrap(NoOpChunnel::<3>)
+                .wrap(NoOpChunnel::<4>))
+        }
+        _ => bail!("stack depth {} not supported", stack_depth),
+    }
 }
 
-pub fn run_server<L, Cn, E>(listener: L, port: u16, threads: usize) -> Result<(), Report>
+pub fn run_server<L, Cn, E>(
+    listener: L,
+    port: u16,
+    threads: usize,
+    stack_depth: usize,
+) -> Result<(), Report>
 where
     L: ChunnelListener<Addr = SocketAddr, Connection = Cn, Error = E> + Clone + Send + 'static,
     Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
     E: Into<Report> + Send + Sync + 'static,
 {
-    fn server_thread<L, Cn, E>(mut listener: L, port: u16) -> Result<(), Report>
+    fn server_thread<L, Cn, E>(mut listener: L, port: u16, stack_depth: usize) -> Result<(), Report>
     where
         L: ChunnelListener<Addr = SocketAddr, Connection = Cn, Error = E>,
         Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
         E: Into<Report> + Send + Sync + 'static,
     {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(async move {
-            let st = listener
-                .listen(SocketAddr::from(SocketAddrV4::new(
-                    std::net::Ipv4Addr::UNSPECIFIED,
-                    port,
-                )))
-                .await
-                .map_err(Into::into)?;
-            let stack = bertha::util::Nothing::<()>::default();
-            let st = bertha::negotiate::negotiate_server(stack, st)
-                .instrument(debug_span!("negotiate_server"))
-                .await
-                .wrap_err("negotiate_server")?;
+        macro_rules! server_with_stack {
+            ($stack: expr) => {{
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async move {
+                    let st = listener
+                        .listen(SocketAddr::from(SocketAddrV4::new(
+                            std::net::Ipv4Addr::UNSPECIFIED,
+                            port,
+                        )))
+                        .await
+                        .map_err(Into::into)?;
+                    let st = bertha::negotiate::negotiate_server($stack, st)
+                        .instrument(debug_span!("negotiate_server"))
+                        .await
+                        .wrap_err("negotiate_server")?;
 
-            tokio::pin!(st);
-            server_thread_inner(st).await
-        })
+                    tokio::pin!(st);
+                    server_thread_inner(st).await
+                })
+            }};
+        }
+
+        match stack_depth {
+            0 => server_with_stack!(bertha::util::Nothing::<()>::default()),
+            1 => server_with_stack!(NoOpChunnel::<0>),
+            2 => server_with_stack!(CxList::from(NoOpChunnel::<0>).wrap(NoOpChunnel::<1>)),
+            3 => {
+                server_with_stack!(CxList::from(NoOpChunnel::<0>)
+                    .wrap(NoOpChunnel::<1>)
+                    .wrap(NoOpChunnel::<2>))
+            }
+            4 => {
+                server_with_stack!(CxList::from(NoOpChunnel::<0>)
+                    .wrap(NoOpChunnel::<1>)
+                    .wrap(NoOpChunnel::<2>)
+                    .wrap(NoOpChunnel::<3>))
+            }
+            5 => {
+                server_with_stack!(CxList::from(NoOpChunnel::<0>)
+                    .wrap(NoOpChunnel::<1>)
+                    .wrap(NoOpChunnel::<2>)
+                    .wrap(NoOpChunnel::<3>)
+                    .wrap(NoOpChunnel::<4>))
+            }
+            _ => bail!("stack depth {} not supported", stack_depth),
+        }
     }
 
     info!(?port, ?threads, "starting server");
     for _ in 1..threads {
         let listener = listener.clone();
-        std::thread::spawn(move || server_thread(listener, port));
+        std::thread::spawn(move || server_thread(listener, port, stack_depth));
     }
 
-    server_thread(listener, port)
+    server_thread(listener, port, stack_depth)
 }
 
 pub(crate) fn run_clients_no_bertha<C, Cn>(
