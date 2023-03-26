@@ -168,7 +168,7 @@ fn validate_message(ms: &[u8]) -> Result<(u64, u64), Report> {
 
     let remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
     let pkt_size = u64::from_le_bytes(msg[16..24].try_into().unwrap());
-    if pkt_size < 64 || pkt_size > 1460 {
+    if !(64..=1460).contains(&pkt_size) {
         debug!(?pkt_size, "bad client request");
         bail!(
             "bad client request: remaining {:?}, pkt_size {:?}",
@@ -200,10 +200,18 @@ fn main() -> Result<(), Report> {
 
     #[cfg(feature = "use_shenango")]
     {
-        if !no_bertha.is_full() && datapath == "shenango" {
+        use color_eyre::eyre::ensure;
+        if no_bertha.try_get_stack_depth().is_err() && datapath == "shenango" {
             shenango_raw::shenango_nobertha(cfg, port, mode);
             unreachable!();
         } else if datapath == "shenangort" {
+            ensure!(
+                no_bertha
+                    .try_get_stack_depth()
+                    .map_err(|_| eyre!("shenangort implies using bertha"))?
+                    == 0,
+                "shenango with more than 0 no-op chunnels not yet supported"
+            );
             shenangort::shenangort_bertha(cfg, port, mode);
             unreachable!();
         }

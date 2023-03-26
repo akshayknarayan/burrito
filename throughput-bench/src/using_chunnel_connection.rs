@@ -161,7 +161,7 @@ where
                                         .instrument(debug_span!("client", ?thread, ?tclient))
                                     })
                                     .collect();
-                            Ok::<_, Report>(futs.try_collect().await?)
+                            futs.try_collect().await
                         })
                     })
                 })
