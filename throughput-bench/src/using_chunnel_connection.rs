@@ -112,7 +112,7 @@ pub(crate) fn run_clients<C, Cn, E>(
     port: u16,
     num_threads: usize,
     stack_depth: usize,
-) -> Result<(usize, Duration), Report>
+) -> Result<(usize, usize, Duration), Report>
 where
     C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = E>
         + Clone
@@ -193,21 +193,20 @@ where
                 .collect()
         };
 
-    let joined: Vec<Result<Vec<(usize, Duration)>, Report>> = client_threads
+    let joined: Vec<Result<Vec<(usize, usize, Duration)>, Report>> = client_threads
         .into_iter()
         .map(|jh| jh.join().expect("thread paniced"))
         .collect();
-    let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+    let (tot_bytes, tot_pkts, elapsed) = joined
         .into_iter()
-        .collect::<Result<Vec<Vec<(usize, Duration)>>, _>>()
+        .collect::<Result<Vec<Vec<(usize, usize, Duration)>>, _>>()
         .wrap_err("failed running one or more clients")?
         .into_iter()
         .flatten()
-        .unzip();
-    let tot_bytes = tot_bytes.into_iter().sum();
-    let elapsed = durs.into_iter().max().unwrap();
-    info!(?tot_bytes, ?elapsed, "all clients done");
-    Ok((tot_bytes, elapsed))
+        .reduce(|(b, p, d), (bi, pi, di)| (b + bi, p + pi, std::cmp::max(d, di)))
+        .expect("There should be at least one client thread");
+    info!(?tot_bytes, ?tot_pkts, ?elapsed, "all clients done");
+    Ok((tot_bytes, tot_pkts, elapsed))
 }
 
 async fn run_client<C, Cn, E>(
@@ -217,7 +216,7 @@ async fn run_client<C, Cn, E>(
     download_size: usize,
     packet_size: usize,
     start_barrier: Arc<Barrier>,
-) -> Result<(usize, Duration), Report>
+) -> Result<(usize, usize, Duration), Report>
 where
     C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = E> + Send + Sync + 'static,
     Cn: ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
@@ -354,7 +353,7 @@ pub(crate) fn run_clients_no_bertha<C, Cn>(
     c: Client,
     port: u16,
     num_threads: usize,
-) -> Result<(usize, Duration), Report>
+) -> Result<(usize, usize, Duration), Report>
 where
     C: ChunnelConnector<Addr = SocketAddr, Connection = Cn, Error = Report>
         + Clone
@@ -420,21 +419,20 @@ where
             .collect()
     };
 
-    let joined: Vec<Result<Vec<(usize, Duration)>, Report>> = client_threads
+    let joined: Vec<Result<Vec<(usize, usize, Duration)>, Report>> = client_threads
         .into_iter()
         .map(|jh| jh.join().expect("thread paniced"))
         .collect();
-    let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+    let (tot_bytes, tot_pkts, elapsed) = joined
         .into_iter()
-        .collect::<Result<Vec<Vec<(usize, Duration)>>, _>>()
+        .collect::<Result<Vec<Vec<(usize, usize, Duration)>>, _>>()
         .wrap_err("failed running one or more clients")?
         .into_iter()
         .flatten()
-        .unzip();
-    let tot_bytes = tot_bytes.into_iter().sum();
-    let elapsed = durs.into_iter().max().unwrap();
-    info!(?tot_bytes, ?elapsed, "all clients done");
-    Ok((tot_bytes, elapsed))
+        .reduce(|(b, p, d), (bi, pi, di)| (b + bi, p + pi, std::cmp::max(d, di)))
+        .expect("There should be at least one client thread");
+    info!(?tot_bytes, ?tot_pkts, ?elapsed, "all clients done");
+    Ok((tot_bytes, tot_pkts, elapsed))
 }
 
 async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
@@ -442,10 +440,11 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     addr: SocketAddrV4,
     download_size: usize,
     packet_size: usize,
-) -> Result<(usize, Duration), Report> {
+) -> Result<(usize, usize, Duration), Report> {
     info!(?addr, ?download_size, ?packet_size, "starting client");
 
     let mut tot_bytes = 0;
+    let mut tot_pkts = 0;
     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
     req.extend((download_size as u64).to_le_bytes());
     req.extend((packet_size as u64).to_le_bytes());
@@ -472,7 +471,8 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
         last_recv_time = Some(Instant::now());
         for (_, r) in ms.iter_mut().map_while(Option::take) {
             tot_bytes += r.len();
-            trace!(?tot_bytes, "received part");
+            tot_pkts += 1;
+            trace!(?tot_bytes, ?tot_pkts, "received part");
             if r[0] == 1 {
                 cn.send(std::iter::once((SocketAddr::V4(addr), r))).await?;
                 break 'cn;
@@ -481,8 +481,8 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     }
 
     let elapsed = last_recv_time.unwrap() - start;
-    info!(?tot_bytes, ?elapsed, "done");
-    Ok((tot_bytes, elapsed))
+    info!(?tot_bytes, ?tot_pkts, ?elapsed, "done");
+    Ok((tot_bytes, tot_pkts, elapsed))
 }
 
 pub fn run_server_no_bertha<L, Cn>(ch: L, port: u16, num_threads: usize) -> Result<(), Report>

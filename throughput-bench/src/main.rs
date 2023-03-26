@@ -118,39 +118,45 @@ pub enum Mode {
 fn write_results(
     of: Option<impl AsRef<std::path::Path>>,
     tot_bytes: usize,
+    tot_pkts: usize,
     elapsed: Duration,
     num_clients: usize,
     download_size: usize,
     packet_size: usize,
 ) -> Result<(), Report> {
     let rate = (tot_bytes as f64 * 8.) / elapsed.as_secs_f64();
-    info!(?num_clients, ?download_size, ?packet_size, rate_mbps=?(rate / 1e6), "finished");
+    let pps = (tot_pkts as f64) / elapsed.as_secs_f64();
+    info!(?num_clients, ?download_size, ?packet_size, rate_mbps=?(rate / 1e6), rate_mpps=?pps, "finished");
     if let Some(of) = of {
         use std::io::Write;
         let mut f = std::fs::File::create(of)?;
         writeln!(
             &mut f,
-            "num_clients,download_size,packet_size,tot_bytes,elapsed_us,rate_bps"
+            "num_clients,download_size,packet_size,tot_bytes,tot_pkts,elapsed_us,rate_bps,rate_pps"
         )?;
         writeln!(
             &mut f,
-            "{:?},{:?},{:?},{:?},{:?},{:?}",
+            "{:?},{:?},{:?},{:?},{:?},{:?},{:?},{:?}",
             num_clients,
             download_size,
             packet_size,
             tot_bytes,
+            tot_pkts,
             elapsed.as_micros(),
-            rate
+            rate,
+            pps,
         )?;
     } else {
         println!(
-                "num_clients={:?},download_size={:?},packet_size={:?},tot_bytes={:?},elapsed_us={:?},rate_bps={:?}",
+                "num_clients={:?},download_size={:?},packet_size={:?},tot_bytes={:?},tot_pkts={:?},elapsed_us={:?},rate_bps={:?},rate_pps={:?}",
                 num_clients,
                 download_size,
                 packet_size,
                 tot_bytes,
+                tot_pkts,
                 elapsed.as_micros(),
-                rate
+                rate,
+                pps
             );
     }
     Ok(())
@@ -236,7 +242,7 @@ fn main() -> Result<(), Report> {
         let num_clients = cl.num_clients;
         let of = cl.out_file.take();
 
-        let (tot_bytes, elapsed) = if no_bertha.try_get_stack_depth().is_err() {
+        let (tot_bytes, tot_pkts, elapsed) = if no_bertha.try_get_stack_depth().is_err() {
             match datapath.as_str() {
                 #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
@@ -288,6 +294,7 @@ fn main() -> Result<(), Report> {
         write_results(
             of,
             tot_bytes,
+            tot_pkts,
             elapsed,
             num_clients,
             download_size,

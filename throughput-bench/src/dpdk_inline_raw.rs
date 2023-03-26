@@ -25,10 +25,11 @@ pub fn dpdk_inline_nobertha(
         let packet_size = cl.packet_size;
         let num_clients = cl.num_clients;
         let of = cl.out_file.take();
-        let (tot_bytes, elapsed) = run_clients(cl, cfg, port, num_threads)?;
+        let (tot_bytes, tot_pkts, elapsed) = run_clients(cl, cfg, port, num_threads)?;
         super::write_results(
             of,
             tot_bytes,
+            tot_pkts,
             elapsed,
             num_clients,
             download_size,
@@ -45,7 +46,7 @@ fn run_clients(
     cfg: std::path::PathBuf,
     port: u16,
     num_threads: usize,
-) -> Result<(usize, Duration), Report> {
+) -> Result<(usize, usize, Duration), Report> {
     let addr = SocketAddrV4::new(c.addr, port);
     let ctr = DpdkInlineChunnel::new(cfg, num_threads)?;
     let start_barrier = Arc::new(Barrier::new(c.num_clients));
@@ -113,21 +114,20 @@ fn run_clients(
             .collect()
     };
 
-    let joined: Vec<Result<Vec<(usize, Duration)>, Report>> = client_threads
+    let joined: Vec<Result<Vec<_>, Report>> = client_threads
         .into_iter()
         .map(|jh| jh.join().expect("thread paniced"))
         .collect();
-    let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+    let (tot_bytes, tot_pkts, elapsed) = joined
         .into_iter()
-        .collect::<Result<Vec<Vec<(usize, Duration)>>, _>>()
+        .collect::<Result<Vec<Vec<_>>, _>>()
         .wrap_err("failed running one or more clients")?
         .into_iter()
         .flatten()
-        .unzip();
-    let tot_bytes = tot_bytes.into_iter().sum();
-    let elapsed = durs.into_iter().max().unwrap();
-    info!(?tot_bytes, ?elapsed, "all clients done");
-    Ok((tot_bytes, elapsed))
+        .reduce(|(b, p, d), (bi, pi, di)| (b + bi, p + pi, std::cmp::max(d, di)))
+        .expect("There should be at least one client thread");
+    info!(?tot_bytes, ?tot_pkts, ?elapsed, "all clients done");
+    Ok((tot_bytes, tot_pkts, elapsed))
 }
 
 async fn run_client(
@@ -136,7 +136,7 @@ async fn run_client(
     download_size: usize,
     packet_size: usize,
     start_barrier: Arc<Barrier>,
-) -> Result<(usize, Duration), Report> {
+) -> Result<(usize, usize, Duration), Report> {
     let cn: DpdkInlineCn = ctr
         .connect(SocketAddr::V4(addr))
         .await
@@ -155,6 +155,7 @@ async fn run_client(
     );
 
     let mut tot_bytes = 0;
+    let mut tot_pkts = 0;
     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
     req.extend((download_size as u64).to_le_bytes());
     req.extend((packet_size as u64).to_le_bytes());
@@ -233,7 +234,8 @@ async fn run_client(
         for msg in slots[..num_received].iter_mut().map_while(Option::take) {
             let r = msg.get_buf();
             tot_bytes += r.len();
-            trace!(?tot_bytes, "received part");
+            tot_pkts += 1;
+            trace!(?tot_bytes, ?tot_pkts, "received part");
             if r[0] == 1 {
                 DPDK_STATE
                     .try_with(|dpdk_cell| {
@@ -256,8 +258,8 @@ async fn run_client(
     }
 
     let elapsed = last_recv_time.unwrap() - start;
-    info!(?tot_bytes, ?elapsed, "done");
-    Ok((tot_bytes, elapsed))
+    info!(?tot_bytes, ?tot_pkts, ?elapsed, "done");
+    Ok((tot_bytes, tot_pkts, elapsed))
 }
 
 pub fn run_server(cfg: PathBuf, port: u16, threads: usize) -> Result<(), Report> {
