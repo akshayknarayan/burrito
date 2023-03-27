@@ -49,6 +49,7 @@ pub fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
                     info!(?addr, ?download_size, ?i, "starting_client");
                     let mut tot_bytes = 0;
+                    let mut tot_pkts = 0;
 
                     // 2. get bytes
                     let mut req = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -81,7 +82,7 @@ pub fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                             cnt += 1;
                             if cnt > 50 {
                                 info!(?i, "terminate");
-                                return Ok((0, start.elapsed()));
+                                return Ok((0, 0, start.elapsed()));
                             }
 
                             debug!(elapsed = ?start.elapsed(), ?i, "retrying req");
@@ -93,6 +94,7 @@ pub fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     }
 
                     tot_bytes += recv_jh.join().unwrap()?;
+                    tot_pkts += 1;
                     info!(elapsed = ?start.elapsed(), ?i, "connection_started");
                     let mut p = shenango::poll::PollWaiter::new();
                     let sleep_trigger = p.trigger(TIME);
@@ -104,18 +106,22 @@ pub fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     let latest_elapsed =
                         Arc::new(AtomicUsize::new((Instant::now() - start).as_micros() as _));
                     let tot_bytes = Arc::new(AtomicUsize::new(tot_bytes));
+                    let tot_pkts = Arc::new(AtomicUsize::new(tot_pkts));
                     let recv_trigger = p.trigger(RECV);
                     let le = Arc::clone(&latest_elapsed);
                     let tb = Arc::clone(&tot_bytes);
+                    let tp = Arc::clone(&tot_pkts);
                     shenango::thread::spawn(move || {
                         let _recv_trigger = recv_trigger;
                         let tot_bytes = tb;
+                        let tot_pkts = tp;
                         let latest_elapsed = le;
                         loop {
                             let (_, m) = cn.recv()?;
                             assert!(!m.is_empty());
                             tot_bytes.fetch_add(m.len(), Ordering::Relaxed);
-                            trace!(?tot_bytes, ?i, "received part");
+                            tot_pkts.fetch_add(1, Ordering::Relaxed);
+                            trace!(?tot_bytes, ?tot_pkts, ?i, "received part");
                             if m[0] == 1 {
                                 break;
                             } else {
@@ -131,28 +137,29 @@ pub fn shenangort_bertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     p.wait();
 
                     let tot_bytes = tot_bytes.load(Ordering::SeqCst);
+                    let tot_pkts = tot_pkts.load(Ordering::SeqCst);
                     let elapsed = Duration::from_micros(latest_elapsed.load(Ordering::SeqCst) as _);
-                    info!(?tot_bytes, ?elapsed, ?i, "done");
-                    Ok((tot_bytes, elapsed))
+                    info!(?tot_bytes, ?tot_pkts, ?elapsed, ?i, "done");
+                    Ok((tot_bytes, tot_pkts, elapsed))
                 });
                 jhs.push(jh);
             }
 
             wg.wait();
-            let joined: Vec<Result<(usize, Duration), Report>> =
+            let joined: Vec<Result<(usize, usize, Duration), Report>> =
                 jhs.into_iter().map(|jh| jh.join().unwrap()).collect();
-            let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+            let (tot_bytes, tot_pkts, elapsed) = joined
                 .into_iter()
-                .collect::<Result<Vec<(usize, Duration)>, _>>()
-                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("client thread errored")
                 .into_iter()
-                .unzip();
-            let tot_bytes: usize = tot_bytes.into_iter().sum();
-            let elapsed = durs.into_iter().max().unwrap();
-            info!(?tot_bytes, ?elapsed, "all clients done");
+                .reduce(|(b, p, d), (bi, pi, di)| (b + bi, p + pi, std::cmp::max(d, di)))
+                .expect("There should be at least one client thread");
+            info!(?tot_bytes, ?tot_pkts, ?elapsed, "all clients done");
             super::write_results(
                 of,
                 tot_bytes,
+                tot_pkts,
                 elapsed,
                 num_clients,
                 download_size,

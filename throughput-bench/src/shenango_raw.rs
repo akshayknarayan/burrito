@@ -32,6 +32,7 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
                     info!(?addr, ?download_size, "starting client");
                     let mut tot_bytes = 0;
+                    let mut tot_pkts = 0;
                     let mut start = Instant::now();
 
                     // 2. get bytes
@@ -64,7 +65,7 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                             cnt += 1;
                             debug!(elapsed = ?start.elapsed(), ?i, ?cnt, "retrying req");
                             if cnt > 50 {
-                                return Ok((0, start.elapsed()));
+                                return Ok((0, 0, start.elapsed()));
                             }
 
                             start = Instant::now();
@@ -76,6 +77,7 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
 
                     debug!(elapsed = ?start.elapsed(), ?i, "connection started");
                     tot_bytes += recv_jh.join().unwrap()?;
+                    tot_pkts += 1;
 
                     let mut buf = [0u8; 2048];
                     let mut last_recv_time = Instant::now();
@@ -83,7 +85,8 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                         let s = cn.recv(&mut buf[0..2048])?;
                         assert!(s != 0);
                         tot_bytes += s;
-                        trace!(?tot_bytes, ?i, ?s, "received part");
+                        tot_pkts += 1;
+                        trace!(?tot_bytes, ?tot_pkts, ?i, ?s, "received part");
                         if buf[0] == 1 {
                             cn.write_to(&buf[0..16], addr)?;
                             break;
@@ -93,27 +96,27 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     }
 
                     let elapsed = last_recv_time - start;
-                    info!(?tot_bytes, ?elapsed, "done");
-                    Ok((tot_bytes, elapsed))
+                    info!(?tot_bytes, ?tot_pkts, ?elapsed, "done");
+                    Ok((tot_bytes, tot_pkts, elapsed))
                 });
                 jhs.push(jh);
             }
 
-            let joined: Vec<Result<(usize, Duration), Report>> =
+            let joined: Vec<Result<(usize, usize, Duration), Report>> =
                 jhs.into_iter().map(|jh| jh.join().unwrap()).collect();
-            let (tot_bytes, durs): (Vec<usize>, Vec<Duration>) = joined
+            let (tot_bytes, tot_pkts, elapsed) = joined
                 .into_iter()
-                .collect::<Result<Vec<(usize, Duration)>, _>>()
-                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("client thread errored")
                 .into_iter()
-                .unzip();
-            let tot_bytes: usize = tot_bytes.into_iter().sum();
-            let elapsed = durs.into_iter().max().unwrap();
-            info!(?tot_bytes, ?elapsed, "all clients done");
+                .reduce(|(b, p, d), (bi, pi, di)| (b + bi, p + pi, std::cmp::max(d, di)))
+                .expect("There should be at least one client thread");
+            info!(?tot_bytes, ?tot_pkts, ?elapsed, "all clients done");
 
             super::write_results(
                 of,
                 tot_bytes,
+                tot_pkts,
                 elapsed,
                 num_clients,
                 download_size,
