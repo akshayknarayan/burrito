@@ -4,7 +4,7 @@ use shenango::udp;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
     if let Mode::Client(mut cl) = mode {
@@ -30,7 +30,7 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                     wg.done();
                     wg.wait();
 
-                    info!(?addr, ?download_size, "starting client");
+                    info!(?addr, ?download_size, ?i, "starting client");
                     let mut tot_bytes = 0;
                     let mut tot_pkts = 0;
                     let mut start = Instant::now();
@@ -60,14 +60,14 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                             shenango::time::sleep(Duration::from_millis(100));
                         });
 
-                        debug!(elapsed = ?start.elapsed(), ?i, "waiting");
                         if p.wait() == TIME {
                             cnt += 1;
-                            debug!(elapsed = ?start.elapsed(), ?i, ?cnt, "retrying req");
                             if cnt > 50 {
+                                error!(?cnt, ?i, "too many retries, aborting client");
                                 return Ok((0, 0, start.elapsed()));
                             }
 
+                            debug!(elapsed = ?start.elapsed(), ?i, ?cnt, "retrying req");
                             start = Instant::now();
                             cn.write_to(&req, addr)?;
                         } else {
@@ -75,9 +75,9 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                         }
                     }
 
-                    debug!(elapsed = ?start.elapsed(), ?i, "connection started");
                     tot_bytes += recv_jh.join().unwrap()?;
                     tot_pkts += 1;
+                    info!(elapsed = ?start.elapsed(), ?i, "connection started");
 
                     let mut buf = [0u8; 2048];
                     let mut last_recv_time = Instant::now();
@@ -149,7 +149,7 @@ pub fn shenango_nobertha(cfg: std::path::PathBuf, port: u16, mode: Mode) {
                 let mut remaining = u64::from_le_bytes(msg[8..16].try_into().unwrap());
                 let pkt_size = u64::from_le_bytes(msg[16..24].try_into().unwrap());
 
-                if pkt_size < 64 || pkt_size > 1460 {
+                if !(64..=1460).contains(&pkt_size) {
                     debug!("bad client request");
                     return;
                 }
