@@ -1,6 +1,7 @@
 //! Bertha logic adapted to work inside a shenango runtime
 // we will only use the things needed for the kvstore application.
 
+pub use base_traits::Chunnel;
 pub use base_traits::ChunnelConnection;
 mod base_traits {
     use bertha::{CxList, CxNil};

@@ -206,19 +206,17 @@ fn main() -> Result<(), Report> {
 
     #[cfg(feature = "use_shenango")]
     {
-        use color_eyre::eyre::ensure;
-        if no_bertha.try_get_stack_depth().is_err() && datapath == "shenango" {
+        if no_bertha.is_raw() && (datapath == "shenango" || datapath == "shenangort") {
             shenango_raw::shenango_nobertha(cfg, port, mode);
             unreachable!();
         } else if datapath == "shenangort" {
-            ensure!(
-                no_bertha
-                    .try_get_stack_depth()
-                    .map_err(|_| eyre!("shenangort implies using bertha"))?
-                    == 0,
-                "shenango with more than 0 no-op chunnels not yet supported"
-            );
-            shenangort::shenangort_bertha(cfg, port, mode);
+            let stack_depth = match no_bertha {
+                BerthaNess::Full { stack_depth } => stack_depth,
+                BerthaNess::UsingChunnelConnection => 0,
+                BerthaNess::Raw => unreachable!(),
+            };
+
+            shenangort::shenangort_bertha(cfg, port, mode, stack_depth);
             unreachable!();
         }
     }
