@@ -12,11 +12,11 @@ import toml
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/build/lib/x86_64-linux-gnu"
 
-def start_server(conn, outf, variant='kernel', use_bertha='full', extra_cfg=None):
+def start_server(conn, outf, variant='kernel', use_bertha='full:0', extra_cfg=None):
     conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
-        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+        conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
         cfg = "--cfg shenango.config"
     elif 'dpdk' in variant:
         cfg = "--cfg dpdk.config"
@@ -32,7 +32,7 @@ def start_server(conn, outf, variant='kernel', use_bertha='full', extra_cfg=None
 
     no_bertha = f'--no-bertha={use_bertha}'
     time.sleep(5)
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} perf record -g ./target/release/throughput-bench \
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/throughput-bench \
         -p 4242 \
         --datapath {variant} \
         {no_bertha} \
@@ -54,7 +54,7 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
     conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
-        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+        conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
         cfg = "--cfg shenango.config"
     elif 'dpdk' in variant:
         cfg = "--cfg dpdk.config"
@@ -103,7 +103,7 @@ def do_exp(iter_num,
     packet_size=None,
     num_clients=None,
     datapath=None,
-    use_bertha='full',
+    use_bertha='full:0',
     overwrite=None
 ):
     assert(
@@ -126,7 +126,7 @@ def do_exp(iter_num,
         m.run(f"rm -rf {outdir}", wd="~/burrito")
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
-    if (datapath == 'shenango' and use_bertha == 'full'):
+    if (datapath == 'shenango' and 'full' in use_bertha):
         agenda.task(f"skipping: {outf}.data")
         return True
 
@@ -303,10 +303,10 @@ if __name__ == '__main__':
         sys.exit(1)
 
     if 'bertha' not in cfg['exp']:
-        cfg['exp']['bertha'] = [True]
+        cfg['exp']['bertha'] = ['full:0']
     for t in cfg['exp']['bertha']:
-        if t not in ['full', 'berthaconn', 'raw']:
-            agenda.failure("Unknown no_bertha mode")
+        if not ((t not in ['berthaconn', 'raw']) or ('full' not in t)):
+            agenda.failure(f"Unknown no_bertha mode {t}")
             sys.exit(1)
     if 'num_clients' not in cfg['exp']:
         agenda.failure("Need num_clients")

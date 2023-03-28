@@ -253,20 +253,7 @@ def write_cfg(conn, config, name):
     else:
         subprocess.run(f"rm -f {name}.config && cp {fname} {name}.config", shell=True)
 
-def write_shenango_config(conn):
-    shenango_config = f"""\
-host_addr {conn.addr}
-host_netmask 255.255.255.0
-host_gateway 10.1.1.1
-runtime_kthreads 2
-runtime_spininng_kthreads 2
-runtime_guaranteed_kthreads 2
-"""
-    write_cfg(conn, shenango_config, 'shenango')
-
-
-dpdk_driver = None
-def write_dpdk_config(conn, machines, lcores):
+def get_pci_addr(conn):
     search = None
     if 'mlx' in dpdk_driver:
         search = 'drv=mlx.*Active'
@@ -292,7 +279,24 @@ def write_dpdk_config(conn, machines, lcores):
         agenda.subtask(f"[{conn.addr}] pci: {pci_addr} iface: {iface}")
     else:
         raise Exception(f"Could not get pci address on {conn.addr}")
+    return pci_addr
 
+
+def write_shenango_config(conn, num_threads):
+    shenango_config = f"""\
+host_addr {conn.addr}
+host_netmask 255.255.255.0
+host_gateway 10.1.1.1
+runtime_kthreads {num_threads}
+runtime_spininng_kthreads {num_threads}
+runtime_guaranteed_kthreads {num_threads}
+"""
+    write_cfg(conn, shenango_config, 'shenango')
+
+
+dpdk_driver = None
+def write_dpdk_config(conn, machines, lcores):
+    pci_addr = conn.pci_addr
     agenda.subtask(f"dpdk configuration file pci_addr={pci_addr} lcore_cfg={lcores}")
     # compile arp entries
     machines = [machines['server']] + machines['clients']
@@ -783,10 +787,14 @@ def setup_all(machines, cfg, args, setup_fn):
     if 'intel' == args.dpdk_driver:
         intel_devbind(machines, 'kernel')
 
+    for m in machines:
+        pci_addr = get_pci_addr(m)
+        m.pci_addr = pci_addr
+
     agenda.task("writing configuration files")
     if any('shenango' in d for d in cfg['exp']['datapath']):
         for m in machines:
-            write_shenango_config(m)
+            write_shenango_config(m, min(len(cfg['cfg']['lcores'].split(',')), 2))
     if any('dpdk' in d for d in cfg['exp']['datapath']):
         for m in machines:
             write_dpdk_config(m, cfg['machines'], cfg['cfg']['lcores'])
