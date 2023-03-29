@@ -452,7 +452,15 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
         .await?;
     let start = Instant::now();
     let mut last_recv_time = None;
-    let mut slots: Vec<_> = (0..16).map(|_| Default::default()).collect();
+    // pre-allocate the receive buffer.
+    let mut slots: Vec<_> = (0..16)
+        .map(|_| {
+            Some((
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+                Vec::with_capacity(packet_size),
+            ))
+        })
+        .collect();
     'cn: loop {
         let ms = if last_recv_time.is_none() {
             match tokio::time::timeout(Duration::from_millis(100), cn.recv(&mut slots)).await {
@@ -469,12 +477,14 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
         };
 
         last_recv_time = Some(Instant::now());
-        for (_, r) in ms.iter_mut().map_while(Option::take) {
+        // don't uselessly throw away our hard-allocated Vec with an `Option::take`
+        for (_, r) in ms.iter().map_while(Option::as_ref) {
             tot_bytes += r.len();
             tot_pkts += 1;
             trace!(?tot_bytes, ?tot_pkts, "received part");
             if r[0] == 1 {
-                cn.send(std::iter::once((SocketAddr::V4(addr), r))).await?;
+                cn.send(std::iter::once((SocketAddr::V4(addr), r.clone())))
+                    .await?;
                 break 'cn;
             }
         }
