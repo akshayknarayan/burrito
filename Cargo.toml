@@ -20,6 +20,7 @@ members = [
     "queue-steer",
     "redis-basechunnel",
     "tls-tunnel",
+    "tcp",
     "negotiation-bench",
     "latency-bench",
     "throughput-bench",
@@ -30,6 +31,3 @@ members = [
 [profile.release]
 debug = true
 lto = true
-
-[profile.release.package.kvstore]
-debug = true
