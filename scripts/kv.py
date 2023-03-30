@@ -340,7 +340,7 @@ def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, 
     conn.run("sudo pkill -INT iokerneld")
 
     if datapath == 'shenango_channel':
-        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+        conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
         datapath = 'shenango'
         cfg = '--cfg=shenango.config'
     elif datapath == 'kernel':
@@ -369,7 +369,7 @@ def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arriv
     conn.run("sudo pkill -INT iokerneld")
 
     if datapath == 'shenango_channel':
-        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+        conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
         datapath = 'shenango'
         cfg = '--cfg=shenango.config'
     elif datapath == 'kernel':
@@ -826,7 +826,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--outdir', type=str, required=True)
     parser.add_argument('--overwrite', action='store_true')
-    parser.add_argument('--dpdk_driver', type=str, choices=['mlx', 'intel'],  required=False)
+    parser.add_argument('--dpdk_driver', type=str, choices=['mlx4', 'mlx5', 'intel'],  required=False)
     parser.add_argument('--setup_only', action='store_true',  required=False)
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")
@@ -862,8 +862,8 @@ if __name__ == '__main__':
             sys.exit(1)
 
     if any('dpdk' in d for d in cfg['exp']['datapath']):
-        if args.dpdk_driver not in ['mlx', 'intel']:
-            agenda.failure("If using dpdk datapath, must specify mlx or intel driver.")
+        if args.dpdk_driver not in ['mlx4', 'mlx5', 'intel']:
+            agenda.failure("If using dpdk datapath, must specify mlx4, mlx5, or intel driver.")
 
     if 'negotiation' not in cfg['exp']:
         cfg['exp']['negotiation'] = [True]
