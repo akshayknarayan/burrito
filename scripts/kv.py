@@ -333,7 +333,7 @@ def get_timeout_remote(conn, wrkfile, interarrival_us) -> int:
     num_reqs = int(res.stdout.strip().split()[0])
     return get_timeout_inner(num_reqs, interarrival_us)
 
-dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
+dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/build/lib/x86_64-linux-gnu"
 
 def start_server(conn, redis_addr, outf, datapath='shenango_channel', shards=1, skip_negotiation=False):
     conn.run("sudo pkill -INT kvserver")
