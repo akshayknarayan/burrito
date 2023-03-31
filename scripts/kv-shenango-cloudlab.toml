@@ -1,4 +1,4 @@
-# This config uses cloudlab machines. The ip addresses probably need to be replaced.
+# This config uses cloudlab xl170 machines. The ip and mac addresses probably need to be replaced.
 
 [machines]
 server = { access = "128.110.218.105", user = "akshayn", alt = "128.110.218.105", exp = "10.10.1.2", mac = "9c:dc:71:5d:01:91" } # node-0
@@ -19,9 +19,10 @@ num-threads = 10
 [exp]
 #wrk = ["./kvstore-ycsb/ycsbc-mock/workloadb-4.access", "./kvstore-ycsb/ycsbc-mock/workloadb-8.access"]
 wrk = ["./kvstore-ycsb/ycsbc-mock/workloadb-8.access"]
-datapath = ['dpdkmulti']
+datapath = ['shenangort']
 load = [10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000, 180000, 200000, 240000, 280000, 320000, 360000, 400000]
 poisson-arrivals = [true]
 #shardtype = ["client", "server"]
 shardtype = ["client"]
 shards = [8]
+no-chunnels = [true, false]

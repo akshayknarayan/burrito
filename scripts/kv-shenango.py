@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-from kv import connect_machines, setup_all, get_local, check, get_timeout_local, write_cfg
+from kv import connect_machines, setup_all, get_local, check, get_timeout_local, write_cfg, write_shenango_config
 import agenda
 import argparse
 import os
@@ -11,22 +11,11 @@ import threading
 import time
 import toml
 
-def write_shenango_config(conn):
-    shenango_config = f"""
-host_addr {conn.addr}
-host_netmask 255.255.255.0
-host_gateway 10.1.1.1
-runtime_kthreads 6
-runtime_spininng_kthreads 6
-runtime_guaranteed_kthreads 6"""
-    write_cfg(conn, shenango_config, 'shenango')
-
 def start_server(conn, outf, shards=1, no_chunnels=False):
     conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
-    write_shenango_config(conn)
-    conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+    conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     nochunnels = ''
     if no_chunnels:
@@ -42,15 +31,13 @@ def start_server(conn, outf, shards=1, no_chunnels=False):
     check(ok, "spawn server", conn.addr)
     agenda.subtask("wait for kvserver check")
     time.sleep(8)
-    conn.check_proc(f"kvserver", f"{outf}.err")
+    conn.check_proc(f"kvserver", [f"{outf}.err"])
 
 def run_client(conn, server, interarrival, poisson_arrivals, no_chunnels, outf, wrkfile):
     conn.run("sudo pkill -INT iokerneld")
 
     timeout = get_timeout_local(wrkfile, interarrival)
-    write_shenango_config(conn)
-
-    conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+    conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
 
@@ -81,9 +68,7 @@ def run_client(conn, server, interarrival, poisson_arrivals, no_chunnels, outf, 
 def run_loads(conn, server, outf, wrkfile, no_chunnels=False):
     conn.run("sudo pkill -INT iokerneld")
 
-    write_shenango_config(conn)
-    #while True:
-    conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
+    conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     nochunnels = ''
     shards_arg = ''
@@ -115,10 +100,8 @@ def run_loads(conn, server, outf, wrkfile, no_chunnels=False):
     if ok is None or ok.exited != 0:
         agenda.subfailure(f"loads failed, retrying after {time.time() - loads_start} s")
         sys.exit(1)
-        #continue
     else:
         agenda.subtask(f"loads client done: {time.time() - loads_start} s")
-        #break
 
 def do_exp(iter_num,
     outdir=None,
@@ -207,9 +190,6 @@ def do_exp(iter_num,
     machines[0].run("sudo pkill -INT kvserver")
     machines[0].run("sudo pkill -INT iokerneld")
 
-    for m in machines:
-        m.run("rm ~/burrito/*.config")
-
     agenda.task("get server files")
     if not machines[0].local:
         machines[0].get(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
@@ -267,6 +247,17 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         ok = conn.run("bash scripts/install-kv-deps.sh", wd="~/burrito")
         check(ok, "install dependencies", conn.addr)
 
+        # caladan/build/config:
+        # CONFIG_MLX5=y/n, CONFIG_MLX4=y/n
+        if dpdk_driver == 'mlx5':
+            ok = conn.run("grep -q \"CONFIG_MLX5=y\" build/config", wd = "~/burrito/shenango-chunnel/caladan")
+            check(ok, "dpdk_driver was mlx5 but shenango not configured with mlx5 support", conn.addr)
+        elif dpdk_driver == 'mlx4':
+            ok = conn.run("grep -q \"CONFIG_MLX4=y\" build/config", wd = "~/burrito/shenango-chunnel/caladan")
+            check(ok, "dpdk_driver was mlx4 but shenango not configured with mlx4 support", conn.addr)
+        else:
+            raise Exception(f"Unknown dpdk_driver for shenango {dpdk_driver}")
+
         agenda.subtask(f"[{conn.addr}] building shenango")
         # need to compile iokerneld
         ok = conn.run("make", wd = "~/burrito/shenango-chunnel/caladan")
@@ -307,6 +298,8 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--outdir', type=str, required=True)
     parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--dpdk_driver', type=str, choices=['mlx4', 'mlx5'],  required=False)
+    parser.add_argument('--setup_only', action='store_true',  required=False)
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")
     cfg = toml.load(args.config)
@@ -345,18 +338,24 @@ if __name__ == '__main__':
 
     machines = connect_machines(cfg)
 
+    found_local = False
     for m in machines:
         if m.host in ['127.0.0.1', '::1', 'localhost']:
             agenda.subtask(f"Local conn: {m.host}/{m.addr}")
             m.is_local = True
+            found_local = True
         else:
             m.is_local = False
 
+    if not found_local:
+        subprocess.run(f"mkdir -p {args.outdir}", shell=True)
+
     # build
-    # shenango is mlx only
-    args.dpdk_driver = 'mlx'
-    cfg['exp']['datapath'] = 'shenangort'
+    cfg['exp']['datapath'] = ['shenangort']
     setup_all(machines, cfg, args, setup_machine)
+    if args.setup_only:
+        agenda.task("setup done")
+        sys.exit(0)
 
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
