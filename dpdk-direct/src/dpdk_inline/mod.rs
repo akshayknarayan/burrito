@@ -162,7 +162,7 @@ fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
                 let core_id = init_state_g
                     .lcore_map
                     .pop()
-                    .ok_or(eyre!("No remaining lcores"))?;
+                    .ok_or_else(|| eyre!("No remaining lcores"))?;
 
                 // affinitize
                 affinitize_thread(core_id as _)
@@ -177,7 +177,7 @@ fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
                 let dpdk_state = init_state_g
                     .mempools
                     .pop()
-                    .ok_or(eyre!("No remaining initialized dpdk thread mempools"))?;
+                    .ok_or_else(|| eyre!("No remaining initialized dpdk thread mempools"))?;
                 info!(?core_id, qid = ?dpdk_state.rx_queue_id(), "taking initialized DpdkState");
                 *dpdk = Some(dpdk_state);
             }
@@ -221,7 +221,7 @@ impl ChunnelListener for DpdkInlineChunnel {
                         let mut dpdk_opt = dpdk_cell.borrow_mut();
                         let dpdk = dpdk_opt
                             .as_mut()
-                            .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                            .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
                         if let Err(err) = {
                             let mut steering_g = self.flow_steering.lock().unwrap();
@@ -265,7 +265,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
                     let mut dpdk_opt = dpdk_cell.borrow_mut();
                     let dpdk = dpdk_opt
                         .as_mut()
-                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
                     let port = {
                         let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
@@ -423,7 +423,7 @@ impl ChunnelConnection for DpdkInlineCn {
                     let mut dpdk_opt = dpdk_cell.borrow_mut();
                     let dpdk = dpdk_opt
                         .as_mut()
-                        .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                        .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
 
                     dpdk.send_burst(burst.into_iter().map(|(to_addr, buf)| {
                         use SocketAddr::*;
@@ -476,7 +476,7 @@ impl ChunnelConnection for DpdkInlineCn {
                             let mut dpdk_opt = dpdk_cell.borrow_mut();
                             let dpdk = dpdk_opt
                                 .as_mut()
-                                .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                                .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
                             let msgs =
                                 dpdk.try_recv_burst(Some((local_port, remote_addr)), new_conns, Some(msgs_buf.len()))?;
 
@@ -506,7 +506,7 @@ impl ChunnelConnection for DpdkInlineCn {
                         if clk.now().duration_since(start) > std::time::Duration::from_secs(5) {
                             if let Err(err) = DPDK_STATE.try_with(|dpdk_cell| {
                                 let mut dpdk_opt = dpdk_cell.borrow_mut();
-                                let dpdk = dpdk_opt.as_mut().ok_or(eyre!(
+                                let dpdk = dpdk_opt.as_mut().ok_or_else(|| eyre!(
                                     "dpdk not initialized on core {:?}",
                                     this_lcore
                                 ))?;
@@ -627,7 +627,7 @@ impl Drop for StreamState {
             let mut dpdk_opt = dpdk_cell.borrow_mut();
             let dpdk = dpdk_opt
                 .as_mut()
-                .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
+                .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
             steering_g.remove_flow(dpdk, self.listen_addr.port())?;
             Ok::<_, Report>(())
         }) {

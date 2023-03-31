@@ -31,7 +31,7 @@ impl std::str::FromStr for Datapath {
 
 fn get_first_line(x: &Path) -> Result<String, Report> {
     let mut f = BufReader::new(
-        std::fs::File::open(x).wrap_err(eyre!("could not open config file {:?}", x))?,
+        std::fs::File::open(x).wrap_err_with(|| eyre!("could not open config file {:?}", x))?,
     );
     let mut line = String::new();
     f.read_line(&mut line)
@@ -47,7 +47,7 @@ impl Datapath {
                 return Ok(());
             }
             Datapath::Shenango | Datapath::DpdkSingleThread | Datapath::DpdkMultiThread => {
-                cfg_file.ok_or(eyre!("datapath cfg must be specified"))?
+                cfg_file.ok_or_else(|| eyre!("datapath cfg must be specified"))?
             }
         };
 
