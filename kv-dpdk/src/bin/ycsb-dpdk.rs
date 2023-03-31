@@ -413,6 +413,7 @@ impl RawKvClient {
         let shard = shardfn(&req, self.inner.len());
         let cn = &self.inner[shard];
         let msg_id = req.id();
+        trace!(?shard, addr = ?cn.addr(), ?msg_id, "sending to shard");
         let mut send_buf = vec![0u8; 2048];
         let sz = bincode::serialized_size(&req)? as usize;
         bincode::serialize_into(&mut send_buf[..sz], &req)?;

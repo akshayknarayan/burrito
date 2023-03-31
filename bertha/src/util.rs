@@ -166,6 +166,10 @@ impl<A, C> ProjectLeft<A, C> {
     pub fn new(a: A, c: C) -> Self {
         ProjectLeft(a, c)
     }
+
+    pub fn addr(&self) -> &A {
+        &self.0
+    }
 }
 
 impl<A, C, D> ChunnelConnection for ProjectLeft<A, C>

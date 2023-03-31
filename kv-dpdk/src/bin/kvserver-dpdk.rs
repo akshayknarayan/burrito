@@ -46,7 +46,12 @@ fn main() -> Result<(), Report> {
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(single_shard_no_conns(ch, shard_addr)).unwrap();
+            if opt.conns {
+                let ch = DpdkInlineReqChunnel::from(ch);
+                rt.block_on(single_shard_conns(ch, shard_addr)).unwrap();
+            } else {
+                rt.block_on(single_shard_no_conns(ch, shard_addr)).unwrap();
+            }
         });
     }
 
