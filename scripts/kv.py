@@ -235,7 +235,7 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         check(ok, "ycsb build", conn.addr)
 
         if 'dpdkmulti' in datapaths:
-            needed_features = [f for f in needed_features if f == 'xl710_intel' or f == 'cx3_mlx']
+            needed_features = [f for f in needed_features if f == 'xl710_intel' or f == 'cx3_mlx' or f == 'cx4_mlx']
             agenda.subtask(f"building kv-dpdk features={needed_features}")
             ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\"", wd = "~/burrito/kv-dpdk")
             check(ok, "kv-dpdk build", conn.addr)
