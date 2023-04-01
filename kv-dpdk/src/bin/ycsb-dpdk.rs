@@ -414,12 +414,12 @@ impl RawKvClient {
         let cn = &self.inner[shard];
         let msg_id = req.id();
         trace!(?shard, addr = ?cn.addr(), ?msg_id, "sending to shard");
-        let mut send_buf = vec![0u8; 2048];
+        let mut send_buf = vec![0u8; 1460];
         let sz = bincode::serialized_size(&req)? as usize;
         bincode::serialize_into(&mut send_buf[..sz], &req)?;
         let (s, r) = flume::bounded(1);
 
-        cn.send(std::iter::once(send_buf.clone())).await?;
+        cn.send(std::iter::once(send_buf[..sz].to_vec())).await?;
 
         self.inflight.lock().unwrap().insert(msg_id, s);
         let mut msgs_buf: Vec<_> = (0..16).map(|_| None).collect();
@@ -440,7 +440,7 @@ impl RawKvClient {
                 }
                 // timed out
                 Either::Left((Err(_), _)) => {
-                    cn.send(std::iter::once(send_buf.clone())).await?;
+                    cn.send(std::iter::once(send_buf[..sz].to_vec())).await?;
                 }
                 // got messages.
                 Either::Right((ms, _)) => {
