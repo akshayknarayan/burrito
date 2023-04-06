@@ -88,6 +88,7 @@ pub trait Negotiate {
     ///
     /// Implementors can pass the nonce to other instances of `negotiate_server` to pick the same
     /// stack.
+    // TODO pass the peer address.
     fn picked<'s>(&mut self, _nonce: &'s [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
         Box::pin(futures_util::future::ready(()))
     }

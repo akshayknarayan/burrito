@@ -1,8 +1,10 @@
 [package]
 name = "tls-tunnel"
 version = "0.1.0"
-authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2021"
+
+[features]
+ghostunnel = ["rand", "tokio/net", "tokio/io-util", "tokio/process"]
 
 [dependencies]
 bertha = { path = "../bertha" }
@@ -10,11 +12,14 @@ futures-util = "0.3"
 color-eyre = "0.6"
 tracing = "0.1"
 tracing-futures = "0.2"
-rand = "0.8"
-tokio = { version = "1", features = ["net", "io-util", "process"] }
+tokio = "1"
 serde = "1"
+rand = { version = "0.8", optional = true }
+rustls = { version = "0.21", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-tracing-subscriber = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-error = "0.2"
+rcgen = "0.10.0"
+tcp = { path = "../tcp" }

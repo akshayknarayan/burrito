@@ -6,7 +6,7 @@
 #![feature(iter_array_chunks)]
 
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{bail, ensure, eyre, Context, Report};
+use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use futures_util::stream::{Stream, TryStreamExt};
 use std::cmp::Ordering;
 use std::net::SocketAddr;
@@ -53,6 +53,52 @@ impl ChunnelConnector for TcpChunnel {
         Box::pin(async move {
             let sk = TcpStream::connect(a).await?;
             Ok(TcpCn::new(sk))
+        })
+    }
+}
+
+pub struct IgnoreAddr<A, C>(pub A, pub C);
+
+impl<A, C, D> ChunnelConnection for IgnoreAddr<A, C>
+where
+    C: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    A: Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+    D: Send,
+{
+    type Data = (A, D);
+
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.1.send(burst.into_iter().map(|(_, d)| d))
+    }
+
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        Box::pin(async move {
+            let mut with_addr_slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+            let ms = self.1.recv(&mut with_addr_slots[..]).await?;
+            let mut ret_len = 0;
+            for (msg, slot) in ms
+                .iter_mut()
+                .map_while(Option::take)
+                .zip(msgs_buf.iter_mut())
+            {
+                *slot = Some((self.0.clone(), msg));
+                ret_len += 1;
+            }
+
+            Ok(&mut msgs_buf[..ret_len])
         })
     }
 }
@@ -127,7 +173,7 @@ impl ChunnelConnection for TcpCn {
                             continue;
                         }
                         Err(e) => {
-                            bail!(e);
+                            bail!(eyre!(e).wrap_err("try_write_vectored error"));
                         }
                     }
                 }
@@ -136,6 +182,10 @@ impl ChunnelConnection for TcpCn {
             if let Some(rem) = batches.into_remainder() {
                 // rem is an iterator with at least 1 and at most 7 elements.
                 let rem_buf = rem.as_slice();
+                if rem_buf.is_empty() {
+                    bail!("remainder is empty (?)");
+                }
+
                 const NULL: [u8; 0] = [];
                 let mut final_batch_nums = [
                     [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4],
@@ -190,7 +240,10 @@ impl ChunnelConnection for TcpCn {
                             continue;
                         }
                         Err(e) => {
-                            bail!(e);
+                            bail!(eyre!(e).wrap_err(eyre!(
+                                "try_write_vectored remainder error: {:?}",
+                                rem_buf.len() * 2
+                            )));
                         }
                     }
                 }
@@ -213,6 +266,8 @@ impl ChunnelConnection for TcpCn {
             let mut tot_msgs = 0;
             'readable: loop {
                 self.inner.readable().await?;
+                // TODO would be more efficient to do bigger reads into buf, and do message
+                // assembly from a buffer here.
 
                 let mut len_buf = [0; 4];
                 let mut buf = [0; 2048];
@@ -267,9 +322,13 @@ impl ChunnelConnection for TcpCn {
                             }
                         }
                     } else {
+                        ensure!(
+                            partial_header_len < len_buf.len(),
+                            "partial_header_len is wrong"
+                        );
                         match self.inner.try_read(&mut len_buf[partial_header_len..]) {
                             Ok(0) => {
-                                unreachable!();
+                                unreachable!()
                             }
                             Ok(n) => {
                                 partial_header_len += n;
@@ -279,11 +338,12 @@ impl ChunnelConnection for TcpCn {
                                     Ordering::Equal => (),
                                 }
                             }
+                            Err(ref e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock && tot_msgs > 0 =>
+                            {
+                                return Ok(&mut msgs_buf[..tot_msgs]);
+                            }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                if tot_msgs > 0 {
-                                    return Ok(&mut msgs_buf[..tot_msgs]);
-                                }
-
                                 continue 'readable;
                             }
                             Err(e) => {
@@ -309,7 +369,7 @@ impl ChunnelConnection for TcpCn {
 mod t {
     use super::TcpChunnel;
     use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-    use color_eyre::eyre::{ensure, Context, Report};
+    use color_eyre::eyre::{ensure, Report, WrapErr};
     use futures_util::TryStreamExt;
     use std::sync::Arc;
     use std::sync::Once;
