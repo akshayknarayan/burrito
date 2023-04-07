@@ -21,6 +21,7 @@ members = [
     "redis-basechunnel",
     "tls-tunnel",
     "tcp",
+    "quic-chunnel",
     "negotiation-bench",
     "latency-bench",
     "throughput-bench",
