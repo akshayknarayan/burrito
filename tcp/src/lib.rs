@@ -57,6 +57,7 @@ impl ChunnelConnector for TcpChunnel {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct IgnoreAddr<A, C>(pub A, pub C);
 
 impl<A, C, D> ChunnelConnection for IgnoreAddr<A, C>
@@ -362,6 +363,119 @@ impl ChunnelConnection for TcpCn {
                 }
             }
         })
+    }
+}
+
+pub trait Connected {
+    fn local_addr(&self) -> SocketAddr;
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+}
+
+impl Connected for TcpCn {
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr().unwrap()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr().ok()
+    }
+}
+
+impl Connected for bertha::udp::UdpSk<SocketAddr> {
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr().unwrap()
+    }
+}
+
+impl Connected for bertha::udp::UdpConn {
+    fn local_addr(&self) -> SocketAddr {
+        self.inner().local_addr().unwrap()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        Some(self.peer())
+    }
+}
+
+impl<C: Connected> Connected for bertha::util::ProjectLeft<SocketAddr, C> {
+    fn local_addr(&self) -> SocketAddr {
+        self.conn().local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        Some(*self.addr())
+    }
+}
+
+impl<C: Connected, D> Connected for bertha::negotiate::InjectWithChannel<C, D> {
+    fn local_addr(&self) -> SocketAddr {
+        self.conn().local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.conn().peer_addr()
+    }
+}
+
+pub struct Connect<C>(SocketAddr, C);
+
+impl<C> Connect<C> {
+    pub fn new(addr: SocketAddr, inner: C) -> Self {
+        Self(addr, inner)
+    }
+}
+
+impl<C, D> ChunnelConnection for Connect<C>
+where
+    C: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
+    D: Send + 'static,
+{
+    type Data = (SocketAddr, D);
+
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        Box::pin(
+            self.1
+                .send(burst.into_iter().map(|(_, data)| (self.0, data))),
+        ) as _
+    }
+
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        Box::pin(async move {
+            let msgs = self.1.recv(&mut msgs_buf[..]).await?;
+            for (a, _) in msgs.iter_mut().map_while(Option::as_mut) {
+                *a = self.0;
+            }
+
+            Ok(&mut msgs[..])
+        })
+    }
+}
+
+impl<C> Connected for Connect<C>
+where
+    C: Connected,
+{
+    fn local_addr(&self) -> SocketAddr {
+        self.1.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        Some(self.0)
     }
 }
 
