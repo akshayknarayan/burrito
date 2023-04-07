@@ -21,6 +21,10 @@ impl<C, D> InjectWithChannel<C, D> {
             s,
         )
     }
+
+    pub fn conn(&self) -> &C {
+        &self.0
+    }
 }
 
 impl<C, D> ChunnelConnection for InjectWithChannel<C, D>

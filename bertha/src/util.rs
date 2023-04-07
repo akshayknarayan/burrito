@@ -170,6 +170,10 @@ impl<A, C> ProjectLeft<A, C> {
     pub fn addr(&self) -> &A {
         &self.0
     }
+
+    pub fn conn(&self) -> &C {
+        &self.1
+    }
 }
 
 impl<A, C, D> ChunnelConnection for ProjectLeft<A, C>

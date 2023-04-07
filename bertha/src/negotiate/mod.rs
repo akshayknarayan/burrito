@@ -191,6 +191,7 @@ pub enum NegotiateMsg {
 }
 
 mod inject_with_channel;
+pub use inject_with_channel::InjectWithChannel;
 mod negotiate_picked;
 pub use negotiate_picked::NegotiatePicked;
 mod get_offers;

@@ -255,6 +255,14 @@ impl UdpConn {
             send,
         }
     }
+
+    pub fn peer(&self) -> SocketAddr {
+        self.resp_addr
+    }
+
+    pub fn inner(&self) -> &UdpSk<SocketAddr> {
+        &self.send
+    }
 }
 
 pub(crate) async fn recv_channel_burst<'cn, 'buf, A>(
