@@ -7,7 +7,7 @@
 
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
-use futures_util::stream::{Stream, TryStreamExt};
+use futures_util::stream::{Stream, StreamExt, TryStreamExt};
 use std::cmp::Ordering;
 use std::net::SocketAddr;
 use std::{future::Future, pin::Pin};
@@ -17,10 +17,12 @@ use tokio_stream::wrappers::TcpListenerStream;
 /// TCP Chunnel connector.
 ///
 /// Wraps [`tokio::net::TcpSocket`]. Carries no state.
+///
+/// If `WITHADDR` == true, wrap the returned connection in an [`IgnoreAddr`].
 #[derive(Default, Clone, Debug)]
-pub struct TcpChunnel;
+pub struct TcpChunnel<const WITHADDR: bool = false>;
 
-impl ChunnelListener for TcpChunnel {
+impl ChunnelListener for TcpChunnel<false> {
     type Addr = SocketAddr;
     type Connection = TcpCn;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
@@ -42,7 +44,29 @@ impl ChunnelListener for TcpChunnel {
     }
 }
 
-impl ChunnelConnector for TcpChunnel {
+impl ChunnelListener for TcpChunnel<true> {
+    type Addr = SocketAddr;
+    type Connection = IgnoreAddr<SocketAddr, TcpCn>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Stream =
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Report;
+
+    fn listen(&mut self, a: Self::Addr) -> Self::Future {
+        Box::pin(async move {
+            let sk = tokio::net::TcpListener::bind(a)
+                .await
+                .wrap_err_with(|| eyre!("Could not bind TcpListener to {:?}", a))?;
+            Ok(Box::pin(TcpListenerStream::new(sk).map(|cn| {
+                let cn = cn?;
+                let addr = cn.peer_addr()?;
+                Ok(IgnoreAddr(addr, TcpCn::new(cn)))
+            })) as _)
+        })
+    }
+}
+
+impl ChunnelConnector for TcpChunnel<false> {
     type Addr = SocketAddr;
     type Connection = TcpCn;
     type Future =
@@ -53,6 +77,21 @@ impl ChunnelConnector for TcpChunnel {
         Box::pin(async move {
             let sk = TcpStream::connect(a).await?;
             Ok(TcpCn::new(sk))
+        })
+    }
+}
+
+impl ChunnelConnector for TcpChunnel<true> {
+    type Addr = SocketAddr;
+    type Connection = IgnoreAddr<SocketAddr, TcpCn>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Error = Report;
+
+    fn connect(&mut self, a: Self::Addr) -> Self::Future {
+        Box::pin(async move {
+            let sk = TcpStream::connect(a).await?;
+            Ok(IgnoreAddr(a, TcpCn::new(sk)))
         })
     }
 }
@@ -508,7 +547,7 @@ mod t {
             .unwrap();
 
         async fn server(start: Arc<Barrier>) -> Result<(), Report> {
-            let mut ch = TcpChunnel;
+            let mut ch: TcpChunnel = TcpChunnel;
             let st = ch.listen("127.0.0.1:58281".parse().unwrap()).await?;
             start.wait().await;
             st.try_for_each_concurrent(None, |cn| async move {
@@ -537,7 +576,7 @@ mod t {
                 unreachable!()
             });
 
-            let mut ch = TcpChunnel;
+            let mut ch: TcpChunnel = TcpChunnel;
             start.wait().await;
             let cn = ch
                 .connect("127.0.0.1:58281".parse().unwrap())

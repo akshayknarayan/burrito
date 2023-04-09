@@ -12,7 +12,7 @@ import toml
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/build/lib/x86_64-linux-gnu"
 
-def start_server(conn, outf, variant='kernel', use_bertha='full:0', extra_cfg=None):
+def start_server(conn, outf, variant='kernel', use_bertha='full:0', tcp=False, extra_cfg=None):
     conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -21,7 +21,7 @@ def start_server(conn, outf, variant='kernel', use_bertha='full:0', extra_cfg=No
     elif 'dpdk' in variant:
         cfg = "--cfg dpdk.config"
     elif 'kernel' in variant:
-        cfg = "--cfg dpdk.config"
+        cfg = ""
     else:
         raise Exception("unknown datapath")
 
@@ -30,6 +30,11 @@ def start_server(conn, outf, variant='kernel', use_bertha='full:0', extra_cfg=No
     else:
         extra_args = ""
 
+    if tcp:
+        tcp_arg = '--use_tcp'
+    else:
+        tcp_arg = ''
+
     no_bertha = f'--no-bertha={use_bertha}'
     time.sleep(5)
     ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/throughput-bench \
@@ -37,6 +42,7 @@ def start_server(conn, outf, variant='kernel', use_bertha='full:0', extra_cfg=No
         --datapath {variant} \
         {no_bertha} \
         {cfg} \
+        {tcp_arg} \
         {extra_args} \
         server",
             wd="~/burrito",
@@ -50,7 +56,7 @@ def start_server(conn, outf, variant='kernel', use_bertha='full:0', extra_cfg=No
     time.sleep(8)
     conn.check_proc(f"throughput", [f"burrito/{outf}.err", f"burrito/{outf}.out"])
 
-def run_client(conn, server, num_clients, file_size, packet_size, variant, use_bertha, extra_cfg, outf):
+def run_client(conn, server, num_clients, file_size, packet_size, variant, use_bertha, tcp, extra_cfg, outf):
     conn.run("sudo pkill -INT throughput")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -59,7 +65,7 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
     elif 'dpdk' in variant:
         cfg = "--cfg dpdk.config"
     elif 'kernel' in variant:
-        cfg = "--cfg dpdk.config"
+        cfg = ""
     else:
         raise Exception("unknown datapath")
 
@@ -69,6 +75,11 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
     else:
         extra_args = ""
 
+    if tcp:
+        tcp_arg = '--use_tcp'
+    else:
+        tcp_arg = ''
+
     time.sleep(2)
     agenda.subtask(f"client starting -> {outf}.out")
     ok = conn.run(
@@ -77,6 +88,7 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
         --datapath {variant} \
         {cfg} \
         {no_bertha} \
+        {tcp_arg} \
         {extra_args} \
         client \
         --addr {server} \
@@ -104,6 +116,7 @@ def do_exp(iter_num,
     num_clients=None,
     datapath=None,
     use_bertha='full:0',
+    tcp=False,
     overwrite=None
 ):
     assert(
@@ -116,8 +129,9 @@ def do_exp(iter_num,
         overwrite is not None
     )
 
-    server_prefix = f"{outdir}/{datapath}_{use_bertha}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_server"
-    outf = f"{outdir}/{datapath}_{use_bertha}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_client"
+    tcp_spec = '_tcp' if tcp else ''
+    server_prefix = f"{outdir}/{datapath}_{use_bertha}{tcp_spec}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_server"
+    outf = f"{outdir}/{datapath}_{use_bertha}{tcp_spec}-num_clients={num_clients}-file_size={file_size}-packet_size={packet_size}-{iter_num}-tbench_client"
 
     for m in machines:
         if m.local:
@@ -125,6 +139,10 @@ def do_exp(iter_num,
             continue
         m.run(f"rm -rf {outdir}", wd="~/burrito")
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
+
+    if tcp and datapath not in ['kernel']: # shenango not supported yet
+        agenda.task(f"skipping: {outf}.data")
+        return True
 
     if (datapath == 'shenango' and 'full' in use_bertha):
         agenda.task(f"skipping: {outf}.data")
@@ -138,11 +156,11 @@ def do_exp(iter_num,
 
     time.sleep(2)
     server_addr = machines[0].addr
-    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, use_bertha = {use_bertha}, num_clients = {num_clients} file_size = {file_size} packet_size = {packet_size}")
+    agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, use_bertha = {use_bertha}, tcp = {tcp}, num_clients = {num_clients} file_size = {file_size} packet_size = {packet_size}")
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    start_server(machines[0], server_prefix, variant=datapath, use_bertha=use_bertha, extra_cfg=cfg['server'] if cfg is not None else None)
+    start_server(machines[0], server_prefix, variant=datapath, use_bertha=use_bertha, tcp=tcp, extra_cfg=cfg['server'] if cfg is not None else None)
     time.sleep(7)
 
     # others are clients
@@ -155,6 +173,7 @@ def do_exp(iter_num,
             packet_size,
             datapath,
             use_bertha,
+            tcp,
             cfg['client'] if cfg is not None else None,
             outf,
         ),
@@ -213,6 +232,7 @@ def do_exp(iter_num,
     agenda.task("done")
     return True
 
+needs_tcp_feature = False
 def setup_machine(conn, outdir, datapaths, dpdk_driver):
     agenda.task(f"[{conn.addr}] setup machine")
     try:
@@ -237,6 +257,8 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
             check(ok, "reserve hugepages", conn.addr)
 
         needed_features = []
+        if needs_tcp_feature:
+            needed_features.append('tcp')
         for d in datapaths:
             if 'dpdk' in d:
                 if 'dpdk-direct' not in needed_features:
@@ -278,9 +300,12 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
 ###
 ### [exp]
 ### num_clients = [1, 2, 4, 8, 16, 32, 64, 128]
-### file_size = [50000000]
+### file_size = [5000000000]
 ### packet_size = [1460]
 ### datapath = ['dpdk', 'shenango']
+### iters = 1
+### bertha = ['raw', 'full:0', 'full:1', 'full:2', 'full:3', 'full:4', 'full:5']
+### tcp = [False, True]
 ###
 if __name__ == '__main__':
     global thread_ok
@@ -323,6 +348,8 @@ if __name__ == '__main__':
         if t not in ['dpdkthread', 'dpdkinline', 'shenango', 'kernel', 'shenangort']:
             agenda.failure('unknown datapath: ' + t)
             sys.exit(1)
+    if 'tcp' not in cfg['exp']:
+        cfg['exp']['tcp'] = [False]
 
     machines = connect_machines(cfg)
 
@@ -338,6 +365,9 @@ if __name__ == '__main__':
     if not found_local:
         subprocess.run(f"mkdir -p {args.outdir}", shell=True)
 
+    if True in cfg['exp']['tcp']:
+        needs_tcp_feature = True
+
     setup_all(machines, cfg, args, setup_machine)
     if args.setup_only:
         agenda.task("setup done")
@@ -346,21 +376,23 @@ if __name__ == '__main__':
     for d in cfg['exp']['datapath']:
         if 'intel' == args.dpdk_driver:
             intel_devbind(machines, d)
-        for use_bertha in cfg['exp']['bertha']:
-            for fs in cfg['exp']['file_size']:
-                for ps in cfg['exp']['packet_size']:
-                    for nc in cfg['exp']['num_clients']:
-                        for i in range(int(cfg['exp']['iters'])):
-                            do_exp(i,
-                                    cfg=cfg['cfg'],
-                                    outdir=outdir,
-                                    machines=machines,
-                                    num_clients=nc,
-                                    file_size=fs,
-                                    packet_size=ps,
-                                    datapath=d,
-                                    use_bertha=use_bertha,
-                                    overwrite=args.overwrite
-                                    )
+        for t in cfg['tcp']:
+            for use_bertha in cfg['exp']['bertha']:
+                for fs in cfg['exp']['file_size']:
+                    for ps in cfg['exp']['packet_size']:
+                        for nc in cfg['exp']['num_clients']:
+                            for i in range(int(cfg['exp']['iters'])):
+                                do_exp(i,
+                                        cfg=cfg['cfg'],
+                                        outdir=outdir,
+                                        machines=machines,
+                                        num_clients=nc,
+                                        file_size=fs,
+                                        packet_size=ps,
+                                        datapath=d,
+                                        tcp=t,
+                                        use_bertha=use_bertha,
+                                        overwrite=args.overwrite
+                                        )
 
     agenda.task("done")

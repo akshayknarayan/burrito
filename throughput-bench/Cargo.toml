@@ -27,3 +27,4 @@ dpdk-direct = { path = "../dpdk-direct", optional = true}
 shenango-chunnel = { path = "../shenango-chunnel", optional = true }
 shenango = { path = "../shenango-chunnel/caladan/bindings/rust", optional = true }
 shenango-bertha = { path = "../shenango-bertha", optional = true }
+tcp = { path = "../tcp", optional = true }

@@ -296,7 +296,7 @@ mod t {
             .with_single_cert(vec![cert], private_key)
             .expect("bad certificate/key");
 
-        let mut tcp = TcpChunnel;
+        let mut tcp: TcpChunnel = TcpChunnel;
         let base_st = tcp
             .listen(addr)
             .await?
@@ -327,7 +327,7 @@ mod t {
 
         let addr = "127.0.0.1:12403".parse().unwrap();
 
-        let mut tcp = TcpChunnel;
+        let mut tcp: TcpChunnel = TcpChunnel;
         start.wait().await;
         let base_cn = IgnoreAddr(
             addr,

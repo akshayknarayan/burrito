@@ -12,6 +12,8 @@ use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use structopt::StructOpt;
+#[cfg(feature = "tcp")]
+use tcp::TcpChunnel;
 use tracing::{debug, info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
@@ -74,6 +76,11 @@ struct Opt {
     #[cfg(any(feature = "use_shenango", feature = "dpdk-direct"))]
     #[structopt(long)]
     cfg: std::path::PathBuf,
+
+    // TODO shenango-TCP support
+    #[cfg(feature = "tcp")]
+    #[structopt(long)]
+    use_tcp: bool,
 
     #[structopt(short, long)]
     port: u16,
@@ -197,6 +204,8 @@ fn main() -> Result<(), Report> {
     let Opt {
         #[cfg(any(feature = "use_shenango", feature = "dpdk-direct"))]
         cfg,
+        #[cfg(feature = "tcp")]
+        use_tcp,
         port,
         datapath,
         num_threads,
@@ -252,8 +261,19 @@ fn main() -> Result<(), Report> {
                     let ch = DpdkUdpSkChunnel::new(cfg)?;
                     using_chunnel_connection::run_clients_no_bertha(ch, cl, port, num_threads)?
                 }
+                #[cfg(not(feature = "tcp"))]
                 "kernel" => {
                     let ch = UdpSkChunnel;
+                    using_chunnel_connection::run_clients_no_bertha(ch, cl, port, num_threads)?
+                }
+                #[cfg(feature = "tcp")]
+                "kernel" if !use_tcp => {
+                    let ch = UdpSkChunnel;
+                    using_chunnel_connection::run_clients_no_bertha(ch, cl, port, num_threads)?
+                }
+                #[cfg(feature = "tcp")]
+                "kernel" if use_tcp => {
+                    let ch: TcpChunnel<true> = TcpChunnel;
                     using_chunnel_connection::run_clients_no_bertha(ch, cl, port, num_threads)?
                 }
                 #[cfg(not(feature = "dpdk-direct"))]
@@ -279,8 +299,19 @@ fn main() -> Result<(), Report> {
                     let ch = ShenangoUdpSkChunnel::new(cfg);
                     using_chunnel_connection::run_clients(ch, cl, port, num_threads, stack_depth)?
                 }
+                #[cfg(not(feature = "tcp"))]
                 "kernel" => {
                     let ch = UdpSkChunnel;
+                    using_chunnel_connection::run_clients(ch, cl, port, num_threads, stack_depth)?
+                }
+                #[cfg(feature = "tcp")]
+                "kernel" if !use_tcp => {
+                    let ch = UdpSkChunnel;
+                    using_chunnel_connection::run_clients(ch, cl, port, num_threads, stack_depth)?
+                }
+                #[cfg(feature = "tcp")]
+                "kernel" if use_tcp => {
+                    let ch: TcpChunnel<true> = TcpChunnel;
                     using_chunnel_connection::run_clients(ch, cl, port, num_threads, stack_depth)?
                 }
                 #[cfg(not(feature = "dpdk-direct"))]
@@ -320,8 +351,19 @@ fn main() -> Result<(), Report> {
                     let ch = ShenangoUdpReqChunnel(ch);
                     using_chunnel_connection::run_server(ch, port, num_threads, stack_depth)?;
                 }
+                #[cfg(not(feature = "tcp"))]
                 "kernel" => {
                     let ch = UdpReqChunnel;
+                    using_chunnel_connection::run_server(ch, port, num_threads, stack_depth)?;
+                }
+                #[cfg(feature = "tcp")]
+                "kernel" if !use_tcp => {
+                    let ch = UdpReqChunnel;
+                    using_chunnel_connection::run_server(ch, port, num_threads, stack_depth)?;
+                }
+                #[cfg(feature = "tcp")]
+                "kernel" if use_tcp => {
+                    let ch: TcpChunnel<true> = TcpChunnel;
                     using_chunnel_connection::run_server(ch, port, num_threads, stack_depth)?;
                 }
                 #[cfg(not(feature = "dpdk-direct"))]
@@ -342,8 +384,19 @@ fn main() -> Result<(), Report> {
                     let ch = DpdkUdpReqChunnel(ch);
                     using_chunnel_connection::run_server_no_bertha(ch, port, num_threads)?;
                 }
+                #[cfg(not(feature = "tcp"))]
                 "kernel" => {
                     let ch = UdpReqChunnel;
+                    using_chunnel_connection::run_server_no_bertha(ch, port, num_threads)?;
+                }
+                #[cfg(feature = "tcp")]
+                "kernel" if !use_tcp => {
+                    let ch = UdpReqChunnel;
+                    using_chunnel_connection::run_server_no_bertha(ch, port, num_threads)?;
+                }
+                #[cfg(feature = "tcp")]
+                "kernel" if use_tcp => {
+                    let ch: TcpChunnel<true> = TcpChunnel;
                     using_chunnel_connection::run_server_no_bertha(ch, port, num_threads)?;
                 }
                 #[cfg(not(feature = "dpdk-direct"))]
