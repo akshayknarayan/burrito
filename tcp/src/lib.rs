@@ -190,6 +190,17 @@ impl ChunnelConnection for TcpCn {
                 [(h0, m0), (h1, m1), (h2, m2), (h3, m3), (h4, m4), (h5, m5), (h6, m6), (h7, m7)],
             ) = batches.next()
             {
+                ensure!(
+                    !(h0 == 0
+                        || h1 == 0
+                        || h2 == 0
+                        || h3 == 0
+                        || h4 == 0
+                        || h5 == 0
+                        || h6 == 0
+                        || h7 == 0),
+                    "tried to send 0-length message"
+                );
                 let h0_buf = h0.to_be_bytes();
                 let h1_buf = h1.to_be_bytes();
                 let h2_buf = h2.to_be_bytes();
@@ -276,6 +287,7 @@ impl ChunnelConnection for TcpCn {
                 // but after checking the resulting assembly the compiler mostly does this for us
                 // anyway, so we will keep it like this.
                 for i in 0..rem_buf.len() {
+                    ensure!(rem_buf[i].0 != 0, "tried to send 0-length message");
                     final_batch_nums[i] = rem_buf[i].0.to_be_bytes();
                 }
                 for i in 0..rem_buf.len() {
