@@ -31,7 +31,7 @@ def start_server(conn, outf, variant='kernel', use_bertha='full:0', tcp=False, e
         extra_args = ""
 
     if tcp:
-        tcp_arg = '--use_tcp'
+        tcp_arg = '--use-tcp'
     else:
         tcp_arg = ''
 
@@ -76,7 +76,7 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
         extra_args = ""
 
     if tcp:
-        tcp_arg = '--use_tcp'
+        tcp_arg = '--use-tcp'
     else:
         tcp_arg = ''
 
@@ -376,7 +376,7 @@ if __name__ == '__main__':
     for d in cfg['exp']['datapath']:
         if 'intel' == args.dpdk_driver:
             intel_devbind(machines, d)
-        for t in cfg['tcp']:
+        for t in cfg['exp']['tcp']:
             for use_bertha in cfg['exp']['bertha']:
                 for fs in cfg['exp']['file_size']:
                     for ps in cfg['exp']['packet_size']:

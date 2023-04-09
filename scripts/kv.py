@@ -261,7 +261,7 @@ def write_cfg(conn, config, name):
 
 def get_pci_addr(conn):
     search = None
-    if 'mlx' in dpdk_driver:
+    if dpdk_driver is not None and 'mlx' in dpdk_driver:
         search = 'drv=mlx.*Active'
     elif dpdk_driver == 'intel':
         search = 'drv=igb'
@@ -926,9 +926,10 @@ def setup_all(machines, cfg, args, setup_fn):
     if 'intel' == args.dpdk_driver:
         intel_devbind(machines, 'kernel')
 
-    for m in machines:
-        pci_addr = get_pci_addr(m)
-        m.pci_addr = pci_addr
+    if any('shenango' in d or 'dpdk' in d for d in cfg['exp']['datapath']):
+        for m in machines:
+            pci_addr = get_pci_addr(m)
+            m.pci_addr = pci_addr
 
     agenda.task("writing configuration files")
     if any('shenango' in d for d in cfg['exp']['datapath']):
