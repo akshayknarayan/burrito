@@ -220,12 +220,14 @@ impl ChunnelConnection for TcpCn {
             }
 
             if let Some(rem) = batches.into_remainder() {
-                // rem is an iterator with at least 1 and at most 7 elements.
+                // rem is an iterator with at least 0 and at most 7 elements.
                 let rem_buf = rem.as_slice();
                 if rem_buf.is_empty() {
-                    bail!("remainder is empty (?)");
+                    // the Some(rem) was a false positive (seems weird)
+                    return Ok(());
                 }
 
+                // rem_buf is now a slice with at least 1 and at most 7 elements.
                 const NULL: [u8; 0] = [];
                 let mut final_batch_nums = [
                     [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4],
