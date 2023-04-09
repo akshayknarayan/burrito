@@ -7,11 +7,14 @@
 
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
-use futures_util::stream::{Stream, StreamExt, TryStreamExt};
+use futures_util::{
+    future::{ready, Ready},
+    stream::{Stream, StreamExt, TryStreamExt},
+};
 use std::cmp::Ordering;
 use std::net::SocketAddr;
 use std::{future::Future, pin::Pin};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::wrappers::TcpListenerStream;
 
 /// TCP Chunnel connector.
@@ -22,47 +25,56 @@ use tokio_stream::wrappers::TcpListenerStream;
 #[derive(Default, Clone, Debug)]
 pub struct TcpChunnel<const WITHADDR: bool = false>;
 
+fn make_tcp_listener(a: SocketAddr) -> Result<TcpListener, Report> {
+    let sk = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    sk.set_reuse_port(true)?;
+    sk.set_nonblocking(true)?;
+    sk.bind(&a.into())?;
+    sk.listen(16)?;
+    TcpListener::from_std(sk.into()).wrap_err_with(|| eyre!("socket bind failed on {:?}", a))
+}
+
 impl ChunnelListener for TcpChunnel<false> {
     type Addr = SocketAddr;
     type Connection = TcpCn;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        Box::pin(async move {
-            let sk = tokio::net::TcpListener::bind(a)
-                .await
-                .wrap_err_with(|| eyre!("Could not bind TcpListener to {:?}", a))?;
+        ready((|| {
+            let sk = make_tcp_listener(a)?;
             Ok(Box::pin(
                 TcpListenerStream::new(sk)
                     .map_ok(TcpCn::new)
                     .map_err(Into::into),
             ) as _)
-        })
+        })())
     }
 }
 
 impl ChunnelListener for TcpChunnel<true> {
     type Addr = SocketAddr;
     type Connection = IgnoreAddr<SocketAddr, TcpCn>;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        Box::pin(async move {
-            let sk = tokio::net::TcpListener::bind(a)
-                .await
-                .wrap_err_with(|| eyre!("Could not bind TcpListener to {:?}", a))?;
+        ready((|| {
+            let sk = make_tcp_listener(a)?;
             Ok(Box::pin(TcpListenerStream::new(sk).map(|cn| {
                 let cn = cn?;
                 let addr = cn.peer_addr()?;
                 Ok(IgnoreAddr(addr, TcpCn::new(cn)))
             })) as _)
-        })
+        })())
     }
 }
 
