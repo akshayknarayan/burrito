@@ -191,14 +191,14 @@ impl ChunnelConnection for TcpCn {
             ) = batches.next()
             {
                 ensure!(
-                    !(h0 == 0
-                        || h1 == 0
-                        || h2 == 0
-                        || h3 == 0
-                        || h4 == 0
-                        || h5 == 0
-                        || h6 == 0
-                        || h7 == 0),
+                    h0 != 0
+                        && h1 != 0
+                        && h2 != 0
+                        && h3 != 0
+                        && h4 != 0
+                        && h5 != 0
+                        && h6 != 0
+                        && h7 != 0,
                     "tried to send 0-length message"
                 );
                 let h0_buf = h0.to_be_bytes();
@@ -231,7 +231,10 @@ impl ChunnelConnection for TcpCn {
                 loop {
                     self.inner.writable().await?;
                     match self.inner.try_write_vectored(&batch) {
-                        Ok(_) => break,
+                        Ok(_) => {
+                            tracing::debug!(lengths = ?(h0,h1,h2,h3,h4,h5,h6,h7), "wrote full burst");
+                            break;
+                        }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             continue;
                         }
@@ -301,7 +304,10 @@ impl ChunnelConnection for TcpCn {
                         .inner
                         .try_write_vectored(&final_batch[..rem_buf.len() * 2])
                     {
-                        Ok(_) => break,
+                        Ok(_) => {
+                            tracing::debug!(lengths = ?final_batch_nums[..rem_buf.len()], "wrote remainder burst");
+                            break;
+                        }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             continue;
                         }
@@ -336,7 +342,7 @@ impl ChunnelConnection for TcpCn {
                 // assembly from a buffer here.
 
                 let mut len_buf = [0; 4];
-                let mut buf = [0; 2048];
+                let mut buf = [0; 8192];
 
                 'msg: loop {
                     if let Some((mut so_far, tot_expect)) = curr_expected_len.take() {
