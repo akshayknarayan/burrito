@@ -419,12 +419,9 @@ where
             .collect()
     };
 
-    let joined: Vec<Result<Vec<(usize, usize, Duration)>, Report>> = client_threads
+    let (tot_bytes, tot_pkts, elapsed) = client_threads
         .into_iter()
         .map(|jh| jh.join().expect("thread paniced"))
-        .collect();
-    let (tot_bytes, tot_pkts, elapsed) = joined
-        .into_iter()
         .collect::<Result<Vec<Vec<(usize, usize, Duration)>>, _>>()
         .wrap_err("failed running one or more clients")?
         .into_iter()
