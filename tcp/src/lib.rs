@@ -334,44 +334,44 @@ impl ChunnelConnection for TcpCn {
     {
         Box::pin(async move {
             let mut partial_header_len = 0;
-            let mut curr_expected_len = None;
+            let mut curr_expected_len: Option<(usize, &mut [u8])> = None;
             let mut tot_msgs = 0;
+            let msgs_capacity = msgs_buf.len();
+            let mut len_buf = [0; 4];
             'readable: loop {
                 self.inner.readable().await?;
                 // TODO would be more efficient to do bigger reads into buf, and do message
                 // assembly from a buffer here.
-
-                let mut len_buf = [0; 4];
-                let mut buf = [0; 8192];
-
                 'msg: loop {
-                    if let Some((mut so_far, tot_expect)) = curr_expected_len.take() {
-                        assert!(so_far < tot_expect, "so_far must be < tot_expect");
-                        match self.inner.try_read(&mut buf[so_far..tot_expect]) {
+                    if let Some((mut so_far, dst_buf)) = curr_expected_len.take() {
+                        ensure!(
+                            so_far < dst_buf.len(),
+                            "invalid state: {:?} !< {:?}",
+                            so_far,
+                            dst_buf.len()
+                        );
+                        match self.inner.try_read(&mut dst_buf[so_far..]) {
                             Ok(0) => {
-                                unreachable!();
+                                unreachable!(
+                                    "curr state: so_far {:?}, tot_expect {:?}",
+                                    so_far,
+                                    dst_buf.len()
+                                );
                             }
                             Ok(n) => {
                                 so_far += n;
-                                match so_far.cmp(&tot_expect) {
+                                match so_far.cmp(&dst_buf.len()) {
                                     Ordering::Equal => {
-                                        if let Some(ref mut dst_buf) = &mut msgs_buf[tot_msgs] {
-                                            dst_buf.clear();
-                                            dst_buf.extend_from_slice(&buf[..tot_expect]);
-                                        } else {
-                                            msgs_buf[tot_msgs] = Some(buf[..tot_expect].to_vec());
-                                        }
-
                                         tot_msgs += 1;
-                                        tracing::debug!(?tot_msgs, ?tot_expect, "read message");
-                                        if tot_msgs == msgs_buf.len() {
+                                        tracing::debug!(?tot_msgs, tot_expect=?dst_buf.len(), "read message");
+                                        if tot_msgs == msgs_capacity {
                                             return Ok(&mut msgs_buf[..]);
                                         }
 
                                         continue 'msg;
                                     }
                                     Ordering::Less => {
-                                        curr_expected_len = Some((so_far, tot_expect));
+                                        curr_expected_len = Some((so_far, dst_buf));
                                         continue 'readable;
                                     }
                                     Ordering::Greater => unreachable!(),
@@ -384,13 +384,13 @@ impl ChunnelConnection for TcpCn {
                                 // if we end up in a situation where we receive a full message and
                                 // then the header of a second message, the first message will be
                                 // delayed while we wait to get the body of the second message.
-                                curr_expected_len = Some((so_far, tot_expect));
+                                curr_expected_len = Some((so_far, dst_buf));
                                 continue 'readable;
                             }
                             Err(e) => {
                                 bail!(eyre!(e).wrap_err(eyre!(
                                     "Error reading message body of length {:?}",
-                                    tot_expect
+                                    dst_buf.len()
                                 )));
                             }
                         }
@@ -424,12 +424,25 @@ impl ChunnelConnection for TcpCn {
                             }
                         };
 
-                        curr_expected_len = Some((0, u32::from_be_bytes(len_buf) as usize));
+                        let tot_expect = u32::from_be_bytes(len_buf) as usize;
                         ensure!(
-                            curr_expected_len.as_ref().unwrap().1 > 0,
-                            "invalid message length 0"
+                            tot_expect > 0 && tot_expect <= 8192,
+                            "invalid message length {:?}",
+                            tot_expect
                         );
-                        //if curr_expected_len.as_ref().unwrap().1 == 0 {
+                        let dst_buf = msgs_buf[tot_msgs]
+                            .get_or_insert_with(|| Vec::with_capacity(tot_expect));
+                        if dst_buf.capacity() < tot_expect {
+                            dst_buf.reserve(tot_expect - dst_buf.capacity());
+                        }
+
+                        // SAFETY: we ensured that there is at least tot_expect amount of capacity
+                        // above. also, we promise not to read dst_buf until writing into it, so we
+                        // won't read any uninitialized memory.
+                        unsafe { dst_buf.set_len(tot_expect) };
+
+                        curr_expected_len = Some((0, &mut dst_buf[..]));
+                        //if curr_expected_len.as_ref().undst_bufp().1 == 0 {
                         //    tracing::warn!(?len_buf, "invalid message length");
                         //    curr_expected_len = None;
                         //}
