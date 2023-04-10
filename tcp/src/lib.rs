@@ -554,7 +554,7 @@ where
 mod t {
     use super::TcpChunnel;
     use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-    use color_eyre::eyre::{ensure, Report, WrapErr};
+    use color_eyre::eyre::{bail, ensure, Report, WrapErr};
     use futures_util::TryStreamExt;
     use std::sync::Arc;
     use std::sync::Once;
@@ -628,6 +628,143 @@ mod t {
                         i == u64::from_le_bytes(m[0..8].try_into().unwrap()) as usize,
                         "wrong message"
                     );
+                }
+            }
+
+            if jh.is_finished() {
+                return jh.await.unwrap();
+            }
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn big_write() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        const TARGET_BYTES: usize = 10000;
+        const PKT_SIZE: usize = 282;
+
+        #[tracing::instrument(skip(start), err)]
+        async fn server(start: Arc<Barrier>) -> Result<(), Report> {
+            info!("starting server");
+            let mut ch: TcpChunnel = TcpChunnel;
+            let st = ch.listen("127.0.0.1:28281".parse().unwrap()).await?;
+            start.wait().await;
+            st.try_for_each_concurrent(None, |cn| async move {
+                info!("starting connection");
+                let mut msgs: Vec<_> = (0..8).map(|_| Some(Vec::with_capacity(2048))).collect();
+                let mut tot_recv = 0;
+                loop {
+                    let ms = cn.recv(&mut msgs[..]).await?;
+                    for msg in ms.iter().map_while(Option::as_ref) {
+                        tot_recv += msg.len();
+                    }
+
+                    debug!(?tot_recv, "received from client");
+
+                    if tot_recv >= TARGET_BYTES {
+                        cn.send(std::iter::once(vec![1u8; 1])).await?;
+                        info!(?tot_recv, "wrote ack to client");
+                    }
+                }
+            })
+            .await?;
+            Ok(())
+        }
+
+        //client
+        rt.block_on(async move {
+            let start = Arc::new(tokio::sync::Barrier::new(2));
+            let srv_start = start.clone();
+            let jh = tokio::spawn(async move {
+                if let Err(err) = server(srv_start).await {
+                    tracing::error!(?err, "server errored");
+                    return Err(err);
+                }
+
+                unreachable!()
+            });
+
+            let mut ch: TcpChunnel = TcpChunnel;
+            start.wait().await;
+            let cn = ch
+                .connect("127.0.0.1:28281".parse().unwrap())
+                .await
+                .wrap_err("could not connect")?;
+
+            let sp = tracing::info_span!("client");
+            let _spg = sp.entered();
+
+            let mut slot = [None];
+            let mut remaining = TARGET_BYTES;
+            let mut recv_fut = cn.recv(&mut slot);
+            info!("starting");
+            let rem_recv = loop {
+                let recv_fut_rem = {
+                    let res = futures_util::future::select(
+                        cn.send((0..16).map_while(|_| {
+                            if remaining > 0 {
+                                let this_send_size = std::cmp::min(PKT_SIZE, remaining);
+                                remaining -= this_send_size;
+                                Some(vec![0u8; this_send_size as usize])
+                            } else {
+                                None
+                            }
+                        })),
+                        recv_fut,
+                    )
+                    .await;
+                    match res {
+                        futures_util::future::Either::Left((send_res, recv_fut_rem)) => {
+                            send_res?;
+                            recv_fut_rem
+                        }
+                        futures_util::future::Either::Right((recv_res, _)) => {
+                            info!("received from server");
+                            if let [Some(ref v)] = recv_res?[..] {
+                                if v[0] == 1 {
+                                    break None;
+                                } else {
+                                    panic!("wrong recv")
+                                }
+                            } else {
+                                bail!("recv failed");
+                            }
+                        }
+                    }
+                };
+
+                tokio::task::yield_now().await;
+                if remaining == 0 {
+                    break Some(recv_fut_rem);
+                } else {
+                    recv_fut = recv_fut_rem;
+                }
+            };
+
+            if let Some(recv_fut) = rem_recv {
+                let recv_res = recv_fut.await;
+                info!("received from server");
+                if let [Some(ref v)] = recv_res?[..] {
+                    if v[0] == 1 {
+                        ()
+                    } else {
+                        bail!("wrong recv")
+                    }
+                } else {
+                    bail!("recv failed");
                 }
             }
 
