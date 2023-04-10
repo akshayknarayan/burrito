@@ -363,6 +363,7 @@ impl ChunnelConnection for TcpCn {
                                         }
 
                                         tot_msgs += 1;
+                                        tracing::debug!(?tot_msgs, ?tot_expect, "read message");
                                         if tot_msgs == msgs_buf.len() {
                                             return Ok(&mut msgs_buf[..]);
                                         }
@@ -404,7 +405,7 @@ impl ChunnelConnection for TcpCn {
                             }
                             Ok(n) => {
                                 partial_header_len += n;
-                                match partial_header_len.cmp(&4) {
+                                match partial_header_len.cmp(&len_buf.len()) {
                                     Ordering::Less => continue 'readable,
                                     Ordering::Greater => unreachable!(),
                                     Ordering::Equal => (),
@@ -426,9 +427,15 @@ impl ChunnelConnection for TcpCn {
                         curr_expected_len = Some((0, u32::from_be_bytes(len_buf) as usize));
                         ensure!(
                             curr_expected_len.as_ref().unwrap().1 > 0,
-                            "invalid message length"
+                            "invalid message length 0"
                         );
+                        //if curr_expected_len.as_ref().unwrap().1 == 0 {
+                        //    tracing::warn!(?len_buf, "invalid message length");
+                        //    curr_expected_len = None;
+                        //}
+
                         partial_header_len = 0;
+                        len_buf = [0, 0, 0, 0];
                         continue 'msg;
                     }
                 }

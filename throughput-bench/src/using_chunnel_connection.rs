@@ -1,6 +1,6 @@
 use crate::Client;
 use bertha::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList};
-use color_eyre::eyre::{bail, Report, WrapErr};
+use color_eyre::eyre::{bail, ensure, Report, WrapErr};
 use futures_util::{
     stream::{FuturesUnordered, TryStreamExt},
     Stream,
@@ -432,6 +432,8 @@ where
     Ok((tot_bytes, tot_pkts, elapsed))
 }
 
+const PAYLOAD_NUM: u8 = 3;
+
 async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
     cn: C,
     addr: SocketAddrV4,
@@ -478,6 +480,7 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
         for (_, r) in ms.iter().map_while(Option::as_ref) {
             tot_bytes += r.len();
             tot_pkts += 1;
+            ensure!(r.iter().all(|i| *i == PAYLOAD_NUM), "payload corrupted");
             trace!(?tot_bytes, ?tot_pkts, "received part");
             if r[0] == 1 {
                 cn.send(std::iter::once((SocketAddr::V4(addr), r.clone())))
@@ -554,7 +557,7 @@ async fn server_thread_inner<
                 if remaining > 0 {
                     let this_send_size = std::cmp::min(pkt_size, remaining);
                     remaining -= this_send_size;
-                    Some((a, vec![0u8; this_send_size as usize]))
+                    Some((a, vec![PAYLOAD_NUM; this_send_size as usize]))
                 } else {
                     None
                 }
