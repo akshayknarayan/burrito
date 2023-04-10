@@ -177,145 +177,51 @@ impl ChunnelConnection for TcpCn {
         <B as IntoIterator>::IntoIter: Send,
     {
         Box::pin(async move {
-            let mut batches = burst
-                .into_iter()
-                .map(|msg| (msg.len() as u32, msg))
-                .array_chunks::<8>();
-
-            use std::io::IoSlice;
-            // we need the while let ... because a for loop takes ownership of `batches`, but we
-            // need to call `::into_remainder` afterward.
-            #[allow(clippy::while_let_on_iterator)]
-            while let Some(
-                [(h0, m0), (h1, m1), (h2, m2), (h3, m3), (h4, m4), (h5, m5), (h6, m6), (h7, m7)],
-            ) = batches.next()
-            {
-                ensure!(
-                    h0 != 0
-                        && h1 != 0
-                        && h2 != 0
-                        && h3 != 0
-                        && h4 != 0
-                        && h5 != 0
-                        && h6 != 0
-                        && h7 != 0,
-                    "tried to send 0-length message"
-                );
-                let h0_buf = h0.to_be_bytes();
-                let h1_buf = h1.to_be_bytes();
-                let h2_buf = h2.to_be_bytes();
-                let h3_buf = h3.to_be_bytes();
-                let h4_buf = h4.to_be_bytes();
-                let h5_buf = h5.to_be_bytes();
-                let h6_buf = h6.to_be_bytes();
-                let h7_buf = h7.to_be_bytes();
-                let batch = [
-                    IoSlice::new(&h0_buf[..]),
-                    IoSlice::new(&m0[..]),
-                    IoSlice::new(&h1_buf[..]),
-                    IoSlice::new(&m1[..]),
-                    IoSlice::new(&h2_buf[..]),
-                    IoSlice::new(&m2[..]),
-                    IoSlice::new(&h3_buf[..]),
-                    IoSlice::new(&m3[..]),
-                    IoSlice::new(&h4_buf[..]),
-                    IoSlice::new(&m4[..]),
-                    IoSlice::new(&h5_buf[..]),
-                    IoSlice::new(&m5[..]),
-                    IoSlice::new(&h6_buf[..]),
-                    IoSlice::new(&m6[..]),
-                    IoSlice::new(&h7_buf[..]),
-                    IoSlice::new(&m7[..]),
-                ];
-
+            for msg in burst.into_iter() {
+                // header
+                let msg_len = msg.len() as u32;
+                let len_buf = u32::to_be_bytes(msg_len);
+                let mut wrote = 0;
                 loop {
                     self.inner.writable().await?;
-                    match self.inner.try_write_vectored(&batch) {
-                        Ok(_) => {
-                            tracing::debug!(lengths = ?(h0,h1,h2,h3,h4,h5,h6,h7), "wrote full burst");
-                            break;
+                    match self.inner.try_write(&len_buf[wrote..4]) {
+                        Ok(n) => {
+                            wrote += n;
+                            assert!(wrote <= 4, "cannot write more than 4");
+                            if wrote == 4 {
+                                break;
+                            }
+
+                            continue;
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             continue;
                         }
                         Err(e) => {
-                            bail!(eyre!(e).wrap_err("try_write_vectored error"));
+                            bail!(eyre!(e).wrap_err("try_write error"));
                         }
                     }
                 }
-            }
 
-            if let Some(rem) = batches.into_remainder() {
-                // rem is an iterator with at least 0 and at most 7 elements.
-                let rem_buf = rem.as_slice();
-                if rem_buf.is_empty() {
-                    // the Some(rem) was a false positive (seems weird)
-                    return Ok(());
-                }
-
-                // rem_buf is now a slice with at least 1 and at most 7 elements.
-                const NULL: [u8; 0] = [];
-                let mut final_batch_nums = [
-                    [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4],
-                ];
-                let mut final_batch = [
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                    IoSlice::new(&NULL[..]),
-                ];
-
-                // `final_batch_nums` is a place to store our message length header buffers. It's
-                // not needed in the previous loop since that one contains an exact number of
-                // messages, so it can use variables. Since that's not the case here - we could
-                // have between 1 and 7 elements - we need an array instead.
-                //
-                // We need two loops because we are assigning to `final_batch_nums[i]` and also
-                // borrowing it to make the IoSlice. We could move the contents of the first loop
-                // into the second like this:
-                // ```rust
-                // let x: *mut [u8; 4] = (&final_batch_nums[i]) as *const _ as *mut _;
-                // unsafe { *x = data[i].0.to_be_bytes(); }
-                // ```
-                // but after checking the resulting assembly the compiler mostly does this for us
-                // anyway, so we will keep it like this.
-                for i in 0..rem_buf.len() {
-                    ensure!(rem_buf[i].0 != 0, "tried to send 0-length message");
-                    final_batch_nums[i] = rem_buf[i].0.to_be_bytes();
-                }
-                for i in 0..rem_buf.len() {
-                    final_batch[i * 2] = IoSlice::new(&final_batch_nums[i][..]);
-                    final_batch[(i * 2) + 1] = IoSlice::new(&(rem_buf[i].1)[..]);
-                }
-
+                wrote = 0;
+                // body
                 loop {
                     self.inner.writable().await?;
-                    match self
-                        .inner
-                        .try_write_vectored(&final_batch[..rem_buf.len() * 2])
-                    {
-                        Ok(_) => {
-                            tracing::debug!(lengths = ?final_batch_nums[..rem_buf.len()], "wrote remainder burst");
-                            break;
+                    match self.inner.try_write(&msg[wrote..]) {
+                        Ok(n) => {
+                            wrote += n;
+                            assert!(wrote <= msg.len(), "cannot write more than msg size");
+                            if wrote == msg.len() {
+                                break;
+                            }
+
+                            continue;
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             continue;
                         }
                         Err(e) => {
-                            bail!(eyre!(e).wrap_err(eyre!(
-                                "try_write_vectored remainder error: {:?}",
-                                rem_buf.len() * 2
-                            )));
+                            bail!(eyre!(e).wrap_err("try_write error"));
                         }
                     }
                 }
@@ -363,7 +269,6 @@ impl ChunnelConnection for TcpCn {
                                 match so_far.cmp(&dst_buf.len()) {
                                     Ordering::Equal => {
                                         tot_msgs += 1;
-                                        tracing::debug!(?tot_msgs, tot_expect=?dst_buf.len(), "read message");
                                         if tot_msgs == msgs_capacity {
                                             return Ok(&mut msgs_buf[..]);
                                         }
@@ -442,11 +347,6 @@ impl ChunnelConnection for TcpCn {
                         unsafe { dst_buf.set_len(tot_expect) };
 
                         curr_expected_len = Some((0, &mut dst_buf[..]));
-                        //if curr_expected_len.as_ref().undst_bufp().1 == 0 {
-                        //    tracing::warn!(?len_buf, "invalid message length");
-                        //    curr_expected_len = None;
-                        //}
-
                         partial_header_len = 0;
                         len_buf = [0, 0, 0, 0];
                         continue 'msg;

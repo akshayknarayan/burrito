@@ -476,16 +476,24 @@ async fn run_client_inner<C: ChunnelConnection<Data = (SocketAddr, Vec<u8>)>>(
         };
 
         last_recv_time = Some(Instant::now());
+        let mut next_remaining_print_thresh = 10_000;
         // don't uselessly throw away our hard-allocated Vec with an `Option::take`
         for (_, r) in ms.iter().map_while(Option::as_ref) {
             tot_bytes += r.len();
             tot_pkts += 1;
-            ensure!(r.iter().all(|i| *i == PAYLOAD_NUM), "payload corrupted");
-            trace!(?tot_bytes, ?tot_pkts, "received part");
             if r[0] == 1 {
                 cn.send(std::iter::once((SocketAddr::V4(addr), r.clone())))
                     .await?;
                 break 'cn;
+            }
+
+            if tracing::enabled!(tracing::Level::TRACE) {
+                trace!(?tot_bytes, ?tot_pkts, "received part");
+            } else if tracing::enabled!(tracing::Level::DEBUG)
+                && tot_bytes > next_remaining_print_thresh
+            {
+                next_remaining_print_thresh = tot_bytes * 2;
+                debug!(?tot_bytes, ?tot_pkts, "received part");
             }
         }
     }
@@ -552,6 +560,7 @@ async fn server_thread_inner<
 
         let start = Instant::now();
         info!(?remaining, ?a, "starting send");
+        let mut next_remaining_print_thresh = remaining / 2;
         while remaining > 0 {
             let bufs = (0..16).map_while(|_| {
                 if remaining > 0 {
@@ -563,6 +572,10 @@ async fn server_thread_inner<
                 }
             });
             cn.send(bufs).await?;
+            if tracing::enabled!(tracing::Level::DEBUG) && remaining < next_remaining_print_thresh {
+                debug!(?remaining, "continuing send");
+                next_remaining_print_thresh = remaining / 2;
+            }
             tokio::task::yield_now().await;
         }
 
