@@ -102,10 +102,16 @@ def run_client(conn, server, num_clients, file_size, packet_size, variant, use_b
         stderr=f"{outf}.err",
         timeout=180,
         )
-    check(ok, "throughput-bench", conn.addr)
-    if 'shenango' in variant:
-        conn.run("sudo pkill -INT iokerneld")
-    agenda.subtask("client done")
+    try:
+        check(ok, "throughput-bench", conn.addr)
+        agenda.subtask("client done")
+    except Exception as e:
+        print(e)
+        global thread_ok
+        thread_ok = False
+    finally:
+        if 'shenango' in variant:
+            conn.run("sudo pkill -INT iokerneld")
 
 def do_exp(iter_num,
     cfg=None,
@@ -228,6 +234,9 @@ def do_exp(iter_num,
             get_files()
         except Exception as e:
             agenda.subfailure(f"At least one file missing for {c}: {e}")
+
+    if not thread_ok:
+        raise Exception("at least one client failed")
 
     agenda.task("done")
     return True
