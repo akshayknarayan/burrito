@@ -1,6 +1,6 @@
 use crate::Client;
 use bertha::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList};
-use color_eyre::eyre::{bail, ensure, Report, WrapErr};
+use color_eyre::eyre::{bail, Report, WrapErr};
 use futures_util::{
     stream::{FuturesUnordered, TryStreamExt},
     Stream,

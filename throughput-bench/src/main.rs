@@ -27,6 +27,9 @@ mod shenango_raw;
 #[cfg(feature = "dpdk-direct")]
 mod dpdk_inline_raw;
 
+#[cfg(feature = "tcp")]
+mod kernel_tcp_raw;
+
 mod using_chunnel_connection;
 
 #[derive(Clone, Copy, Debug)]
@@ -44,7 +47,7 @@ impl BerthaNess {
         }
     }
 
-    #[cfg(any(feature = "use_shenango", feature = "dpdk-direct"))]
+    #[cfg(any(feature = "use_shenango", feature = "dpdk-direct", feature = "tcp"))]
     fn is_raw(&self) -> bool {
         match self {
             BerthaNess::Raw => true,
@@ -251,6 +254,13 @@ fn main() -> Result<(), Report> {
     {
         if datapath == "dpdkinline" && no_bertha.is_raw() {
             return dpdk_inline_raw::dpdk_inline_nobertha(cfg, port, mode, num_threads);
+        }
+    }
+
+    #[cfg(feature = "tcp")]
+    {
+        if datapath == "kernel" && no_bertha.is_raw() {
+            return kernel_tcp_raw::kernel_tcp_inline_raw(port, mode, num_threads);
         }
     }
 
