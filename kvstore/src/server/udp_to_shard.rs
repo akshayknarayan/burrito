@@ -3,6 +3,7 @@ use color_eyre::eyre::{eyre, Report};
 use futures_util::stream::{Stream, StreamExt};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::{future::Future, pin::Pin};
+use tracing::debug;
 
 /// Shim address semantics.
 ///
@@ -111,12 +112,12 @@ where
             let mut slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
             let ms = self.0.recv(&mut slots).await?;
             let mut slot_idx = 0;
-            for m in ms.into_iter().map_while(Option::take) {
+            for m in ms.iter_mut().map_while(Option::take) {
                 msgs_buf[slot_idx] = Some(peel_addr(m)?);
                 slot_idx += 1;
             }
 
-            Ok(msgs_buf)
+            Ok(&mut msgs_buf[..slot_idx])
         })
     }
 }
@@ -136,6 +137,7 @@ fn peel_addr(mut data: Vec<u8>) -> Result<(SocketAddr, Vec<u8>), Report> {
             a.copy_from_slice(&data[3..7]);
             let addr = Ipv4Addr::from(a);
             let sa = SocketAddr::new(IpAddr::V4(addr), port);
+            debug!(?sa, "peeled return address from payload");
             data.splice(0..7, std::iter::empty());
             Ok((sa, data))
         }
@@ -166,6 +168,7 @@ fn prepend_addr((addr, mut data): (SocketAddr, Vec<u8>)) -> Vec<u8> {
             let i = std::iter::once(addr_bytes_len)
                 .chain(p.iter().copied())
                 .chain(addr_bytes.iter().copied());
+            debug!(?addr, "prepended address bytes to payload");
             data.splice(0..0, i);
         }
         IpAddr::V6(v6) => {

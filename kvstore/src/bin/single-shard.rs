@@ -41,13 +41,14 @@ macro_rules! spawn_n {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build().unwrap();
+                let int_addr = SocketAddr::new(addr.ip(), addr.port() + 1000);
                 rt.block_on(
                     single_shard(
                         addr,
-                        l,
-                        None,                               // no internal addr
-                        None::<bertha::udp::UdpReqChunnel>, // no internal listener
-                        false,                              // don't need address embedding
+                        l.clone(),
+                        Some(int_addr),                               // no internal addr
+                        Some(l), // no internal listener
+                        true,                              // need address embedding
                         None,                               // no ready notification
                         $opt.skip_negotiation,
                     )
@@ -57,23 +58,24 @@ macro_rules! spawn_n {
                 });
         }
 
-    // thread 0
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build().unwrap();
-    rt.block_on(
+        // thread 0
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build().unwrap();
+        let int_addr = SocketAddr::new(last.ip(), last.port() + 1000);
+        rt.block_on(
                 single_shard(
                     last,
-                    $listener,
-                    None,                               // no internal addr
-                    None::<bertha::udp::UdpReqChunnel>, // no internal listener
-                    false,                              // don't need address embedding
+                    $listener.clone(),
+                    Some(int_addr),                               // no internal addr
+                    Some($listener), // no internal listener
+                    true,                              // need address embedding
                     None,                               // no ready notification
                     $opt.skip_negotiation,
                 )
                 .instrument(debug_span!("serve_lb thread", thread=?i)),
-    )
-    .unwrap();
+        )
+        .unwrap();
    }}
 }
 
