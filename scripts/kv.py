@@ -305,11 +305,10 @@ def write_dpdk_config(conn, machines, lcores):
     pci_addr = conn.pci_addr
     agenda.subtask(f"dpdk configuration file pci_addr={pci_addr} lcore_cfg={lcores}")
     # compile arp entries
-    machines = [machines['server']] + machines['clients']
     arp_cfg = '\n\n'.join([f"""\
   [[net.arp]]
-  ip = "{m['exp']}"
-  mac = "{m['mac']}"
+  ip = "{m.addr}"
+  mac = "{m.mac}"
 """ for m in machines])
     dpdk_config = f"""\
 [dpdk]
@@ -390,7 +389,7 @@ def start_server_no_chunnels(conn, outf, no_chunnels, shards=1):
     check(ok, "spawn server", conn.addr)
     agenda.subtask("wait for kvserver check")
     time.sleep(8)
-    conn.check_proc(f"kvserver", f"{outf}.err")
+    conn.check_proc(f"kvserver", [f"{outf}.err"])
 
 
 def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile):
@@ -409,7 +408,7 @@ def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arriv
 
     if shardtype == 'client':
         shard_arg = '--use-clientsharding'
-    elif shardtype == 'server':
+    elif shardtype == 'server' or shardtype == 'remote':
         shard_arg = ''
     elif shardtype == 'basicclient':
         shard_arg = '--use-basicclient'
@@ -908,7 +907,7 @@ def setup_all(machines, cfg, args, setup_fn):
         raise Exception("setup error")
     agenda.task("...done building")
 
-    ms = [cfg['machines']['server']] + cfg['machines']['clients']
+    ms = [cfg['machines']['server']] if not type(cfg['machines']['server']) == list else cfg['machines']['server'] + cfg['machines']['clients']
     for m in ms:
         for x in machines:
             if x.addr == m['exp']:
@@ -937,7 +936,7 @@ def setup_all(machines, cfg, args, setup_fn):
             write_shenango_config(m, min(len(cfg['cfg']['lcores'].split(',')), 2))
     if any('dpdk' in d for d in cfg['exp']['datapath']):
         for m in machines:
-            write_dpdk_config(m, cfg['machines'], cfg['cfg']['lcores'])
+            write_dpdk_config(m, machines, cfg['cfg']['lcores'])
 
 ### Sample config
 ### [machines]

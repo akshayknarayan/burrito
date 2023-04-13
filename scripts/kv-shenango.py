@@ -130,8 +130,8 @@ def do_exp(iter_num,
     else:
         noch = ''
 
-    server_prefix = f"{outdir}/shenango_rt{noch}-{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-kvserver"
-    outf = f"{outdir}/shenango_rt{noch}-{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-client"
+    server_prefix = f"{outdir}/shenangort{noch}-{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-kvserver"
+    outf = f"{outdir}/shenangort{noch}-{num_shards}-clientshard-{ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}-client"
 
     for m in machines:
         if m.local:
@@ -267,7 +267,7 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         check(ok, "shenango setup-machine", conn.addr)
 
         agenda.subtask(f"building kvserver-shenango")
-        ok = conn.run(f"~/.cargo/bin/cargo build --release", wd = "~/burrito/shenango-bertha")
+        ok = conn.run(f"~/.cargo/bin/cargo +nightly build --release", wd = "~/burrito/shenango-bertha")
         check(ok, "shenango-bertha build", conn.addr)
 
         return conn
