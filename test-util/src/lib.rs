@@ -3,9 +3,9 @@ use tracing::debug;
 
 pub fn reset_root_dir(path: &std::path::Path) {
     debug!(dir = ?&path, "removing");
-    std::fs::remove_dir_all(&path).unwrap_or_default();
+    std::fs::remove_dir_all(path).unwrap_or_default();
     debug!(dir = ?&path, "creating");
-    std::fs::create_dir_all(&path).unwrap();
+    std::fs::create_dir_all(path).unwrap();
 }
 
 pub fn start_redis(port: u16) -> Redis {
@@ -23,7 +23,7 @@ impl Redis {
         kill_redis(port);
 
         let mut redis = std::process::Command::new("sudo")
-            .args(&[
+            .args([
                 "docker",
                 "run",
                 "--name",
