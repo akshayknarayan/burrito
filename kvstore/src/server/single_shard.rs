@@ -8,7 +8,7 @@ use bertha::{
     bincode::SerializeChunnel, negotiate::StackNonce, select::SelectListener, ChunnelConnection,
     ChunnelListener, CxList, GetOffers,
 };
-use color_eyre::eyre::Report;
+use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::{Stream, TryStreamExt};
 use std::fmt::Debug;
 use std::net::SocketAddr;
@@ -44,9 +44,14 @@ pub async fn single_shard(
     addr: SocketAddr,
     mut raw_listener: impl ChunnelListener<
             Addr = SocketAddr,
-            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>
+                             + Connected
+                             + Send
+                             + Sync
+                             + 'static,
             Error = impl Into<Report> + Send + Sync + 'static,
         > + Send
+        + Sync
         + 'static,
     internal_addr: Option<SocketAddr>,
     internal_srv: Option<
@@ -122,6 +127,16 @@ pub async fn single_shard(
                 serve_stack!(bertha::negotiate::negotiate_server, external, st)
             }
         }
+    } else if need_address_embedding {
+        let st = UdpToShard::new(raw_listener).listen(addr).await?;
+        if no_negotiation {
+            let external = SerializeChunnel::default();
+            serve_stack!(make_cn, external, st)
+        } else {
+            let external = CxList::from(KvReliabilityServerChunnel::default())
+                .wrap(SerializeChunnel::default());
+            serve_stack!(bertha::negotiate::negotiate_server, external, st)
+        }
     } else {
         let st = raw_listener.listen(addr).await.map_err(Into::into)?;
         if no_negotiation {
@@ -132,7 +147,7 @@ pub async fn single_shard(
                 .wrap(SerializeChunnel::default());
             serve_stack!(bertha::negotiate::negotiate_server, external, st)
         }
-    };
+    }
 
     unreachable!()
 }
@@ -148,7 +163,11 @@ async fn serve_one(
     debug!("new");
     loop {
         trace!("call recv");
-        let msgs = match cn.recv(&mut slots).await {
+        let msgs = match cn
+            .recv(&mut slots)
+            .await
+            .wrap_err("kvstore/shard: Error while processing requests")
+        {
             Ok(ms) => ms,
             Err(e) => {
                 warn!(err = ?e, ?idx, "exiting on recv error");

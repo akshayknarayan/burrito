@@ -27,9 +27,9 @@ def start_shard(conn, shard_ports, outf, datapath='kernel', skip_negotiation=Fal
         raise Exception(f"unknown datapath {datapath}")
 
     skip_neg = '--skip-negotiation' if skip_negotiation else ''
-    addrs = ' '.join(f"--addr=0.0.0.0:{p}" for p in shard_ports)
+    addrs = ' '.join(f"--addr={conn.addr}:{p}" for p in shard_ports)
 
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/single-shard \
+    ok = conn.run(f"RUST_LOG=debug {dpdk_ld_var} ./target/release/single-shard \
             --datapath={datapath} \
             --log \
             {addrs} \
@@ -63,7 +63,7 @@ def start_lb(conn, redis_addr, shard_addrs, threads, outf, datapath='kernel', sk
     skip_neg = '--skip-negotiation' if skip_negotiation else ''
 
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/burrito-lb \
+    ok = conn.run(f"RUST_LOG=debug,burrito_shard_ctl=trace {dpdk_ld_var} ./target/release/burrito-lb \
             --addr {conn.addr}:{SRV_BASE_PORT} \
             --redis-addr {redis_addr} \
             {shard_addrs} \

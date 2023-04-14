@@ -23,6 +23,7 @@ pub use dpdk_state::{DpdkState, Msg, SendMsg};
 
 std::thread_local! {
     pub static DPDK_STATE: RefCell<Option<DpdkState>> = RefCell::new(None);
+    pub static THREAD_RNG: RefCell<rand::rngs::ThreadRng> = RefCell::new(rand::thread_rng());
 }
 
 #[derive(Default)]
@@ -269,11 +270,16 @@ impl ChunnelConnector for DpdkInlineChunnel {
 
                     let port = {
                         let mut free_ports_g = self.ephemeral_ports.lock().unwrap();
-                        if let Some(p) = free_ports_g.pop() {
-                            p
-                        } else {
+                        let num_ports_avail = free_ports_g.len();
+                        if num_ports_avail == 0 {
                             bail!("Could not find appropriate src port to use");
                         }
+
+                        THREAD_RNG.with(|rng_cell| {
+                            use rand::Rng;
+                            let port_idx = rng_cell.borrow_mut().gen_range(0..num_ports_avail);
+                            free_ports_g.swap_remove(port_idx)
+                        })
                     };
 
                     if let Err(err) = {

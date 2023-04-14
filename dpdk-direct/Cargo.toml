@@ -21,6 +21,7 @@ lazy_static = "1"
 macaddr = "1"
 ahash = "0.8"
 quanta = "0.10"
+rand = "0.8"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

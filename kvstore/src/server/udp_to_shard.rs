@@ -3,7 +3,7 @@ use color_eyre::eyre::{eyre, Report};
 use futures_util::stream::{Stream, StreamExt};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::{future::Future, pin::Pin};
-use tracing::debug;
+use tracing::trace;
 
 /// Shim address semantics.
 ///
@@ -54,7 +54,7 @@ pub trait Connected {
 #[cfg(feature = "dpdk-direct")]
 impl Connected for dpdk_direct::DpdkInlineCn {
     fn peer_addr(&self) -> SocketAddr {
-        self.remote_addr().unwrap()
+        SocketAddr::V4(self.remote_addr().unwrap())
     }
 }
 
@@ -177,7 +177,7 @@ fn peel_addr(mut data: Vec<u8>) -> Result<(SocketAddr, Vec<u8>), Report> {
             a.copy_from_slice(&data[3..7]);
             let addr = Ipv4Addr::from(a);
             let sa = SocketAddr::new(IpAddr::V4(addr), port);
-            debug!(?sa, "peeled return address from payload");
+            trace!(?sa, "peeled return address from payload");
             data.splice(0..7, std::iter::empty());
             Ok((sa, data))
         }
@@ -189,6 +189,7 @@ fn peel_addr(mut data: Vec<u8>) -> Result<(SocketAddr, Vec<u8>), Report> {
             let mut a = [0u8; 16];
             a.copy_from_slice(&data[3..19]);
             let sa = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(a)), port);
+            trace!(?sa, "peeled return address from payload");
             data.splice(0..19, std::iter::empty());
             Ok((sa, data))
         }
@@ -208,7 +209,7 @@ fn prepend_addr((addr, mut data): (SocketAddr, Vec<u8>)) -> Vec<u8> {
             let i = std::iter::once(addr_bytes_len)
                 .chain(p.iter().copied())
                 .chain(addr_bytes.iter().copied());
-            debug!(?addr, "prepended address bytes to payload");
+            trace!(?addr, "prepended address bytes to payload");
             data.splice(0..0, i);
         }
         IpAddr::V6(v6) => {
@@ -217,6 +218,7 @@ fn prepend_addr((addr, mut data): (SocketAddr, Vec<u8>)) -> Vec<u8> {
             let i = std::iter::once(addr_bytes_len)
                 .chain(p.iter().copied())
                 .chain(addr_bytes.iter().copied());
+            trace!(?addr, "prepended address bytes to payload");
             data.splice(0..0, i);
         }
     };

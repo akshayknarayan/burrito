@@ -178,12 +178,11 @@ fn do_exp(
         + Sync
         + 'static,
 ) -> Result<(), Report> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
     let loads_ctr = ctr.clone();
     if !opt.skip_loads {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         let accesses = opt.accesses.clone();
         let skip_negotiation = opt.skip_negotiation.clone();
         rt.block_on(async move {
@@ -401,7 +400,7 @@ where
         let mut inflight = FuturesUnordered::new();
         let mut arrv = std::time::Instant::now();
 
-        debug!("starting");
+        info!("starting ycsb client requests");
         loop {
             // first check for a finished request.
             let ops_val = match select(ops.next(), inflight.next()).await {
@@ -452,7 +451,7 @@ where
         thread_id: usize,
         done_tx: Arc<tokio::sync::watch::Sender<bool>>,
         done_rx: tokio::sync::watch::Receiver<bool>,
-        mut start_rx: tokio::sync::watch::Receiver<bool>,
+        start: Arc<tokio::sync::Barrier>,
         access_by_client: Vec<(usize, Vec<Op>)>,
         interarrival_micros: u64,
         poisson_arrivals: bool,
@@ -475,12 +474,15 @@ where
                 .into_iter()
                 .map(|(client_id, ops)| {
                     assert!(!ops.is_empty());
+                    let start = start.clone();
                     let done_rx = done_rx.clone();
                     let make_client = Arc::clone(&make_client);
                     async move {
                         let cl = make_client(client_id)
                             .await
                             .wrap_err("could not make client")?;
+                        debug!(?thread_id, ?client_id, "wait for start barrier");
+                        start.wait().await;
                         if poisson_arrivals {
                             let ops = poisson_paced_ops_stream(ops, interarrival_micros, client_id);
                             req_loop(cl, ops, done_rx.clone(), client_id).await
@@ -491,9 +493,6 @@ where
                     }
                 })
                 .collect();
-
-            // wait for start signal
-            start_rx.changed().await.expect("awaiting start signal");
 
             // do the accesses until the first client is done.
             let (mut durs, mut remaining_inflight) = reqs
@@ -525,8 +524,8 @@ where
         })
     }
 
-    info!(?interarrival_micros, "starting requests");
-    let (start_tx, start_rx) = tokio::sync::watch::channel::<bool>(false);
+    let start = Arc::new(tokio::sync::Barrier::new(num_clients));
+    info!(?interarrival_micros, ?num_clients, "starting requests");
     let (done_tx, done_rx) = tokio::sync::watch::channel::<bool>(false);
     let done_tx = Arc::new(done_tx);
     let make_client = Arc::new(make_client);
@@ -534,7 +533,7 @@ where
     for thread_id in 1..num_threads {
         let done_tx = done_tx.clone();
         let done_rx = done_rx.clone();
-        let start_rx = start_rx.clone();
+        let start = start.clone();
         let access_by_client = std::mem::take(&mut access_by_thread[thread_id]);
         let mc = Arc::clone(&make_client);
         let thread_jh = std::thread::spawn(move || {
@@ -542,7 +541,7 @@ where
                 thread_id,
                 done_tx,
                 done_rx,
-                start_rx,
+                start,
                 access_by_client,
                 interarrival_micros,
                 poisson_arrivals,
@@ -554,13 +553,12 @@ where
     }
 
     let access_start = tokio::time::Instant::now();
-    start_tx.send(true).expect("Could not send start signal");
     // local thread
     let (mut durs, mut remaining_inflight) = run_thread(
         0,
         done_tx,
         done_rx,
-        start_rx,
+        start,
         std::mem::take(&mut access_by_thread[0]),
         interarrival_micros,
         poisson_arrivals,

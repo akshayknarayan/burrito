@@ -109,19 +109,21 @@ fn run_server_shenango(opt: Opt) -> Result<(), Report> {
 #[cfg(feature = "dpdk-direct")]
 fn run_server_dpdk_singlethread(opt: Opt) -> Result<(), Report> {
     info!("using dpdk single-thread datapath");
+    // need udp_to_shard::Connected implementation
+    unimplemented!()
 
-    let s = dpdk_direct::DpdkUdpSkChunnel::new(&opt.cfg.unwrap())?;
-    let l = dpdk_direct::DpdkUdpReqChunnel(s);
-    serve(
-        l,
-        opt.redis_addr,
-        opt.ip_addr,
-        opt.port,
-        opt.num_shards,
-        None,
-        opt.skip_negotiation,
-    )
-    .wrap_err(eyre!("serve errored"))
+    //let s = dpdk_direct::DpdkUdpSkChunnel::new(&opt.cfg.unwrap())?;
+    //let l = dpdk_direct::DpdkUdpReqChunnel(s);
+    //serve(
+    //    l,
+    //    opt.redis_addr,
+    //    opt.ip_addr,
+    //    opt.port,
+    //    opt.num_shards,
+    //    None,
+    //    opt.skip_negotiation,
+    //)
+    //.wrap_err(eyre!("serve errored"))
 }
 
 #[cfg(feature = "dpdk-direct")]

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, debug_span, instrument, trace, warn};
+use tracing::{debug, debug_span, instrument, trace, trace_span, warn};
 use tracing_futures::Instrument;
 
 /// Return a stream of connections with `stack`'s semantics, listening on `raw_cn_st`.
@@ -203,12 +203,13 @@ where
 
                 let buf = bincode::serialize(&client_resp)?;
                 assert!(buf.len() < 1500); // response has to fit in a packet
+                let a_str = format!("{:?}", &a);
                 cn.send(std::iter::once((a, buf))).await?;
-                debug!("sent client response");
+                debug!(?a_str, "sent client response");
                 if let Some(mut new_stack) = new_stack {
                     debug!(stack = ?&new_stack, "handshake done, picked stack");
                     let new_cn = new_stack.connect_wrap(cn).await.map_err(Into::into)?;
-                    debug!("returning connection");
+                    debug!(?a_str, "returning connection");
                     return Ok(Some(Either::Left(new_cn)));
                 } else {
                     continue;
@@ -272,7 +273,14 @@ where
     let mut slot = [None];
     loop {
         trace!("call recv()");
-        let ms = cn.recv(&mut slot).await?;
+        let ms = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            cn.recv(&mut slot) // ShardCanonicalServerConnection is recv-only
+                .instrument(trace_span!("recv"))
+                .await
+                .wrap_err("negotiate/server/process_nonces_connection: Error receiving")
+        })
+        .await??;
+
         if ms.is_empty() {
             continue;
         }

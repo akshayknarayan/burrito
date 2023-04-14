@@ -42,10 +42,15 @@ pub use udp_to_shard::UdpToShard;
 pub fn serve(
     mut raw_listener: impl ChunnelListener<
             Addr = SocketAddr,
-            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
+            Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>
+                             + udp_to_shard::Connected
+                             + Send
+                             + Sync
+                             + 'static,
             Error = impl Into<Report> + Send + Sync + 'static,
         > + Clone
         + Send
+        + Sync
         + 'static,
     redis_addr: SocketAddr,
     srv_ip: IpAddr,

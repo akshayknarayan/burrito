@@ -92,15 +92,15 @@ pub async fn serve_lb(
             loop {
                 match cn
                     .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
-                    .instrument(trace_span!("lb-serve-recv", ?ctr))
+                    .instrument(trace_span!("shard-canonical-server-connection", ?ctr))
                     .await
-                    .wrap_err("kvstore/server: Error while processing requests")
+                    .wrap_err("kvstore/serve_lb: Error in serving canonical connection")
                 {
-                    Ok(_) => {}
                     Err(e) => {
-                        warn!(err = ?e, ?ctr, "exiting");
-                        break Err(e);
+                        warn!(err = ?e, ?ctr, "exiting connection loop");
+                        break Ok(());
                     }
+                    Ok(_) => {}
                 }
             }
         }

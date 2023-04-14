@@ -41,18 +41,17 @@ macro_rules! spawn_n {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build().unwrap();
-                let int_addr = SocketAddr::new(addr.ip(), addr.port() + 1000);
                 rt.block_on(
                     single_shard(
                         addr,
-                        l.clone(),
-                        Some(int_addr),                               // no internal addr
-                        Some(l), // no internal listener
+                        l,
+                        None,                               // no internal addr
+                        None::<bertha::udp::UdpReqChunnel>, // no internal listener
                         true,                              // need address embedding
                         None,                               // no ready notification
                         $opt.skip_negotiation,
                     )
-                    .instrument(debug_span!( "serve_lb thread", thread=?i)),
+                    .instrument(debug_span!( "single_shard thread", thread=?i)),
                 )
                     .unwrap();
                 });
@@ -62,18 +61,17 @@ macro_rules! spawn_n {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build().unwrap();
-        let int_addr = SocketAddr::new(last.ip(), last.port() + 1000);
         rt.block_on(
                 single_shard(
                     last,
-                    $listener.clone(),
-                    Some(int_addr),                               // no internal addr
-                    Some($listener), // no internal listener
+                    $listener,
+                    None,                               // no internal addr
+                    None::<bertha::udp::UdpReqChunnel>, // no internal listener
                     true,                              // need address embedding
                     None,                               // no ready notification
                     $opt.skip_negotiation,
                 )
-                .instrument(debug_span!("serve_lb thread", thread=?i)),
+                .instrument(debug_span!("single_shard thread", thread=?i)),
         )
         .unwrap();
    }}
@@ -111,10 +109,12 @@ fn main() -> Result<(), Report> {
         }
         #[cfg(feature = "dpdk-direct")]
         Datapath::DpdkSingleThread if cfg!(feature = "dpdk-direct") => {
-            let cfg = opt.cfg.unwrap();
-            let s = dpdk_direct::DpdkUdpSkChunnel::new(&cfg)?;
-            let listener = dpdk_direct::DpdkUdpReqChunnel(s);
-            spawn_n!(listener, opt);
+            // TODO need UdpToShard::Connected for connection type
+            unimplemented!()
+            //let cfg = opt.cfg.unwrap();
+            //let s = dpdk_direct::DpdkUdpSkChunnel::new(&cfg)?;
+            //let listener = dpdk_direct::DpdkUdpReqChunnel(s);
+            //spawn_n!(listener, opt);
         }
         #[cfg(feature = "dpdk-direct")]
         Datapath::DpdkMultiThread if cfg!(feature = "dpdk-direct") => {
