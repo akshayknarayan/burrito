@@ -13,6 +13,49 @@ use std::sync::{atomic::AtomicUsize, Arc};
 use tracing::{debug_span, info, info_span, trace_span, warn};
 use tracing_futures::Instrument;
 
+macro_rules! serve {
+    ($raw_listener: expr, $si: expr, $external: expr, $ready: expr) => {{
+    let st = $raw_listener
+        .listen($si.canonical_addr)
+        .await
+        .map_err(Into::into)
+        .wrap_err("Listen on raw_listener")?;
+    let st = bertha::negotiate::negotiate_server($external, st)
+        .instrument(info_span!("negotiate_server"))
+        .await
+        .wrap_err("negotiate_server")?;
+
+    if let Some(ready) = $ready.into() {
+        ready.send(()).unwrap_or_default();
+    }
+
+    let ctr: Arc<AtomicUsize> = Default::default();
+    tokio::pin!(st);
+    st.try_for_each_concurrent(None, |cn| {
+        let ctr = Arc::clone(&ctr);
+        async move {
+            let ctr = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut slot = [None];
+            loop {
+                if let Err(e) = cn
+                    .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
+                    .instrument(trace_span!("shard-canonical-server-connection", ?ctr))
+                    .await
+                    .wrap_err("kvstore/serve_lb: Error in serving canonical connection")
+                {
+                    warn!(err = ?e, ?ctr, "exiting connection loop");
+                    break Ok(());
+                }
+            }
+        }
+        .instrument(debug_span!("serve_lb_conn"))
+    })
+    .await?;
+
+    unreachable!() // negotiate_server never returns None
+    }}
+}
+
 /// Start and serve a load balancer, which just forwards connections to existing shards.
 ///
 /// Don't call `spawn`.
@@ -36,6 +79,7 @@ pub async fn serve_lb(
         + 'static,
     redis_addr: SocketAddr,
     ready: impl Into<Option<tokio::sync::oneshot::Sender<()>>>,
+    opt: bool,
 ) -> Result<(), Report> {
     let si = ShardInfo {
         canonical_addr: addr,
@@ -63,50 +107,17 @@ pub async fn serve_lb(
     )
     .await
     .wrap_err("Create ShardCanonicalServer")?;
-    //use crate::opt::SerdeOpt;
-    let external = CxList::from(cnsrv)
-        .wrap(KvReliabilityServerChunnel::default())
-        .wrap(SerializeChunnel::default());
-    //let external = external.serde_opt();
-    let st = raw_listener
-        .listen(si.canonical_addr)
-        .await
-        .map_err(Into::into)
-        .wrap_err("Listen on raw_listener")?;
-    let st = bertha::negotiate::negotiate_server(external, st)
-        .instrument(info_span!("negotiate_server"))
-        .await
-        .wrap_err("negotiate_server")?;
 
-    if let Some(ready) = ready.into() {
-        ready.send(()).unwrap_or_default();
+    if opt {
+        //use crate::opt::SerdeOpt;
+        //let external = external.serde_opt();
+        let cnsrv = burrito_shard_ctl::ShardCanonicalServerRaw::<_, _, _, _, 18>::from(cnsrv);
+        let external = CxList::from(cnsrv).wrap(KvReliabilityServerChunnel::default());
+        serve!(raw_listener, si, external, ready)
+    } else {
+        let external = CxList::from(cnsrv)
+            .wrap(KvReliabilityServerChunnel::default())
+            .wrap(SerializeChunnel::default());
+        serve!(raw_listener, si, external, ready)
     }
-
-    let ctr: Arc<AtomicUsize> = Default::default();
-    tokio::pin!(st);
-    st.try_for_each_concurrent(None, |cn| {
-        let ctr = Arc::clone(&ctr);
-        async move {
-            let ctr = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut slot = [None];
-            loop {
-                match cn
-                    .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
-                    .instrument(trace_span!("shard-canonical-server-connection", ?ctr))
-                    .await
-                    .wrap_err("kvstore/serve_lb: Error in serving canonical connection")
-                {
-                    Err(e) => {
-                        warn!(err = ?e, ?ctr, "exiting connection loop");
-                        break Ok(());
-                    }
-                    Ok(_) => {}
-                }
-            }
-        }
-        .instrument(debug_span!("serve_lb_conn"))
-    })
-    .await?;
-
-    unreachable!() // negotiate_server never returns None
 }

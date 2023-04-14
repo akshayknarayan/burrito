@@ -424,9 +424,20 @@ where
 ///
 /// Otherwise just wrap `ShardCanonicalServer`, functionality is identical (even the connection
 /// type is identical).
-#[derive(Clone)]
 pub struct ShardCanonicalServerRaw<A, S, Ss, D, const OFFSET: usize> {
     inner: ShardCanonicalServer<A, S, Ss, D>,
+}
+
+impl<A, S, Ss, D, const OFFSET: usize> Clone for ShardCanonicalServerRaw<A, S, Ss, D, OFFSET>
+where
+    A: Clone,
+    Ss: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<A: std::fmt::Debug, S, Ss, D, const OFFSET: usize> std::fmt::Debug

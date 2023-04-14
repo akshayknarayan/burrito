@@ -26,6 +26,9 @@ struct Opt {
     log: bool,
 
     #[structopt(long)]
+    opt: bool,
+
+    #[structopt(long)]
     trace_time: Option<PathBuf>,
 
     #[structopt(long)]
@@ -57,6 +60,7 @@ macro_rules! spawn_n {
                     c,
                     $opt.redis_addr,
                     None, // no ready notification
+                    $opt.opt,
                 )
                 .instrument(debug_span!("serve_lb thread", thread=?i)),
             )
@@ -77,6 +81,7 @@ macro_rules! spawn_n {
             $connector,
             $opt.redis_addr,
             None, // no ready notification
+            $opt.opt,
         )
         .instrument(debug_span!("serve_lb thread", thread = 0)),
     )
