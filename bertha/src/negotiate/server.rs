@@ -15,7 +15,7 @@ use tracing_futures::Instrument;
 
 /// Return a stream of connections with `stack`'s semantics, listening on `raw_cn_st`.
 #[allow(clippy::manual_async_fn)] // we need the + 'static which async fn does not do.
-pub fn negotiate_server<'c, Srv, Sc, Se, C, A>(
+pub fn negotiate_server<Srv, Sc, Se, C, A>(
     stack: Srv,
     raw_cn_st: Sc,
 ) -> impl Future<
