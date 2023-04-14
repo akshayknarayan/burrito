@@ -275,10 +275,10 @@ where
                         return;
                     }
 
-                    trace!("wait for nonce ack");
+                    debug!("wait for nonce ack");
                     let mut slot = [None];
                     match cn.recv(&mut slot).await {
-                        Ok([Some((a, buf))]) => match bincode::deserialize(&buf) {
+                        Ok([Some((a, buf))]) => match bincode::deserialize(buf) {
                             Ok(bertha::negotiate::NegotiateMsg::ServerNonceAck) => {
                                 // TODO collect received addresses since we could receive acks from
                                 // any shard
@@ -286,7 +286,7 @@ where
                                     warn!(addr = ?a, expected = ?shard.clone(), "received from unexpected address");
                                 }
 
-                                trace!("got nonce ack");
+                                debug!("got nonce ack");
                             }
                             Ok(m) => {
                                 warn!(msg = ?m, shard = ?shard.clone(), "got unexpected response to nonce");
@@ -378,7 +378,7 @@ where
                     .collect::<Result<_, Error>>()
                     .wrap_err("Could not connect to at least one shard")?;
 
-                trace!("connected to shards");
+                debug!("connected to shards");
 
                 // serve canonical address
                 // we are only responsible for the canonical address here.
@@ -564,7 +564,7 @@ where
                     .collect::<Result<_, Error>>()
                     .wrap_err("Could not connect to at least one shard")?;
 
-                trace!("connected to shards");
+                debug!("connected to shards");
 
                 // serve canonical address
                 // we are only responsible for the canonical address here.

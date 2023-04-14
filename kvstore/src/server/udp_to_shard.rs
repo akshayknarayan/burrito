@@ -47,9 +47,47 @@ where
     }
 }
 
+pub trait Connected {
+    fn peer_addr(&self) -> SocketAddr;
+}
+
+#[cfg(feature = "dpdk-direct")]
+impl Connected for dpdk_direct::DpdkInlineCn {
+    fn peer_addr(&self) -> SocketAddr {
+        self.remote_addr().unwrap()
+    }
+}
+
+impl Connected for bertha::udp::UdpConn {
+    fn peer_addr(&self) -> SocketAddr {
+        self.peer()
+    }
+}
+
+impl Connected for bertha::chan_transport::ChanChunnel<SocketAddr, (SocketAddr, Vec<u8>)> {
+    fn peer_addr(&self) -> SocketAddr {
+        self.peer()
+    }
+}
+
+impl<A, B> Connected for bertha::either::Either<A, B>
+where
+    A: Connected,
+    B: Connected,
+{
+    fn peer_addr(&self) -> SocketAddr {
+        match self {
+            bertha::either::Either::Left(a) => a.peer_addr(),
+            bertha::either::Either::Right(b) => b.peer_addr(),
+        }
+    }
+}
+
 impl<I, E> ChunnelListener for UdpToShard<I>
 where
     I: ChunnelListener<Addr = SocketAddr, Error = E> + Send + Sync + 'static,
+    <I as ChunnelListener>::Connection:
+        ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Connected + Send + Sync + 'static,
     E: Into<Report> + Send + Sync + 'static,
     UdpToShardCn<ProjectLeft<SocketAddr, <I as ChunnelListener>::Connection>>:
         ChunnelConnection<Data = (SocketAddr, Vec<u8>)> + Send + Sync + 'static,
@@ -65,11 +103,13 @@ where
         let lis_fut = self.0.listen(a);
         Box::pin(async move {
             let l = lis_fut.await.map_err(Into::into)?;
-            // ProjectLeft a is a dummy, the UdpConn will ignore it and replace with the
-            // req-connection source addr.
-            Ok(Box::pin(
-                l.map(move |cn| Ok(UdpToShardCn(ProjectLeft::new(a, cn.map_err(Into::into)?)))),
-            ) as _)
+            // we need to get the address to respond to here, so that the connection sends back to
+            // the right address
+            Ok(Box::pin(l.map(move |cn| {
+                let cn = cn.map_err(Into::into)?;
+                let resp_addr = cn.peer_addr();
+                Ok(UdpToShardCn(ProjectLeft::new(resp_addr, cn)))
+            })) as _)
         })
     }
 }

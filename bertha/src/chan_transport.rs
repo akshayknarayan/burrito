@@ -4,9 +4,9 @@ use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report};
 use dashmap::DashMap;
 use futures_util::stream::{Stream, StreamExt};
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{future::Future, net::SocketAddr};
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
@@ -19,7 +19,7 @@ pub struct Cln;
 /// Channel connector where server registers on listen(), and client grabs client on connect().
 pub struct RendezvousChannel<Addr, Data, Side> {
     channel_size: usize,
-    map: Arc<DashMap<Addr, mpsc::Sender<ChanChunnel<(Addr, Data)>>>>,
+    map: Arc<DashMap<Addr, mpsc::Sender<ChanChunnel<Addr, (Addr, Data)>>>>,
     side: std::marker::PhantomData<Side>,
 }
 
@@ -67,7 +67,7 @@ where
     D: Send + Sync + 'static,
 {
     type Addr = A;
-    type Connection = ChanChunnel<(A, D)>;
+    type Connection = ChanChunnel<A, (A, D)>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -93,7 +93,7 @@ where
     D: Send + Sync + 'static,
 {
     type Addr = A;
-    type Connection = ChanChunnel<(A, D)>;
+    type Connection = ChanChunnel<A, (A, D)>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Report;
@@ -105,8 +105,8 @@ where
             Box::pin(async move {
                 let (s1, r1) = mpsc::channel(channel_size);
                 let (s2, r2) = mpsc::channel(channel_size);
-                let connect_ch = ChanChunnel::new(s1, r2, Arc::new(|x| x));
-                let listen_ch = ChanChunnel::new(s2, r1, Arc::new(|x| x));
+                let connect_ch = ChanChunnel::new(a.clone(), s1, r2, Arc::new(|x| x));
+                let listen_ch = ChanChunnel::new(a, s2, r1, Arc::new(|x| x));
                 notify_listener
                     .send(listen_ch)
                     .await
@@ -186,7 +186,7 @@ where
     D: Send + Sync + 'static,
 {
     type Addr = ();
-    type Connection = ChanChunnel<D>;
+    type Connection = ChanChunnel<(), D>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -194,6 +194,7 @@ where
 
     fn listen(&mut self, _a: Self::Addr) -> Self::Future {
         let r = ChanChunnel::new(
+            (),
             self.snd1.take().unwrap(),
             self.rcv2.take().unwrap(),
             Arc::clone(&self.link),
@@ -207,13 +208,14 @@ where
     D: Send + Sync + 'static,
 {
     type Addr = ();
-    type Connection = ChanChunnel<D>;
+    type Connection = ChanChunnel<(), D>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Report;
 
     fn connect(&mut self, _a: Self::Addr) -> Self::Future {
         let r = ChanChunnel::new(
+            (),
             self.snd2.take().unwrap(),
             self.rcv1.take().unwrap(),
             Arc::clone(&self.link),
@@ -222,19 +224,22 @@ where
     }
 }
 
-pub struct ChanChunnel<Data> {
+pub struct ChanChunnel<A, Data> {
+    addr: A,
     snd: mpsc::Sender<Data>,
     rcv: Arc<Mutex<mpsc::Receiver<Data>>>,
     link: Arc<dyn Fn(Option<Data>) -> Option<Data> + Send + Sync + 'static>,
 }
 
-impl<D> ChanChunnel<D> {
+impl<A, D> ChanChunnel<A, D> {
     fn new(
+        addr: A,
         snd: mpsc::Sender<D>,
         r: mpsc::Receiver<D>,
         link: Arc<dyn Fn(Option<D>) -> Option<D> + Send + Sync + 'static>,
     ) -> Self {
         Self {
+            addr,
             snd,
             rcv: Arc::new(Mutex::new(r)),
             link,
@@ -242,8 +247,15 @@ impl<D> ChanChunnel<D> {
     }
 }
 
-impl<D> ChunnelConnection for ChanChunnel<D>
+impl<D> ChanChunnel<SocketAddr, D> {
+    pub fn peer(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl<A, D> ChunnelConnection for ChanChunnel<A, D>
 where
+    A: Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
     type Data = D;

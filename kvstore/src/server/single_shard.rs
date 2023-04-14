@@ -1,7 +1,7 @@
 use crate::kv::Store;
 use crate::msg::Msg;
 use crate::reliability::KvReliabilityServerChunnel;
-use crate::server::udp_to_shard::UdpToShard;
+use crate::server::udp_to_shard::{Connected, UdpToShard};
 use and_then_concurrent::TryStreamAndThenExt;
 use bertha::Chunnel;
 use bertha::{
@@ -53,6 +53,7 @@ pub async fn single_shard(
         impl ChunnelListener<
                 Addr = SocketAddr,
                 Connection = impl ChunnelConnection<Data = (SocketAddr, Vec<u8>)>
+                                 + Connected
                                  + Send
                                  + Sync
                                  + 'static,
