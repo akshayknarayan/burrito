@@ -8,11 +8,11 @@ import sys
 import time
 import subprocess
 import agenda
-from kv import ConnectionWrapper, check_machine, setup_machine, start_redis, write_shenango_config, run_loads, run_client, get_local, dpdk_ld_var, setup_all, generate_ycsb_file, check
+from kv import ConnectionWrapper, check_machine, setup_machine, start_redis, write_shenango_config, run_loads, run_client, get_local, dpdk_ld_var, setup_all, generate_ycsb_file, check, local_path
 
 SRV_BASE_PORT = 4242
 
-def start_shard(conn, shard_ports, outf, datapath='kernel', skip_negotiation=False):
+def start_shard(conn, shard_ports, outf, datapath='kernel', skip_negotiation=False, bin_root="./target/release"):
     conn.run("sudo pkill -9 single-shard")
     conn.run("sudo pkill -9 iokerneld")
     if datapath == 'shenango_channel':
@@ -29,7 +29,7 @@ def start_shard(conn, shard_ports, outf, datapath='kernel', skip_negotiation=Fal
     skip_neg = '--skip-negotiation' if skip_negotiation else ''
     addrs = ' '.join(f"--addr={conn.addr}:{p}" for p in shard_ports)
 
-    ok = conn.run(f"RUST_LOG=debug {dpdk_ld_var} ./target/release/single-shard \
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} {bin_root}/single-shard \
             --datapath={datapath} \
             --log \
             {addrs} \
@@ -46,7 +46,7 @@ def start_shard(conn, shard_ports, outf, datapath='kernel', skip_negotiation=Fal
     time.sleep(8)
     conn.check_proc(f"single-shard", [f"{outf}.out", f"{outf}.err"])
 
-def start_lb(conn, redis_addr, shard_addrs, threads, outf, datapath='kernel', skip_negotiation=False):
+def start_lb(conn, redis_addr, shard_addrs, threads, outf, datapath='kernel', skip_negotiation=False, bin_root="./target/release", use_opt=False):
     conn.run("sudo pkill -9 burrito-lb")
     conn.run("sudo pkill -9 iokerneld")
     if datapath == 'shenango_channel':
@@ -61,9 +61,10 @@ def start_lb(conn, redis_addr, shard_addrs, threads, outf, datapath='kernel', sk
         raise Exception(f"unknown datapath {datapath}")
 
     skip_neg = '--skip-negotiation' if skip_negotiation else ''
+    opt_arg = '--opt' if use_opt else ''
 
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=debug,burrito_shard_ctl=trace {dpdk_ld_var} ./target/release/burrito-lb \
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} {bin_root}/burrito-lb \
             --addr {conn.addr}:{SRV_BASE_PORT} \
             --redis-addr {redis_addr} \
             {shard_addrs} \
@@ -71,7 +72,8 @@ def start_lb(conn, redis_addr, shard_addrs, threads, outf, datapath='kernel', sk
             --log \
             --datapath={datapath} \
             {cfg} \
-            {skip_neg}",
+            {skip_neg} \
+            {opt_arg}",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -82,6 +84,7 @@ def start_lb(conn, redis_addr, shard_addrs, threads, outf, datapath='kernel', sk
     agenda.subtask("wait for burrito-lb check")
     time.sleep(8)
     conn.check_proc(f"burrito-lb", [f"{outf}.out", f"{outf}.err"])
+
 
 def do_exp(
     outdir=None,
@@ -95,6 +98,8 @@ def do_exp(
     skip_negotiation=None,
     cfg_client=None,
     cfg_server=None,
+    use_opt=None,
+    cloudlab=False,
 ):
     assert(
         outdir is not None and
@@ -105,16 +110,26 @@ def do_exp(
         poisson_arrivals is not None and
         wrkload is not None and
         overwrite is not None and
-        skip_negotiation is not None
+        skip_negotiation is not None and
+        use_opt is not None
     )
     wrkname = wrkload.split("/")[-1].split(".")[0]
     noneg = '_noneg' if skip_negotiation else ''
+    useopt = '_opt' if use_opt else ''
+
+    target_dir = None
+    orig_outdir = outdir
+    if cloudlab:
+        res = machines[0].run("ls /proj/")
+        target_dir = f"/proj/{res.stdout.strip().split()[0]}"
+        outdir = f"{target_dir}/{outdir}"
+    agenda.subtask(f"exp outdir: {outdir} target dir: {target_dir}")
 
     lb = conns['lb']
     shards = conns['shards']
     clients = conns['clients']
 
-    exp_pfx = f"{outdir}/{datapath}{noneg}-{num_shards}-remoteshard-load={ops_per_sec}-poisson={poisson_arrivals}-{wrkname}"
+    exp_pfx = f"{outdir}/{datapath}{noneg}{useopt}-{num_shards}-remoteshard-load={ops_per_sec}-poisson={poisson_arrivals}-{wrkname}"
     server_prefix = f"{exp_pfx}-lb"
     shard_prefix = f"{exp_pfx}-shard"
     outf = f"{exp_pfx}-client"
@@ -147,6 +162,7 @@ def do_exp(
         raise Exception(f"trying to start more shards per thread ({shards_per_machine}) than number of threads ({cfg_server['num_threads']})")
 
     threads = cfg_server['num-threads']
+    bin_root_dir = f"{target_dir}/burrito-target/release" if target_dir is not None else "./target/release"
 
     curr_shard_port = SRV_BASE_PORT + 1
     shard_addrs = []
@@ -160,7 +176,8 @@ def do_exp(
             shard_ports,
             shard_prefix,
             datapath=datapath,
-            skip_negotiation=skip_negotiation
+            skip_negotiation=skip_negotiation,
+            bin_root=bin_root_dir,
         )
     time.sleep(5)
 
@@ -173,7 +190,9 @@ def do_exp(
         threads,
         server_prefix,
         datapath=datapath,
-        skip_negotiation=skip_negotiation
+        skip_negotiation=skip_negotiation,
+        bin_root=bin_root_dir,
+        use_opt=use_opt,
     )
     time.sleep(5)
 
@@ -189,12 +208,22 @@ def do_exp(
         redis_addr,
         outf,
         wrkload,
-        skip_negotiation=num_shards if skip_negotiation else 0
+        skip_negotiation=num_shards if skip_negotiation else 0,
+        bin_root=bin_root_dir
     )
 
+    get_fn = f"{'' if cloudlab else 'burrito/'}{outf}-loads"
+    loc = local_path(f"{outf}-loads", orig_outdir) if cloudlab else f"{outf}-loads"
+    try:
+        machines[1].get(get_fn+".out", local=loc+".out", preserve_mode=False)
+        machines[1].get(get_fn+".err", local=loc+".err", preserve_mode=False)
+    except Exception as e:
+        agenda.subfailure(f"Could not get file {loc}.[out,err] from loads client: {e}")
+
+    time.sleep(2)
     # others are clients
     agenda.task("starting clients")
-    clients = [threading.Thread(target=run_client, args=(
+    client_threads = [threading.Thread(target=run_client, args=(
             m,
             cfg_client,
             server_addr,
@@ -207,6 +236,7 @@ def do_exp(
             outf,
             wrkload
         ),
+        kwargs={'bin_root': bin_root_dir}
     ) for m in clients]
 
     [t.start() for t in client_threads]
@@ -226,45 +256,52 @@ def do_exp(
     for m in clients:
         m.run("rm ~/burrito/*.config")
 
-    agenda.task("get lb files")
-    if not lb.local:
-        lb.get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
-        lb.get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+    agenda.task("get server files")
+    if not lb.is_local:
+        get_fn = f"{'' if cloudlab else 'burrito/'}{server_prefix}"
+        loc = local_path(f"{server_prefix}", orig_outdir) if cloudlab else f"{server_prefix}"
+        machines[0].get(get_fn +'.out', local=loc +'.out', preserve_mode=False)
+        machines[0].get(get_fn +'.err', local=loc +'.err', preserve_mode=False)
     agenda.task("get shard files")
     for s in shards:
         if not s.local:
-            s.get(f"burrito/{shard_prefix}-{s.addr}.out", local=f"{shard_prefix}-{s.addr}.out", preserve_mode=False)
-            s.get(f"burrito/{shard_prefix}-{s.addr}.err", local=f"{shard_prefix}-{s.addr}.err", preserve_mode=False)
+            get_fn = f"{'' if cloudlab else 'burrito/'}{shard_prefix}-{s.addr}"
+            loc = local_path(f"{shard_prefix}-{s.addr}", orig_outdir) if cloudlab else f"{shard_prefix}-{s.addr}"
+            machines[0].get(get_fn +'.out', local=loc +'.out', preserve_mode=False)
+            machines[0].get(get_fn +'.err', local=loc +'.err', preserve_mode=False)
             #s.get(f"burrito/{shard_prefix}-{s.addr}.trace", local=f"{shard_prefix}-{s.addr}.trace", preserve_mode=False)
 
     def get_files(num):
         fn = c.get
-        if c.local:
+        if c.is_local:
             agenda.subtask(f"Use get_local: {c.host}")
             fn = get_local
 
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
+        get_fn = f"{'' if cloudlab else 'burrito/'}{outf}{num}"
+        loc = local_path(f"{outf}{num}-{c.addr}", orig_outdir) if cloudlab else f"{outf}{num}-{c.addr}"
+
+        agenda.subtask(f"getting {get_fn}.err")
         fn(
-            f"burrito/{outf}{num}.err",
-            local=f"{outf}{num}-{c.addr}.err",
+            f"{get_fn}.err",
+            local=f"{loc}.err",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.out")
+        agenda.subtask(f"getting {get_fn}.out")
         fn(
-            f"burrito/{outf}{num}.out",
-            local=f"{outf}{num}-{c.addr}.out",
+            f"{get_fn}.out",
+            local=f"{loc}.out",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.data")
+        agenda.subtask(f"getting {get_fn}.data")
         fn(
-            f"burrito/{outf}{num}.data",
-            local=f"{outf}{num}-{c.addr}.data",
+            f"{get_fn}.data",
+            local=f"{loc}.data",
             preserve_mode=False,
         )
-        #agenda.subtask(f"getting {outf}{num}-{c.addr}.trace")
+        #agenda.subtask(f"getting {get_fn}.trace")
         #fn(
-        #    f"burrito/{outf}{num}.trace",
-        #    local=f"{outf}{num}-{c.addr}.trace",
+        #    f"{get_fn}.trace",
+        #    local=f"{loc}.trace",
         #    preserve_mode=False,
         #)
 
@@ -293,8 +330,7 @@ def connect_machines(cfg):
     conns = { c.addr: c for c in machines }
     return { 'lb': conns[lb_ip], 'shards': [conns[i] for i in shard_ips], 'clients': [conns[i] for i in client_ips] }
 
-def setup_machine_lb(conn, outdir, datapaths, dpdk_driver):
-    setup_machine(conn, outdir, datapaths, dpdk_driver)
+def compile_binaries_lb(conn, outdir, datapaths, dpdk_driver, target_dir):
     try:
         needed_features = ["bin"]
         for d in datapaths:
@@ -310,15 +346,41 @@ def setup_machine_lb(conn, outdir, datapaths, dpdk_driver):
                     needed_features.append('cx4_mlx')
                 elif dpdk_driver == 'intel' and 'xl710_intel' not in needed_features:
                     needed_features.append('xl710_intel')
-        agenda.subtask(f"building kvserver features={needed_features}")
-        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"single-shard\" --bin=\"burrito-lb\"", wd = "~/burrito/kvstore")
-        check(ok, "single-shard build", conn.addr)
+        agenda.subtask(f"building burrito-lb + single-shard features={needed_features}, target-dir {target_dir}")
+        target_dir_arg = f"--target-dir {target_dir}/burrito-target" if target_dir is not None else ""
+        ok = conn.run(f"~/.cargo/bin/cargo build \
+            --release \
+            --features=\"{','.join(needed_features)}\" \
+            --bin=\"single-shard\" \
+            --bin=\"burrito-lb\" \
+            {target_dir_arg}",
+            wd = "~/burrito/kvstore")
+        check(ok, "kvserver build", conn.addr)
+
+        agenda.subtask(f"building ycsb features={needed_features}")
+        ok = conn.run(f"~/.cargo/bin/cargo build \
+            --release \
+            --features=\"{','.join(needed_features[1:])}\" \
+            --bin=\"ycsb\" \
+            {target_dir_arg}",
+            wd = "~/burrito/kvstore-ycsb")
+        check(ok, "ycsb build", conn.addr)
+
+        if 'dpdkmulti' in datapaths:
+            needed_features = [f for f in needed_features if f == 'xl710_intel' or f == 'cx3_mlx' or f == 'cx4_mlx']
+            agenda.subtask(f"building kv-dpdk features={needed_features} target-dir {target_dir}")
+            ok = conn.run(f"~/.cargo/bin/cargo build \
+                --release \
+                --features=\"{','.join(needed_features)}\" \
+                {target_dir_arg}",
+                wd = "~/burrito/kv-dpdk")
+            check(ok, "kv-dpdk build", conn.addr)
+        return conn
     except Exception as e:
-        msg = f"[{conn.addr}] setup_machine failed: {e}"
-        agenda.failure(msg)
+        agenda.failure(f"[{conn.addr}] setup_machine failed: {e}")
         global thread_ok
         thread_ok = False
-        raise Exception(msg) from e
+        raise e
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -327,6 +389,7 @@ if __name__ == '__main__':
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--dpdk_driver', type=str, choices=['mlx4', 'mlx5', 'intel'],  required=False)
     parser.add_argument('--setup_only', action='store_true',  required=False)
+    parser.add_argument('--cloudlab', action='store_true',  required=False)
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")
     cfg = toml.load(args.config)
@@ -378,6 +441,15 @@ if __name__ == '__main__':
     except Exception as e:
         raise Exception("negotiation key must be present and bool") from e
 
+    try:
+        for t in cfg['exp']['optimization']:
+            if t not in [True,False]:
+                raise Exception("optimization must be present and bool")
+    except Exception as e:
+        raise Exception("negotiation key must be present and bool") from e
+
+
+
     conns = connect_machines(cfg)
     machines = [conns['lb']] + conns['shards'] + conns['clients']
 
@@ -394,7 +466,7 @@ if __name__ == '__main__':
         subprocess.run(f"mkdir -p {args.outdir}", shell=True)
 
     # build
-    setup_all(machines, cfg, args, setup_machine_lb)
+    setup_all(machines, cfg, args, setup_machine, compile_binaries_lb)
 
     for w in cfg['exp']['wrk']:
         for conn in machines:
@@ -414,18 +486,21 @@ if __name__ == '__main__':
                 for s in cfg['exp']['shards']:
                     for p in cfg['exp']['poisson-arrivals']:
                         for o in cfg['exp']['load']:
-                            do_exp(
-                                outdir=outdir,
-                                conns=conns,
-                                num_shards=s,
-                                ops_per_sec=o,
-                                datapath=dp,
-                                poisson_arrivals=p,
-                                wrkload=w,
-                                skip_negotiation=not neg,
-                                overwrite=args.overwrite,
-                                cfg_client=cfg['cfg']['client'],
-                                cfg_server=cfg['cfg']['server'],
-                            )
+                            for z in cfg['exp']['optimization']:
+                                do_exp(
+                                    outdir=outdir,
+                                    conns=conns,
+                                    num_shards=s,
+                                    ops_per_sec=o,
+                                    datapath=dp,
+                                    poisson_arrivals=p,
+                                    wrkload=w,
+                                    skip_negotiation=not neg,
+                                    overwrite=args.overwrite,
+                                    cfg_client=cfg['cfg']['client'],
+                                    cfg_server=cfg['cfg']['server'],
+                                    cloudlab=args.cloudlab,
+                                    use_opt=z,
+                                )
 
     agenda.task("done")

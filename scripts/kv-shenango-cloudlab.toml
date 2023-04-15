@@ -1,14 +1,13 @@
-# This config uses cloudlab xl170 machines. The ip and mac addresses probably need to be replaced.
-
 [machines]
-server = { access = "128.110.218.105", user = "akshayn", alt = "128.110.218.105", exp = "10.10.1.2", mac = "9c:dc:71:5d:01:91" } # node-0
+server = { access = "128.110.218.171", user = "akshayn", alt = "128.110.218.171", exp = "10.10.1.2", mac = "9c:dc:71:56:af:45" } # node-0
 clients = [
-    { access = "128.110.218.109", user = "akshayn", alt = "128.110.218.109", exp = "10.10.1.1", mac = "9c:dc:71:5b:42:91" }, # node-1
+    #{ access = "128.110.218.134", user = "akshayn", alt = "128.110.218.134", exp = "10.10.1.1", mac = "9c:dc:71:49:a8:a1" }, # node-1
+    { access = "128.110.218.86", user = "akshayn", alt = "128.110.218.86", exp = "10.10.1.3", mac = "9c:dc:71:5e:2f:61" } # node-2
+    { access = "128.110.218.181", user = "akshayn", alt = "128.110.218.181", exp = "10.10.1.4", mac = "9c:dc:71:4b:63:21" }, # node-3
 ]
 
 [cfg]
 lcores = "0,1,2,3,4,5,6,7,8,9"
-#lcores = "1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41,43,45,47,49,51,53,55,57,59,61,63"
 
 [cfg.client]
 num-threads = 10
@@ -17,10 +16,9 @@ num-threads = 10
 num-threads = 10
 
 [exp]
-#wrk = ["./kvstore-ycsb/ycsbc-mock/workloadb-4.access", "./kvstore-ycsb/ycsbc-mock/workloadb-8.access"]
 wrk = ["./kvstore-ycsb/ycsbc-mock/workloadb-8.access"]
 datapath = ['shenangort']
-load = [10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000, 180000, 200000, 240000, 280000, 320000, 360000, 400000]
+load = [10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000, 180000, 200000]
 poisson-arrivals = [true]
 #shardtype = ["client", "server"]
 shardtype = ["client"]

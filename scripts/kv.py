@@ -188,11 +188,11 @@ def check_machine(ip):
     conn.alt = alt
     return (conn, commit)
 
-def setup_machine(conn, outdir, datapaths, dpdk_driver):
+def setup_machine(conn, outdir, datapaths, dpdk_driver, target_dir):
     agenda.task(f"[{conn.addr}] setup machine")
     try:
         agenda.subtask(f"[{conn.addr}] make outdir {outdir}")
-        ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
+        ok = conn.run(f"mkdir -p {target_dir if target_dir is not None else '~/burrito'}/{outdir}")
         check(ok, "mk outdir", conn.addr)
 
         # dpdk dependencies, rust, and docker
@@ -211,7 +211,14 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
         if any('dpdk' in d for d in datapaths):
             ok = conn.run("./usertools/dpdk-hugepages.py -p 2M --setup 10G", wd = "~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
             check(ok, "reserve hugepages", conn.addr)
+    except Exception as e:
+        agenda.failure(f"[{conn.addr}] setup_machine failed: {e}")
+        global thread_ok
+        thread_ok = False
+        raise e
 
+def compile_binaries(conn, outdir, datapaths, dpdk_driver, target_dir):
+    try:
         needed_features = ["bin"]
         for d in datapaths:
             if 'shenango_channel' == d:
@@ -226,18 +233,19 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
                     needed_features.append('cx4_mlx')
                 elif dpdk_driver == 'intel' and 'xl710_intel' not in needed_features:
                     needed_features.append('xl710_intel')
-        agenda.subtask(f"building kvserver features={needed_features}")
-        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"kvserver\"", wd = "~/burrito/kvstore")
+        agenda.subtask(f"building kvserver features={needed_features}, target-dir {target_dir}")
+        target_dir_arg = f"--target-dir {target_dir}/burrito-target" if target_dir is not None else ""
+        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"kvserver\" {target_dir_arg}", wd = "~/burrito/kvstore")
         check(ok, "kvserver build", conn.addr)
 
         agenda.subtask(f"building ycsb features={needed_features}")
-        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features[1:])}\" --bin=\"ycsb\"", wd = "~/burrito/kvstore-ycsb")
+        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features[1:])}\" --bin=\"ycsb\" {target_dir_arg}", wd = "~/burrito/kvstore-ycsb")
         check(ok, "ycsb build", conn.addr)
 
         if 'dpdkmulti' in datapaths:
             needed_features = [f for f in needed_features if f == 'xl710_intel' or f == 'cx3_mlx' or f == 'cx4_mlx']
-            agenda.subtask(f"building kv-dpdk features={needed_features}")
-            ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\"", wd = "~/burrito/kv-dpdk")
+            agenda.subtask(f"building kv-dpdk features={needed_features} target-dir {target_dir}")
+            ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\" {target_dir_arg}", wd = "~/burrito/kv-dpdk")
             check(ok, "kv-dpdk build", conn.addr)
         return conn
     except Exception as e:
@@ -340,7 +348,7 @@ def get_timeout_remote(conn, wrkfile, interarrival_us) -> int:
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/build/lib/x86_64-linux-gnu"
 
-def start_server(conn, redis_addr, outf, datapath='kernel', shards=1, skip_negotiation=False):
+def start_server(conn, redis_addr, outf, datapath='kernel', shards=1, skip_negotiation=False, bin_root="./target/release/"):
     conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
@@ -358,7 +366,7 @@ def start_server(conn, redis_addr, outf, datapath='kernel', shards=1, skip_negot
     skip_neg = '--skip-negotiation' if skip_negotiation else ''
 
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/kvserver --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} --datapath={datapath} {cfg} {skip_neg} --log",
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} {bin_root}/kvserver --ip-addr {conn.addr} --port 4242 --num-shards {shards} --redis-addr={redis_addr} --datapath={datapath} {cfg} {skip_neg} --log",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -370,12 +378,12 @@ def start_server(conn, redis_addr, outf, datapath='kernel', shards=1, skip_negot
     time.sleep(8)
     conn.check_proc(f"kvserver", [f"burrito/{outf}.err", f"burrito/{outf}.out"])
 
-def start_server_no_chunnels(conn, outf, no_chunnels, shards=1):
+def start_server_no_chunnels(conn, outf, no_chunnels, shards=1, bin_root="./target/release/"):
     conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
     time.sleep(2)
     no_chunnels_arg = '--conns' if no_chunnels == 'conns' else ''
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/kvserver-dpdk \
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} {bin_root}/kvserver-dpdk \
             --addr {conn.addr}:4242 \
             --num-shards {shards} \
             --cfg=dpdk.config \
@@ -392,7 +400,7 @@ def start_server_no_chunnels(conn, outf, no_chunnels, shards=1):
     conn.check_proc(f"kvserver", [f"{outf}.err"])
 
 
-def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile):
+def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile, bin_root="./target/release/"):
     conn.run("sudo pkill -INT iokerneld")
 
     if datapath == 'shenango_channel':
@@ -437,7 +445,7 @@ def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arriv
 
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/ycsb \
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} {bin_root}/ycsb \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
             -i {interarrival} \
@@ -474,7 +482,7 @@ def start_redis(machine):
     agenda.subtask(f"Started redis on {machine.host}")
     return f"{machine.alt}:6379"
 
-def run_client_no_chunnels(conn, cfg_client, server, num_shards, interarrival, poisson_arrivals, outf, wrkfile):
+def run_client_no_chunnels(conn, cfg_client, server, num_shards, interarrival, poisson_arrivals, outf, wrkfile, bin_root="./target/release/"):
     conn.run("sudo pkill -INT iokerneld")
     poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
     timeout = None
@@ -492,7 +500,7 @@ def run_client_no_chunnels(conn, cfg_client, server, num_shards, interarrival, p
 
     time.sleep(2)
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/ycsb-dpdk \
+    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} {bin_root}/ycsb-dpdk \
             --addr {server}:4242 \
             --num-shards {num_shards} \
             -i {interarrival} \
@@ -512,7 +520,7 @@ def run_client_no_chunnels(conn, cfg_client, server, num_shards, interarrival, p
     agenda.subtask("client done")
     pass
 
-def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0):
+def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0, bin_root="./target/release/"):
     conn.run("sudo pkill -INT iokerneld")
 
     skip_neg = ''
@@ -541,7 +549,7 @@ def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, ski
         agenda.subtask(f"loads client starting")
         ok = None
         try:
-            ok = conn.run(f"RUST_LOG=info,ycsb=debug,bertha=debug {dpdk_ld_var} ./target/release/ycsb \
+            ok = conn.run(f"RUST_LOG=debug {dpdk_ld_var} {bin_root}/ycsb \
                     --addr {server}:4242 \
                     --redis-addr={redis_addr} \
                     -i 1000 \
@@ -568,7 +576,7 @@ def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, ski
             agenda.subtask(f"loads client done: {time.time() - loads_start} s")
             break
 
-def run_loads_no_chunnels(conn, cfg_client, server, num_shards, outf, wrkfile):
+def run_loads_no_chunnels(conn, cfg_client, server, num_shards, outf, wrkfile, bin_root="./target/release/"):
     conn.run("sudo pkill -INT iokerneld")
     extra_cfg = ' '.join(f"--{key}={cfg_client[key]}" for key in cfg_client)
 
@@ -578,7 +586,7 @@ def run_loads_no_chunnels(conn, cfg_client, server, num_shards, outf, wrkfile):
         agenda.subtask(f"loads client starting")
         ok = None
         try:
-            ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/ycsb-dpdk \
+            ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} {bin_root}/ycsb-dpdk \
                     --addr {server}:4242 \
                     -i 1000 \
                     --accesses {wrkfile} \
@@ -603,6 +611,15 @@ def run_loads_no_chunnels(conn, cfg_client, server, num_shards, outf, wrkfile):
             agenda.subtask(f"loads client done: {time.time() - loads_start} s")
             break
 
+def local_path(outf, orig_outdir):
+    sp = outf.split('/')
+    i = 0
+    for dr in sp:
+        i += 1
+        if dr == orig_outdir:
+            return '/'.join([dr] + sp[i:])
+    raise Exception(f"{orig_outdir} not found in {outf}")
+
 def do_exp(iter_num,
     outdir=None,
     machines=None,
@@ -616,6 +633,7 @@ def do_exp(iter_num,
     overwrite=None,
     cfg_client=None,
     no_chunnels=False,
+    cloudlab=False,
 ):
     assert(
         outdir is not None and
@@ -629,6 +647,13 @@ def do_exp(iter_num,
         wrkload is not None and
         overwrite is not None
     )
+
+    target_dir = None
+    orig_outdir = outdir
+    if cloudlab:
+        res = machines[0].run("ls /proj/")
+        target_dir = f"/proj/{res.stdout.strip().split()[0]}"
+        outdir = f"{target_dir}/{outdir}"
 
     if (no_chunnels != 'off' and no_chunnels != False) and (datapath != 'dpdkmulti' or shardtype != 'client'):
         agenda.task("skipping: no_chunnels mode supported only for dpdkmulti + client sharding")
@@ -674,28 +699,41 @@ def do_exp(iter_num,
     server_addr = machines[0].addr
     agenda.task(f"starting: server = {machines[0].addr}, datapath = {datapath}, num_shards = {num_shards}, shardtype = {shardtype}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
 
+    bin_root_dir = f"{target_dir}/burrito-target/release" if target_dir is not None else "./target/release"
     # first one is the server, start the server
     agenda.subtask("starting server")
     if len(nochunnels) > 0:
-        start_server_no_chunnels(machines[0], server_prefix, no_chunnels, shards=num_shards)
+        start_server_no_chunnels(machines[0], server_prefix, no_chunnels, shards=num_shards, bin_root=bin_root_dir)
         time.sleep(5)
     else:
         redis_port = redis_addr.split(":")[-1]
-        start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, datapath=datapath, shards=num_shards, skip_negotiation=skip_negotiation)
+        start_server(machines[0], f"127.0.0.1:{redis_port}", server_prefix, datapath=datapath, shards=num_shards, skip_negotiation=skip_negotiation, bin_root=bin_root_dir)
         time.sleep(5)
 
     # prime the server with loads
     agenda.task("doing loads")
     if no_chunnels:
-        run_loads_no_chunnels(machines[1], cfg_client, server_addr, num_shards, outf, wrkload)
+        run_loads_no_chunnels(machines[1], cfg_client, server_addr, num_shards, outf, wrkload, bin_root=bin_root_dir)
     else:
-        run_loads(machines[1], cfg_client, server_addr, datapath, redis_addr, outf, wrkload, skip_negotiation=num_shards if skip_negotiation else 0)
+        run_loads(
+            machines[1],
+            cfg_client,
+            server_addr,
+            datapath,
+            redis_addr,
+            outf,
+            wrkload,
+            skip_negotiation=num_shards if skip_negotiation else 0,
+            bin_root=bin_root_dir
+        )
 
+    get_fn = f"{'' if cloudlab else 'burrito/'}{outf}-loads"
+    loc = local_path(f"{outf}-loads", orig_outdir) if cloudlab else f"{outf}-loads"
     try:
-        machines[1].get(f"burrito/{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
-        machines[1].get(f"burrito/{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
+        machines[1].get(get_fn+".out", local=loc+".out", preserve_mode=False)
+        machines[1].get(get_fn+".err", local=loc+".err", preserve_mode=False)
     except Exception as e:
-        agenda.subfailure(f"Could not get file {outf}-loads.[out,err] from loads client: {e}")
+        agenda.subfailure(f"Could not get file {loc}.[out,err] from loads client: {e}")
 
     # others are clients
     agenda.task("starting clients")
@@ -710,6 +748,7 @@ def do_exp(iter_num,
                 outf,
                 wrkload
             ),
+            kwargs={'bin_root': bin_root_dir}
         ) for m in machines[1:]]
     else:
         clients = [threading.Thread(target=run_client, args=(
@@ -725,6 +764,7 @@ def do_exp(iter_num,
                 outf,
                 wrkload
             ),
+            kwargs={'bin_root': bin_root_dir}
         ) for m in machines[1:]]
 
     [t.start() for t in clients]
@@ -737,8 +777,10 @@ def do_exp(iter_num,
 
     agenda.task("get server files")
     if not machines[0].is_local:
-        machines[0].get(f"burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
-        machines[0].get(f"burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+        get_fn = f"{'' if cloudlab else 'burrito/'}{server_prefix}"
+        loc = local_path(f"{server_prefix}", orig_outdir) if cloudlab else f"{server_prefix}"
+        machines[0].get(get_fn +'.out', local=loc +'.out', preserve_mode=False)
+        machines[0].get(get_fn +'.err', local=loc +'.err', preserve_mode=False)
 
     def get_files(num):
         fn = c.get
@@ -746,28 +788,31 @@ def do_exp(iter_num,
             agenda.subtask(f"Use get_local: {c.host}")
             fn = get_local
 
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
+        get_fn = f"{'' if cloudlab else 'burrito/'}{outf}{num}"
+        loc = local_path(f"{outf}{num}-{c.addr}", orig_outdir) if cloudlab else f"{outf}{num}-{c.addr}"
+
+        agenda.subtask(f"getting {get_fn}.err")
         fn(
-            f"burrito/{outf}{num}.err",
-            local=f"{outf}{num}-{c.addr}.err",
+            f"{get_fn}.err",
+            local=f"{loc}.err",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.out")
+        agenda.subtask(f"getting {get_fn}.out")
         fn(
-            f"burrito/{outf}{num}.out",
-            local=f"{outf}{num}-{c.addr}.out",
+            f"{get_fn}.out",
+            local=f"{loc}.out",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.data")
+        agenda.subtask(f"getting {get_fn}.data")
         fn(
-            f"burrito/{outf}{num}.data",
-            local=f"{outf}{num}-{c.addr}.data",
+            f"{get_fn}.data",
+            local=f"{loc}.data",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.trace")
+        agenda.subtask(f"getting {get_fn}.trace")
         fn(
-            f"burrito/{outf}{num}.trace",
-            local=f"{outf}{num}-{c.addr}.trace",
+            f"{get_fn}.trace",
+            local=f"{loc}.trace",
             preserve_mode=False,
         )
 
@@ -895,17 +940,34 @@ def connect_machines(cfg):
         raise Exception("Commits mismatched on machines")
     return machines
 
-def setup_all(machines, cfg, args, setup_fn):
+def setup_all(machines, cfg, args, setup_fn, compile_fn):
     global thread_ok
     thread_ok = True
-    agenda.task("building...")
-    setups = [threading.Thread(target=setup_fn, args=(m, args.outdir, cfg['exp']['datapath'] if 'datapath' in cfg['exp'] else [], args.dpdk_driver)) for m in machines]
+
+    target_dir = None
+    if args.cloudlab:
+        res = machines[0].run("ls /proj/")
+        target_dir = f"/proj/{res.stdout.strip().split()[0]}"
+
+    fn_args = (args.outdir, cfg['exp']['datapath'] if 'datapath' in cfg['exp'] else [], args.dpdk_driver, target_dir)
+    agenda.task("setup machines")
+    setups = [threading.Thread(target=setup_fn, args=(m, *fn_args)) for m in machines]
     [t.start() for t in setups]
     [t.join() for t in setups]
     if not thread_ok:
         agenda.failure("Something went wrong")
         raise Exception("setup error")
-    agenda.task("...done building")
+    agenda.task("build binaries")
+    if args.cloudlab:
+        compile_fn(machines[0], *fn_args)
+    else:
+        setups = [threading.Thread(target=compile_fn, args=(m, *fn_args)) for m in machines]
+        [t.start() for t in setups]
+        [t.join() for t in setups]
+        if not thread_ok:
+            agenda.failure("Something went wrong")
+            raise Exception("setup error")
+    agenda.task("done building")
 
     ms = [cfg['machines']['server']] if not type(cfg['machines']['server']) == list else cfg['machines']['server'] + cfg['machines']['clients']
     for m in ms:
@@ -967,6 +1029,7 @@ if __name__ == '__main__':
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--dpdk_driver', type=str, choices=['mlx4', 'mlx5', 'intel'],  required=False)
     parser.add_argument('--setup_only', action='store_true',  required=False)
+    parser.add_argument('--cloudlab', action='store_true',  required=False)
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")
     cfg = toml.load(args.config)
@@ -1034,7 +1097,7 @@ if __name__ == '__main__':
         subprocess.run(f"mkdir -p {args.outdir}", shell=True)
 
     # build
-    setup_all(machines, cfg, args, setup_machine)
+    setup_all(machines, cfg, args, setup_machine, compile_binaries)
 
     for w in cfg['exp']['wrk']:
         for conn in machines:
