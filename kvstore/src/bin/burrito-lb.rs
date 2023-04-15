@@ -126,9 +126,14 @@ fn main() -> Result<(), Report> {
         #[cfg(feature = "dpdk-direct")]
         Datapath::DpdkMultiThread if cfg!(feature = "dpdk-direct") => {
             let cfg = opt.cfg.unwrap();
+            // problem:
+            // DpdkInlineChunnel is listening for packets at the same time as the ReqChunnel.
+            // So, the DpdkInlineChunnel-owned connection might receive and stash a packet that's
+            // intended for the ReqChunnel connection. But, the InlineChunnel does not have a
+            // connection notifier. So those packets just get stashed away and the new_conn signal
+            // is never sent.
             let sk = dpdk_direct::DpdkInlineChunnel::new(cfg, opt.num_threads)?;
-            let listener = dpdk_direct::DpdkInlineReqChunnel::from(sk.clone());
-            spawn_n!(listener, sk, opt);
+            spawn_n!(sk.clone(), sk, opt);
         }
         Datapath::DpdkSingleThread | Datapath::DpdkMultiThread => {
             bail!("This binary was not compiled with dpdk-direct support.")

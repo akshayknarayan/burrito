@@ -1,6 +1,6 @@
 use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{ensure, Report, WrapErr};
-use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn, DpdkInlineReqChunnel};
+use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn};
 use futures_util::Stream;
 use futures_util::{future::Either, TryStreamExt};
 use quanta::Instant;
@@ -106,7 +106,6 @@ fn main() -> Result<(), Report> {
         let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, opt.port));
         info!(?local_addr, "Dpdk Inline Chunnel Test - Server");
         let ch = DpdkInlineChunnel::new(opt.datapath_cfg, opt.threads)?;
-        let ch = DpdkInlineReqChunnel::from(ch);
         let ch = Arc::new(Mutex::new(ch));
 
         for thread in 1..opt.threads {

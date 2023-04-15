@@ -6,7 +6,7 @@
 use bertha::udp::{UdpReqChunnel, UdpSkChunnel};
 use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 #[cfg(feature = "dpdk-direct")]
-use dpdk_direct::{DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
+use dpdk_direct::{DpdkInlineChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 #[cfg(feature = "shenango-chunnel")]
 use shenango_chunnel::{ShenangoUdpReqChunnel, ShenangoUdpSkChunnel};
 use std::net::Ipv4Addr;
@@ -363,7 +363,6 @@ fn main() -> Result<(), Report> {
                 #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
                     let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
-                    let ch = DpdkInlineReqChunnel::from(ch);
                     using_chunnel_connection::run_server(ch, port, num_threads, stack_depth)?;
                 }
                 #[cfg(feature = "use_shenango")]
@@ -396,7 +395,6 @@ fn main() -> Result<(), Report> {
                 #[cfg(feature = "dpdk-direct")]
                 "dpdkinline" => {
                     let ch = DpdkInlineChunnel::new(cfg, num_threads)?;
-                    let ch = DpdkInlineReqChunnel::from(ch);
                     using_chunnel_connection::run_server_no_bertha(ch, port, num_threads)?;
                 }
                 #[cfg(feature = "dpdk-direct")]

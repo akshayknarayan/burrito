@@ -343,7 +343,7 @@ impl DpdkState {
                         num_stashed += 1;
                         self.rx_packets_for_ports
                             .push(((dst_port, pkt_src_addr), new_stash));
-                        debug!(?dst_port, ?pkt_src_addr, "created new stash for connection");
+                        debug!(?dst_port, ?pkt_src_addr, notif=?&new_conns.is_some(), stash_only="no", "created new stash for connection");
                         // signal new connection.
                         if let Some(nc) = new_conns {
                             nc.send(pkt_src_addr)
@@ -473,7 +473,7 @@ impl DpdkState {
             new_stash.push_back(msg);
             self.rx_packets_for_ports
                 .push(((dst_port, pkt_src_addr), new_stash));
-            debug!(?dst_port, ?pkt_src_addr, "created new stash for connection");
+            debug!(?dst_port, ?pkt_src_addr, notif=?&new_conns.is_some(), stash_only="yes", "created new stash for connection");
             // signal new connection.
             if let Some(nc) = new_conns {
                 nc.try_send(pkt_src_addr)

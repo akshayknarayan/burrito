@@ -130,9 +130,8 @@ fn run_server_dpdk_singlethread(opt: Opt) -> Result<(), Report> {
 fn run_server_dpdk_multithread(opt: Opt) -> Result<(), Report> {
     info!("using dpdk multi-thread datapath");
     let s = dpdk_direct::DpdkInlineChunnel::new(opt.cfg.unwrap(), (opt.num_shards + 1) as _)?;
-    let l = dpdk_direct::DpdkInlineReqChunnel::from(s);
     serve(
-        l,
+        s,
         opt.redis_addr,
         opt.ip_addr,
         opt.port,

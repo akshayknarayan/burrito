@@ -120,8 +120,7 @@ fn main() -> Result<(), Report> {
         Datapath::DpdkMultiThread if cfg!(feature = "dpdk-direct") => {
             let cfg = opt.cfg.unwrap();
             let ch = dpdk_direct::DpdkInlineChunnel::new(cfg, opt.addr.len())?;
-            let listener = dpdk_direct::DpdkInlineReqChunnel::from(ch);
-            spawn_n!(listener, opt);
+            spawn_n!(ch, opt);
         }
         Datapath::DpdkSingleThread | Datapath::DpdkMultiThread => {
             bail!("This binary was not compiled with dpdk-direct support.")

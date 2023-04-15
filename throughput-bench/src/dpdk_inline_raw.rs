@@ -11,7 +11,7 @@ use tokio::sync::Barrier;
 use tracing::Instrument;
 use tracing::{debug, debug_span, info, trace, warn};
 
-use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn, DpdkInlineReqChunnel};
+use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn};
 use dpdk_direct::{DpdkState, Msg, SendMsg, DPDK_STATE};
 
 pub fn dpdk_inline_nobertha(
@@ -264,9 +264,8 @@ async fn run_client(
 
 pub fn run_server(cfg: PathBuf, port: u16, threads: usize) -> Result<(), Report> {
     let ch = DpdkInlineChunnel::new(cfg, threads)?;
-    let ch = DpdkInlineReqChunnel::from(ch);
 
-    fn server_thread(mut ch: DpdkInlineReqChunnel, port: u16, thread: usize) -> Result<(), Report> {
+    fn server_thread(mut ch: DpdkInlineChunnel, port: u16, thread: usize) -> Result<(), Report> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;

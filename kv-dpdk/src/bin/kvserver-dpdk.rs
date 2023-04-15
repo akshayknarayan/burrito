@@ -1,6 +1,6 @@
 use bertha::{ChunnelConnection, ChunnelListener};
 use color_eyre::eyre::Report;
-use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn, DpdkInlineReqChunnel};
+use dpdk_direct::{DpdkInlineChunnel, DpdkInlineCn};
 use futures_util::stream::TryStreamExt;
 use kvstore::{kv::Store, Msg};
 use std::net::{SocketAddr, SocketAddrV4};
@@ -47,10 +47,11 @@ fn main() -> Result<(), Report> {
                 .build()
                 .unwrap();
             if opt.conns {
-                let ch = DpdkInlineReqChunnel::from(ch);
                 rt.block_on(single_shard_conns(ch, shard_addr)).unwrap();
             } else {
-                rt.block_on(single_shard_no_conns(ch, shard_addr)).unwrap();
+                tracing::warn!("dpdkinline no-conns mode not implemented");
+                unimplemented!();
+                //rt.block_on(single_shard_no_conns(ch, shard_addr)).unwrap();
             }
         });
     }
@@ -60,10 +61,10 @@ fn main() -> Result<(), Report> {
         .enable_all()
         .build()?;
     if opt.conns {
-        let ch = DpdkInlineReqChunnel::from(ch);
         rt.block_on(single_shard_conns(ch, shard_addr))?;
     } else {
-        rt.block_on(single_shard_no_conns(ch, shard_addr))?;
+        unimplemented!("dpdkinline no-conns not implemented");
+        //rt.block_on(single_shard_no_conns(ch, shard_addr))?;
     }
 
     Ok(())
@@ -126,10 +127,7 @@ async fn conn(cn: DpdkInlineCn, store: Store) -> Result<(), Report> {
 }
 
 #[instrument(level = "debug", err)]
-async fn single_shard_conns(
-    mut ch: DpdkInlineReqChunnel,
-    addr: SocketAddrV4,
-) -> Result<(), Report> {
+async fn single_shard_conns(mut ch: DpdkInlineChunnel, addr: SocketAddrV4) -> Result<(), Report> {
     info!(?addr, "listening");
 
     // initialize the kv store.
