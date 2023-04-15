@@ -6,9 +6,8 @@ use dpdk_wrapper::{
     wrapper::{affinitize_thread, FlowSteeringHandle},
 };
 use flume::{Receiver, Sender};
-use futures_util::future::ready;
+use futures_util::future::{ready, Ready};
 use futures_util::Stream;
-use futures_util::{future::Ready, stream::Once};
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
@@ -204,10 +203,10 @@ fn try_init_thread(init_state: &Mutex<DpdkInitState>) -> Result<(), Report> {
 impl ChunnelConnector for DpdkInlineChunnel {
     type Addr = SocketAddr;
     type Connection = DpdkInlineCn;
-    type Future = futures_util::future::Ready<Result<Self::Connection, Report>>;
+    type Future = Ready<Result<Self::Connection, Report>>;
     type Error = Report;
 
-    fn connect(&mut self, _addr: Self::Addr) -> Self::Future {
+    fn connect(&mut self, addr: Self::Addr) -> Self::Future {
         ready((|| {
             try_init_thread(self.initialization_state.as_ref()).and_then(|_| {
                 DPDK_STATE.with(|dpdk_cell| {
@@ -238,9 +237,15 @@ impl ChunnelConnector for DpdkInlineChunnel {
                         warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                     }
 
+                    let remote_addr = match addr {
+                        SocketAddr::V4(a) => a,
+                        a => bail!("Address must be ipv4: {:?}", a),
+                    };
+
                     dpdk.register_flow_buffer(
                         port,
-                        SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+                        //SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+                        remote_addr,
                     );
 
                     // figure out if there's a listen stream happening for which we should notify
@@ -255,7 +260,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
                     });
                     let cn = DpdkInlineCn::new(
                         port,
-                        None, //Some(remote_addr),
+                        Some(remote_addr), // None
                         new_conn_signaller_g.clone(),
                         Arc::clone(&self.initialization_state),
                         Some(Arc::clone(&self.ephemeral_ports)),
@@ -279,7 +284,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
 impl ChunnelListener for DpdkInlineChunnel {
     type Addr = SocketAddr;
     type Connection = DpdkInlineCn;
-    type Future = futures_util::future::Ready<Result<Self::Stream, Report>>;
+    type Future = Ready<Result<Self::Stream, Report>>;
     type Stream =
         Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Error = Report;
