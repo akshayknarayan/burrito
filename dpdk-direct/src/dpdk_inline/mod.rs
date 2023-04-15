@@ -3,7 +3,7 @@ use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::{
     bindings::{get_lcore_id, get_lcore_map},
-    wrapper::{affinitize_thread, FlowSteeringHandle},
+    wrapper::{affinitize_thread, setup_flow_steering_solo, FlowSteeringHandle, SteeringMatchRule},
 };
 use flume::{Receiver, Sender};
 use futures_util::future::{ready, Ready};
@@ -26,35 +26,79 @@ std::thread_local! {
 }
 
 #[derive(Default)]
-struct FlowSteering(HashMap<u16, (Option<FlowSteeringHandle>, Vec<u16>)>);
+struct FlowSteering {
+    local_dst_port: HashMap<u16, (Option<FlowSteeringHandle>, Vec<u16>)>,
+    remote_src_port: HashMap<u16, (Option<FlowSteeringHandle>, u16)>,
+}
 
 impl FlowSteering {
-    pub fn add_flow(&mut self, dpdk: &mut DpdkState, port: u16) -> Result<(), Report> {
-        let (ref mut port_handle, ref mut queues_on_port) = self.0.entry(port).or_default();
-        // 1. if port_handle is Some, it's always getting dropped and replaced
-        //    here. we need to drop first to clear the old rule.
-        std::mem::drop(port_handle.take());
+    pub fn add_flow(
+        &mut self,
+        dpdk: &mut DpdkState,
+        port: SteeringMatchRule,
+    ) -> Result<(), Report> {
+        // there are 3 cases.
+        // 1. neither the remote src port nor the local dest port conflicts with a solo rule.
+        // 2. the local dest port conflicts. here, we can switch to an RSS rule
+        // 3. the remote source port conflicts. example: multiple connections to the same remote
+        //    port. we can't use the source port rule in this case. (except on one connection,
+        //    which is fine)
 
-        // 2. add to queues_on_port and make the new rule.
-        queues_on_port.push(dpdk.rx_queue_id() as _);
-        queues_on_port.sort();
+        // if the remote port is present at all, that takes dominance. if we end up with duplicate
+        // rules (e.g., a rule that matches the src port and dst port here, and one that matches
+        // dst port only below), that is ok since they will be ordered by priority.
+        if let Some(src_port) = port.remote_port() {
+            // case 3
+            if let Some(_) = self.remote_src_port.get(&src_port) {
+                debug!("cannot double register remote src port {:?}", port);
+            } else {
+            let qid = dpdk.rx_queue_id();
+            let h = unsafe { setup_flow_steering_solo(dpdk.dpdk_port(), port, qid as _) }?;
+            self.remote_src_port.insert(src_port, (Some(h), qid as _));
+            }
+        }
 
-        // TODO XXX on mlx5, we turn off flow rule rss between a set of queues, since when we turn
-        // it on all packets go to a single queue.
-        if cfg!(not(feature = "cx4_mlx")) || queues_on_port.len() < 2 {
-            let flow_handle = dpdk.register_flow_steering(port, &queues_on_port[..])?;
+        if let Some(port) = port.local_port() {
+            let (ref mut handle, ref mut queues_on_port) =
+                self.local_dst_port.entry(port).or_default();
 
-            // 3. save the flow_handle.
-            *port_handle = Some(flow_handle);
+            // 1. if port_handle is Some, it's always getting dropped and replaced
+            //    here. we need to drop first to clear the old rule.
+            std::mem::drop(handle.take());
+
+            // 2. add to queues_on_port and make the new rule.
+            queues_on_port.push(dpdk.rx_queue_id() as _);
+            queues_on_port.sort();
+
+            // TODO XXX on mlx5, we turn off flow rule rss between a set of queues, since when we turn
+            // it on all packets go to a single queue.
+            if cfg!(not(feature = "cx4_mlx")) || queues_on_port.len() < 2 {
+                let flow_handle = dpdk.register_flow_steering(port, &queues_on_port[..])?;
+
+                // 3. save the flow_handle.
+                *handle = Some(flow_handle);
+            }
         }
 
         Ok(())
     }
 
-    pub fn remove_flow(&mut self, dpdk: &mut DpdkState, port: u16) -> Result<(), Report> {
+    pub fn remove_flow(
+        &mut self,
+        dpdk: &mut DpdkState,
+        local_port: u16,
+        remote_port: Option<u16>,
+    ) -> Result<(), Report> {
         let queue_id = dpdk.rx_queue_id() as u16;
-        let (ref mut port_handle, ref mut queues_on_port) = self.0.entry(port).or_default();
-        debug!(?port, "removing flow steering rule");
+
+        if let Some(src_port) = remote_port {
+            debug!(?src_port, "removing flow steering rule");
+            self.remote_src_port.remove(&src_port);
+        }
+
+        let (ref mut port_handle, ref mut queues_on_port) =
+            self.local_dst_port.entry(local_port).or_default();
+        debug!(?local_port, "removing flow steering rule");
         std::mem::drop(port_handle.take());
 
         // 1. remove `queue` from `queues_on_port`
@@ -74,7 +118,7 @@ impl FlowSteering {
 
         // 2. now make a new rule for the current number of flows.
         queues_on_port.sort();
-        let flow_handle = dpdk.register_flow_steering(port, &queues_on_port[..])?;
+        let flow_handle = dpdk.register_flow_steering(local_port, &queues_on_port[..])?;
 
         *port_handle = Some(flow_handle);
         Ok(())
@@ -229,18 +273,19 @@ impl ChunnelConnector for DpdkInlineChunnel {
                             free_ports_g.swap_remove(port_idx)
                         })
                     };
-
-                    if let Err(err) = {
-                        let mut steering_g = self.flow_steering.lock().unwrap();
-                        steering_g.add_flow(dpdk, port)
-                    } {
-                        warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
-                    }
-
+                    
                     let remote_addr = match addr {
                         SocketAddr::V4(a) => a,
                         a => bail!("Address must be ipv4: {:?}", a),
                     };
+
+                    if let Err(err) = {
+                        let mut steering_g = self.flow_steering.lock().unwrap();
+                        steering_g.add_flow(dpdk, SteeringMatchRule::LocalAndRemote { local_dst_port: port, remote_src_port: remote_addr.port() })
+                    } {
+                        warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
+                    }
+
 
                     dpdk.register_flow_buffer(
                         port,
@@ -311,7 +356,7 @@ impl ChunnelListener for DpdkInlineChunnel {
                             let dpdk = dpdk_opt
                                 .as_mut()
                                 .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-                            if let Err(err) = steering_g.add_flow(dpdk, a.port()) {
+                            if let Err(err) = steering_g.add_flow(dpdk, SteeringMatchRule::LocalDstOnly(a.port())) {
                                 warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                             }
 
@@ -393,7 +438,11 @@ impl Drop for DpdkInlineCn {
 
                 if let Some(fs) = self.flow_steering.take() {
                     let mut steering_g = fs.lock().unwrap();
-                    if let Err(err) = steering_g.remove_flow(dpdk, self.local_port) {
+                    if let Err(err) = steering_g.remove_flow(
+                        dpdk,
+                        self.local_port,
+                        self.remote_addr.map(|s| s.port()),
+                    ) {
                         warn!(?err, "Error editing steering rules on flow drop");
                     }
                 }
@@ -600,7 +649,7 @@ impl Drop for StreamState {
             let dpdk = dpdk_opt
                 .as_mut()
                 .ok_or_else(|| eyre!("dpdk not initialized on core {:?}", this_lcore))?;
-            steering_g.remove_flow(dpdk, self.listen_addr.port())?;
+            steering_g.remove_flow(dpdk, self.listen_addr.port(), None)?;
             Ok::<_, Report>(())
         }) {
             warn!(?err, "Error updating flow steering on stream close");

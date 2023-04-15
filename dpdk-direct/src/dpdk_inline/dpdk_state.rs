@@ -143,6 +143,10 @@ impl DpdkState {
         self.rx_queue_id
     }
 
+    pub(crate) fn dpdk_port(&self) -> u16 {
+        self.port as _
+    }
+
     pub fn register_flow_buffer(&mut self, local_port: u16, remote_addr: SocketAddrV4) {
         self.rx_packets_for_ports
             .push(((local_port, remote_addr), VecDeque::with_capacity(16)));
@@ -170,7 +174,6 @@ impl DpdkState {
         );
     }
 
-    /// Set up a single-flow, single-queue steering rule.
     pub fn register_flow_steering(
         &mut self,
         local_port: u16,
@@ -178,7 +181,13 @@ impl DpdkState {
     ) -> Result<FlowSteeringHandle, Report> {
         debug!(?queues, ?local_port, "Registering flow steering rule");
         if queues.len() == 1 {
-            unsafe { setup_flow_steering_solo(self.port, local_port, queues[0] as _) }
+            unsafe {
+                setup_flow_steering_solo(
+                    self.port,
+                    SteeringMatchRule::LocalDstOnly(local_port),
+                    queues[0] as _,
+                )
+            }
         } else {
             unsafe { setup_flow_steering_rss(self.port, local_port, queues) }
         }
