@@ -35,6 +35,7 @@ macro_rules! serve {
         let ctr = Arc::clone(&ctr);
         async move {
             let ctr = ctr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            info!(?ctr, "established connection");
             let mut slot = [None];
             loop {
                 if let Err(e) = cn

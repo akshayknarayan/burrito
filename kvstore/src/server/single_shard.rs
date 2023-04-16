@@ -13,8 +13,7 @@ use futures_util::stream::{Stream, TryStreamExt};
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::{atomic::AtomicUsize, Arc};
-use tracing::{debug, debug_span, info, trace, warn};
-use tracing_futures::Instrument;
+use tracing::{debug, info, trace, warn};
 
 /// Start and serve a single shard.
 ///
@@ -94,12 +93,11 @@ pub async fn single_shard(
             st.try_for_each_concurrent(None, |cn| {
                 let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let store = store.clone();
-                async move {
                 // TODO deduplicate possible spurious retxs by req id
                 serve_one(cn, store, idx, 16)
-                    .instrument(debug_span!("shard_connection", idx = ?idx)).await
-            }}).await?;
-        }}
+            })
+            .await?;
+        }};
     }
 
     if let Some(internal_srv) = internal_srv {
