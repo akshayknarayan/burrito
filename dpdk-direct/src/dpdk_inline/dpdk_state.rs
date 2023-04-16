@@ -57,6 +57,8 @@ pub struct DpdkState {
     mbuf_pool: *mut rte_mempool,
     arp_table: HashMap<Ipv4Addr, MacAddress>,
 
+    pub(crate) new_conn_signaller: Option<Sender<SocketAddrV4>>,
+
     rx_queue_id: usize,
     rx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
     rx_packets_for_ports: Vec<((u16, SocketAddrV4), VecDeque<Msg>)>,
@@ -128,6 +130,7 @@ impl DpdkState {
                 ip_addr_raw,
                 port,
                 mbuf_pool,
+                new_conn_signaller: None,
                 arp_table: arp_table.clone(),
                 rx_queue_id: qid,
                 rx_bufs: [std::ptr::null_mut(); RECEIVE_BURST_SIZE as usize],

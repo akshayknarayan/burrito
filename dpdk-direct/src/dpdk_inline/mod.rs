@@ -52,9 +52,9 @@ impl FlowSteering {
             if let Some(_) = self.remote_src_port.get(&src_port) {
                 debug!("cannot double register remote src port {:?}", port);
             } else {
-            let qid = dpdk.rx_queue_id();
-            let h = unsafe { setup_flow_steering_solo(dpdk.dpdk_port(), port, qid as _) }?;
-            self.remote_src_port.insert(src_port, (Some(h), qid as _));
+                let qid = dpdk.rx_queue_id();
+                let h = unsafe { setup_flow_steering_solo(dpdk.dpdk_port(), port, qid as _) }?;
+                self.remote_src_port.insert(src_port, (Some(h), qid as _));
             }
         }
 
@@ -163,10 +163,6 @@ pub struct DpdkInlineChunnel {
     // we need to manage single-queue vs rss flow steering rules based on how many flows are
     // listening on the port.
     flow_steering: Arc<Mutex<FlowSteering>>,
-    // if a listen stream is active, it will set this field, and connect()-originating connections
-    // can then pass it in.
-    new_conn_signaller: Arc<Mutex<Option<Sender<SocketAddrV4>>>>,
-    conn_closed_notifier: Arc<Mutex<Option<Sender<()>>>>,
 }
 
 struct DpdkInitState {
@@ -202,8 +198,6 @@ impl DpdkInlineChunnel {
             })),
             ephemeral_ports: Arc::new(Mutex::new((4096..16_384).collect())),
             flow_steering: Default::default(),
-            new_conn_signaller: Arc::new(Mutex::new(None)),
-            conn_closed_notifier: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -273,7 +267,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
                             free_ports_g.swap_remove(port_idx)
                         })
                     };
-                    
+
                     let remote_addr = match addr {
                         SocketAddr::V4(a) => a,
                         a => bail!("Address must be ipv4: {:?}", a),
@@ -281,7 +275,7 @@ impl ChunnelConnector for DpdkInlineChunnel {
 
                     if let Err(err) = {
                         let mut steering_g = self.flow_steering.lock().unwrap();
-                        steering_g.add_flow(dpdk, SteeringMatchRule::LocalAndRemote { local_dst_port: port, remote_src_port: remote_addr.port() })
+                        steering_g.add_flow(dpdk, SteeringMatchRule::LocalDstOnly(port))
                     } {
                         warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                     }
@@ -295,31 +289,13 @@ impl ChunnelConnector for DpdkInlineChunnel {
 
                     // figure out if there's a listen stream happening for which we should notify
                     // new connections for.
-                    let mut new_conn_signaller_g = self.new_conn_signaller.lock().unwrap();
-                    *new_conn_signaller_g = new_conn_signaller_g.take().and_then(|c| {
-                        if c.is_disconnected() {
-                            None
-                        } else {
-                            Some(c)
-                        }
-                    });
-                    let cn = DpdkInlineCn::new(
+                    Ok(DpdkInlineCn::new(
                         port,
                         Some(remote_addr), // None
-                        new_conn_signaller_g.clone(),
+                        dpdk.new_conn_signaller.clone(),
                         Arc::clone(&self.initialization_state),
                         Some(Arc::clone(&self.ephemeral_ports)),
-                    ).with_flow_steering(Arc::clone(&self.flow_steering));
-                    let mut conn_closed_notifier_g = self.conn_closed_notifier.lock().unwrap();
-                    *conn_closed_notifier_g = conn_closed_notifier_g.take().and_then(|c| {
-                        if c.is_disconnected() {
-                            None
-                        } else { Some(c) }
-                    });
-                    debug!(new_conn = ?&new_conn_signaller_g, closed = ?&conn_closed_notifier_g, "returning new connection");
-                    if let Some(c) = conn_closed_notifier_g.clone() {
-                        Ok(cn.with_closed_notification(c))
-                    } else { Ok(cn) }
+                    ).with_flow_steering(Arc::clone(&self.flow_steering)))
                 })
             })
         })())
@@ -343,6 +319,9 @@ impl ChunnelListener for DpdkInlineChunnel {
                     try_init_thread(self.initialization_state.as_ref())
                         .wrap_err("try_init_thread failed")?;
 
+                    let (s, r) = flume::bounded(512);
+                    let (conn_closed_notifier, conn_closed_listener) = flume::bounded(512);
+
                     // we don't return `FlowSteeringHandle`s to connections here. Instead we
                     // register once here. If this stream is ever dropped/cancelled, the state will
                     // get cleaned up then.
@@ -360,20 +339,11 @@ impl ChunnelListener for DpdkInlineChunnel {
                                 warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                             }
 
+                            // store new_conn signaller in local dpdk state
+                            dpdk.new_conn_signaller = Some(s.clone());
+
                             Ok::<_, Report>(())
                         })?;
-                    }
-
-                    let (s, r) = flume::bounded(512);
-                    let (conn_closed_notifier, conn_closed_listener) = flume::bounded(512);
-
-                    {
-                        let mut new_conn_signaller_g = self.new_conn_signaller.lock().unwrap();
-                        let mut conn_closed_notifier_g = self.conn_closed_notifier.lock().unwrap();
-                        if new_conn_signaller_g.is_none() {
-                            *new_conn_signaller_g = Some(s.clone());
-                            *conn_closed_notifier_g = Some(conn_closed_notifier.clone());
-                        }
                     }
 
                     let state = StreamState {
@@ -678,6 +648,23 @@ impl StreamState {
                     match self.receiver.try_recv() {
                         Ok(addr) => {
                             debug!(?addr, "found first connection");
+                            DPDK_STATE.with(|dpdk_cell| {
+                                let this_lcore = get_lcore_id();
+                                let mut dpdk_opt = dpdk_cell.borrow_mut();
+                                let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
+                                    eyre!("dpdk not initialized on core {:?}", this_lcore)
+                                })?;
+
+                                let mut steering_g = self.flow_steering.lock().unwrap();
+                                steering_g.add_flow(
+                                    dpdk,
+                                    SteeringMatchRule::LocalAndRemote {
+                                        local_dst_port: self.listen_addr.port(),
+                                        remote_src_port: addr.port(),
+                                    },
+                                )?;
+                                Ok::<_, Report>(())
+                            })?;
                             let cn = DpdkInlineCn::new(
                                 self.listen_addr.port(),
                                 Some(addr),
@@ -713,6 +700,23 @@ impl StreamState {
                     Either::Left((Ok(addr), _)) => {
                         debug!(?addr, "returning new connection");
                         self.conn_count += 1;
+                        DPDK_STATE.with(|dpdk_cell| {
+                            let this_lcore = get_lcore_id();
+                            let mut dpdk_opt = dpdk_cell.borrow_mut();
+                            let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
+                                eyre!("dpdk not initialized on core {:?}", this_lcore)
+                            })?;
+
+                            let mut steering_g = self.flow_steering.lock().unwrap();
+                            steering_g.add_flow(
+                                dpdk,
+                                SteeringMatchRule::LocalAndRemote {
+                                    local_dst_port: self.listen_addr.port(),
+                                    remote_src_port: addr.port(),
+                                },
+                            )?;
+                            Ok::<_, Report>(())
+                        })?;
                         Some(
                             DpdkInlineCn::new(
                                 self.listen_addr.port(),
