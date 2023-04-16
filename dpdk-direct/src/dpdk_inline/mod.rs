@@ -648,23 +648,6 @@ impl StreamState {
                     match self.receiver.try_recv() {
                         Ok(addr) => {
                             debug!(?addr, "found first connection");
-                            DPDK_STATE.with(|dpdk_cell| {
-                                let this_lcore = get_lcore_id();
-                                let mut dpdk_opt = dpdk_cell.borrow_mut();
-                                let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
-                                    eyre!("dpdk not initialized on core {:?}", this_lcore)
-                                })?;
-
-                                let mut steering_g = self.flow_steering.lock().unwrap();
-                                steering_g.add_flow(
-                                    dpdk,
-                                    SteeringMatchRule::LocalAndRemote {
-                                        local_dst_port: self.listen_addr.port(),
-                                        remote_src_port: addr.port(),
-                                    },
-                                )?;
-                                Ok::<_, Report>(())
-                            })?;
                             let cn = DpdkInlineCn::new(
                                 self.listen_addr.port(),
                                 Some(addr),
@@ -700,23 +683,6 @@ impl StreamState {
                     Either::Left((Ok(addr), _)) => {
                         debug!(?addr, "returning new connection");
                         self.conn_count += 1;
-                        DPDK_STATE.with(|dpdk_cell| {
-                            let this_lcore = get_lcore_id();
-                            let mut dpdk_opt = dpdk_cell.borrow_mut();
-                            let dpdk = dpdk_opt.as_mut().ok_or_else(|| {
-                                eyre!("dpdk not initialized on core {:?}", this_lcore)
-                            })?;
-
-                            let mut steering_g = self.flow_steering.lock().unwrap();
-                            steering_g.add_flow(
-                                dpdk,
-                                SteeringMatchRule::LocalAndRemote {
-                                    local_dst_port: self.listen_addr.port(),
-                                    remote_src_port: addr.port(),
-                                },
-                            )?;
-                            Ok::<_, Report>(())
-                        })?;
                         Some(
                             DpdkInlineCn::new(
                                 self.listen_addr.port(),
