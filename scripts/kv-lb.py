@@ -8,7 +8,7 @@ import sys
 import time
 import subprocess
 import agenda
-from kv import ConnectionWrapper, check_machine, setup_machine, start_redis, write_shenango_config, run_loads, run_client, get_local, dpdk_ld_var, setup_all, generate_ycsb_file, check, local_path
+from kv import check_machine, setup_machine, start_redis, run_loads, run_client, get_local, dpdk_ld_var, setup_all, generate_ycsb_file, check, local_path, intel_devbind
 
 SRV_BASE_PORT = 4242
 
@@ -87,6 +87,7 @@ def start_lb(conn, redis_addr, shard_addrs, threads, outf, datapath='kernel', sk
 
 
 def do_exp(
+    iter_num=None,
     outdir=None,
     conns=None,
     num_shards=None,
@@ -96,12 +97,13 @@ def do_exp(
     wrkload=None,
     overwrite=None,
     skip_negotiation=None,
-    cfg_client=None,
-    cfg_server=None,
+    cfg_client={},
+    cfg_server={},
     use_opt=None,
     cloudlab=False,
 ):
     assert(
+        iter_num is not None and
         outdir is not None and
         conns is not None and
         num_shards is not None and
@@ -120,28 +122,27 @@ def do_exp(
     target_dir = None
     orig_outdir = outdir
     if cloudlab:
-        res = machines[0].run("ls /proj/")
+        res = conns[0].run("ls /proj/")
         target_dir = f"/proj/{res.stdout.strip().split()[0]}"
         outdir = f"{target_dir}/{outdir}"
     agenda.subtask(f"exp outdir: {outdir} target dir: {target_dir}")
-
     lb = conns['lb']
     shards = conns['shards']
     clients = conns['clients']
-
-    exp_pfx = f"{outdir}/{datapath}{noneg}{useopt}-{num_shards}-remoteshard-load={ops_per_sec}-poisson={poisson_arrivals}-{wrkname}"
+    exp_pfx = f"{outdir}/{datapath}{noneg}{useopt}-{num_shards}-remoteshard-load={ops_per_sec}-poisson={poisson_arrivals}-{wrkname}-{iter_num}"
     server_prefix = f"{exp_pfx}-lb"
     shard_prefix = f"{exp_pfx}-shard"
     outf = f"{exp_pfx}-client"
-
-    agenda.task(f"checking {outf}0-{clients[0].addr}.data")
-    if not overwrite and os.path.exists(f"{outf}-{clients[0].addr}.data"):
+    check_file = f"{outf}-{clients[0].addr}.data"
+    check_file = local_path(check_file, orig_outdir) if cloudlab else check_file
+    agenda.task(f"checking {check_file}")
+    if not overwrite and os.path.exists(check_file):
         agenda.task(f"skipping: load = {ops_per_sec} ops/s")
         return True
     else:
         agenda.task(f"running: load = {ops_per_sec} ops/s")
 
-    for m in machines:
+    for m in conns:
         if m.is_local:
             m.run(f"mkdir -p {outdir}", wd="~/burrito")
             continue
@@ -155,7 +156,7 @@ def do_exp(
     num_client_threads = int(wrkname.split('-')[-1])
     interarrival_secs = num_client_threads * len(clients) / ops_per_sec
     interarrival_us = int(interarrival_secs * 1e6)
-    agenda.task(f"starting: load = {ops_per_sec}, ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(clients)}, num_shards = {num_shards}, skip_negotiation = {skip_negotiation}")
+    agenda.task(f"starting: iter = {iter_num}, load = {ops_per_sec}, ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(clients)}, num_shards = {num_shards}, skip_negotiation = {skip_negotiation}")
 
     shards_per_machine = int(num_shards / len(shards))
     if shards_per_machine > cfg_server['num-threads']:
@@ -215,8 +216,8 @@ def do_exp(
     get_fn = f"{'' if cloudlab else 'burrito/'}{outf}-loads"
     loc = local_path(f"{outf}-loads", orig_outdir) if cloudlab else f"{outf}-loads"
     try:
-        machines[1].get(get_fn+".out", local=loc+".out", preserve_mode=False)
-        machines[1].get(get_fn+".err", local=loc+".err", preserve_mode=False)
+        conns[1].get(get_fn+".out", local=loc+".out", preserve_mode=False)
+        conns[1].get(get_fn+".err", local=loc+".err", preserve_mode=False)
     except Exception as e:
         agenda.subfailure(f"Could not get file {loc}.[out,err] from loads client: {e}")
 
@@ -448,8 +449,6 @@ if __name__ == '__main__':
     except Exception as e:
         raise Exception("negotiation key must be present and bool") from e
 
-
-
     conns = connect_machines(cfg)
     machines = [conns['lb']] + conns['shards'] + conns['clients']
 
@@ -478,29 +477,31 @@ if __name__ == '__main__':
         agenda.task("setup done")
         sys.exit(0)
 
-    for dp in cfg['exp']['datapath']:
-        if 'intel' == args.dpdk_driver:
-            intel_devbind(machines, dp)
-        for neg in cfg['exp']['negotiation']:
-            for w in cfg['exp']['wrk']:
-                for s in cfg['exp']['shards']:
-                    for p in cfg['exp']['poisson-arrivals']:
-                        for o in cfg['exp']['load']:
-                            for z in cfg['exp']['optimization']:
-                                do_exp(
-                                    outdir=outdir,
-                                    conns=conns,
-                                    num_shards=s,
-                                    ops_per_sec=o,
-                                    datapath=dp,
-                                    poisson_arrivals=p,
-                                    wrkload=w,
-                                    skip_negotiation=not neg,
-                                    overwrite=args.overwrite,
-                                    cfg_client=cfg['cfg']['client'],
-                                    cfg_server=cfg['cfg']['server'],
-                                    cloudlab=args.cloudlab,
-                                    use_opt=z,
-                                )
+    for iter_num in range(cfg['exp']['iters']):
+        for dp in cfg['exp']['datapath']:
+            if 'intel' == args.dpdk_driver:
+                intel_devbind(machines, dp)
+            for neg in cfg['exp']['negotiation']:
+                for w in cfg['exp']['wrk']:
+                    for s in cfg['exp']['shards']:
+                        for p in cfg['exp']['poisson-arrivals']:
+                            for o in cfg['exp']['load']:
+                                for z in cfg['exp']['optimization']:
+                                    do_exp(
+                                        iter_num=iter_num,
+                                        outdir=outdir,
+                                        conns=conns,
+                                        num_shards=s,
+                                        ops_per_sec=o,
+                                        datapath=dp,
+                                        poisson_arrivals=p,
+                                        wrkload=w,
+                                        skip_negotiation=not neg,
+                                        overwrite=args.overwrite,
+                                        cfg_client=cfg['cfg']['client'],
+                                        cfg_server=cfg['cfg']['server'],
+                                        cloudlab=args.cloudlab,
+                                        use_opt=z,
+                                    )
 
     agenda.task("done")

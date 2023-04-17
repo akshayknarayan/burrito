@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-from kv import connect_machines, setup_all, get_local, check, get_timeout_local, write_cfg, write_shenango_config
+from kv import connect_machines, setup_all, get_local, check, get_timeout_local, write_cfg, write_shenango_config, local_path
 import agenda
 import argparse
 import os
@@ -11,7 +11,7 @@ import threading
 import time
 import toml
 
-def start_server(conn, outf, shards=1, no_chunnels=False):
+def start_server(conn, outf, shards=1, no_chunnels=False, bin_root="./target/release"):
     conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
@@ -21,7 +21,7 @@ def start_server(conn, outf, shards=1, no_chunnels=False):
     if no_chunnels:
         nochunnels = '-nochunnels'
 
-    ok = conn.run(f"./target/release/kvserver-shenango-raw{nochunnels} --addr {conn.addr}:4242 --num-shards {shards} --cfg shenango.config",
+    ok = conn.run(f"{bin_root}/kvserver-shenango-raw{nochunnels} --addr {conn.addr}:4242 --num-shards {shards} --cfg shenango.config",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -33,7 +33,7 @@ def start_server(conn, outf, shards=1, no_chunnels=False):
     time.sleep(8)
     conn.check_proc(f"kvserver", [f"{outf}.err"])
 
-def run_client(conn, server, interarrival, poisson_arrivals, no_chunnels, outf, wrkfile):
+def run_client(conn, server, interarrival, poisson_arrivals, no_chunnels, outf, wrkfile, bin_root="./target/release"):
     conn.run("sudo pkill -INT iokerneld")
 
     timeout = get_timeout_local(wrkfile, interarrival)
@@ -47,7 +47,7 @@ def run_client(conn, server, interarrival, poisson_arrivals, no_chunnels, outf, 
         nochunnels = '-nochunnels'
         shards_arg = f'--num-shards={no_chunnels}'
     agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info ./target/release/ycsb-shenango-raw{nochunnels} \
+    ok = conn.run(f"RUST_LOG=info {bin_root}/ycsb-shenango-raw{nochunnels} \
             --addr {server}:4242 \
             -i {interarrival} \
             --accesses {wrkfile} \
@@ -65,7 +65,7 @@ def run_client(conn, server, interarrival, poisson_arrivals, no_chunnels, outf, 
     conn.run("sudo pkill -INT iokerneld")
     agenda.subtask("client done")
 
-def run_loads(conn, server, outf, wrkfile, no_chunnels=False):
+def run_loads(conn, server, outf, wrkfile, no_chunnels=False, bin_root="./target/release"):
     conn.run("sudo pkill -INT iokerneld")
 
     conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
@@ -79,7 +79,7 @@ def run_loads(conn, server, outf, wrkfile, no_chunnels=False):
     agenda.subtask(f"loads client starting")
     ok = None
     try:
-        ok = conn.run(f"RUST_LOG=info ./target/release/ycsb-shenango-raw{nochunnels} \
+        ok = conn.run(f"RUST_LOG=info {bin_root}/ycsb-shenango-raw{nochunnels} \
                 --addr {server}:4242 \
                 -i 1000 \
                 --accesses {wrkfile} \
@@ -111,7 +111,8 @@ def do_exp(iter_num,
     poisson_arrivals=None,
     no_chunnels=None,
     wrkload=None,
-    overwrite=None
+    overwrite=None,
+    cloudlab=False,
 ):
     assert(
         outdir is not None and
@@ -123,6 +124,13 @@ def do_exp(iter_num,
         wrkload is not None and
         overwrite is not None
     )
+
+    target_dir = None
+    orig_outdir = outdir
+    if cloudlab:
+        res = machines[0].run("ls /proj/")
+        target_dir = f"/proj/{res.stdout.strip().split()[0]}"
+        outdir = f"{target_dir}/{outdir}"
 
     wrkname = wrkload.split("/")[-1].split(".")[0]
     if no_chunnels:
@@ -156,18 +164,23 @@ def do_exp(iter_num,
     server_addr = machines[0].addr
     agenda.task(f"starting: server = {machines[0].addr}, num_shards = {num_shards}, no_chunnels = {no_chunnels}, load = {ops_per_sec} ops/s -> interarrival_us = {interarrival_us}, num_clients = {len(machines)-1}")
 
+    bin_root_dir = f"{target_dir}/burrito-target/release" if target_dir is not None else "./target/release"
+
     # first one is the server, start the server
     agenda.subtask("starting server")
-    start_server(machines[0], server_prefix, shards=num_shards, no_chunnels=no_chunnels)
+    start_server(machines[0], server_prefix, shards=num_shards, no_chunnels=no_chunnels, bin_root=bin_root_dir)
     time.sleep(5)
     # prime the server with loads
     agenda.task("doing loads")
-    run_loads(machines[1], server_addr, outf, wrkload, no_chunnels=num_shards if no_chunnels else 0)
+    run_loads(machines[1], server_addr, outf, wrkload, no_chunnels=num_shards if no_chunnels else 0, bin_root=bin_root_dir)
+
+    get_fn = f"{'' if cloudlab else 'burrito/'}{outf}-loads"
+    loc = local_path(f"{outf}-loads", orig_outdir) if cloudlab else f"{outf}-loads"
     try:
-        machines[1].get(f"{outf}-loads.out", local=f"{outf}-loads.out", preserve_mode=False)
-        machines[1].get(f"{outf}-loads.err", local=f"{outf}-loads.err", preserve_mode=False)
+        machines[1].get(get_fn+".out", local=loc+".out", preserve_mode=False)
+        machines[1].get(get_fn+".err", local=loc+".err", preserve_mode=False)
     except Exception as e:
-        agenda.subfailure(f"Could not get file from loads client: {e}")
+        agenda.subfailure(f"Could not get file {loc}.[out,err] from loads client: {e}")
 
     # others are clients
     agenda.task("starting clients")
@@ -180,6 +193,7 @@ def do_exp(iter_num,
             outf,
             wrkload,
         ),
+        kwargs={'bin_root': bin_root_dir}
     ) for m in machines[1:]]
 
     [t.start() for t in clients]
@@ -191,9 +205,11 @@ def do_exp(iter_num,
     machines[0].run("sudo pkill -INT iokerneld")
 
     agenda.task("get server files")
-    if not machines[0].local:
-        machines[0].get(f"~/burrito/{server_prefix}.out", local=f"{server_prefix}.out", preserve_mode=False)
-        machines[0].get(f"~/burrito/{server_prefix}.err", local=f"{server_prefix}.err", preserve_mode=False)
+    if not machines[0].is_local:
+        get_fn = f"{'' if cloudlab else 'burrito/'}{server_prefix}"
+        loc = local_path(f"{server_prefix}", orig_outdir) if cloudlab else f"{server_prefix}"
+        machines[0].get(get_fn +'.out', local=loc +'.out', preserve_mode=False)
+        machines[0].get(get_fn +'.err', local=loc +'.err', preserve_mode=False)
 
     def get_files(num):
         fn = c.get
@@ -201,28 +217,31 @@ def do_exp(iter_num,
             agenda.subtask(f"Use get_local: {c.host}")
             fn = get_local
 
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.err")
+        get_fn = f"{'' if cloudlab else 'burrito/'}{outf}{num}"
+        loc = local_path(f"{outf}{num}-{c.addr}", orig_outdir) if cloudlab else f"{outf}{num}-{c.addr}"
+
+        agenda.subtask(f"getting {get_fn}.err")
         fn(
-            f"burrito/{outf}{num}.err",
-            local=f"{outf}{num}-{c.addr}.err",
+            f"{get_fn}.err",
+            local=f"{loc}.err",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.out")
+        agenda.subtask(f"getting {get_fn}.out")
         fn(
-            f"burrito/{outf}{num}.out",
-            local=f"{outf}{num}-{c.addr}.out",
+            f"{get_fn}.out",
+            local=f"{loc}.out",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.data")
+        agenda.subtask(f"getting {get_fn}.data")
         fn(
-            f"burrito/{outf}{num}.data",
-            local=f"{outf}{num}-{c.addr}.data",
+            f"{get_fn}.data",
+            local=f"{loc}.data",
             preserve_mode=False,
         )
-        agenda.subtask(f"getting {outf}{num}-{c.addr}.trace")
+        agenda.subtask(f"getting {get_fn}.trace")
         fn(
-            f"burrito/{outf}{num}.trace",
-            local=f"{outf}{num}-{c.addr}.trace",
+            f"{get_fn}.trace",
+            local=f"{loc}.trace",
             preserve_mode=False,
         )
 
@@ -236,11 +255,11 @@ def do_exp(iter_num,
     agenda.task("done")
     return True
 
-def setup_machine(conn, outdir, datapaths, dpdk_driver):
+def setup_machine(conn, outdir, datapaths, dpdk_driver, target_dir):
     agenda.task(f"[{conn.addr}] setup machine")
     try:
         agenda.subtask(f"[{conn.addr}] make outdir {outdir}")
-        ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
+        ok = conn.run(f"mkdir -p {target_dir if target_dir is not None else '~/burrito'}/{outdir}")
         check(ok, "mk outdir", conn.addr)
 
         # dpdk dependencies, rust, and docker
@@ -265,9 +284,17 @@ def setup_machine(conn, outdir, datapaths, dpdk_driver):
 
         ok = conn.run("./scripts/setup_machine.sh", wd = "~/burrito/shenango-chunnel/caladan")
         check(ok, "shenango setup-machine", conn.addr)
+    except Exception as e:
+        agenda.failure(f"[{conn.addr}] setup_machine failed: {e}")
+        global thread_ok
+        thread_ok = False
+        raise e
 
+def compile_binaries(conn, outdir, datapaths, dpdk_driver, target_dir):
+    try:
+        target_dir_arg = f"--target-dir {target_dir}/burrito-target" if target_dir is not None else ""
         agenda.subtask(f"building kvserver-shenango")
-        ok = conn.run(f"~/.cargo/bin/cargo +nightly build --release", wd = "~/burrito/shenango-bertha")
+        ok = conn.run(f"~/.cargo/bin/cargo +nightly build --release {target_dir_arg}", wd = "~/burrito/shenango-bertha")
         check(ok, "shenango-bertha build", conn.addr)
 
         return conn
@@ -300,6 +327,7 @@ if __name__ == '__main__':
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--dpdk_driver', type=str, choices=['mlx4', 'mlx5'],  required=False)
     parser.add_argument('--setup_only', action='store_true',  required=False)
+    parser.add_argument('--cloudlab', action='store_true',  required=False)
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")
     cfg = toml.load(args.config)
@@ -352,7 +380,7 @@ if __name__ == '__main__':
 
     # build
     cfg['exp']['datapath'] = ['shenangort']
-    setup_all(machines, cfg, args, setup_machine)
+    setup_all(machines, cfg, args, setup_machine, compile_binaries)
     if args.setup_only:
         agenda.task("setup done")
         sys.exit(0)
@@ -366,14 +394,15 @@ if __name__ == '__main__':
                 for p in cfg['exp']['poisson-arrivals']:
                     for o in ops_per_sec:
                         do_exp(0,
-                                outdir=outdir,
-                                machines=machines,
-                                num_shards=s,
-                                ops_per_sec=o,
-                                poisson_arrivals=p,
-                                wrkload=w,
-                                no_chunnels=noch,
-                                overwrite=args.overwrite
-                                )
+                            outdir=outdir,
+                            machines=machines,
+                            num_shards=s,
+                            ops_per_sec=o,
+                            poisson_arrivals=p,
+                            wrkload=w,
+                            no_chunnels=noch,
+                            overwrite=args.overwrite,
+                            cloudlab=args.cloudlab,
+                        )
 
     agenda.task("done")

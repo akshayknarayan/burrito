@@ -233,13 +233,15 @@ def compile_binaries(conn, outdir, datapaths, dpdk_driver, target_dir):
                     needed_features.append('cx4_mlx')
                 elif dpdk_driver == 'intel' and 'xl710_intel' not in needed_features:
                     needed_features.append('xl710_intel')
-        agenda.subtask(f"building kvserver features={needed_features}, target-dir {target_dir}")
+
+        nightly = '+nightly' if 'shenango-chunnel' in needed_features else ''
+        agenda.subtask(f"building kvserver features={needed_features}, target-dir {target_dir}, {nightly}")
         target_dir_arg = f"--target-dir {target_dir}/burrito-target" if target_dir is not None else ""
-        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features)}\" --bin=\"kvserver\" {target_dir_arg}", wd = "~/burrito/kvstore")
+        ok = conn.run(f"~/.cargo/bin/cargo {nightly} build --release --features=\"{','.join(needed_features)}\" --bin=\"kvserver\" {target_dir_arg}", wd = "~/burrito/kvstore")
         check(ok, "kvserver build", conn.addr)
 
-        agenda.subtask(f"building ycsb features={needed_features}")
-        ok = conn.run(f"~/.cargo/bin/cargo build --release --features=\"{','.join(needed_features[1:])}\" --bin=\"ycsb\" {target_dir_arg}", wd = "~/burrito/kvstore-ycsb")
+        agenda.subtask(f"building ycsb features={needed_features}, {nightly}")
+        ok = conn.run(f"~/.cargo/bin/cargo {nightly} build --release --features=\"{','.join(needed_features[1:])}\" --bin=\"ycsb\" {target_dir_arg}", wd = "~/burrito/kvstore-ycsb")
         check(ok, "ycsb build", conn.addr)
 
         if 'dpdkmulti' in datapaths:
@@ -457,7 +459,7 @@ def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arriv
             {poisson_arg} \
             {shard_arg} \
             {skip_neg} \
-            --logging --skip-loads",
+            --skip-loads",
         wd="~/burrito",
         sudo='dpdk' in datapath,
         stdout=f"{outf}0.out",
@@ -529,6 +531,7 @@ def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, ski
         skip_negotiation -= 1
 
     if datapath == 'shenango_channel':
+        conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
         datapath = 'shenango'
         cfg = '--cfg=shenango.config'
     elif datapath == 'kernel':
@@ -820,6 +823,11 @@ def do_exp(iter_num,
     for c in machines[1:]:
         try:
             get_files(0)
+            #agenda.subtask("getting perf")
+            #if no_chunnels:
+            #    c.get(f"~/burrito/perf.data", "./nochunnels.perf.data")
+            #else:
+            #    c.get(f"~/burrito/perf.data", "./chunnels.perf.data")
         except Exception as e:
             agenda.subfailure(f"At least one file missing for {c}: {e}")
 
@@ -969,7 +977,7 @@ def setup_all(machines, cfg, args, setup_fn, compile_fn):
             raise Exception("setup error")
     agenda.task("done building")
 
-    ms = [cfg['machines']['server']] if not type(cfg['machines']['server']) == list else cfg['machines']['server'] + cfg['machines']['clients']
+    ms = ([cfg['machines']['server']] if not type(cfg['machines']['server']) == list else cfg['machines']['server']) + cfg['machines']['clients']
     for m in ms:
         for x in machines:
             if x.addr == m['exp']:
@@ -995,7 +1003,9 @@ def setup_all(machines, cfg, args, setup_fn, compile_fn):
     agenda.task("writing configuration files")
     if any('shenango' in d for d in cfg['exp']['datapath']):
         for m in machines:
-            write_shenango_config(m, min(len(cfg['cfg']['lcores'].split(',')), 2))
+            lcores = cfg['cfg']['lcores'].split(',')
+            agenda.subtask(f"shenango config num_threads={lcores}")
+            write_shenango_config(m, max(len(lcores), 2))
     if any('dpdk' in d for d in cfg['exp']['datapath']):
         for m in machines:
             write_dpdk_config(m, machines, cfg['cfg']['lcores'])
@@ -1133,6 +1143,7 @@ if __name__ == '__main__':
                                         overwrite=args.overwrite,
                                         cfg_client=cfg['cfg']['client'],
                                         no_chunnels=noch,
+                                        cloudlab=args.cloudlab,
                                     )
 
     agenda.task("done")

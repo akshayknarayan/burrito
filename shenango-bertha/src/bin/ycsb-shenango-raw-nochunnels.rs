@@ -42,12 +42,18 @@ struct Opt {
 
     #[structopt(short, long)]
     out_file: Option<PathBuf>,
+
+    #[structopt(long)]
+    logging: bool,
 }
 
 fn main() -> Result<(), Report> {
     color_eyre::install()?;
-    tracing_subscriber::fmt::init();
     let opt = Opt::from_args();
+
+    if opt.logging {
+        tracing_subscriber::fmt::init();
+    }
 
     if opt.loads_only && opt.skip_loads {
         return Err(eyre!("Must do either loads or skip them"));

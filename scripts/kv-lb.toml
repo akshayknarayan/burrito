@@ -8,11 +8,6 @@ clients = [
     { access = "128.110.218.181", user = "akshayn", alt = "128.110.218.181", exp = "10.10.1.4", mac = "9c:dc:71:4b:63:21" }, # node-3
 ]
 
-#node-0 128.110.218.171 10.10.1.2 9c:dc:71:56:af:45
-#node-1 128.110.218.134 10.10.1.1 9c:dc:71:49:a8:a1
-#node-2 128.110.218.86 10.10.1.3 9c:dc:71:5e:2f:61
-#node-3 128.110.218.181 10.10.1.4 9c:dc:71:4b:63:21
-
 [cfg]
 lcores = "0,1,2,3,4,5,6,7,8,9"
 
@@ -25,8 +20,10 @@ num-threads = 10
 [exp]
 wrk = ["./kvstore-ycsb/ycsbc-mock/workloadb-8.access"]
 datapath = ['dpdkmulti']
-load = [10000]
+load = [10000, 20000, 40000, 60000, 80000, 100000, 120000]
 poisson-arrivals = [true]
 shardtype = ["server"]
 shards = [8]
 negotiation = [true]
+optimization = [true, false]
+iters = 3
