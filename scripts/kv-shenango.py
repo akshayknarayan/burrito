@@ -18,10 +18,13 @@ def start_server(conn, outf, shards=1, no_chunnels=False, bin_root="./target/rel
     conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     nochunnels = ''
-    if no_chunnels:
+    if no_chunnels == 'conns' or no_chunnels==True:
         nochunnels = '-nochunnels'
 
-    ok = conn.run(f"{bin_root}/kvserver-shenango-raw{nochunnels} --addr {conn.addr}:4242 --num-shards {shards} --cfg shenango.config",
+    #cns = '--use-connections' if len(nochunnels) >0 else ''
+    cns = ''
+
+    ok = conn.run(f"{bin_root}/kvserver-shenango-raw{nochunnels} --addr {conn.addr}:4242 --num-shards {shards} {cns} --cfg shenango.config",
             wd="~/burrito",
             sudo=True,
             background=True,
@@ -40,25 +43,26 @@ def run_client(conn, server, interarrival, poisson_arrivals, no_chunnels, outf, 
     conn.run(f"./iokerneld ias nicpci {conn.pci_addr}", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     time.sleep(2)
     poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
+    outf = f"{outf}-{conn.addr}"
 
     nochunnels = ''
     shards_arg = ''
     if no_chunnels is not None:
         nochunnels = '-nochunnels'
         shards_arg = f'--num-shards={no_chunnels}'
-    agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
-    ok = conn.run(f"RUST_LOG=info {bin_root}/ycsb-shenango-raw{nochunnels} \
+    agenda.subtask(f"client starting, timeout {timeout} -> {outf}.out")
+    ok = conn.run(f"{bin_root}/ycsb-shenango-raw{nochunnels} \
             --addr {server}:4242 \
             -i {interarrival} \
             --accesses {wrkfile} \
-            --out-file={outf}0.data \
+            --out-file={outf}.data \
             -s shenango.config \
             {shards_arg} \
             {poisson_arg} \
             --skip-loads",
         wd="~/burrito",
-        stdout=f"{outf}0.out",
-        stderr=f"{outf}0.err",
+        stdout=f"{outf}.out",
+        stderr=f"{outf}.err",
         timeout=timeout,
         )
     check(ok, "client", conn.addr)
@@ -84,6 +88,7 @@ def run_loads(conn, server, outf, wrkfile, no_chunnels=False, bin_root="./target
                 -i 1000 \
                 --accesses {wrkfile} \
                 -s shenango.config \
+                --logging \
                 {shards_arg} \
                 --loads-only",
             wd="~/burrito",
@@ -133,7 +138,7 @@ def do_exp(iter_num,
         outdir = f"{target_dir}/{outdir}"
 
     wrkname = wrkload.split("/")[-1].split(".")[0]
-    if no_chunnels:
+    if no_chunnels == True or no_chunnels == 'off' or no_chunnels == 'conns':
         noch = '_nochunnels'
     else:
         noch = ''
@@ -211,14 +216,14 @@ def do_exp(iter_num,
         machines[0].get(get_fn +'.out', local=loc +'.out', preserve_mode=False)
         machines[0].get(get_fn +'.err', local=loc +'.err', preserve_mode=False)
 
-    def get_files(num):
+    def get_files(c):
         fn = c.get
         if c.is_local:
             agenda.subtask(f"Use get_local: {c.host}")
             fn = get_local
 
-        get_fn = f"{'' if cloudlab else 'burrito/'}{outf}{num}"
-        loc = local_path(f"{outf}{num}-{c.addr}", orig_outdir) if cloudlab else f"{outf}{num}-{c.addr}"
+        get_fn = f"{'' if cloudlab else 'burrito/'}{outf}-{c.addr}"
+        loc = local_path(f"{outf}-{c.addr}", orig_outdir) if cloudlab else f"{outf}-{c.addr}"
 
         agenda.subtask(f"getting {get_fn}.err")
         fn(
@@ -248,7 +253,7 @@ def do_exp(iter_num,
     agenda.task("get client files")
     for c in machines[1:]:
         try:
-            get_files(0)
+            get_files(c)
         except Exception as e:
             agenda.subfailure(f"At least one file missing for {c}: {e}")
 
@@ -353,7 +358,7 @@ if __name__ == '__main__':
         agenda.subfailure('no-chunnels field not found')
         cfg['exp']['no-chunnels'] = [False]
     for t in cfg['exp']['no-chunnels']:
-        if t not in [True, False]:
+        if t not in [True,False,'full','conns','off']:
             agenda.failure("Disabling chunnels must be bool")
             sys.exit(1)
 

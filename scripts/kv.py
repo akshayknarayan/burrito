@@ -304,7 +304,7 @@ host_addr {conn.addr}
 host_netmask 255.255.255.0
 host_gateway 10.1.1.1
 runtime_kthreads {num_threads}
-runtime_spininng_kthreads {num_threads}
+runtime_spinning_kthreads {num_threads}
 runtime_guaranteed_kthreads {num_threads}
 """
     write_cfg(conn, shenango_config, 'shenango')
@@ -350,7 +350,7 @@ def get_timeout_remote(conn, wrkfile, interarrival_us) -> int:
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/build/lib/x86_64-linux-gnu"
 
-def start_server(conn, redis_addr, outf, datapath='kernel', shards=1, skip_negotiation=False, bin_root="./target/release/"):
+def start_server(conn, redis_addr, outf, datapath='kernel', shards=1, skip_negotiation=False, bin_root="./target/release"):
     conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
 
@@ -380,7 +380,7 @@ def start_server(conn, redis_addr, outf, datapath='kernel', shards=1, skip_negot
     time.sleep(8)
     conn.check_proc(f"kvserver", [f"burrito/{outf}.err", f"burrito/{outf}.out"])
 
-def start_server_no_chunnels(conn, outf, no_chunnels, shards=1, bin_root="./target/release/"):
+def start_server_no_chunnels(conn, outf, no_chunnels, shards=1, bin_root="./target/release"):
     conn.run("sudo pkill -INT kvserver")
     conn.run("sudo pkill -INT iokerneld")
     time.sleep(2)
@@ -402,7 +402,7 @@ def start_server_no_chunnels(conn, outf, no_chunnels, shards=1, bin_root="./targ
     conn.check_proc(f"kvserver", [f"{outf}.err"])
 
 
-def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile, bin_root="./target/release/"):
+def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arrivals, datapath, shardtype, skip_negotiation, outf, wrkfile, bin_root="./target/release"):
     conn.run("sudo pkill -INT iokerneld")
 
     if datapath == 'shenango_channel':
@@ -444,15 +444,16 @@ def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arriv
             raise e
 
     extra_cfg = ' '.join(f"--{key}={cfg_client[key]}" for key in cfg_client)
+    outf = f"{outf}-{conn.addr}"
 
     time.sleep(2)
-    agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
+    agenda.subtask(f"client starting, timeout {timeout} -> {outf}.out")
     ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} {bin_root}/ycsb \
             --addr {server}:4242 \
             --redis-addr={redis_addr} \
             -i {interarrival} \
             --accesses {wrkfile} \
-            --out-file={outf}0.data \
+            --out-file={outf}.data \
             --datapath={datapath} \
             {cfg} \
             {extra_cfg} \
@@ -462,8 +463,8 @@ def run_client(conn, cfg_client, server, redis_addr, interarrival, poisson_arriv
             --skip-loads",
         wd="~/burrito",
         sudo='dpdk' in datapath,
-        stdout=f"{outf}0.out",
-        stderr=f"{outf}0.err",
+        stdout=f"{outf}.out",
+        stderr=f"{outf}.err",
         timeout=timeout,
         )
     check(ok, "client", conn.addr)
@@ -484,7 +485,7 @@ def start_redis(machine):
     agenda.subtask(f"Started redis on {machine.host}")
     return f"{machine.alt}:6379"
 
-def run_client_no_chunnels(conn, cfg_client, server, num_shards, interarrival, poisson_arrivals, outf, wrkfile, bin_root="./target/release/"):
+def run_client_no_chunnels(conn, cfg_client, server, num_shards, interarrival, poisson_arrivals, outf, wrkfile, bin_root="./target/release"):
     conn.run("sudo pkill -INT iokerneld")
     poisson_arg = "--poisson-arrivals" if poisson_arrivals  else ''
     timeout = None
@@ -499,9 +500,10 @@ def run_client_no_chunnels(conn, cfg_client, server, num_shards, interarrival, p
             raise e
 
     extra_cfg = ' '.join(f"--{key}={cfg_client[key]}" for key in cfg_client)
+    outf = f"{outf}-{conn.addr}"
 
     time.sleep(2)
-    agenda.subtask(f"client starting, timeout {timeout} -> {outf}0.out")
+    agenda.subtask(f"client starting, timeout {timeout} -> {outf}.out")
     ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} {bin_root}/ycsb-dpdk \
             --addr {server}:4242 \
             --num-shards {num_shards} \
@@ -514,15 +516,15 @@ def run_client_no_chunnels(conn, cfg_client, server, num_shards, interarrival, p
             --skip-loads",
         wd="~/burrito",
         sudo=True,
-        stdout=f"{outf}0.out",
-        stderr=f"{outf}0.err",
+        stdout=f"{outf}.out",
+        stderr=f"{outf}.err",
         timeout=timeout,
         )
     check(ok, "client", conn.addr)
     agenda.subtask("client done")
     pass
 
-def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0, bin_root="./target/release/"):
+def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, skip_negotiation=0, bin_root="./target/release"):
     conn.run("sudo pkill -INT iokerneld")
 
     skip_neg = ''
@@ -579,7 +581,7 @@ def run_loads(conn, cfg_client, server, datapath, redis_addr, outf, wrkfile, ski
             agenda.subtask(f"loads client done: {time.time() - loads_start} s")
             break
 
-def run_loads_no_chunnels(conn, cfg_client, server, num_shards, outf, wrkfile, bin_root="./target/release/"):
+def run_loads_no_chunnels(conn, cfg_client, server, num_shards, outf, wrkfile, bin_root="./target/release"):
     conn.run("sudo pkill -INT iokerneld")
     extra_cfg = ' '.join(f"--{key}={cfg_client[key]}" for key in cfg_client)
 
@@ -785,14 +787,14 @@ def do_exp(iter_num,
         machines[0].get(get_fn +'.out', local=loc +'.out', preserve_mode=False)
         machines[0].get(get_fn +'.err', local=loc +'.err', preserve_mode=False)
 
-    def get_files(num):
+    def get_files(c):
         fn = c.get
         if c.is_local:
             agenda.subtask(f"Use get_local: {c.host}")
             fn = get_local
 
-        get_fn = f"{'' if cloudlab else 'burrito/'}{outf}{num}"
-        loc = local_path(f"{outf}{num}-{c.addr}", orig_outdir) if cloudlab else f"{outf}{num}-{c.addr}"
+        get_fn = f"{'' if cloudlab else 'burrito/'}{outf}-{c.addr}"
+        loc = local_path(f"{outf}-{c.addr}", orig_outdir) if cloudlab else f"{outf}-{c.addr}"
 
         agenda.subtask(f"getting {get_fn}.err")
         fn(
@@ -822,7 +824,7 @@ def do_exp(iter_num,
     agenda.task("get client files")
     for c in machines[1:]:
         try:
-            get_files(0)
+            get_files(c)
             #agenda.subtask("getting perf")
             #if no_chunnels:
             #    c.get(f"~/burrito/perf.data", "./nochunnels.perf.data")
@@ -1005,7 +1007,8 @@ def setup_all(machines, cfg, args, setup_fn, compile_fn):
         for m in machines:
             lcores = cfg['cfg']['lcores'].split(',')
             agenda.subtask(f"shenango config num_threads={lcores}")
-            write_shenango_config(m, max(len(lcores), 2))
+            #write_shenango_config(m, max(len(lcores)-1, 2))
+            write_shenango_config(m, 8)
     if any('dpdk' in d for d in cfg['exp']['datapath']):
         for m in machines:
             write_dpdk_config(m, machines, cfg['cfg']['lcores'])

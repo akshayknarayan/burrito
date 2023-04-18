@@ -40,7 +40,7 @@ fn main() -> Result<(), Report> {
 
 fn run_server(opt: Opt) -> Result<(), Report> {
     let use_conns = opt.use_connections;
-    for i in 0..opt.num_shards {
+    for i in 1..opt.num_shards {
         let ip = opt.addr.ip();
         let base_port = opt.addr.port();
         let shard_addr = SocketAddrV4::new(*ip, base_port + i + 1);
@@ -51,6 +51,15 @@ fn run_server(opt: Opt) -> Result<(), Report> {
                 single_shard_no_conns(shard_addr).unwrap()
             }
         });
+    }
+
+    let ip = opt.addr.ip();
+    let base_port = opt.addr.port();
+    let shard_addr = SocketAddrV4::new(*ip, base_port + 1);
+    if use_conns {
+        single_shard_conns(shard_addr)
+    } else {
+        single_shard_no_conns(shard_addr).unwrap()
     }
 
     Ok(())
