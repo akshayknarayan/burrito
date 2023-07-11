@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+default = ["switcher_lockfree"]
 cx3_mlx = ["dpdk-wrapper/cx3_mlx"]
 cx4_mlx = ["dpdk-wrapper/cx4_mlx"]
 xl710_intel = ["dpdk-wrapper/xl710_intel"]
+switcher_lock = []
+switcher_lockfree = []
 
 [dependencies]
 bertha = { path = "../bertha" }
@@ -30,3 +33,7 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 structopt = "0.3"
 rand = "0.8"
+
+[[example]]
+name = "switch_datapath"
+required-features = ["switcher_lock", "switcher_lockfree"]

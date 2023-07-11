@@ -3,9 +3,9 @@ use ahash::HashMap;
 use bertha::{either::Either, ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 use dpdk_wrapper::{BoundDpdkConn, DpdkConn, DpdkIoKernel, DpdkIoKernelHandle};
-use eui48::MacAddress;
 use futures_util::future::{ready, Ready};
 use futures_util::stream::{once, Once, Stream, StreamExt};
+use macaddr::MacAddr6 as MacAddress;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -109,7 +109,7 @@ impl DpdkUdpSkChunnel {
         }
     }
 
-    fn load_connections(
+    pub(crate) fn load_connections(
         &mut self,
         conns: Vec<ActiveConnection>,
     ) -> Result<HashMap<ActiveConnection, Either<DpdkUdpSk, BoundDpdkUdpSk>>, Report> {

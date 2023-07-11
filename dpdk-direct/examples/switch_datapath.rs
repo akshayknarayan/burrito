@@ -1,23 +1,15 @@
-use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
-use color_eyre::eyre::{ensure, Report, WrapErr};
-use dpdk_direct::{DatapathCn, DpdkDatapath, DpdkDatapathChoice, DpdkReqDatapath};
-use futures_util::Stream;
-use futures_util::{future::Either, TryStreamExt};
+use color_eyre::eyre::{ensure, Report};
+use dpdk_direct::switcher::DpdkDatapathChoice;
 use quanta::Instant;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
-};
+use std::net::SocketAddr;
 use std::time::Duration;
 use structopt::StructOpt;
-use tracing::{debug, debug_span, error, info, info_span, instrument, trace};
-use tracing_futures::Instrument;
+use tracing::trace;
 use tracing_subscriber::prelude::*;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "Switch datapaths microbenchmark")]
-struct Opt {
+pub struct Opt {
     #[structopt(short, long)]
     port: u16,
 
@@ -32,6 +24,9 @@ struct Opt {
 
     #[structopt(long)]
     datapath_choice: DpdkDatapathChoice,
+
+    #[structopt(long)]
+    use_locks: bool,
 
     #[structopt(long)]
     swap_delay_msgs: usize,
@@ -82,6 +77,67 @@ fn main() -> Result<(), Report> {
         _ => (),
     }
 
+    if opt.use_locks {
+        lock::run(opt)
+    } else {
+        lockfree::run(opt)
+    }
+}
+
+fn handle_received(
+    remote_addr: SocketAddr,
+    ms: &mut [Option<(SocketAddr, Vec<u8>)>],
+    rs: &mut [(Duration, Option<(Duration, Duration)>)],
+    start: quanta::Instant,
+    clk: &quanta::Clock,
+) -> Result<usize, Report> {
+    let now = clk.now().duration_since(start);
+    ms.iter_mut()
+        .map_while(Option::take)
+        .try_fold(0, |cnt, msg| {
+            ensure!(
+                msg.0 == remote_addr,
+                "received response from unexpected address"
+            );
+
+            let msg_seq = u32::from_le_bytes(msg.1[0..4].try_into().unwrap()) as usize;
+            ensure!(
+                msg_seq < rs.len(),
+                "received out-of-bounds seq number echo {}",
+                msg_seq,
+            );
+
+            ensure!(
+                rs[msg_seq].1.is_none(),
+                "received duplicate echo packet {}",
+                msg_seq
+            );
+
+            let elapsed = now - rs[msg_seq].0;
+            trace!(?msg_seq, ?elapsed, "received");
+            rs[msg_seq].1 = Some((now, elapsed));
+            Ok(cnt + 1)
+        })
+}
+
+macro_rules! exp_impl {
+    ($datapathCn: ty, $dpdkDatapath: ty, $dpdkReqDatapath: ty) => {
+use crate::Opt;
+use bertha::{ChunnelConnection, ChunnelConnector, ChunnelListener};
+use color_eyre::eyre::{ensure, Report, WrapErr};
+use dpdk_direct::switcher::DpdkDatapathChoice;
+use futures_util::Stream;
+use futures_util::{future::Either, TryStreamExt};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
+use tracing::{debug, debug_span, error, info, info_span, instrument, trace};
+use tracing_futures::Instrument;
+
+pub fn run(opt: Opt) -> Result<(), Report> {
     if let Some(addr) = opt.ip_addr {
         let remote_addr = SocketAddr::V4(SocketAddrV4::new(addr, opt.port));
         let interarrival = std::time::Duration::from_micros(opt.interarrival_us);
@@ -91,7 +147,7 @@ fn main() -> Result<(), Report> {
             "Dpdk Inline Chunnel Test - Client"
         );
 
-        let mut ch = DpdkDatapath::new(opt.config, opt.datapath_choice)?;
+        let mut ch = <$dpdkDatapath>::new(opt.config, opt.datapath_choice)?;
 
         let mut jhs = Vec::with_capacity(opt.threads);
         for thread in 1..opt.threads {
@@ -198,8 +254,8 @@ fn main() -> Result<(), Report> {
     } else {
         let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, opt.port));
         info!(?local_addr, "Dpdk Inline Chunnel Test - Server");
-        let ch = DpdkDatapath::new(opt.config, opt.datapath_choice)?;
-        let mut ch = DpdkReqDatapath::from(ch);
+        let ch = <$dpdkDatapath>::new(opt.config, opt.datapath_choice)?;
+        let mut ch = <$dpdkReqDatapath>::from(ch);
         let swap_spec = ServerSwapSpec {
             swap_after_msgs_num: opt.swap_delay_msgs,
             swap_to: opt.swap_to,
@@ -245,16 +301,16 @@ fn main() -> Result<(), Report> {
 }
 
 #[derive(Debug, Clone)]
-struct ServerSwapSpec {
+pub struct ServerSwapSpec {
     swap_after_msgs_num: usize,
     swap_to: DpdkDatapathChoice,
-    ch: Arc<Mutex<DpdkReqDatapath>>,
+    ch: Arc<Mutex<$dpdkReqDatapath>>,
     did_swap: Arc<AtomicBool>,
 }
 
 #[instrument(skip(stream, swap_dp), level = "info", err)]
-async fn server(
-    stream: impl Stream<Item = Result<DatapathCn, Report>> + Send + 'static,
+pub async fn server(
+    stream: impl Stream<Item = Result<$datapathCn, Report>> + Send + 'static,
     thread_idx: usize,
     swap_dp: Option<ServerSwapSpec>,
 ) -> Result<(), Report> {
@@ -281,7 +337,7 @@ async fn server(
                         if !did_swap.load(Ordering::Relaxed) && cnt > *swap_after_msgs_num {
                             info!(?swap_to, ?cnt, "swapping datapath now");
                             did_swap.store(true, Ordering::SeqCst);
-                            if let Err(err) = ch.lock().unwrap().trigger_transition(*swap_to) {
+                            if let Err(err) = ch.lock().unwrap().trigger_transition(*swap_to).await {
                                 error!(?err, "trigger_transition failed");
                                 return Err(err);
                             }
@@ -303,55 +359,19 @@ async fn server(
             }
             .instrument(info_span!("connection", ?port, ?peer))
         })
-        .await
+    .await
 }
 
 #[derive(Debug)]
-struct ClientSwapSpec {
+pub struct ClientSwapSpec {
     swap_after_msgs_num: usize,
     swap_to: DpdkDatapathChoice,
-    ch: DpdkDatapath,
-}
-
-fn handle_received(
-    remote_addr: SocketAddr,
-    ms: &mut [Option<(SocketAddr, Vec<u8>)>],
-    rs: &mut [(Duration, Option<(Duration, Duration)>)],
-    start: quanta::Instant,
-    clk: &quanta::Clock,
-) -> Result<usize, Report> {
-    let now = clk.now().duration_since(start);
-    ms.iter_mut()
-        .map_while(Option::take)
-        .try_fold(0, |cnt, msg| {
-            ensure!(
-                msg.0 == remote_addr,
-                "received response from unexpected address"
-            );
-
-            let msg_seq = u32::from_le_bytes(msg.1[0..4].try_into().unwrap()) as usize;
-            ensure!(
-                msg_seq < rs.len(),
-                "received out-of-bounds seq number echo {}",
-                msg_seq,
-            );
-
-            ensure!(
-                rs[msg_seq].1.is_none(),
-                "received duplicate echo packet {}",
-                msg_seq
-            );
-
-            let elapsed = now - rs[msg_seq].0;
-            trace!(?msg_seq, ?elapsed, "received");
-            rs[msg_seq].1 = Some((now, elapsed));
-            Ok(cnt + 1)
-        })
+    ch: $dpdkDatapath,
 }
 
 #[instrument(skip(num_msgs, remote_addr), level = "info", err)]
-async fn closed_loop_client(
-    cn: DatapathCn,
+pub async fn closed_loop_client(
+    cn: $datapathCn,
     num_msgs: usize,
     remote_addr: SocketAddr,
     mut swap_dp: Option<ClientSwapSpec>,
@@ -386,7 +406,7 @@ async fn closed_loop_client(
             if !swapped && snd_msg_count >= *swap_after_msgs_num {
                 // called *non-concurrently* with send/recv.
                 info!(?swap_to, "swapping datapath now");
-                ch.trigger_transition(*swap_to)?;
+                ch.trigger_transition(*swap_to).await?;
                 swapped = true;
             }
         }
@@ -410,19 +430,19 @@ async fn closed_loop_client(
             std::time::Duration::from_millis(500),
             cn.recv(&mut slots[..]),
         )
-        .await
-        {
-            Ok(ms) => ms?,
-            Err(_) => {
-                debug!("timed out burst");
-                for seq in inflight_seqs {
-                    recvs[seq].1 = Some((Duration::from_secs(0), Duration::from_secs(0)));
-                }
+            .await
+            {
+                Ok(ms) => ms?,
+                Err(_) => {
+                    debug!("timed out burst");
+                    for seq in inflight_seqs {
+                        recvs[seq].1 = Some((Duration::from_secs(0), Duration::from_secs(0)));
+                    }
 
-                continue;
+                    continue;
             }
-        };
-        let cnt = handle_received(remote_addr, ms, &mut recvs[..], start, &clk)?;
+            };
+        let cnt = super::handle_received(remote_addr, ms, &mut recvs[..], start, &clk)?;
         recv_cnt += cnt;
         debug!(?cnt, ?recv_cnt, "received burst");
     }
@@ -431,7 +451,7 @@ async fn closed_loop_client(
 
     match tokio::time::timeout(std::time::Duration::from_secs(1), cn.recv(&mut slots[..])).await {
         Ok(ms) => {
-            let cnt = handle_received(remote_addr, ms?, &mut recvs[..], start, &clk)?;
+            let cnt = super::handle_received(remote_addr, ms?, &mut recvs[..], start, &clk)?;
             recv_cnt += cnt;
             debug!(?cnt, ?recv_cnt, "received burst");
         }
@@ -443,14 +463,14 @@ async fn closed_loop_client(
 }
 
 #[instrument(skip(num_msgs, interarrival, remote_addr), level = "info", err)]
-async fn open_loop_client(
-    cn: DatapathCn,
+pub async fn open_loop_client(
+    cn: $datapathCn,
     num_msgs: usize,
     interarrival: Duration,
     remote_addr: SocketAddr,
     mut swap_dp: Option<ClientSwapSpec>,
 ) -> Result<Vec<(Duration, Option<(Duration, Duration)>)>, Report> {
-    let mut ticker = AsyncSpinTimer::new(interarrival);
+    let mut ticker = super::AsyncSpinTimer::new(interarrival);
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
     let mut msgs = (0..num_msgs).map(|i| {
         let seq_bytes: [u8; 4] = (i as u32).to_le_bytes();
@@ -478,7 +498,7 @@ async fn open_loop_client(
             if !swapped && snd_msg_count >= *swap_after_msgs_num {
                 // called *non-concurrently* with send/recv.
                 info!(?swap_to, "swapping datapath now");
-                ch.trigger_transition(*swap_to)?;
+                ch.trigger_transition(*swap_to).await?;
                 swapped = true;
             }
         }
@@ -508,7 +528,7 @@ async fn open_loop_client(
                 }
             }
             Either::Right((ms, _)) => {
-                let cnt = handle_received(remote_addr, ms?, &mut recvs[..], start, &clk)?;
+                let cnt = crate::handle_received(remote_addr, ms?, &mut recvs[..], start, &clk)?;
                 recv_cnt += cnt;
                 debug!(?cnt, ?recv_cnt, "received burst");
             }
@@ -518,20 +538,38 @@ async fn open_loop_client(
     while recv_cnt < num_msgs {
         let ms =
             match tokio::time::timeout(std::time::Duration::from_secs(3), cn.recv(&mut slots[..]))
-                .await
+            .await
             {
                 Ok(ms) => ms?,
                 Err(_) => {
                     break;
                 }
             };
-        let cnt = handle_received(remote_addr, ms, &mut recvs[..], start, &clk)?;
+        let cnt = crate::handle_received(remote_addr, ms, &mut recvs[..], start, &clk)?;
         recv_cnt += cnt;
         debug!(?cnt, ?recv_cnt, "received burst");
     }
 
     info!(?recv_cnt, "done");
     Ok(recvs)
+}
+    }
+}
+
+mod lock {
+    exp_impl!(
+        dpdk_direct::switcher_lock::DatapathCn,
+        dpdk_direct::switcher_lock::DpdkDatapath,
+        dpdk_direct::switcher_lock::DpdkReqDatapath
+    );
+}
+
+mod lockfree {
+    exp_impl!(
+        dpdk_direct::switcher_lockfree::DatapathCn,
+        dpdk_direct::switcher_lockfree::DpdkDatapath,
+        dpdk_direct::switcher_lockfree::DpdkReqDatapath
+    );
 }
 
 struct AsyncSpinTimer {
