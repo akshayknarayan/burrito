@@ -28,19 +28,22 @@
 //! in a single implementation of that interface. It should also support dynamic switching between
 //! the two via a handle.
 
-use crate::{DpdkInlineChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
+use crate::{
+    switcher::{ActiveConnection, DatapathConnectionMigrator, DpdkDatapathChoice},
+    DpdkInlineChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel,
+};
 use ahash::HashMap;
 use bertha::{ChunnelConnector, ChunnelListener, Either};
 use color_eyre::{
     eyre::{ensure, eyre, WrapErr},
     Report,
 };
-use eui48::MacAddress;
 use flume::Sender;
 use futures_util::{
     future::{ready, Ready},
     stream::{once, Once, Stream, TryStreamExt},
 };
+use macaddr::MacAddr6 as MacAddress;
 use std::task::Waker;
 use std::{
     cell::{RefCell, UnsafeCell},
@@ -48,14 +51,10 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     pin::Pin,
-    str::FromStr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Barrier, Mutex, RwLock},
 };
 use tracing::debug;
-
-mod migrator;
-pub use migrator::*;
 
 mod connection;
 pub use connection::*;
@@ -74,35 +73,6 @@ impl DatapathInner {
         match self {
             DatapathInner::Thread(t) => t.shut_down(),
             DatapathInner::Inline(t) => t.shut_down(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum DpdkDatapathChoice {
-    Thread,
-    Inline { num_threads: usize },
-}
-
-impl FromStr for DpdkDatapathChoice {
-    type Err = Report;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let l = s.to_lowercase();
-        match l.chars().next().ok_or(eyre!("got empty string"))? {
-            't' => Ok(DpdkDatapathChoice::Thread),
-            'i' => {
-                let parts: Vec<&str> = l.split(':').collect();
-                if parts.len() == 1 {
-                    Ok(DpdkDatapathChoice::Inline { num_threads: 0 })
-                } else if parts.len() == 2 {
-                    let num_threads = parts[1].parse()?;
-                    Ok(DpdkDatapathChoice::Inline { num_threads })
-                } else {
-                    Err(eyre!("unknown specifier {:?}", s))
-                }
-            }
-            x => Err(eyre!("unknown specifier {:?}", x)),
         }
     }
 }
@@ -241,7 +211,7 @@ impl DpdkDatapath {
         debug!("done");
     }
 
-    pub fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
+    pub async fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
         if !self.check_do_transition(choice) {
             return Ok(());
         }
@@ -421,7 +391,7 @@ impl From<DpdkDatapath> for DpdkReqDatapath {
 
 impl DpdkReqDatapath {
     pub async fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
-        self.inner.trigger_transition(choice)?;
+        self.inner.trigger_transition(choice).await?;
         for (_, senders) in self.acceptors.lock().unwrap().iter() {
             for s in senders {
                 s.send(self.inner.curr_datapath.clone())?;

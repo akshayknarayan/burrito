@@ -1,6 +1,8 @@
 use ahash::HashMap;
+use color_eyre::eyre::eyre;
 use color_eyre::Report;
 use std::net::SocketAddrV4;
+use std::str::FromStr;
 
 /// A single active connection. Used in `DatapathConnectionMigrator`.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
@@ -39,4 +41,33 @@ pub trait DatapathConnectionMigrator {
         &mut self,
         conns: Vec<ActiveConnection>,
     ) -> Result<HashMap<ActiveConnection, Self::Conn>, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DpdkDatapathChoice {
+    Thread,
+    Inline { num_threads: usize },
+}
+
+impl FromStr for DpdkDatapathChoice {
+    type Err = Report;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let l = s.to_lowercase();
+        match l.chars().next().ok_or(eyre!("got empty string"))? {
+            't' => Ok(DpdkDatapathChoice::Thread),
+            'i' => {
+                let parts: Vec<&str> = l.split(':').collect();
+                if parts.len() == 1 {
+                    Ok(DpdkDatapathChoice::Inline { num_threads: 0 })
+                } else if parts.len() == 2 {
+                    let num_threads = parts[1].parse()?;
+                    Ok(DpdkDatapathChoice::Inline { num_threads })
+                } else {
+                    Err(eyre!("unknown specifier {:?}", s))
+                }
+            }
+            x => Err(eyre!("unknown specifier {:?}", x)),
+        }
+    }
 }

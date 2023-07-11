@@ -28,33 +28,32 @@
 //! in a single implementation of that interface. It should also support dynamic switching between
 //! the two via a handle.
 
-use crate::{DpdkInlineChunnel, DpdkInlineChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
+use crate::{
+    switcher::{ActiveConnection, DatapathConnectionMigrator, DpdkDatapathChoice},
+    DpdkInlineChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel,
+};
 use ahash::HashMap;
 use bertha::{ChunnelConnector, ChunnelListener, Either};
 use color_eyre::{
     eyre::{ensure, eyre, WrapErr},
     Report,
 };
-use eui48::MacAddress;
 use flume::Sender;
 use futures_util::{
     future::{ready, Ready},
     stream::{once, FuturesUnordered, Once, Stream, TryStreamExt},
     StreamExt,
 };
+use macaddr::MacAddr6 as MacAddress;
 use std::{
     fmt::Debug,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::Path,
     pin::Pin,
-    str::FromStr,
     sync::{Arc, Mutex as StdMutex},
 };
 use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
-
-mod migrator;
-pub use migrator::*;
 
 mod connection;
 pub use connection::*;
@@ -73,35 +72,6 @@ impl DatapathInner {
         match self {
             DatapathInner::Thread(t) => t.shut_down(),
             DatapathInner::Inline(t) => t.shut_down(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum DpdkDatapathChoice {
-    Thread,
-    Inline { num_threads: usize },
-}
-
-impl FromStr for DpdkDatapathChoice {
-    type Err = Report;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let l = s.to_lowercase();
-        match l.chars().next().ok_or(eyre!("got empty string"))? {
-            't' => Ok(DpdkDatapathChoice::Thread),
-            'i' => {
-                let parts: Vec<&str> = l.split(':').collect();
-                if parts.len() == 1 {
-                    Ok(DpdkDatapathChoice::Inline { num_threads: 0 })
-                } else if parts.len() == 2 {
-                    let num_threads = parts[1].parse()?;
-                    Ok(DpdkDatapathChoice::Inline { num_threads })
-                } else {
-                    Err(eyre!("unknown specifier {:?}", s))
-                }
-            }
-            x => Err(eyre!("unknown specifier {:?}", x)),
         }
     }
 }

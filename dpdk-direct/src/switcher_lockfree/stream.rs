@@ -1,7 +1,5 @@
-use super::{DatapathInner, ReqDatapathStream};
-use crate::{
-    ActiveConnection, DatapathCnInner, DpdkInlineReqChunnel, DpdkReqDatapath, DpdkUdpReqChunnel,
-};
+use super::{DatapathCnInner, DatapathInner, DpdkReqDatapath, ReqDatapathStream};
+use crate::{switcher::ActiveConnection, DpdkUdpReqChunnel};
 use ahash::HashMap;
 use bertha::{ChunnelListener, Either};
 use color_eyre::{
@@ -85,12 +83,9 @@ impl UpgradeStream {
                     .map_ok(Either::Right)
                     .map_ok(DatapathCnInner::Thread),
             ) as _,
-            DatapathInner::Inline(s) => Box::pin(
-                DpdkInlineReqChunnel::from(s)
-                    .listen(addr)
-                    .into_inner()?
-                    .map_ok(DatapathCnInner::Inline),
-            ) as _,
+            DatapathInner::Inline(mut s) => {
+                Box::pin(s.listen(addr).into_inner()?.map_ok(DatapathCnInner::Inline)) as _
+            }
         };
 
         let st = DpdkReqDatapath::adapt_inner_stream(

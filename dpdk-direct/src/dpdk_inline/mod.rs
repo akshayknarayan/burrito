@@ -5,12 +5,10 @@ use dpdk_wrapper::{
     bindings::{get_lcore_id, get_lcore_map},
     wrapper::{affinitize_thread, setup_flow_steering_solo, FlowSteeringHandle, SteeringMatchRule},
 };
-use eui48::MacAddress;
 use flume::{Receiver, Sender};
 use futures_util::future::{ready, Ready};
 use futures_util::Stream;
-use std::future::Future;
-use std::net::{SocketAddr, SocketAddrV4};
+use macaddr::MacAddr6 as MacAddress;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -258,7 +256,9 @@ impl DpdkInlineChunnel {
     }
 
     fn do_shutdown(&self) {
-        self.flow_steering.lock().unwrap().0.clear();
+        let mut fs = self.flow_steering.lock().unwrap();
+        fs.local_dst_port.clear();
+        fs.remote_src_port.clear();
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -292,7 +292,7 @@ impl DpdkInlineChunnel {
                     .ok_or(eyre!("dpdk not initialized on core {:?}", this_lcore))?;
                 if let Err(err) = {
                     let mut steering_g = this.flow_steering.lock().unwrap();
-                    steering_g.add_flow(dpdk, port)
+                    steering_g.add_flow(dpdk, SteeringMatchRule::LocalDstOnly(port))
                 } {
                     warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                 }
@@ -441,7 +441,7 @@ impl DpdkInlineChunnel {
 
                 if let Err(err) = {
                     let mut steering_g = self.flow_steering.lock().unwrap();
-                    steering_g.add_flow(dpdk, a.port())
+                    steering_g.add_flow(dpdk, SteeringMatchRule::LocalDstOnly(a.port()))
                 } {
                     warn!(?err, "Error setting flow steering. This could be ok, as long as the last one works.");
                 }
@@ -600,7 +600,7 @@ impl ChunnelListener for DpdkInlineChunnel {
     type Connection = DpdkInlineCn;
     type Future = Ready<Result<Self::Stream, Report>>;
     type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + Sync + 'static>>;
     type Error = Report;
 
     fn listen(&mut self, addr: Self::Addr) -> Self::Future {
@@ -648,7 +648,7 @@ impl ChunnelListener for DpdkInlineChunnel {
                         initialization_state: Arc::clone(&self.initialization_state),
                         flow_steering: Arc::clone(&self.flow_steering),
                         conn_count: 0,
-                        shutdown: Arc::clone(&self.0.shutdown),
+                        shutdown: Arc::clone(&self.shutdown),
                     };
 
                     Ok(Box::pin(futures_util::stream::try_unfold(state, |state| {
