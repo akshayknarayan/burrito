@@ -1,5 +1,5 @@
 //! Dynamically switch between `dpdk_direct::DpdkUdpReqChunnel` and
-//! `dpdk_direct::DpdkInlineReqChunnel`.
+//! `dpdk_direct::DpdkInlineChunnel`.
 //!
 //! kvserver::server::serve is expecting:
 //! ```
@@ -21,14 +21,14 @@
 //!
 //! fn run_server_dpdk_multithread(opt: Opt) -> Result<(), Report> {
 //!     let s = dpdk_direct::DpdkInlineChunnel::new(opt.cfg.unwrap(), (opt.num_shards + 1) as _)?;
-//!     let l = dpdk_direct::DpdkInlineReqChunnel::from(s);
+//!     let l = dpdk_direct::DpdkInlineChunnel::from(s);
 //!     serve( l, /* ... */)
 //! }
 //! ```
 //! in a single implementation of that interface. It should also support dynamic switching between
 //! the two via a handle.
 
-use crate::{DpdkInlineChunnel, DpdkInlineReqChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
+use crate::{DpdkInlineChunnel, DpdkUdpReqChunnel, DpdkUdpSkChunnel};
 use ahash::HashMap;
 use bertha::{ChunnelConnector, ChunnelListener, Either};
 use color_eyre::{
@@ -420,7 +420,7 @@ impl From<DpdkDatapath> for DpdkReqDatapath {
 }
 
 impl DpdkReqDatapath {
-    pub fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
+    pub async fn trigger_transition(&mut self, choice: DpdkDatapathChoice) -> Result<(), Report> {
         self.inner.trigger_transition(choice)?;
         for (_, senders) in self.acceptors.lock().unwrap().iter() {
             for s in senders {
@@ -480,7 +480,7 @@ impl ChunnelListener for DpdkReqDatapath {
         ) -> Result<UpgradeStream, Report> {
             let inner: Pin<
                 Box<dyn Stream<Item = Result<DatapathCnInner, Report>> + Send + Sync + 'static>,
-            > = match &this.inner.curr_datapath {
+            > = match &mut this.inner.curr_datapath {
                 DatapathInner::Thread(ref s) => Box::pin(
                     DpdkUdpReqChunnel(s.clone())
                         .listen(addr)
@@ -488,12 +488,9 @@ impl ChunnelListener for DpdkReqDatapath {
                         .map_ok(Either::Right)
                         .map_ok(DatapathCnInner::Thread),
                 ) as _,
-                DatapathInner::Inline(ref s) => Box::pin(
-                    DpdkInlineReqChunnel::from(s.clone())
-                        .listen(addr)
-                        .into_inner()?
-                        .map_ok(DatapathCnInner::Inline),
-                ) as _,
+                DatapathInner::Inline(ref mut s) => {
+                    Box::pin(s.listen(addr).into_inner()?.map_ok(DatapathCnInner::Inline)) as _
+                }
             };
 
             let st = DpdkReqDatapath::adapt_inner_stream(

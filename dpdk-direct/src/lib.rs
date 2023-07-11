@@ -10,5 +10,5 @@ pub use dpdk_inline::{DpdkState, Msg, SendMsg, DPDK_STATE};
 
 pub use dpdk_wrapper::bindings::{get_lcore_id, get_lcore_map};
 
-mod switcher;
-pub use switcher::*;
+pub mod switcher_lock;
+pub mod switcher_lockfree;

@@ -109,7 +109,7 @@ impl DpdkUdpSkChunnel {
         }
     }
 
-    fn load_connections(
+    pub(crate) fn load_connections(
         &mut self,
         conns: Vec<ActiveConnection>,
     ) -> Result<HashMap<ActiveConnection, Either<DpdkUdpSk, BoundDpdkUdpSk>>, Report> {
