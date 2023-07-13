@@ -888,6 +888,29 @@ def get_iface(ip_link_out, mac):
             return line.split()[1][:-1]
     raise Exception(f"interface for {ip_link_out}/{mac} not found")
 
+def mlx_ofed_install_one(conn):
+    agenda.task(f"checking for mlx ofed install on {conn.addr}")
+    res = conn.run(f"ofed_info", wd="~/burrito/dpdk-direct/dpdk-wrapper/dpdk", sudo=True)
+    if res.exited == 0:
+        # already installed
+        agenda.subtask("mlx ofed already installed")
+        return
+
+    agenda.task(f"installing mlx ofed on {conn.addr}")
+    res = conn.run("./scripts/install-mlx5.sh ~/burrito", sudo=True)
+    if res.exited != 0:
+        agenda.failure(f"mlx ofed install failed:\n{res.stdout}\n{res.stderr}")
+        global thread_ok
+        thread_ok = False
+    agenda.subtask("mlx ofed installed")
+
+def mlx_ofed_install(machines):
+    installs = [threading.Thread(target=mlx_ofed_install_one, args=(m,)) for m in machines]
+    [i.start() for i in installs]
+    [i.join() for i in installs]
+    if not thread_ok:
+        raise Exception("mlx install failed")
+
 def intel_devbind(machines, datapath):
     agenda.task(f"bind interfaces to correct driver for {datapath}")
     for conn in machines:
@@ -988,6 +1011,9 @@ def setup_all(machines, cfg, args, setup_fn, compile_fn):
 
     if 'intel' == args.dpdk_driver and 'datapath' in cfg['exp'] and any('dpdk' in d for d in cfg['exp']['datapath']):
         intel_setup(machines)
+
+    if 'mlx' in args.dpdk_driver:
+        mlx_ofed_install(machines)
 
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
