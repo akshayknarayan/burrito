@@ -897,7 +897,7 @@ def mlx_ofed_install_one(conn):
         return
 
     agenda.task(f"installing mlx ofed on {conn.addr}")
-    res = conn.run("./scripts/install-mlx5.sh ~/burrito", sudo=True)
+    res = conn.run("./scripts/install-mlx5.sh ~/burrito", sudo=True, wd="~/burrito")
     if res.exited != 0:
         agenda.failure(f"mlx ofed install failed:\n{res.stdout}\n{res.stderr}")
         global thread_ok
