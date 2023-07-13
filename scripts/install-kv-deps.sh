@@ -5,7 +5,7 @@ set -e
 pushd ~
 
 sudo apt update
-sudo apt upgrade -y
+sudo apt dist-upgrade -y
 
 # install dependencies (first line dpdk, second line ycsbc-mock)
 sudo apt install -y  \

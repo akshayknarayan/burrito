@@ -1,0 +1,20 @@
+[machines]
+server = { access = "128.110.218.214", user = "akshayn", alt = "128.110.218.214", exp = "10.10.1.2", mac = "9c:dc:71:56:af:95" } # node-0
+clients = [
+    { access = "128.110.218.210", user = "akshayn", alt = "128.110.218.210", exp = "10.10.1.1", mac = "9c:dc:71:5d:40:f1" } # node-1
+]
+
+[cfg]
+lcores = "0,1,2,3,4,5,6,7,8,9"
+
+[cfg.client]
+num-threads = 10
+
+[cfg.server]
+num-threads = 10
+
+[exp]
+use-locks=[true,false]
+arrivals=['closed','open:100']
+num-msgs=9000
+switchpoint=[3000]
