@@ -984,12 +984,20 @@ def setup_all(machines, cfg, args, setup_fn, compile_fn):
 
     fn_args = (args.outdir, cfg['exp']['datapath'] if 'datapath' in cfg['exp'] else [], args.dpdk_driver, target_dir)
     agenda.task("setup machines")
+
     setups = [threading.Thread(target=setup_fn, args=(m, *fn_args)) for m in machines]
     [t.start() for t in setups]
     [t.join() for t in setups]
     if not thread_ok:
         agenda.failure("Something went wrong")
         raise Exception("setup error")
+
+    if 'intel' == args.dpdk_driver and 'datapath' in cfg['exp'] and any('dpdk' in d for d in cfg['exp']['datapath']):
+        intel_setup(machines)
+
+    if 'mlx' in args.dpdk_driver:
+        mlx_ofed_install(machines)
+
     agenda.task("build binaries")
     if args.cloudlab:
         compile_fn(machines[0], *fn_args)
@@ -1008,12 +1016,6 @@ def setup_all(machines, cfg, args, setup_fn, compile_fn):
             if x.addr == m['exp']:
                 x.mac = m['mac']
                 break
-
-    if 'intel' == args.dpdk_driver and 'datapath' in cfg['exp'] and any('dpdk' in d for d in cfg['exp']['datapath']):
-        intel_setup(machines)
-
-    if 'mlx' in args.dpdk_driver:
-        mlx_ofed_install(machines)
 
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
