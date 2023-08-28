@@ -360,7 +360,7 @@ mod test {
 
                     let mut slot = [None];
                     let d = cn.recv(&mut slot).await.unwrap();
-                    cn.send(d.into_iter().map(|x| x.take().unwrap()))
+                    cn.send(d.iter_mut().map(|x| x.take().unwrap()))
                         .await
                         .unwrap();
                 });
@@ -414,7 +414,7 @@ mod test {
                             loop {
                                 match cn.recv(&mut slot).await {
                                     Ok(d) => {
-                                        cn.send(d.into_iter().map_while(Option::take))
+                                        cn.send(d.iter_mut().map_while(Option::take))
                                             .await
                                             .expect("server send");
                                         debug!("echoed");

@@ -449,12 +449,12 @@ mod test {
                 let addr = "127.0.0.1:35184".to_socket_addrs().unwrap().next().unwrap();
 
                 tokio::spawn(async move {
-                    let srv = UdpReqChunnel::default().listen(addr).await.unwrap();
+                    let srv = UdpReqChunnel.listen(addr).await.unwrap();
                     srv.try_for_each_concurrent(None, |cn| async move {
                         let mut recv_slots = [None, None];
                         loop {
                             let data = cn.recv(&mut recv_slots).await?;
-                            cn.send(data.into_iter().map_while(Option::take)).await?;
+                            cn.send(data.iter_mut().map_while(Option::take)).await?;
                         }
                     })
                     .instrument(tracing::info_span!("echo-srv"))
@@ -462,11 +462,11 @@ mod test {
                     .unwrap();
                 });
 
-                let cli1 = UdpSkChunnel::default().connect(addr).await.unwrap();
-                let cli2 = UdpSkChunnel::default().connect(addr).await.unwrap();
+                let cli1 = UdpSkChunnel.connect(addr).await.unwrap();
+                let cli2 = UdpSkChunnel.connect(addr).await.unwrap();
 
                 for i in 0..10 {
-                    cli1.send(std::iter::once((addr, vec![i as u8; 12])))
+                    cli1.send(std::iter::once((addr, vec![i; 12])))
                         .await
                         .unwrap();
                     cli2.send(std::iter::once((addr, vec![i + 1; 12])))
@@ -477,7 +477,7 @@ mod test {
                     let one = cli1.recv(&mut recv_slots).await.unwrap();
                     let (from1, data1) = one[0].take().unwrap();
                     assert_eq!(from1, addr);
-                    assert_eq!(data1, vec![i as u8; 12]);
+                    assert_eq!(data1, vec![i; 12]);
                     let two = cli2.recv(&mut recv_slots).await.unwrap();
                     let (from2, data2) = two[0].take().unwrap();
                     assert_eq!(from2, addr);
