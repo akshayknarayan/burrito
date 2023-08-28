@@ -149,7 +149,7 @@ impl<T1, T2, I> Select<T1, T2, I> {
     }
 }
 
-fn have_all(univ: &[Vec<u8>], joint: &[Vec<u8>]) -> bool {
+pub(crate) fn have_all(univ: &[Vec<u8>], joint: &[Vec<u8>]) -> bool {
     univ.iter().all(|x| joint.contains(x))
 }
 
@@ -214,7 +214,7 @@ pub use client::{
 mod rendezvous;
 pub use rendezvous::{
     negotiate_rendezvous, NegotiateRendezvousResult, RendezvousBackend, RendezvousEntry,
-    SelectPolicy, UpgradeSelect,
+    UpgradeSelect,
 };
 
 #[allow(non_upper_case_globals)]
@@ -223,6 +223,7 @@ mod test {
     use super::{negotiate_client, negotiate_server, CapabilitySet, Negotiate, Select};
     use crate::test::COLOR_EYRE;
     use crate::udp::{UdpReqChunnel, UdpSkChunnel};
+    use crate::GetOffers;
     use crate::{
         chan_transport::Chan, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     };
@@ -240,6 +241,7 @@ mod test {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     #[allow(non_upper_case_globals)]
+    #[macro_export]
     macro_rules! mock_serve_impl {
         (StructDef==>$name:ident) => {
             #[derive(Debug, Clone, Copy)]
@@ -288,6 +290,7 @@ mod test {
     mock_serve_impl!(ChunnelC);
 
     #[allow(non_upper_case_globals)]
+    #[macro_export]
     macro_rules! mock_alt_impl {
         ($name:ident) => {
             paste::paste! {
@@ -309,6 +312,24 @@ mod test {
     }
 
     mock_alt_impl!(ChunnelB);
+
+    #[test]
+    fn stack_associativity() {
+        let stack1 = Select::from((
+            CxList::from(ChunnelB).wrap(ChunnelA),
+            CxList::from(ChunnelC).wrap(ChunnelA),
+        ));
+
+        let stack2 = CxList::from(ChunnelA).wrap(Select::from((ChunnelB, ChunnelC)));
+
+        let stack1_offers: Vec<_> = stack1.offers().collect();
+        let stack2_offers: Vec<_> = stack2.offers().collect();
+
+        dbg!(&stack1_offers);
+        dbg!(&stack2_offers);
+
+        assert_eq!(stack1_offers, stack2_offers);
+    }
 
     #[test]
     fn both_select() {
@@ -400,7 +421,7 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let raw_st = UdpReqChunnel::default().listen(addr).await?;
+                        let raw_st = UdpReqChunnel.listen(addr).await?;
                         let srv_stream = negotiate_server(srv_stack, raw_st).await?;
                         s.send(()).unwrap();
                         srv_stream
@@ -410,7 +431,7 @@ mod test {
                                 let mut slots = [EMPTY; 4];
                                 loop {
                                     let ms = cn.recv(&mut slots).await?;
-                                    cn.send(ms.into_iter().map_while(Option::take)).await?;
+                                    cn.send(ms.iter_mut().map_while(Option::take)).await?;
                                     debug!("echoed");
                                 }
                             })
@@ -424,12 +445,12 @@ mod test {
 
                 r.await.unwrap();
                 info!("starting client");
-                let raw_cn = UdpSkChunnel::default().connect(addr).await?;
+                let raw_cn = UdpSkChunnel.connect(addr).await?;
                 let cn1 = negotiate_client(stack.clone(), raw_cn, addr)
                     .instrument(info_span!("negotiate_client"))
                     .await?;
 
-                let raw_cn = UdpSkChunnel::default().connect(addr).await?;
+                let raw_cn = UdpSkChunnel.connect(addr).await?;
                 let cn2 = negotiate_client(stack, raw_cn, addr)
                     .instrument(info_span!("negotiate_client"))
                     .await?;
@@ -456,6 +477,7 @@ mod test {
     }
 
     #[allow(non_upper_case_globals)]
+    #[macro_export]
     macro_rules! mock_serve_bothsides_impl {
         ($name:ident) => {
             paste::paste! {
@@ -519,7 +541,7 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let raw_st = UdpReqChunnel::default().listen(addr).await?;
+                        let raw_st = UdpReqChunnel.listen(addr).await?;
                         let srv_stream = negotiate_server(srv_stack, raw_st).await?;
                         s.send(()).unwrap();
                         srv_stream
@@ -544,7 +566,7 @@ mod test {
                 r.await.unwrap();
                 info!("starting client");
                 let cl_stack = ChunnelA;
-                let raw_cn = UdpSkChunnel::default().connect(addr).await?;
+                let raw_cn = UdpSkChunnel.connect(addr).await?;
                 let _ = negotiate_client(cl_stack, raw_cn, addr)
                     .instrument(info_span!("negotiate_client"))
                     .await
@@ -580,7 +602,7 @@ mod test {
                 tokio::spawn(
                     async move {
                         info!("starting");
-                        let raw_st = UdpReqChunnel::default().listen(addr).await?;
+                        let raw_st = UdpReqChunnel.listen(addr).await?;
                         let srv_stream = negotiate_server(srv_stack, raw_st).await?;
                         s.send(()).unwrap();
                         srv_stream
@@ -590,7 +612,7 @@ mod test {
                                 let mut slots = [EMPTY; 4];
                                 loop {
                                     let ms = cn.recv(&mut slots).await?;
-                                    cn.send(ms.into_iter().map_while(Option::take)).await?;
+                                    cn.send(ms.iter_mut().map_while(Option::take)).await?;
                                     debug!("echoed");
                                 }
                             })
@@ -606,7 +628,7 @@ mod test {
                 let mut cl_neg = super::ClientNegotiator::default();
                 async {
                     info!("starting client");
-                    let raw_cn = UdpSkChunnel::default().connect(addr).await?;
+                    let raw_cn = UdpSkChunnel.connect(addr).await?;
                     let cn = cl_neg
                         .negotiate_fetch_nonce(stack.clone(), raw_cn, addr)
                         .instrument(info_span!("negotiate_client"))
@@ -627,7 +649,7 @@ mod test {
 
                 async {
                     info!("starting client");
-                    let raw_cn = UdpSkChunnel::default().connect(addr).await?;
+                    let raw_cn = UdpSkChunnel.connect(addr).await?;
                     let cn = cl_neg
                         .negotiate_zero_rtt(stack.clone(), raw_cn, addr)
                         .instrument(info_span!("negotiate_client"))
@@ -651,7 +673,7 @@ mod test {
                     // make a fake bad nonce
                     let cl_stack = ChunnelA;
                     let bad_nonce = cl_stack.offers().next().unwrap();
-                    let raw_cn = UdpSkChunnel::default().connect(addr).await?;
+                    let raw_cn = UdpSkChunnel.connect(addr).await?;
                     let cn = super::client::negotiate_client_nonce(
                         cl_stack,
                         raw_cn.clone(),

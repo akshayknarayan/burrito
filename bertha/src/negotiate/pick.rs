@@ -107,12 +107,18 @@ where
             stack: head_pick,
             filtered_pairs,
             touched_cap_guids: head_caps,
-        } = self.head.pick(offer_pairs)?;
+        } = self
+            .head
+            .pick(offer_pairs)
+            .wrap_err_with(|| eyre!("CxList head pick failed: {:?}", std::any::type_name::<H>()))?;
         let PickResult {
             stack: tail_pick,
             filtered_pairs,
             touched_cap_guids: tail_caps,
-        } = self.tail.pick(filtered_pairs)?;
+        } = self
+            .tail
+            .pick(filtered_pairs)
+            .wrap_err_with(|| eyre!("CxList tail pick failed: {:?}", std::any::type_name::<T>()))?;
 
         Ok(PickResult {
             stack: CxList {
@@ -125,59 +131,165 @@ where
     }
 }
 
-pub(crate) fn check_touched<T: Pick>(
+pub(crate) fn check_touched_complete<T: Pick>(
     t: T,
     pairs: Vec<(StackNonce, StackNonce)>,
 ) -> Result<PickResult<T::Picked>, Report>
 where
     T::Picked: Debug,
 {
-    let pr = t.pick(pairs).wrap_err("pick failed")?;
+    let pr = t
+        .pick(pairs.clone())
+        .wrap_err_with(|| eyre!("pick failed: {:?}", pairs))?;
     let touched = &pr.touched_cap_guids;
     let pairs: Vec<_> = pr
         .filtered_pairs
         .into_iter()
-        .filter(|(client, server)| {
-            let client = &client.0;
-            let server = &server.0;
+        .map(|(client, server)| {
+            let client_m = &client.0;
+            let server_m = &server.0;
+
             // if client has something with sidedness none, that means the server has to match its
             // capabilities. So if we didn't touch it, then invalid.
-            client
+
+            if !client_m
                 .iter()
                 .all(|(guid, of)| of.sidedness.is_some() || touched.get(guid).is_some())
-                && touched.iter().all(|t| {
-                    // for all the things we did touch, the impls should match.
-                    let of = server.get(t).unwrap();
-                    match of {
-                        Offer { impl_guid, .. } if *impl_guid == 0 => true,
-                        Offer {
-                            sidedness: Some(univ),
-                            available,
-                            ..
-                        } => {
-                            if let Some(cl_of) = client.get(t) {
-                                let h: HashSet<&[u8]> = cl_of
-                                    .available
-                                    .iter()
-                                    .map(Vec::as_slice)
-                                    .chain(available.iter().map(Vec::as_slice))
-                                    .collect();
-                                h.len() == univ.len()
+            {
+                return Err(eyre!(
+                    "t: {:?} pairs: {:?}, touched set {:?} missing touched guids: {:?}",
+                    std::any::type_name::<T>(),
+                    pairs,
+                    touched,
+                    client_m
+                        .iter()
+                        .filter_map(|(guid, of)| {
+                            if of.sidedness.is_none() && touched.get(guid).is_none() {
+                                Some(guid)
                             } else {
-                                available.len() == univ.len()
+                                None
                             }
+                        })
+                        .collect::<Vec<_>>()
+                ));
+            }
+
+            let impls_matched = touched.iter().all(|t| {
+                // for all the things we did touch, the impls should match.
+                let of = server_m.get(t).unwrap();
+                match of {
+                    Offer { impl_guid, .. } if *impl_guid == 0 => true,
+                    Offer {
+                        sidedness: Some(univ),
+                        available,
+                        ..
+                    } => {
+                        if let Some(cl_of) = client_m.get(t) {
+                            let h: HashSet<&[u8]> = cl_of
+                                .available
+                                .iter()
+                                .map(Vec::as_slice)
+                                .chain(available.iter().map(Vec::as_slice))
+                                .collect();
+                            h.len() == univ.len()
+                        } else {
+                            available.len() == univ.len()
                         }
-                        _ => false,
                     }
-                })
+                    _ => false,
+                }
+            });
+            if impls_matched {
+                Ok((client, server))
+            } else {
+                Err(eyre!("impls_matched: {:?}", ()))
+            }
         })
         .collect();
 
-    if pairs.is_empty() {
-        Err(eyre!("No remaining valid (client, server) offer pairs"))
+    if pairs.iter().all(|r| r.is_err()) {
+        let mut report = eyre!("No remaining valid (client, server) offer pairs");
+
+        for p in pairs.into_iter() {
+            report = report.wrap_err(p.unwrap_err())
+        }
+
+        Err(report)
     } else {
+        let filtered_pairs = pairs.into_iter().filter_map(|r| r.ok()).collect();
         Ok(PickResult {
-            filtered_pairs: pairs,
+            filtered_pairs,
+            ..pr
+        })
+    }
+}
+
+fn check_touched_partial<T: Pick>(
+    t: T,
+    pairs: Vec<(StackNonce, StackNonce)>,
+) -> Result<PickResult<T::Picked>, Report>
+where
+    T::Picked: Debug,
+{
+    let pr = t
+        .pick(pairs.clone())
+        .wrap_err_with(|| eyre!("pick failed: {:?}", pairs))?;
+    let touched = &pr.touched_cap_guids;
+    let pairs: Vec<_> = pr
+        .filtered_pairs
+        .into_iter()
+        .map(|(client, server)| {
+            let client_m = &client.0;
+            let server_m = &server.0;
+
+            let impls_matched = touched.iter().all(|t| {
+                // for all the things we did touch, the impls should match.
+                // We cannot check exhaustively (we might be mid-stack), so don't error on a
+                // missing entry
+                let of = server_m.get(t);
+                match of {
+                    Some(Offer { impl_guid, .. }) if *impl_guid == 0 => true,
+                    Some(Offer {
+                        sidedness: Some(univ),
+                        available,
+                        ..
+                    }) => {
+                        if let Some(cl_of) = client_m.get(t) {
+                            let h: HashSet<&[u8]> = cl_of
+                                .available
+                                .iter()
+                                .map(Vec::as_slice)
+                                .chain(available.iter().map(Vec::as_slice))
+                                .collect();
+                            h.len() == univ.len()
+                        } else {
+                            available.len() == univ.len()
+                        }
+                    }
+                    Some(_) => false,
+                    None => true,
+                }
+            });
+            if impls_matched {
+                Ok((client, server))
+            } else {
+                Err(eyre!("impls_matched: {:?}", ()))
+            }
+        })
+        .collect();
+
+    if pairs.iter().all(|r| r.is_err()) {
+        let mut report = eyre!("No remaining valid (client, server) offer pairs");
+
+        for p in pairs.into_iter() {
+            report = report.wrap_err(p.unwrap_err())
+        }
+
+        Err(report)
+    } else {
+        let filtered_pairs = pairs.into_iter().filter_map(|r| r.ok()).collect();
+        Ok(PickResult {
+            filtered_pairs,
             ..pr
         })
     }
@@ -210,7 +322,7 @@ where
             <T2 as Pick>::Picked: Debug,
             Inner: MakeEither<T1::Picked, T2::Picked>,
         {
-            let first_err = match check_touched(first_pick, offer_pairs.clone()) {
+            let first_err = match check_touched_partial(first_pick, offer_pairs.clone()) {
                 Ok(PickResult {
                     stack,
                     filtered_pairs,
@@ -226,7 +338,7 @@ where
                 Err(e) => e.wrap_err("first choice pick erred"),
             };
 
-            match check_touched(second_pick, offer_pairs) {
+            match check_touched_partial(second_pick, offer_pairs) {
                 Ok(PickResult {
                     stack,
                     filtered_pairs,

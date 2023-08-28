@@ -1,15 +1,16 @@
 use super::{monomorphize, Apply, ApplyResult, GetOffers, NegotiateMsg, Pick, Select, StackNonce};
+use crate::Offer;
 use crate::{util::NeverCn, Chunnel, ChunnelConnection, Either};
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::future;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex as TokioMutex};
-use tracing::{debug, debug_span, instrument, trace, warn};
-use tracing_futures::Instrument;
+use tokio::sync::{oneshot, watch, Mutex as TokioMutex};
+use tracing::{debug, instrument, trace, warn};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RendezvousEntry {
@@ -120,6 +121,8 @@ pub trait RendezvousBackend {
                 x @ NoMatch { .. } => return Ok(x),
             };
 
+            debug!(?conn_ctr, ?round_number, "polling for changes");
+
             assert_eq!(
                 curr_round, round_number,
                 "Semantic round number mismatch: got {:?} expected {:?}",
@@ -135,7 +138,7 @@ pub trait RendezvousBackend {
                     Ok(Matched {
                         num_participants, ..
                     }) if num_participants == conn_ctr => {
-                        debug!("did poll; no change");
+                        trace!("did poll; no change");
                         continue;
                     }
                     r => return r,
@@ -166,97 +169,120 @@ pub trait RendezvousBackend {
     ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>>;
 }
 
-/// A policy to select which side of a Select to use.
-#[derive(Debug, Clone, Copy)]
-pub enum SelectPolicy {
-    /// Evaluates true if the number of participants is greater than `participant_threshold`.
-    Gt {
-        participant_threshold: usize,
-        preference: Either<(), ()>,
-    },
-    /// Evaluates true if the number of participants is less than `participant_threshold`.
-    Lt {
-        participant_threshold: usize,
-        preference: Either<(), ()>,
-    },
+pub trait CollectUpgradeHandles {
+    fn collect_handles(&self) -> Vec<Arc<UpgradeHandle>>;
 }
 
-impl SelectPolicy {
-    fn eval(&self, num_participants: usize) -> bool {
-        match *self {
-            SelectPolicy::Gt {
-                participant_threshold,
-                ..
-            } if num_participants > participant_threshold => true,
-            SelectPolicy::Lt {
-                participant_threshold,
-                ..
-            } if num_participants < participant_threshold => true,
-            _ => false,
-        }
+impl<H, T> CollectUpgradeHandles for crate::CxList<H, T>
+where
+    H: CollectUpgradeHandles,
+    T: CollectUpgradeHandles,
+{
+    fn collect_handles(&self) -> Vec<Arc<UpgradeHandle>> {
+        let mut x = self.head.collect_handles();
+        x.extend(self.tail.collect_handles());
+        x
     }
+}
 
-    fn pref(&self) -> Either<(), ()> {
-        match *self {
-            SelectPolicy::Gt { preference, .. } | SelectPolicy::Lt { preference, .. } => preference,
-        }
+impl<N> CollectUpgradeHandles for N
+where
+    N: crate::Negotiate,
+{
+    fn collect_handles(&self) -> Vec<Arc<UpgradeHandle>> {
+        vec![]
+    }
+}
+
+impl<T1, T2> CollectUpgradeHandles for UpgradeSelect<T1, T2>
+where
+    T1: CollectUpgradeHandles,
+    T2: CollectUpgradeHandles,
+{
+    fn collect_handles(&self) -> Vec<Arc<UpgradeHandle>> {
+        let mut x = self.inner.left.collect_handles();
+        x.extend(self.inner.right.collect_handles());
+        x.push(self.handle.clone());
+        x
+    }
+}
+
+impl<T1, T2> CollectUpgradeHandles for Select<T1, T2>
+where
+    T1: CollectUpgradeHandles,
+    T2: CollectUpgradeHandles,
+{
+    fn collect_handles(&self) -> Vec<Arc<UpgradeHandle>> {
+        let mut x = self.left.collect_handles();
+        x.extend(self.right.collect_handles());
+        x
     }
 }
 
 /// Negotiation type to choose between T1 and T2 which can change its mind later.
-///
-/// This type only works with rendezvous negotiation. Handshake negotiation should just drop the
-/// connection and start over to change its mind.
-///
-/// To specify how you would like to change your mind, use `prefer_when`.
 ///
 /// `UpgradeSelect` implements `Apply` => `UpgradeEitherApply`
 /// `UpgradeEitherApply` implements `Chunnel` => `UpgradeEitherConn`
 /// `UpgradeEitherConn` implements `ChunnelConnection` and exposes `try_upgrade`.
 /// `UpgradeEitherConnWrap` wraps `UpgradeEitherConn` to listen for negotiation updates, and calls
 /// `try_upgrade` when needed.
+#[derive(Clone, Debug)]
 pub struct UpgradeSelect<T1, T2> {
-    pub left: T1,
-    pub right: T2,
-    policies: Vec<SelectPolicy>,
+    inner: Select<T1, T2>,
+    trigger: watch::Receiver<StackNonce>,
+    handle: Arc<UpgradeHandle>,
 }
 
-impl<T1, T2> From<UpgradeSelect<T1, T2>> for Select<T1, T2> {
-    fn from(us: UpgradeSelect<T1, T2>) -> Self {
-        Select::from((us.left, us.right))
+impl<T1, T2> UpgradeSelect<T1, T2>
+where
+    T1: GetOffers,
+    T2: GetOffers,
+{
+    pub fn from_select(inner: Select<T1, T2>) -> (Self, Arc<UpgradeHandle>) {
+        let (stack_sender, stack_receiver) = watch::channel(Default::default());
+
+        let (s, r) = flume::bounded(1);
+
+        let uh = Arc::new(UpgradeHandle {
+            trigger_locally: stack_sender,
+            left_offers: inner.left.offers().collect(),
+            right_offers: inner.right.offers().collect(),
+            want_transition: s,
+            want_transition_listener: r,
+        });
+
+        let this = Self {
+            inner,
+            trigger: stack_receiver,
+            handle: uh.clone(),
+        };
+
+        (this, uh)
     }
 }
 
-impl<T1, T2> From<Select<T1, T2>> for UpgradeSelect<T1, T2> {
-    fn from(s: Select<T1, T2>) -> Self {
-        UpgradeSelect {
-            left: s.left,
-            right: s.right,
-            policies: vec![],
-        }
+impl<T1, T2> GetOffers for UpgradeSelect<T1, T2>
+where
+    Select<T1, T2>: GetOffers,
+{
+    type Iter = <Select<T1, T2> as GetOffers>::Iter;
+
+    fn offers(&self) -> Self::Iter {
+        self.inner.offers()
     }
 }
 
-impl<T1, T2> UpgradeSelect<T1, T2> {
-    /// Append a policy to the `UpgradeSelect`.
-    ///
-    /// At runtime, when an event changing the number of connection participants occurs, we will
-    /// check the list of policies in the order this function was called in, and apply the first
-    /// one that matches.
-    ///
-    /// # Example
-    /// Use the left semantics if there are less than two participants and the right if there are
-    /// more than four.
-    /// ```
-    /// use bertha::{Either, Select, UpgradeSelect, SelectPolicy};
-    /// let mut select: UpgradeSelect<_, _> = Select::from(((), ())).into();
-    /// select
-    ///   .prefer_when(SelectPolicy::Lt { participant_threshold: 2, preference: Either::Left(()) })
-    ///   .prefer_when(SelectPolicy::Gt { participant_threshold: 4, preference: Either::Right(()) });
-    /// ```
-    pub fn prefer_when(&mut self, policy: SelectPolicy) -> &mut Self {
-        self.policies.push(policy);
-        self
+impl<T1, T2> Pick for UpgradeSelect<T1, T2>
+where
+    Select<T1, T2>: Pick,
+{
+    type Picked = <Select<T1, T2> as Pick>::Picked;
+
+    fn pick(
+        self,
+        offer_pairs: Vec<(StackNonce, StackNonce)>,
+    ) -> Result<super::pick::PickResult<Self::Picked>, Report> {
+        self.inner.pick(offer_pairs)
     }
 }
 
@@ -267,20 +293,16 @@ where
 {
     type Applied = UpgradeEitherApply<T1, T2>;
 
-    fn apply(mut self, picked_offers: StackNonce) -> Result<ApplyResult<Self::Applied>, Report> {
-        let left_saved = self.left.clone();
-        let right_saved = self.right.clone();
-
-        let policies = std::mem::take(&mut self.policies);
-        let sel: Select<T1, T2> = self.into();
+    fn apply(self, picked_offers: StackNonce) -> Result<ApplyResult<Self::Applied>, Report> {
+        let left_saved = self.inner.left.clone();
+        let right_saved = self.inner.right.clone();
         let ApplyResult {
             applied,
             picked,
             touched,
             score,
-        } = sel.apply(picked_offers)?;
-
-        let applied = UpgradeEitherApply::new(applied, left_saved, right_saved, policies);
+        } = self.inner.apply(picked_offers)?;
+        let applied = UpgradeEitherApply::new(applied, left_saved, right_saved, self.trigger);
         Ok(ApplyResult {
             applied,
             picked,
@@ -294,7 +316,7 @@ pub struct UpgradeEitherApply<A: Apply, B: Apply> {
     left: A,
     right: B,
     current: Either<A::Applied, B::Applied>,
-    policies: Vec<SelectPolicy>,
+    switch_listener: watch::Receiver<StackNonce>,
 }
 
 impl<A: Apply, B: Apply> UpgradeEitherApply<A, B> {
@@ -302,54 +324,56 @@ impl<A: Apply, B: Apply> UpgradeEitherApply<A, B> {
         applied: Either<A::Applied, B::Applied>,
         a_saved: A,
         b_saved: B,
-        policies: Vec<SelectPolicy>,
+        switch_listener: watch::Receiver<StackNonce>,
     ) -> Self {
         Self {
             left: a_saved,
             right: b_saved,
             current: applied,
-            policies,
+            switch_listener,
         }
     }
 }
 
 impl<InC, A, B, Acn, Bcn> Chunnel<InC> for UpgradeEitherApply<A, B>
 where
-    InC: Send + 'static,
+    InC: Send + Sync + 'static,
     A: Apply + Clone + Send + 'static,
     B: Apply + Clone + Send + 'static,
-    <A as Apply>::Applied: Chunnel<InC, Connection = Acn> + Clone + Send + 'static,
-    <B as Apply>::Applied: Chunnel<InC, Connection = Bcn> + Clone + Send + 'static,
-    <<A as Apply>::Applied as Chunnel<InC>>::Future: Send + 'static,
-    <<B as Apply>::Applied as Chunnel<InC>>::Future: Send + 'static,
-    <<A as Apply>::Applied as Chunnel<InC>>::Error: Into<Report>,
-    <<B as Apply>::Applied as Chunnel<InC>>::Error: Into<Report>,
-    Acn: ChunnelConnection + 'static,
-    Bcn: ChunnelConnection + 'static,
-    UpgradeEitherConn<A, B, Acn, Bcn>: ChunnelConnection,
+    <A as Apply>::Applied: Chunnel<Arc<InC>, Connection = Acn> + Clone + Send + 'static,
+    <B as Apply>::Applied: Chunnel<Arc<InC>, Connection = Bcn> + Clone + Send + 'static,
+    <<A as Apply>::Applied as Chunnel<Arc<InC>>>::Future: Send + 'static,
+    <<B as Apply>::Applied as Chunnel<Arc<InC>>>::Future: Send + 'static,
+    <<A as Apply>::Applied as Chunnel<Arc<InC>>>::Error: Into<Report>,
+    <<B as Apply>::Applied as Chunnel<Arc<InC>>>::Error: Into<Report>,
+    Acn: ChunnelConnection + Send + 'static,
+    Bcn: ChunnelConnection + Send + 'static,
+    UpgradeEitherConn<A, B, Acn, Bcn, InC>: ChunnelConnection,
 {
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
-    type Connection = UpgradeEitherConn<A, B, Acn, Bcn>;
+    type Connection = UpgradeEitherConn<A, B, Acn, Bcn, InC>;
     type Error = Report;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
         let left = self.left.clone();
         let right = self.right.clone();
-        let policies = self.policies.clone();
+        let cn = Arc::new(cn);
+        let sl = self.switch_listener.clone();
         match self {
             UpgradeEitherApply {
                 current: Either::Left(ref mut ach),
                 ..
             } => {
-                let fut = ach.connect_wrap(cn);
+                let fut = ach.connect_wrap(cn.clone());
                 Box::pin(async move {
                     let acn = fut.await.map_err(Into::into)?;
                     Ok(UpgradeEitherConn {
                         left,
                         right,
-                        current: Either::Left(acn),
-                        policies,
+                        base: cn,
+                        current: Arc::new(TokioMutex::new(Either::Left(acn))),
+                        switch_listener: sl,
                     })
                 })
             }
@@ -357,14 +381,15 @@ where
                 current: Either::Right(ref mut bch),
                 ..
             } => {
-                let fut = bch.connect_wrap(cn);
+                let fut = bch.connect_wrap(cn.clone());
                 Box::pin(async move {
                     let bcn = fut.await.map_err(Into::into)?;
                     Ok(UpgradeEitherConn {
                         left,
                         right,
-                        current: Either::Right(bcn),
-                        policies,
+                        base: cn,
+                        current: Arc::new(TokioMutex::new(Either::Right(bcn))),
+                        switch_listener: sl,
                     })
                 })
             }
@@ -372,17 +397,27 @@ where
     }
 }
 
-pub struct UpgradeEitherConn<A, B, Acn, Bcn> {
+pub struct UpgradeEitherConn<A, B, Acn, Bcn, InC> {
     left: A,
     right: B,
-    current: Either<Acn, Bcn>,
-    policies: Vec<SelectPolicy>,
+    base: Arc<InC>,
+    current: Arc<TokioMutex<Either<Acn, Bcn>>>,
+    switch_listener: watch::Receiver<StackNonce>,
 }
 
-impl<A, B, Acn, Bcn, D> ChunnelConnection for UpgradeEitherConn<A, B, Acn, Bcn>
+impl<A, B, Acn, Bcn, InC, D> ChunnelConnection for UpgradeEitherConn<A, B, Acn, Bcn, InC>
 where
-    Acn: ChunnelConnection<Data = D>,
-    Bcn: ChunnelConnection<Data = D>,
+    A: Apply + Clone + Send + Sync + 'static,
+    B: Apply + Clone + Send + Sync + 'static,
+    Select<A, B>: Apply<Applied = Either<<A as Apply>::Applied, <B as Apply>::Applied>>,
+    Either<<A as Apply>::Applied, <B as Apply>::Applied>:
+        Chunnel<Arc<InC>, Connection = Either<Acn, Bcn>>,
+    <Either<<A as Apply>::Applied, <B as Apply>::Applied> as Chunnel<Arc<InC>>>::Error:
+        Into<Report>,
+    Acn: ChunnelConnection<Data = D> + Send + Sync,
+    Bcn: ChunnelConnection<Data = D> + Send + Sync,
+    D: Send,
+    InC: Send + Sync,
 {
     type Data = D;
 
@@ -394,11 +429,17 @@ where
         R: IntoIterator<Item = Self::Data> + Send + 'cn,
         <R as IntoIterator>::IntoIter: Send,
     {
-        use Either::*;
-        match self.current {
-            Left(ref a) => a.send(burst),
-            Right(ref b) => b.send(burst),
-        }
+        let mut switch_listener = self.switch_listener.clone();
+        Box::pin(async move {
+            if switch_listener.has_changed()? {
+                let v = switch_listener.borrow_and_update().clone();
+                self.try_upgrade(v)
+                    .await
+                    .wrap_err("UpgradeEitherConn could not apply new stack")?;
+            }
+
+            self.current.lock().await.send(burst).await
+        })
     }
 
     fn recv<'cn, 'buf>(
@@ -408,401 +449,424 @@ where
     where
         'buf: 'cn,
     {
-        use Either::*;
-        match self.current {
-            Left(ref a) => a.recv(msgs_buf),
-            Right(ref b) => b.recv(msgs_buf),
-        }
+        let mut switch_listener = Some(self.switch_listener.clone());
+        Box::pin(async move {
+            loop {
+                let sl = switch_listener.take();
+                let upgrade_fut = async move {
+                    let mut sl = sl.unwrap();
+                    sl.changed().await.wrap_err("sender dropped")?;
+                    let v = sl.borrow_and_update().clone();
+                    Ok::<_, Report>((sl, v))
+                };
+
+                let mut slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+                let recv_fut = async { self.current.lock().await.recv(&mut slots).await };
+
+                // We need to `Box::pin` this so that the `drop` call below actually drops the future,
+                // instead of dropping a `Pin` of the future. We need to actually drop the future so
+                // that it drops the `MutexGuard` it holds, so the lock doesn't deadlock.
+                let recv_fut = Box::pin(recv_fut);
+                let upgrade_fut = Box::pin(upgrade_fut);
+                // we need a temporary variable here to let the compiler figure out slots_borrow will
+                // be dropped before slots
+                match future::select(recv_fut, upgrade_fut).await {
+                    future::Either::Left((recvd, _)) => {
+                        let mut slot_idx = 0;
+                        for r in recvd?.iter_mut().map_while(Option::take) {
+                            msgs_buf[slot_idx] = Some(r);
+                            slot_idx += 1;
+                        }
+
+                        return Ok(&mut msgs_buf[..slot_idx]);
+                    }
+                    future::Either::Right((x, recvr)) => {
+                        debug!("received on upgrade channel");
+                        std::mem::drop(recvr); // cancel the future and drop, so its lock on inner is dropped.
+                        let (sl, upgrade) = x?;
+                        switch_listener = Some(sl);
+                        self.try_upgrade(upgrade)
+                            .await
+                            .wrap_err("UpgradeEitherConn could not apply new stack")?;
+                        continue;
+                    }
+                };
+            }
+        })
     }
 }
 
-impl<'c, A, B, Acn, Bcn> UpgradeEitherConn<A, B, Acn, Bcn>
+impl<A, B, Acn, Bcn, InC> UpgradeEitherConn<A, B, Acn, Bcn, InC>
 where
     A: Apply + Clone,
     B: Apply + Clone,
     Select<A, B>: Apply<Applied = Either<<A as Apply>::Applied, <B as Apply>::Applied>>,
     Either<<A as Apply>::Applied, <B as Apply>::Applied>:
-        Chunnel<NeverCn, Connection = Either<Acn, Bcn>>,
-    <Either<<A as Apply>::Applied, <B as Apply>::Applied> as Chunnel<NeverCn>>::Error: Into<Report>,
+        Chunnel<Arc<InC>, Connection = Either<Acn, Bcn>>,
+    <Either<<A as Apply>::Applied, <B as Apply>::Applied> as Chunnel<Arc<InC>>>::Error:
+        Into<Report>,
 {
-    async fn try_upgrade(&mut self, new_offers: StackNonce) -> Result<(), Report> {
-        let sel = Select::from((self.left.clone(), self.right.clone()));
-        let ApplyResult { mut applied, .. } = sel.apply(new_offers)?;
-        self.current = applied
-            .connect_wrap(NeverCn::default())
-            .await
-            .map_err(Into::into)?;
+    async fn try_upgrade(&self, new_offers: StackNonce) -> Result<(), Report> {
+        let new_fut = {
+            let sel = Select::from((self.left.clone(), self.right.clone()));
+            let ApplyResult { mut applied, .. } = sel.apply(new_offers)?;
+            applied.connect_wrap(self.base.clone())
+        }; // drop applied so it is not held across await
+
+        let new = new_fut.await.map_err(Into::into)?;
+        let mut inner = self.current.lock().await;
+        debug!("applying upgraded semantics");
+        *inner = new;
         Ok(())
     }
 }
 
-pub struct UpgradeEitherConnWrap<A, B, Acn, Bcn> {
-    negotiation: Arc<TokioMutex<mpsc::Receiver<StackNonce>>>,
-    inner: Arc<TokioMutex<UpgradeEitherConn<A, B, Acn, Bcn>>>,
-    dropped: tokio::task::JoinHandle<()>,
-}
-
-impl<A, B, Acn, Bcn> Drop for UpgradeEitherConnWrap<A, B, Acn, Bcn> {
-    fn drop(&mut self) {
-        self.dropped.abort();
-    }
-}
-
-impl<'c, D, A, B, Acn, Bcn> ChunnelConnection for UpgradeEitherConnWrap<A, B, Acn, Bcn>
-where
-    UpgradeEitherConn<A, B, Acn, Bcn>: ChunnelConnection<Data = D>,
-    A: Apply + Clone + Send + Sync + 'static,
-    B: Apply + Clone + Send + Sync + 'static,
-    Select<A, B>: Apply<Applied = Either<<A as Apply>::Applied, <B as Apply>::Applied>>,
-    Either<<A as Apply>::Applied, <B as Apply>::Applied>:
-        Chunnel<NeverCn, Connection = Either<Acn, Bcn>>,
-    <Either<<A as Apply>::Applied, <B as Apply>::Applied> as Chunnel<NeverCn>>::Error: Into<Report>,
-    <A as Apply>::Applied: Chunnel<NeverCn, Connection = Acn> + Clone + Send + 'static,
-    <B as Apply>::Applied: Chunnel<NeverCn, Connection = Bcn> + Clone + Send + 'static,
-    <<A as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
-    <<B as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
-    Acn: Send + Sync + 'static,
-    Bcn: Send + Sync + 'static,
-    D: Send + Sync + 'static,
-{
-    type Data = D;
-    fn send<'cn, R>(
-        &'cn self,
-        burst: R,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
-    where
-        R: IntoIterator<Item = Self::Data> + Send + 'cn,
-        <R as IntoIterator>::IntoIter: Send,
-    {
-        Box::pin(async move {
-            if let Ok(upgrade) = self.negotiation.lock().await.try_recv() {
-                debug!("applying upgraded semantics (send)");
-                self.inner.lock().await.try_upgrade(upgrade).await?;
-            }
-
-            self.inner.lock().await.send(burst).await
-        })
-    }
-
-    fn recv<'cn, 'buf>(
-        &'cn self,
-        msgs_buf: &'buf mut [Option<Self::Data>],
-    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
-    where
-        'buf: 'cn,
-    {
-        Box::pin(async move {
-            let upgrade_fut = async move {
-                let mut rg = self.negotiation.lock().await;
-                if let Some(u) = rg.recv().await {
-                    u
-                } else {
-                    std::mem::drop(rg);
-                    future::pending().await
-                }
-            };
-
-            let mut slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
-            let slots_borrow = &mut slots;
-            let recv_fut = async move { self.inner.lock().await.recv(slots_borrow).await };
-
-            // We need to `Box::pin` this so that the `drop` call below actually drops the future,
-            // instead of dropping a `Pin` of the future. We need to actually drop the future so
-            // that it drops the `MutexGuard` it holds, so the lock doesn't deadlock.
-            let recv_fut = Box::pin(recv_fut);
-            let upgrade_fut = Box::pin(upgrade_fut);
-            // we need a temporary variable here to let the compiler figure out slots_borrow will
-            // be dropped before slots
-            let x = match future::select(recv_fut, upgrade_fut).await {
-                future::Either::Left((recvd, _)) => {
-                    let mut slot_idx = 0;
-                    for r in recvd?.into_iter().map_while(Option::take) {
-                        msgs_buf[slot_idx] = Some(r);
-                        slot_idx += 1;
-                    }
-
-                    Ok(&mut msgs_buf[..slot_idx])
-                }
-                future::Either::Right((upgrade, recvr)) => {
-                    debug!("received on upgrade channel");
-                    std::mem::drop(recvr); // cancel the future and drop, so its lock on inner is dropped.
-                    let mut inner = self.inner.lock().await;
-                    debug!("applying upgraded semantics (recv)");
-                    inner.try_upgrade(upgrade).await?;
-                    inner.recv(msgs_buf).await
-                }
-            };
-
-            x
-        })
-    }
-}
-
-impl<'c, D, A, B, Acn, Bcn> UpgradeEitherConnWrap<A, B, Acn, Bcn>
-where
-    UpgradeEitherConn<A, B, Acn, Bcn>: ChunnelConnection<Data = D>,
-    A: Pick + Apply + GetOffers + Clone + Debug + Send + 'static,
-    B: Pick + Apply + GetOffers + Clone + Debug + Send + 'static,
-    <A as Pick>::Picked: Debug + Clone + Send + 'static,
-    <B as Pick>::Picked: Debug + Clone + Send + 'static,
-    <A as Apply>::Applied: Chunnel<NeverCn, Connection = Acn> + Clone + Send + 'static,
-    <B as Apply>::Applied: Chunnel<NeverCn, Connection = Bcn> + Clone + Send + 'static,
-    <<A as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
-    <<B as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
-    Select<A, B>: Apply<Applied = Either<<A as Apply>::Applied, <B as Apply>::Applied>>,
-{
-    async fn with_negotiator<R>(
-        mut inner: UpgradeEitherConn<A, B, Acn, Bcn>,
-        mut negotiator: R,
-        addr: String,
-        curr_entry: RendezvousEntry,
-        mut curr_participant_count: usize,
-        mut curr_round: usize,
-    ) -> Self
-    where
-        R: RendezvousBackend + Send + 'static,
-        <R as RendezvousBackend>::Error: Into<Report> + Send,
-    {
-        let (s, r) = mpsc::channel(4);
-        let a = addr.clone();
-        let negotiation = Arc::new(TokioMutex::new(r));
-        let neg_l = Arc::clone(&negotiation);
-        let policies = std::mem::take(&mut inner.policies);
-        let mut curr_branch_is_left = inner.current.is_left();
-        let left_opt = inner.left.clone();
-        let right_opt = inner.right.clone();
-        let left_offer = if let (_stack, NegotiateMsg::ServerNonce { picked, .. }, _client_offers) =
-            monomorphize(
-                left_opt.clone(),
-                left_opt.offers().collect(),
-                &String::new(),
-            )
-            .unwrap()
-        {
-            picked
-        } else {
-            unreachable!()
-        };
-        let right_offer =
-            if let (_stack, NegotiateMsg::ServerNonce { picked, .. }, _client_offers) =
-                monomorphize(
-                    right_opt.clone(),
-                    right_opt.offers().collect(),
-                    &String::new(),
-                )
-                .unwrap()
-            {
-                picked
-            } else {
-                unreachable!()
-            };
-        let neg_task = tokio::spawn(
-            async move {
-                debug!("starting");
-                use future::Either as FEither;
-                loop {
-                    let close_fut = s.closed();
-                    tokio::pin!(close_fut);
-                    let notify_res = match future::select(negotiator.notify(addr.clone(), curr_entry.clone(), curr_round), close_fut).await {
-                        FEither::Right(_) => {
-                            debug!("upgrade receiver closed, exiting");
-                            return;
-                        }
-                        FEither::Left((res, _)) => {
-                            res
-                        }
-                    };
-
-                    let nonce = match notify_res {
-                        Ok(NegotiateRendezvousResult::Matched { num_participants, .. })
-                            if num_participants == curr_participant_count =>
-                        {
-                            continue; // do nothing.
-                        }
-                        Ok(NegotiateRendezvousResult::NoMatch {
-                            entry,
-                            num_participants,
-                            round_number,
-                        }) => {
-                            curr_participant_count = num_participants;
-                            curr_round = round_number;
-                            // Check if `entry` is compatible. If so, ACK with staged_update.
-                            // Don't actually use the applied value, try_upgrade will handle that.
-                            let sel = Select::from((left_opt.clone(), right_opt.clone()));
-                            match sel.apply(entry.nonce.clone()) {
-                                Ok(ApplyResult { applied, ..}) => {
-                                    curr_branch_is_left = applied.is_left();
-                                    debug!(?num_participants, ?curr_branch_is_left, "Got new compatible semantics");
-                                    // we lock this not to use it, but to prevent a send while the commit is happening.
-                                    let _neg_g = neg_l.lock().await;
-                                    if let Err(e) = negotiator.staged_update(addr.clone(), curr_round).await {
-                                        let r = e.into();
-                                        warn!(err = ?r, "staged_update failed");
-                                        return;
-                                    }
-
-                                    entry.nonce
-                                }
-                                Err(e) => {
-                                    debug!(err = %format!("{:#}", e), "Could not apply new semantics, cannot commit");
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let r = e.into();
-                            debug!(err = %format!("{:#}", r), "notify failed");
-                            return;
-                        }
-                        Ok(NegotiateRendezvousResult::Matched { num_participants, .. }) => {
-                            // the semantics are the same, but the number of participants changed.
-                            // consider transitioning.
-                            if let Some(ent) = policies.iter().find_map(|&p| {
-                                if !p.eval(num_participants) { None } else {
-                                    match p.pref() {
-                                        Either::Left(_) if !curr_branch_is_left => Some(left_offer.clone()),
-                                        Either::Right(_) if curr_branch_is_left => Some(right_offer.clone()),
-                                        _ => None,
-                                    }
-                                }
-                            }) {
-                                curr_participant_count = num_participants;
-                                // we lock this not to use it, but to prevent a send while the commit is happening.
-                                let _neg_g = neg_l.lock().await;
-                                if let Err(e) = negotiator.transition(addr.clone(), RendezvousEntry { nonce: ent.clone() }).await {
-                                    let r = e.into();
-                                    warn!(err = ?r, "staged_update failed");
-                                    return;
-                                }
-
-                                ent
-                            } else {
-                                trace!(?num_participants, "No policies applied, doing nothing");
-                                continue;
-                            }
-                        }
-                    };
-
-                    debug!("upgrade committed, channel send");
-                    s.send(nonce).await.unwrap();
-                }
-            }
-            .instrument(debug_span!("negotiate_runtime", addr = ?a)),
-        );
-
-        Self {
-            negotiation,
-            inner: Arc::new(TokioMutex::new(inner)),
-            dropped: neg_task,
-        }
-    }
-}
-
 /// Rendezvous-based negotiation.
+///
+/// Returns a connection to use, and a `StackUpgradeHandle` to manage the negotiation update task.
+/// Triggering a change with an individual `UpgradeHandle` will also cause a negotiation commit
+/// cycle.  
 #[instrument(skip(stack, rendezvous_point))]
-pub async fn negotiate_rendezvous<'c, Sleft, Sright, SleftCn, SrightCn, R>(
-    stack: UpgradeSelect<Sleft, Sright>,
+pub async fn negotiate_rendezvous<Srv, Cn, R, E>(
+    stack: Srv,
     mut rendezvous_point: R,
     addr: String,
-) -> Result<UpgradeEitherConnWrap<Sleft, Sright, SleftCn, SrightCn>, Report>
+) -> Result<(Cn, StackUpgradeHandle<R>), Report>
 where
-    Sleft: Pick + Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
-    <Sleft as Pick>::Picked: Clone + Debug + Send,
-    <Sleft as Apply>::Applied: Chunnel<NeverCn, Connection = SleftCn> + Clone + Debug + Send,
-    <<Sleft as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
-    Sright: Pick + Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
-    <Sright as Pick>::Picked: Clone + Debug + Send,
-    <Sright as Apply>::Applied: Chunnel<NeverCn, Connection = SrightCn> + Clone + Debug + Send,
-    <<Sright as Apply>::Applied as Chunnel<NeverCn>>::Error: Into<Report>,
-    UpgradeEitherApply<Sleft, Sright>:
-        Chunnel<NeverCn, Connection = UpgradeEitherConn<Sleft, Sright, SleftCn, SrightCn>>,
-    <UpgradeEitherApply<Sleft, Sright> as Chunnel<NeverCn>>::Error: Into<Report>,
-    UpgradeEitherConn<Sleft, Sright, SleftCn, SrightCn>: ChunnelConnection,
+    Srv: CollectUpgradeHandles + Pick + Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
+    <Srv as Pick>::Picked: Debug,
+    <Srv as Apply>::Applied: Chunnel<NeverCn, Connection = Cn, Error = E>,
+    E: Into<Report>,
     R: RendezvousBackend + Send + 'static,
     <R as RendezvousBackend>::Error: Into<Report> + Send,
 {
     debug!("starting");
-    let left_offer = solo_monomorphize(stack.left.clone())?;
-    let right_offer = solo_monomorphize(stack.right.clone())?;
-
-    let offer = stack
-        .policies
-        .iter()
-        .find_map(|&p| {
-            if !p.eval(1) {
-                None
-            } else {
-                match p.pref() {
-                    Either::Left(_) => Some(left_offer.clone()),
-                    Either::Right(_) => Some(right_offer.clone()),
-                }
-            }
-        })
-        .unwrap_or_else(|| left_offer.clone());
-
+    // 1. get the stack of us by ourselves
+    let offers: Vec<StackNonce> = stack.offers().collect();
+    let offer = solo_monomorphize(stack.clone()).wrap_err("Malformed chunnel stack")?;
     trace!(?offer, "monomorphized sole occupancy stack");
     let picked = offer.clone();
 
-    // 1. try_init our favored semantics.
-    let res = {
+    // 2. collect the upgrade handles to use
+    let handles = stack.collect_handles();
+
+    // 2. try_init our favored semantics.
+    let (entry, num_participants, round_number) = match {
         let rp = &mut rendezvous_point;
-        rp.try_init(addr.clone(), RendezvousEntry { nonce: offer })
+        let res = rp
+            .try_init(addr.clone(), RendezvousEntry { nonce: offer })
             .await
             .map_err(Into::into)
-            .wrap_err("rendezvous backend try_init")?
-    };
-
-    trace!(?res, "got try_init response");
-    match res {
+            .wrap_err("rendezvous backend try_init")?;
+        trace!(?res, "got try_init response");
+        res
+    } {
         NegotiateRendezvousResult::Matched {
             num_participants,
             round_number,
         } => {
             // if Matched, we joined the connection.
-            let ApplyResult { mut applied, .. } = stack
-                .apply(picked.clone())
-                .expect("solo_monomorphize means self-application will work");
-            let cn = applied
-                .connect_wrap(NeverCn::default())
-                .await
-                .map_err(Into::into)?;
-            let cn = UpgradeEitherConnWrap::with_negotiator(
-                cn,
-                rendezvous_point,
-                addr.clone(),
+            debug!(matched = true, "returning upgradable connection");
+            (
                 RendezvousEntry { nonce: picked },
                 num_participants,
                 round_number,
             )
-            .await;
-            debug!(matched = true, "returning upgradable connection");
-            Ok(cn)
         }
         NegotiateRendezvousResult::NoMatch {
             num_participants,
             round_number,
             entry,
         } => {
-            let ApplyResult { mut applied, .. } = stack
-                .apply(entry.nonce.clone())
-                .wrap_err("Could not apply current semantics on addr")?;
-            let cn = applied
-                .connect_wrap(NeverCn::default())
-                .await
-                .map_err(Into::into)?;
-            let cn = UpgradeEitherConnWrap::with_negotiator(
-                cn,
-                rendezvous_point,
-                addr.clone(),
+            debug!(matched = false, "returning upgradable connection");
+            (entry, num_participants, round_number)
+        }
+    };
+
+    let stack_upgrade_handle = StackUpgradeHandle::new(
+        handles,
+        rendezvous_point,
+        addr,
+        offers,
+        entry.clone(),
+        num_participants,
+        round_number,
+    );
+
+    let ApplyResult { mut applied, .. } = stack
+        .apply(entry.nonce)
+        .expect("solo_monomorphize means self-application will work");
+    let cn = applied
+        .connect_wrap(NeverCn::default())
+        .await
+        .map_err(Into::into)?;
+
+    trace!("returning");
+    Ok((cn, stack_upgrade_handle))
+}
+
+#[derive(Debug)]
+pub struct UpgradeHandle {
+    trigger_locally: watch::Sender<StackNonce>,
+    left_offers: Vec<StackNonce>,
+    right_offers: Vec<StackNonce>,
+    want_transition: flume::Sender<(Vec<StackNonce>, oneshot::Sender<Result<(), Report>>)>,
+    want_transition_listener:
+        flume::Receiver<(Vec<StackNonce>, oneshot::Sender<Result<(), Report>>)>,
+}
+
+impl UpgradeHandle {
+    pub async fn trigger_left(&self) -> Result<(), Report> {
+        self.propose_change(self.left_offers.clone()).await
+    }
+
+    pub async fn trigger_right(&self) -> Result<(), Report> {
+        self.propose_change(self.right_offers.clone()).await
+    }
+
+    async fn propose_change(&self, stack: Vec<StackNonce>) -> Result<(), Report> {
+        let (s, r) = oneshot::channel();
+        self.want_transition.send_async((stack, s)).await?;
+        r.await.expect("sender won't drop")
+    }
+
+    fn switch_to_stack(&self, new_stack: StackNonce) {
+        self.trigger_locally
+            .send(new_stack)
+            .expect("Sends only happen if .closed().await did not complete")
+    }
+
+    fn check_compatibility(&self, new_stack: &StackNonce) -> bool {
+        // stack_pair_valid should do a partial check based on the stack subset
+        // corresponding to this upgradehandle.
+        self.left_offers
+            .iter()
+            .chain(self.right_offers.iter())
+            .any(|option| stack_pair_partial_valid(&new_stack.0, &option.0))
+    }
+}
+
+fn stack_pair_partial_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, Offer>) -> bool {
+    for (guid, offer) in client.iter() {
+        // sidedness
+        if let Some(univ) = &offer.sidedness {
+            let mut joint = offer.available.clone();
+            if let Some(srv_offer) = server.get(guid) {
+                joint.extend(srv_offer.available.clone());
+            }
+
+            if !crate::negotiate::have_all(univ, &joint) {
+                return false;
+            }
+        } else {
+            // two-sided, they must be equal
+            if let Some(srv_offer) = server.get(guid) {
+                if offer.impl_guid != srv_offer.impl_guid
+                    || !crate::negotiate::have_all(&offer.available, &srv_offer.available)
+                    || !crate::negotiate::have_all(&srv_offer.available, &offer.available)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+#[derive(Debug)]
+pub struct StackUpgradeHandle<R> {
+    pub conn_participants_changed_receiver: watch::Receiver<usize>,
+    upgrade_handles: Vec<Arc<UpgradeHandle>>,
+    conn_participants_changed_notifier: watch::Sender<usize>,
+    negotiator: R,
+    addr: String,
+    offers: Vec<StackNonce>,
+    curr_entry: RendezvousEntry,
+    curr_num_participants: usize,
+    curr_round: usize,
+}
+
+impl<R> StackUpgradeHandle<R>
+where
+    R: RendezvousBackend + Send + 'static,
+    <R as RendezvousBackend>::Error: Into<Report> + Send,
+{
+    fn new(
+        upgrade_handles: Vec<Arc<UpgradeHandle>>,
+        negotiator: R,
+        addr: String,
+        offers: Vec<StackNonce>,
+        curr_entry: RendezvousEntry,
+        curr_num_participants: usize,
+        curr_round: usize,
+    ) -> Self {
+        let (s, r) = watch::channel(curr_num_participants);
+        Self {
+            conn_participants_changed_receiver: r,
+            upgrade_handles,
+            conn_participants_changed_notifier: s,
+            negotiator,
+            addr,
+            offers,
+            curr_entry,
+            curr_num_participants,
+            curr_round,
+        }
+    }
+
+    /// Spawn a task for this function to listen for updates from the rendezvous negotiator.
+    ///
+    /// Before doing so, clone `conn_participants_changed_receiver` to get updates, to decide
+    /// whether to switch stacks.
+    #[instrument(skip(self), fields(addr = self.addr), level = "debug", err)]
+    pub async fn monitor_connection_negotiation_state(&mut self) -> Result<(), Report> {
+        debug!("starting");
+        let uhs = self.upgrade_handles.clone();
+        loop {
+            // select between two things:
+            // 1. all upgrade handle receivers we might send to (contained within returned connections) are dropped. In this case, this task is not necessary anymore and should exit.
+            // 2. something happens with the rendezvous negotiation. We should handle that.
+            let all_closed =
+                futures_util::future::join_all(uhs.iter().map(|uh| uh.trigger_locally.closed()));
+
+            let want_transition = futures_util::future::select_all(
+                uhs.iter()
+                    .map(|uh| uh.want_transition_listener.recv_async()),
+            );
+
+            tokio::select! {
+                _ = all_closed => {
+                    debug!("upgrade receiver closed, exiting");
+                    return Ok(());
+                }
+                (wt, idx, _remaining_futs) = want_transition => {
+                    debug!(?idx, "remote requested transition");
+                    let (wanted_stack, done) = wt.expect("want_transition sender won't drop");
+                    let res = self.handle_trigger(idx, wanted_stack).await;
+                    debug!("done attempting transition");
+                    done.send(res).expect("oneshot receiver won't drop");
+                }
+                notify_res = self.negotiator
+                    .notify(self.addr.clone(), self.curr_entry.clone(), self.curr_round) => {
+                        self.handle_notify(notify_res.map_err(Into::into)).await?;
+                }
+            };
+        }
+    }
+
+    async fn handle_trigger(
+        &mut self,
+        handle_idx: usize,
+        wanted: Vec<StackNonce>,
+    ) -> Result<(), Report> {
+        let full_stack = find_stack_from_stub(&wanted, &self.offers);
+        let new_round = self
+            .negotiator
+            .transition(
+                self.addr.clone(),
+                RendezvousEntry {
+                    nonce: full_stack.clone(),
+                },
+            )
+            .await
+            .map_err(Into::into)?;
+        self.curr_round = new_round;
+
+        self.upgrade_handles[handle_idx].switch_to_stack(full_stack);
+        Ok(())
+    }
+
+    async fn handle_notify(
+        &mut self,
+        notify_res: Result<NegotiateRendezvousResult, Report>,
+    ) -> Result<(), Report> {
+        debug!(?notify_res, "handling rendezvous change notification");
+        // match statement returns a nonce if there was a remote update that we need to apply
+        // locally. otherwise it will continue to the next loop iteration.
+        let nonce = match notify_res {
+            Ok(NegotiateRendezvousResult::Matched {
+                num_participants,
+                round_number,
+            }) if num_participants == self.curr_num_participants => {
+                self.curr_round = round_number;
+                return Ok(()); // do nothing.
+            }
+            Ok(NegotiateRendezvousResult::NoMatch {
                 entry,
                 num_participants,
                 round_number,
-            )
-            .await;
-            debug!(matched = false, "returning upgradable connection");
-            Ok(cn)
+            }) => {
+                self.curr_num_participants = num_participants;
+                self.curr_round = round_number;
+                self.curr_entry = entry.clone();
+                // Check if `entry` is compatible. If so, ACK with staged_update.
+                let new_stack_is_compatible = self
+                    .upgrade_handles
+                    .iter()
+                    .all(|uh| uh.check_compatibility(&entry.nonce));
+                if new_stack_is_compatible {
+                    if let Err(e) = self
+                        .negotiator
+                        .staged_update(self.addr.clone(), self.curr_round)
+                        .await
+                    {
+                        let r = e.into();
+                        warn!(err = ?&r, "staged_update failed");
+                        return Err(r);
+                    }
+
+                    entry
+                } else {
+                    debug!("Could not apply new semantics, cannot commit");
+                    return Ok(());
+                }
+            }
+            Ok(NegotiateRendezvousResult::Matched {
+                num_participants, ..
+            }) => {
+                // the semantics are the same, but the number of participants changed.
+                self.conn_participants_changed_notifier
+                    .send(num_participants)
+                    .unwrap();
+                return Ok(());
+            }
+            Err(e) => {
+                debug!(err = %format!("{:#}", &e), "notify failed");
+                return Err(e);
+            }
+        };
+
+        debug!("upgrade committed, channel send");
+        for uh in &self.upgrade_handles {
+            uh.switch_to_stack(nonce.nonce.clone());
+        }
+
+        Ok(())
+    }
+}
+
+fn find_stack_from_stub(stub: &Vec<StackNonce>, stacks: &Vec<StackNonce>) -> StackNonce {
+    for stack in stacks {
+        for s in stub {
+            // all stacks in s should be in stack
+            if s.0.iter().all(|(guid, Offer { impl_guid, .. })| {
+                if let Some(Offer {
+                    impl_guid: s_impl_guid,
+                    ..
+                }) = stack.0.get(guid)
+                {
+                    s_impl_guid == impl_guid
+                } else {
+                    false
+                }
+            }) {
+                return stack.clone();
+            }
         }
     }
+
+    unreachable!()
 }
 
 // "negotiate" against ourselves for a nonce.
@@ -810,8 +874,8 @@ where
 // our Either type explicitly handles apply.
 fn solo_monomorphize<T>(stack: T) -> Result<StackNonce, Report>
 where
-    T: Pick + Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
-    <T as Pick>::Picked: Clone + Debug + Send + 'static,
+    T: Pick + GetOffers + Debug,
+    <T as Pick>::Picked: Debug,
 {
     let offers = stack.offers().collect();
     if let (_stack, NegotiateMsg::ServerNonce { picked, .. }, _client_offers) =
@@ -820,5 +884,331 @@ where
         Ok(picked)
     } else {
         unreachable!()
+    }
+}
+
+#[allow(non_upper_case_globals)]
+#[cfg(test)]
+mod t {
+    use super::{find_stack_from_stub, NegotiateRendezvousResult, RendezvousEntry};
+    use crate::{
+        mock_serve_bothsides_impl, mock_serve_impl, negotiate_rendezvous, CxList, Select,
+        UpgradeSelect,
+    };
+    use crate::{Chunnel, ChunnelConnection, GetOffers, Negotiate};
+    use ahash::HashMap;
+    use color_eyre::eyre::{ensure, eyre, Report};
+    use futures_util::future::{ready, Ready};
+    use std::cmp::Ordering;
+    use std::time::Duration;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{Arc, Mutex},
+    };
+    use tokio::sync::oneshot;
+    use tracing::{debug, info, info_span, Instrument};
+    use tracing_error::ErrorLayer;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    mock_serve_bothsides_impl!(ChunnelA);
+    mock_serve_bothsides_impl!(ChunnelB);
+    mock_serve_bothsides_impl!(ChunnelC);
+
+    #[test]
+    fn stack_subset() {
+        let sel = Select::from((ChunnelB, ChunnelC));
+        let (sel, uh) = UpgradeSelect::from_select(sel);
+        let stack = CxList::from(ChunnelA).wrap(sel);
+
+        let all_offers: Vec<_> = stack.offers().collect();
+        let b_offer = &uh.left_offers;
+        assert_eq!(b_offer.len(), 1);
+        let c_offer = &uh.right_offers;
+        assert_eq!(c_offer.len(), 1);
+
+        let bn = find_stack_from_stub(b_offer, &all_offers);
+        let cn = find_stack_from_stub(c_offer, &all_offers);
+
+        dbg!(&b_offer, &bn);
+        assert_eq!(
+            bn.0.get(&ChunnelBCapGuid).unwrap().impl_guid,
+            b_offer[0].0.get(&ChunnelBCapGuid).unwrap().impl_guid
+        );
+        dbg!(&c_offer, &cn);
+        assert_eq!(
+            cn.0.get(&ChunnelCCapGuid).unwrap().impl_guid,
+            c_offer[0].0.get(&ChunnelCCapGuid).unwrap().impl_guid
+        );
+    }
+
+    #[test]
+    fn solo_monomorphize_associative() {
+        crate::test::COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
+        let stack1 = Select::from((
+            CxList::from(ChunnelB).wrap(ChunnelA),
+            CxList::from(ChunnelC).wrap(ChunnelA),
+        ));
+
+        let stack2 = CxList::from(ChunnelA).wrap(Select::from((ChunnelB, ChunnelC)));
+
+        super::solo_monomorphize(stack1).expect("stack 1");
+        super::solo_monomorphize(stack2).expect("stack 2");
+    }
+
+    #[test]
+    fn rendezvous_swap() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        crate::test::COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let sel = Select::from((ChunnelB, ChunnelC));
+            let (sel, upgrade) = UpgradeSelect::from_select(sel);
+            let stack = CxList::from(ChunnelA).wrap(sel);
+
+            let addr = "foo".to_owned();
+            let addr2 = addr.clone();
+
+            let r = MockRendezvous::default();
+            let r2 = r.clone();
+
+            let (_cn, mut handle) = negotiate_rendezvous(stack, r, addr).await.unwrap();
+
+            let mut p_changed = handle.conn_participants_changed_receiver.clone();
+
+            tokio::spawn(
+                async move {
+                    handle.monitor_connection_negotiation_state().await.unwrap();
+                }
+                .instrument(info_span!("client1")),
+            );
+
+            let (wait_ready_s, wait_ready_r) = oneshot::channel();
+
+            tokio::spawn(
+                async move {
+                    let sel = Select::from((ChunnelB, ChunnelC));
+                    let (sel, _upgrade) = UpgradeSelect::from_select(sel);
+                    let stack = CxList::from(ChunnelA).wrap(sel);
+
+                    let (_cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await.unwrap();
+
+                    let mut p_changed = handle.conn_participants_changed_receiver.clone();
+
+                    tokio::spawn(
+                        async move {
+                            loop {
+                                p_changed.changed().await.unwrap();
+                                let new_num_participants = *p_changed.borrow_and_update();
+                                info!(?new_num_participants, "num participants change");
+                            }
+                        }
+                        .instrument(info_span!("client2-num_participants-observer")),
+                    );
+
+                    wait_ready_s.send(()).unwrap();
+                    handle.monitor_connection_negotiation_state().await.unwrap();
+                }
+                .instrument(info_span!("client2")),
+            );
+
+            wait_ready_r.await.unwrap();
+
+            p_changed.changed().await.unwrap();
+            let new_num_participants = *p_changed.borrow_and_update();
+            info!(
+                ?new_num_participants,
+                "num participants change, transitioning"
+            );
+
+            upgrade
+                .trigger_right()
+                .await
+                .expect("trigger right upgrade");
+
+            info!("finished transition");
+
+            Ok::<_, Report>(())
+        })
+        .unwrap();
+    }
+
+    struct ConnState {
+        num_participants: usize,
+        round_number: usize,
+        curr_semantics: RendezvousEntry,
+        staged: Option<RendezvousEntry>,
+        commit_count: usize,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockRendezvous {
+        inner: Arc<Mutex<HashMap<String, ConnState>>>,
+    }
+
+    impl super::RendezvousBackend for MockRendezvous {
+        type Error = Report;
+
+        fn try_init<'a>(
+            &'a mut self,
+            addr: String,
+            offer: RendezvousEntry,
+        ) -> Pin<Box<dyn Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a>>
+        {
+            Box::pin(ready({
+                let mut inner_g = self.inner.lock().unwrap();
+                let state = inner_g.entry(addr.clone()).or_insert(ConnState {
+                    num_participants: 0,
+                    round_number: 0,
+                    curr_semantics: offer.clone(),
+                    staged: None,
+                    commit_count: 0,
+                });
+
+                if state.curr_semantics == offer {
+                    state.num_participants += 1;
+                    debug!(?state.num_participants, ?state.round_number, "new compatible participant");
+                    Ok(NegotiateRendezvousResult::Matched {
+                        num_participants: state.num_participants,
+                        round_number: state.round_number,
+                    })
+                } else {
+                    debug!(?state.num_participants, ?state.round_number, "incompatible participant");
+                    Ok(NegotiateRendezvousResult::NoMatch {
+                        entry: state.curr_semantics.clone(),
+                        num_participants: state.num_participants,
+                        round_number: state.round_number,
+                    })
+                }
+            })) as _
+        }
+
+        fn poll_entry<'a>(
+            &'a mut self,
+            addr: String,
+            curr_entry: RendezvousEntry,
+            curr_round: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a>>
+        {
+            Box::pin(ready((|| {
+                let mut inner_g = self.inner.lock().unwrap();
+                let state = inner_g
+                    .get_mut(&addr)
+                    .ok_or_else(|| eyre!("Connection not found"))?;
+
+                if state.round_number == curr_round && curr_entry == state.curr_semantics {
+                    Ok(NegotiateRendezvousResult::Matched {
+                        num_participants: state.num_participants,
+                        round_number: state.round_number,
+                    })
+                } else if state.round_number > curr_round {
+                    ensure!(
+                        state.staged.is_some(),
+                        "Round number advanced ({:?} > {:?}) but no staged entry",
+                        state.round_number,
+                        curr_round,
+                    );
+
+                    debug!(?state.num_participants, ?state.round_number, ?curr_round, "Informing client about new round");
+                    Ok(NegotiateRendezvousResult::NoMatch {
+                        entry: state.staged.clone().unwrap(),
+                        num_participants: state.num_participants,
+                        round_number: state.round_number,
+                    })
+                } else {
+                    panic!("round counter ticked backwards");
+                }
+            })())) as _
+        }
+
+        fn set_liveness_expiration(&mut self, _expiration: std::time::Duration) {}
+
+        fn transition<'a>(
+            &'a mut self,
+            addr: String,
+            new_entry: RendezvousEntry,
+        ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>> {
+            Box::pin(async move {
+                debug!(?addr, "starting transition commit");
+                // phase 1: set
+                {
+                    let mut inner_g = self.inner.lock().unwrap();
+                    let state = inner_g
+                        .get_mut(&addr)
+                        .ok_or_else(|| eyre!("Connection not found"))?;
+
+                    state.staged = Some(new_entry);
+                    state.round_number += 1;
+                    state.commit_count = 1;
+                    debug!(?state.round_number, "waiting for commit phase 2");
+                }
+
+                // phase 2: wait for commit_count == num_participants
+                let cnt = loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let mut inner_g = self.inner.lock().unwrap();
+                    let state = inner_g
+                        .get_mut(&addr)
+                        .ok_or_else(|| eyre!("Connection not found"))?;
+
+                    debug!(?state.round_number, ?state.commit_count, ?state.num_participants, "polling commit phase 2");
+                    if state.commit_count == state.num_participants {
+                        state.round_number += 1;
+                        state.commit_count = 0;
+                        state.curr_semantics = state.staged.take().unwrap();
+                        debug!(?state.round_number, ?state.num_participants, "polling commit phase 2");
+                        break state.round_number;
+                    }
+                };
+
+                Ok(cnt)
+            })
+        }
+
+        fn staged_update<'a>(
+            &'a mut self,
+            addr: String,
+            round_ctr: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>> {
+            Box::pin(async move {
+                {
+                    let mut inner_g = self.inner.lock().unwrap();
+                    let state = inner_g
+                        .get_mut(&addr)
+                        .ok_or_else(|| eyre!("Connection not found"))?;
+
+                    match state.round_number.cmp(&round_ctr) {
+                        Ordering::Greater | Ordering::Less => panic!("round counter mismatched"),
+                        Ordering::Equal => {
+                            assert!(state.staged.is_some());
+                            state.commit_count += 1;
+                        }
+                    }
+                }
+
+                let cnt = loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let mut inner_g = self.inner.lock().unwrap();
+                    let state = inner_g
+                        .get_mut(&addr)
+                        .ok_or_else(|| eyre!("Connection not found"))?;
+
+                    if state.staged.is_none() {
+                        break state.round_number;
+                    }
+                };
+
+                Ok(cnt)
+            })
+        }
     }
 }

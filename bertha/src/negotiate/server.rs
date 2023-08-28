@@ -314,7 +314,7 @@ where
     }
 }
 
-fn stack_pair_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, Offer>) -> bool {
+pub(crate) fn stack_pair_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, Offer>) -> bool {
     for (guid, offer) in client.iter() {
         // sidedness
         if let Some(univ) = &offer.sidedness {
@@ -385,7 +385,8 @@ where
         stack: new_stack,
         filtered_pairs,
         ..
-    } = super::pick::check_touched(stack, valid_pairs).wrap_err("error monomorphizing stack")?;
+    } = super::pick::check_touched_complete(stack, valid_pairs)
+        .wrap_err("error monomorphizing stack")?;
     assert!(!filtered_pairs.is_empty());
     let (client_choices, mut server_choices): (Vec<_>, Vec<_>) = filtered_pairs.into_iter().unzip();
     let server_choice = server_choices.pop().unwrap();
