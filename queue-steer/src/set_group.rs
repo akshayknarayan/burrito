@@ -7,18 +7,14 @@ pub trait SetGroup {
     fn set_group(&mut self, group: String);
 }
 
+#[cfg(feature = "sqs")]
 impl SetGroup for sqs::SqsAddr {
     fn set_group(&mut self, group: String) {
         self.group = Some(group);
     }
 }
 
-impl SetGroup for gcp_pubsub::PubSubAddr {
-    fn set_group(&mut self, group: String) {
-        self.group = Some(group);
-    }
-}
-
+#[cfg(feature = "kafka")]
 impl SetGroup for kafka::KafkaAddr {
     fn set_group(&mut self, group: String) {
         self.group = Some(group);
@@ -51,7 +47,7 @@ impl Negotiate for FakeSetGroup {
 
 impl<InC> Chunnel<InC> for FakeSetGroup
 where
-    InC: ChunnelConnection<Data = (String, String)> + Send + 'static,
+    InC: ChunnelConnection<Data = (String, String)> + Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
     type Connection = FakeSetGroupCn<InC>;
@@ -72,22 +68,54 @@ impl<C> From<C> for FakeSetGroupCn<C> {
 
 impl<C> ChunnelConnection for FakeSetGroupCn<C>
 where
-    C: ChunnelConnection<Data = (String, String)>,
+    C: ChunnelConnection<Data = (String, String)> + Send + Sync,
 {
     type Data = (FakeSetGroupAddr, String);
 
-    fn send(
-        &self,
-        (FakeSetGroupAddr(addr, _), body): Self::Data,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
-        self.0.send((addr, body))
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.0.send(
+            burst
+                .into_iter()
+                .map(|(FakeSetGroupAddr(addr, _), body)| (addr, body)),
+        )
     }
 
-    fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
-        let fut = self.0.recv();
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
         Box::pin(async move {
-            let (a, d) = fut.await?;
-            Ok((FakeSetGroupAddr(a, String::new()), d))
+            let mut slots = vec![None; msgs_buf.len()];
+            let bufs = self.0.recv(&mut slots).await?;
+            let mut ret_len = 0;
+            for (buf, slot) in bufs
+                .iter_mut()
+                .map_while(|x| x.take())
+                .zip(msgs_buf.iter_mut())
+            {
+                *slot = Some((FakeSetGroupAddr(buf.0, String::new()), buf.1));
+                ret_len += 1;
+            }
+
+            Ok(&mut msgs_buf[..ret_len])
         })
     }
+
+    //fn recv(&self) -> Pin<Box<dyn Future<Output = Result<Self::Data, Report>> + Send + 'static>> {
+    //    let fut = self.0.recv();
+    //    Box::pin(async move {
+    //        let (a, d) = fut.await?;
+    //        Ok((FakeSetGroupAddr(a, String::new()), d))
+    //    })
+    //}
 }

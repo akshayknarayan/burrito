@@ -3,10 +3,12 @@
 //!
 //! Chunnel data type = (String, String) -> (queue URL, msg_string)
 
-use bertha::ChunnelConnection;
+use bertha::{util::NeverCn, Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use google_cloud::pubsub::{Client, PublishMessage, Subscription, SubscriptionConfig, Topic};
+use queue_steer::{MessageQueueCaps, MessageQueueOrdering, MessageQueueReliability};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -116,162 +118,81 @@ impl From<(String, String)> for PubSubAddr {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct OrderedPubSubChunnel {
-    inner: PubSubChunnel,
+#[derive(Clone)]
+pub struct PubSubChunnel {
+    client: Client,
+    recv_topics: Vec<String>,
 }
 
-impl OrderedPubSubChunnel {
-    pub async fn new<'a>(
-        ps_client: Client,
-        recv_topics: impl IntoIterator<Item = &'a str>,
-    ) -> Result<Self, Report> {
-        let (subscriptions, topics) =
-            make_subscriptions(ps_client.clone(), recv_topics, true).await?;
-
-        Ok(OrderedPubSubChunnel {
-            inner: PubSubChunnel {
-                ps_client,
-                subscriptions,
-                topics: Arc::new(Mutex::new(topics)),
-            },
-        })
-    }
-
-    pub async fn convert(mut inner: PubSubChunnel) -> Result<Self, Report> {
-        let topics: Vec<_> = inner.subscriptions.keys().cloned().collect();
-        inner.cleanup().await?;
-        Self::new(inner.ps_client, topics.iter().map(String::as_str)).await
-    }
-
-    pub async fn cleanup(&mut self) -> Result<(), Report> {
-        self.inner.cleanup().await
+impl Debug for PubSubChunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PubSubChunnel")
+            .field("recv_topics", &self.recv_topics)
+            .finish()
     }
 }
 
-impl ChunnelConnection for OrderedPubSubChunnel {
-    type Data = (PubSubAddr, String);
+impl PubSubChunnel {
+    pub fn new<'a>(client: Client, recv_topics: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            client,
+            recv_topics: recv_topics.into_iter().map(|s| s.to_owned()).collect(),
+        }
+    }
+}
 
-    fn send<'cn, B>(
-        &'cn self,
-        burst: B,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
-    where
-        B: IntoIterator<Item = Self::Data> + Send + 'cn,
-        <B as IntoIterator>::IntoIter: Send,
-    {
-        let mut ps_client = self.inner.ps_client.clone();
+impl Chunnel<NeverCn> for PubSubChunnel {
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = PubSubConn;
+    type Error = Report;
+
+    fn connect_wrap(&mut self, _: NeverCn) -> Self::Future {
+        let client = self.client.clone();
+        let recv_topics = self.recv_topics.clone();
         Box::pin(async move {
-            let msgs_with_cached_topics: Vec<_> = {
-                let mut topics_local = self.inner.topics.lock().unwrap();
-                burst
-                    .into_iter()
-                    .map(|(PubSubAddr { topic_id, group }, body)| {
-                        (
-                            topics_local
-                                .get_mut(&topic_id)
-                                .map(|t| {
-                                    (
-                                        PubSubAddr {
-                                            topic_id: topic_id.clone(),
-                                            group: group.clone(),
-                                        },
-                                        t.clone(),
-                                    )
-                                })
-                                .ok_or(PubSubAddr {
-                                    topic_id: topic_id.clone(),
-                                    group: group.clone(),
-                                }),
-                            body,
-                        )
-                    })
-                    .collect()
-            }; // unlock self.topics to avoid holding the lock across the await point below
-
-            let mut new_topics: HashMap<_, _> = Default::default();
-            let mut topic_batches: HashMap<_, (Topic, Vec<_>)> = Default::default();
-            for (maybe_topic, body) in msgs_with_cached_topics {
-                match maybe_topic {
-                    Ok((tname, t)) => {
-                        let (_, v) = topic_batches
-                            .entry(tname.topic_id)
-                            .or_insert((t.clone(), Vec::new()));
-                        v.push(
-                            PublishMessage::from(body.into_bytes()).with_ordering_key(
-                                tname.group.ok_or_else(|| {
-                                    eyre!("Ordered send must include ordering group")
-                                })?,
-                            ),
-                        );
-                    }
-                    Err(PubSubAddr { topic_id, group }) => {
-                        let t = ps_client
-                            .topic(&topic_id)
-                            .await
-                            .wrap_err(eyre!("get topic {:?}", &topic_id))?
-                            .ok_or_else(|| eyre!("topic not found: {:?}", &topic_id))?;
-                        new_topics.insert(topic_id.clone(), t.clone());
-                        let (_, v) = topic_batches.entry(topic_id).or_insert((t, Vec::new()));
-                        v.push(
-                            PublishMessage::from(body.into_bytes()).with_ordering_key(
-                                group.ok_or_else(|| {
-                                    eyre!("Ordered send must include ordering group")
-                                })?,
-                            ),
-                        );
-                    }
-                };
-            }
-
-            for (topic_id, (mut topic, msg_batch)) in topic_batches {
-                topic
-                    .publish::<_, _, Vec<u8>>(msg_batch.into_iter())
-                    .await
-                    .wrap_err(eyre!("Send on topic: {:?}", &topic_id))?;
-            }
-
-            {
-                let mut topics_local = self.inner.topics.lock().unwrap();
-                topics_local.extend(new_topics);
-            }
-
-            Ok(())
+            let rt: Vec<_> = recv_topics.iter().map(|s| s.as_str()).collect();
+            Ok(PubSubConn::new(client, rt).await?)
         })
     }
+}
 
-    fn recv<'cn, 'buf>(
-        &'cn self,
-        msgs_buf: &'buf mut [Option<Self::Data>],
-    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
-    where
-        'buf: 'cn,
-    {
-        self.inner.recv(msgs_buf)
+impl Negotiate for PubSubChunnel {
+    type Capability = MessageQueueCaps;
+
+    fn guid() -> u64 {
+        0xf8269884685dc39e
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![MessageQueueCaps {
+            ordering: MessageQueueOrdering::BestEffort,
+            reliability: MessageQueueReliability::AtLeastOnce,
+        }]
     }
 }
 
 #[derive(Clone)]
-pub struct PubSubChunnel {
+pub struct PubSubConn {
     ps_client: Client,
     subscriptions: HashMap<String, Subscription>,
     topics: Arc<Mutex<HashMap<String, Topic>>>,
 }
 
-impl std::fmt::Debug for PubSubChunnel {
+impl std::fmt::Debug for PubSubConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PubSubChunnel").finish()
+        f.debug_struct("PubSubConn").finish()
     }
 }
 
-impl PubSubChunnel {
+impl PubSubConn {
     pub async fn new<'a>(
         ps_client: Client,
         recv_topics: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, Report> {
         let (subscriptions, topics_cached) =
             make_subscriptions(ps_client.clone(), recv_topics, false).await?;
-        Ok(PubSubChunnel {
+        Ok(PubSubConn {
             ps_client,
             subscriptions,
             topics: Arc::new(Mutex::new(topics_cached)),
@@ -287,7 +208,7 @@ impl PubSubChunnel {
     }
 }
 
-impl ChunnelConnection for PubSubChunnel {
+impl ChunnelConnection for PubSubConn {
     type Data = (PubSubAddr, String);
 
     fn send<'cn, B>(
@@ -438,6 +359,180 @@ impl ChunnelConnection for PubSubChunnel {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct OrderedPubSubChunnel(PubSubChunnel);
+impl From<PubSubChunnel> for OrderedPubSubChunnel {
+    fn from(i: PubSubChunnel) -> Self {
+        Self(i)
+    }
+}
+
+impl Chunnel<NeverCn> for OrderedPubSubChunnel {
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = OrderedPubSubConn;
+    type Error = Report;
+
+    fn connect_wrap(&mut self, _: NeverCn) -> Self::Future {
+        let client = self.0.client.clone();
+        let recv_topics = self.0.recv_topics.clone();
+        Box::pin(async move {
+            let rt: Vec<_> = recv_topics.iter().map(|s| s.as_str()).collect();
+            Ok(OrderedPubSubConn::new(client, rt).await?)
+        })
+    }
+}
+
+impl Negotiate for OrderedPubSubChunnel {
+    type Capability = MessageQueueCaps;
+
+    fn guid() -> u64 {
+        0x8521569756866026
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![MessageQueueCaps {
+            ordering: MessageQueueOrdering::Ordered,
+            reliability: MessageQueueReliability::AtMostOnce,
+        }]
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderedPubSubConn {
+    inner: PubSubConn,
+}
+
+impl OrderedPubSubConn {
+    pub async fn new<'a>(
+        ps_client: Client,
+        recv_topics: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, Report> {
+        let (subscriptions, topics) =
+            make_subscriptions(ps_client.clone(), recv_topics, true).await?;
+
+        Ok(OrderedPubSubConn {
+            inner: PubSubConn {
+                ps_client,
+                subscriptions,
+                topics: Arc::new(Mutex::new(topics)),
+            },
+        })
+    }
+
+    pub async fn convert(mut inner: PubSubConn) -> Result<Self, Report> {
+        let topics: Vec<_> = inner.subscriptions.keys().cloned().collect();
+        inner.cleanup().await?;
+        Self::new(inner.ps_client, topics.iter().map(String::as_str)).await
+    }
+
+    pub async fn cleanup(&mut self) -> Result<(), Report> {
+        self.inner.cleanup().await
+    }
+}
+
+impl ChunnelConnection for OrderedPubSubConn {
+    type Data = (PubSubAddr, String);
+
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        let mut ps_client = self.inner.ps_client.clone();
+        Box::pin(async move {
+            let msgs_with_cached_topics: Vec<_> = {
+                let mut topics_local = self.inner.topics.lock().unwrap();
+                burst
+                    .into_iter()
+                    .map(|(PubSubAddr { topic_id, group }, body)| {
+                        (
+                            topics_local
+                                .get_mut(&topic_id)
+                                .map(|t| {
+                                    (
+                                        PubSubAddr {
+                                            topic_id: topic_id.clone(),
+                                            group: group.clone(),
+                                        },
+                                        t.clone(),
+                                    )
+                                })
+                                .ok_or(PubSubAddr {
+                                    topic_id: topic_id.clone(),
+                                    group: group.clone(),
+                                }),
+                            body,
+                        )
+                    })
+                    .collect()
+            }; // unlock self.topics to avoid holding the lock across the await point below
+
+            let mut new_topics: HashMap<_, _> = Default::default();
+            let mut topic_batches: HashMap<_, (Topic, Vec<_>)> = Default::default();
+            for (maybe_topic, body) in msgs_with_cached_topics {
+                match maybe_topic {
+                    Ok((tname, t)) => {
+                        let (_, v) = topic_batches
+                            .entry(tname.topic_id)
+                            .or_insert((t.clone(), Vec::new()));
+                        v.push(
+                            PublishMessage::from(body.into_bytes()).with_ordering_key(
+                                tname.group.ok_or_else(|| {
+                                    eyre!("Ordered send must include ordering group")
+                                })?,
+                            ),
+                        );
+                    }
+                    Err(PubSubAddr { topic_id, group }) => {
+                        let t = ps_client
+                            .topic(&topic_id)
+                            .await
+                            .wrap_err(eyre!("get topic {:?}", &topic_id))?
+                            .ok_or_else(|| eyre!("topic not found: {:?}", &topic_id))?;
+                        new_topics.insert(topic_id.clone(), t.clone());
+                        let (_, v) = topic_batches.entry(topic_id).or_insert((t, Vec::new()));
+                        v.push(
+                            PublishMessage::from(body.into_bytes()).with_ordering_key(
+                                group.ok_or_else(|| {
+                                    eyre!("Ordered send must include ordering group")
+                                })?,
+                            ),
+                        );
+                    }
+                };
+            }
+
+            for (topic_id, (mut topic, msg_batch)) in topic_batches {
+                topic
+                    .publish::<_, _, Vec<u8>>(msg_batch.into_iter())
+                    .await
+                    .wrap_err(eyre!("Send on topic: {:?}", &topic_id))?;
+            }
+
+            {
+                let mut topics_local = self.inner.topics.lock().unwrap();
+                topics_local.extend(new_topics);
+            }
+
+            Ok(())
+        })
+    }
+
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        self.inner.recv(msgs_buf)
+    }
+}
+
 async fn make_subscriptions<'a>(
     ps_client: Client,
     topics: impl IntoIterator<Item = &'a str>,
@@ -503,7 +598,7 @@ fn gen_resource_id() -> String {
 
 #[cfg(test)]
 mod test {
-    use super::{OrderedPubSubChunnel, PubSubAddr, PubSubChunnel};
+    use super::{OrderedPubSubConn, PubSubAddr, PubSubConn};
     use bertha::ChunnelConnection;
     use color_eyre::{
         eyre::{ensure, WrapErr},
@@ -548,11 +643,10 @@ mod test {
                     .await
                     .wrap_err("make my-topic1")?;
 
-                let mut rch =
-                    OrderedPubSubChunnel::new(gcloud_client.clone(), vec![TEST_TOPIC_URL])
-                        .await
-                        .wrap_err("making chunnel")?;
-                let mut sch = OrderedPubSubChunnel::new(gcloud_client, vec![])
+                let mut rch = OrderedPubSubConn::new(gcloud_client.clone(), vec![TEST_TOPIC_URL])
+                    .await
+                    .wrap_err("making chunnel")?;
+                let mut sch = OrderedPubSubConn::new(gcloud_client, vec![])
                     .await
                     .wrap_err("making chunnel")?;
 
@@ -666,7 +760,7 @@ mod test {
                     .await
                     .wrap_err("make my-topic")?;
 
-                let mut ch = PubSubChunnel::new(gcloud_client, vec![TEST_TOPIC_URL])
+                let mut ch = PubSubConn::new(gcloud_client, vec![TEST_TOPIC_URL])
                     .await
                     .wrap_err("making chunnel")?;
 

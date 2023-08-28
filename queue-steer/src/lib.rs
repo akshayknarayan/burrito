@@ -2,7 +2,7 @@
 
 use bertha::{
     atmostonce::{AtMostOnceChunnel, AtMostOnceCn},
-    tagger::{OrderedChunnelProj, OrderedProj},
+    tagger::OrderedChunnel,
     Chunnel, ChunnelConnection, Negotiate,
 };
 use futures_util::future::{ready, Ready};
@@ -11,13 +11,17 @@ use std::hash::Hash;
 #[cfg(feature = "bin")]
 pub mod bin_help;
 
+#[cfg(feature = "sqs")]
 mod aws;
+#[cfg(feature = "sqs")]
 pub use aws::{BatchSqsChunnelWrap, OrderedSqsChunnelWrap, SqsChunnelWrap};
+#[cfg(feature = "azure")]
 mod azure;
+#[cfg(feature = "azure")]
 pub use azure::AzQueueChunnelWrap;
-mod gcp;
-pub use gcp::{GcpPubSubWrap, OrderedGcpPubSubWrap};
+#[cfg(feature = "kafka")]
 mod kafka_ch;
+#[cfg(feature = "kafka")]
 pub use kafka_ch::KafkaChunnelWrap;
 mod set_group;
 pub use set_group::{FakeSetGroup, FakeSetGroupAddr, FakeSetGroupCn, SetGroup};
@@ -39,8 +43,8 @@ pub enum MessageQueueReliability {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct MessageQueueCaps {
-    ordering: MessageQueueOrdering,
-    reliability: MessageQueueReliability,
+    pub ordering: MessageQueueOrdering,
+    pub reliability: MessageQueueReliability,
 }
 
 impl bertha::negotiate::CapabilitySet for MessageQueueCaps {
@@ -54,13 +58,13 @@ impl bertha::negotiate::CapabilitySet for MessageQueueCaps {
     }
 }
 
-/// Newtype [`bertha::tagger::OrderedChunnelProj`] to impl `Negotiate` on `MessageQueueCaps`
+/// Newtype [`bertha::tagger::OrderedChunnel`] to impl `Negotiate` on `MessageQueueCaps`
 /// semantics.
 #[derive(Debug, Clone, Default)]
-pub struct Ordered(OrderedChunnelProj);
+pub struct Ordered(OrderedChunnel);
 
-impl From<OrderedChunnelProj> for Ordered {
-    fn from(i: OrderedChunnelProj) -> Self {
+impl From<OrderedChunnel> for Ordered {
+    fn from(i: OrderedChunnel) -> Self {
         Self(i)
     }
 }
@@ -80,11 +84,16 @@ where
     D: Send + Sync + 'static,
 {
     type Future = Ready<Result<Self::Connection, Self::Error>>;
-    type Connection = OrderedProj<A, InC, D>;
+    type Connection = <OrderedChunnel as Chunnel<InC>>::Connection;
     type Error = std::convert::Infallible;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
-        ready(Ok(OrderedProj::new(cn, self.0.hole_thresh)))
+        let inner = self
+            .0
+            .connect_wrap(cn)
+            .into_inner()
+            .expect("OrderedChunnel::connect_wrap does not error");
+        ready(Ok(inner))
     }
 }
 
