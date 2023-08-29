@@ -399,6 +399,7 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct UpgradeEitherConn<A, B, Acn, Bcn, InC> {
     left: A,
     right: B,

@@ -214,7 +214,7 @@ pub use client::{
 mod rendezvous;
 pub use rendezvous::{
     negotiate_rendezvous, NegotiateRendezvousResult, RendezvousBackend, RendezvousEntry,
-    UpgradeSelect,
+    StackUpgradeHandle, UpgradeEitherApply, UpgradeEitherConn, UpgradeHandle, UpgradeSelect,
 };
 
 #[allow(non_upper_case_globals)]
