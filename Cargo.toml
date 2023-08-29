@@ -27,6 +27,7 @@ members = [
     "throughput-bench",
     "cx-list-opt",
     "cx-list-opt-test",
+    "elk-app-logparser",
 ]
 
 [profile.release]

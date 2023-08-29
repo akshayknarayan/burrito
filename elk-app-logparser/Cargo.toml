@@ -1,0 +1,17 @@
+[package]
+name = "elk-app-logparser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bertha = { path = "../bertha" }
+queue-steer = { path = "../queue-steer"  }
+gcp-pubsub = { path = "../gcp-pubsub" }
+kafka = { path = "../kafka" }
+redis-basechunnel = { path = "../redis-basechunnel" }
+tokio = { version = "1.21", features = ["rt", "sync", "time"] }
+color-eyre = "0.6"
+chrono = "0.4"
+tracing = { version = "0.1" }
+tracing-futures = "0.2"
+futures-util = "0.3"
