@@ -3,10 +3,12 @@
 //!
 //! Chunnel data type = (String, String) -> (queue URL, msg_string)
 
-use bertha::{util::NeverCn, Chunnel, ChunnelConnection, Negotiate};
+use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use google_cloud::pubsub::{Client, PublishMessage, Subscription, SubscriptionConfig, Topic};
-use queue_steer::{MessageQueueCaps, MessageQueueOrdering, MessageQueueReliability};
+use queue_steer::{
+    MessageQueueAddr, MessageQueueCaps, MessageQueueOrdering, MessageQueueReliability,
+};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -103,21 +105,6 @@ pub async fn delete_topic(client: &mut Client, name: String) -> Result<(), Repor
         .map_err(Into::into)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct PubSubAddr {
-    pub topic_id: String,
-    pub group: Option<String>,
-}
-
-impl From<(String, String)> for PubSubAddr {
-    fn from((topic_id, group): (String, String)) -> Self {
-        PubSubAddr {
-            topic_id,
-            group: Some(group),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct PubSubChunnel {
     client: Client,
@@ -209,7 +196,7 @@ impl PubSubConn {
 }
 
 impl ChunnelConnection for PubSubConn {
-    type Data = (PubSubAddr, String);
+    type Data = (MessageQueueAddr, String);
 
     fn send<'cn, B>(
         &'cn self,
@@ -225,7 +212,7 @@ impl ChunnelConnection for PubSubConn {
                 let mut topics_local = self.topics.lock().unwrap();
                 burst
                     .into_iter()
-                    .map(|(PubSubAddr { topic_id, .. }, body)| {
+                    .map(|(MessageQueueAddr { topic_id, .. }, body)| {
                         (
                             topics_local
                                 .get_mut(&topic_id)
@@ -300,7 +287,7 @@ impl ChunnelConnection for PubSubConn {
                         let group = if group.is_empty() { None } else { Some(group) };
                         trace!(?topic_id, ?group, "recvd msg");
                         msgs_buf[msgs_buf.len() - remaining_slots] = Some((
-                            PubSubAddr {
+                            MessageQueueAddr {
                                 topic_id: topic_id.clone(),
                                 group,
                             },
@@ -341,7 +328,7 @@ impl ChunnelConnection for PubSubConn {
                 let group = if group.is_empty() { None } else { Some(group) };
                 trace!(?topic_received_on, ?group, "recvd msg");
                 msgs_buf[msgs_buf.len() - remaining_slots] = Some((
-                    PubSubAddr {
+                    MessageQueueAddr {
                         topic_id: topic_received_on.clone(),
                         group,
                     },
@@ -432,7 +419,7 @@ impl OrderedPubSubConn {
 }
 
 impl ChunnelConnection for OrderedPubSubConn {
-    type Data = (PubSubAddr, String);
+    type Data = (MessageQueueAddr, String);
 
     fn send<'cn, B>(
         &'cn self,
@@ -448,20 +435,20 @@ impl ChunnelConnection for OrderedPubSubConn {
                 let mut topics_local = self.inner.topics.lock().unwrap();
                 burst
                     .into_iter()
-                    .map(|(PubSubAddr { topic_id, group }, body)| {
+                    .map(|(MessageQueueAddr { topic_id, group }, body)| {
                         (
                             topics_local
                                 .get_mut(&topic_id)
                                 .map(|t| {
                                     (
-                                        PubSubAddr {
+                                        MessageQueueAddr {
                                             topic_id: topic_id.clone(),
                                             group: group.clone(),
                                         },
                                         t.clone(),
                                     )
                                 })
-                                .ok_or(PubSubAddr {
+                                .ok_or(MessageQueueAddr {
                                     topic_id: topic_id.clone(),
                                     group: group.clone(),
                                 }),
@@ -487,7 +474,7 @@ impl ChunnelConnection for OrderedPubSubConn {
                             ),
                         );
                     }
-                    Err(PubSubAddr { topic_id, group }) => {
+                    Err(MessageQueueAddr { topic_id, group }) => {
                         let t = ps_client
                             .topic(&topic_id)
                             .await
@@ -598,13 +585,14 @@ fn gen_resource_id() -> String {
 
 #[cfg(test)]
 mod test {
-    use super::{OrderedPubSubConn, PubSubAddr, PubSubConn};
+    use super::{OrderedPubSubConn, PubSubConn};
     use bertha::ChunnelConnection;
     use color_eyre::{
         eyre::{ensure, WrapErr},
         Report,
     };
     use google_cloud::pubsub::Client;
+    use queue_steer::MessageQueueAddr;
     use std::iter::once;
     use std::sync::Once;
     use tracing::info;
@@ -657,8 +645,10 @@ mod test {
                 const B1: &str = "message B1";
                 const B2: &str = "message B2";
 
-                let addr_a: PubSubAddr = (TEST_TOPIC_URL.to_string(), GROUP_A.to_string()).into();
-                let addr_b: PubSubAddr = (TEST_TOPIC_URL.to_string(), GROUP_B.to_string()).into();
+                let addr_a: MessageQueueAddr =
+                    (TEST_TOPIC_URL.to_string(), GROUP_A.to_string()).into();
+                let addr_b: MessageQueueAddr =
+                    (TEST_TOPIC_URL.to_string(), GROUP_B.to_string()).into();
 
                 sch.send(once((addr_a.clone(), A1.to_string())))
                     .await
@@ -764,7 +754,7 @@ mod test {
                     .await
                     .wrap_err("making chunnel")?;
 
-                let a = PubSubAddr {
+                let a = MessageQueueAddr {
                     topic_id: TEST_TOPIC_URL.to_string(),
                     group: None,
                 };

@@ -1,14 +1,19 @@
 //! Kafka wrapper for Bertha.
 
-use bertha::ChunnelConnection;
+use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{eyre, Report, WrapErr};
+use futures_util::future::{ready, Ready};
 use futures_util::StreamExt;
+use queue_steer::{
+    MessageQueueAddr, MessageQueueCaps, MessageQueueOrdering, MessageQueueReliability,
+};
 use rdkafka::{
     admin::AdminClient,
     consumer::{stream_consumer::StreamConsumer, Consumer},
     producer::{future_producer::FutureProducer, FutureRecord},
     ClientConfig,
 };
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -53,21 +58,96 @@ pub async fn delete_topic(addr: &str, name: &str) -> Result<(), Report> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct KafkaAddr {
-    pub topic_id: String,
-    pub group: Option<String>, // group = partition?
+#[derive(Clone)]
+pub struct KafkaChunnel {
+    addr: String,
+    topics: Vec<String>,
+    producer_cfg: Option<ClientConfig>,
+    consumer_cfg: Option<ClientConfig>,
+}
+
+impl Debug for KafkaChunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaChunnel")
+            .field("recv_topics", &self.topics)
+            .finish()
+    }
+}
+
+impl KafkaChunnel {
+    pub fn new<'a>(addr: &str, recv_topics: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            addr: addr.to_owned(),
+            topics: recv_topics.into_iter().map(|s| s.to_owned()).collect(),
+            producer_cfg: None,
+            consumer_cfg: None,
+        }
+    }
+
+    pub fn send_cfg(self, cfg: ClientConfig) -> Self {
+        Self {
+            producer_cfg: Some(cfg),
+            ..self
+        }
+    }
+
+    pub fn recv_cfg(self, cfg: ClientConfig) -> Self {
+        Self {
+            consumer_cfg: Some(cfg),
+            ..self
+        }
+    }
+}
+
+impl<InC> Chunnel<InC> for KafkaChunnel {
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = KafkaConn;
+    type Error = Report;
+
+    fn connect_wrap(&mut self, _: InC) -> Self::Future {
+        ready((|| {
+            let mut producer_cfg = self
+                .producer_cfg
+                .clone()
+                .unwrap_or_else(|| default_producer_cfg(&self.addr));
+            producer_cfg.set("bootstrap.servers", &self.addr);
+            let mut consumer_cfg = self
+                .consumer_cfg
+                .clone()
+                .unwrap_or_else(|| default_consumer_cfg(&self.addr));
+            consumer_cfg.set("bootstrap.servers", &self.addr);
+            let cn = KafkaConn::new_with_cfg(producer_cfg, consumer_cfg)?;
+            let t: Vec<&str> = self.topics.iter().map(|s| s.as_str()).collect();
+            cn.listen(&t[..])?;
+            Ok(cn)
+        })())
+    }
+}
+
+impl Negotiate for KafkaChunnel {
+    type Capability = MessageQueueCaps;
+
+    fn guid() -> u64 {
+        0x982a6af1c899fe15
+    }
+
+    fn capabilities() -> Vec<Self::Capability> {
+        vec![MessageQueueCaps {
+            ordering: MessageQueueOrdering::Ordered,
+            reliability: MessageQueueReliability::AtMostOnce,
+        }]
+    }
 }
 
 #[derive(Clone)]
-pub struct KafkaChunnel {
+pub struct KafkaConn {
     producer: FutureProducer,
     consumer: Arc<StreamConsumer>,
 }
 
-impl std::fmt::Debug for KafkaChunnel {
+impl std::fmt::Debug for KafkaConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        f.debug_tuple("KafkaChunnel").finish()
+        f.debug_tuple("KafkaConn").finish()
     }
 }
 
@@ -77,17 +157,19 @@ fn default_consumer_cfg(addr: &str) -> ClientConfig {
     cfg.set("group.id", gen_resource_id())
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "smallest")
-        .set("enable.partition.eof", "false");
+        .set("enable.partition.eof", "false")
+        .set("socket.nagle.disable", "true");
     cfg
 }
 
 fn default_producer_cfg(addr: &str) -> ClientConfig {
     let mut cfg = ClientConfig::new();
-    cfg.set("bootstrap.servers", addr);
+    cfg.set("bootstrap.servers", addr)
+        .set("socket.nagle.disable", "true");
     cfg
 }
 
-impl KafkaChunnel {
+impl KafkaConn {
     pub fn new(addr: &str) -> Result<Self, Report> {
         Self::new_with_cfg(default_producer_cfg(addr), default_consumer_cfg(addr))
     }
@@ -103,8 +185,8 @@ impl KafkaChunnel {
         producer_cfg: ClientConfig,
         consumer_cfg: ClientConfig,
     ) -> Result<Self, Report> {
-        tracing::debug!(consumer_group_id = ?&consumer_cfg.get("group.id"), "making KafkaChunnel");
-        Ok(KafkaChunnel {
+        tracing::debug!(consumer_group_id = ?&consumer_cfg.get("group.id"), "making KafkaConn");
+        Ok(KafkaConn {
             producer: producer_cfg.create()?,
             consumer: Arc::new(consumer_cfg.create()?),
         })
@@ -116,8 +198,8 @@ impl KafkaChunnel {
     }
 }
 
-impl ChunnelConnection for KafkaChunnel {
-    type Data = (KafkaAddr, String);
+impl ChunnelConnection for KafkaConn {
+    type Data = (MessageQueueAddr, String);
 
     fn send<'cn, B>(
         &'cn self,
@@ -131,7 +213,7 @@ impl ChunnelConnection for KafkaChunnel {
         Box::pin(async move {
             // producer.send() uses internal buffering, so it is not expected to be necessary
             // to await the sends in this loop concurrently.
-            for (KafkaAddr { topic_id, group }, body) in burst {
+            for (MessageQueueAddr { topic_id, group }, body) in burst {
                 let fr = FutureRecord {
                     topic: &topic_id,
                     partition: None,
@@ -196,7 +278,7 @@ impl ChunnelConnection for KafkaChunnel {
                     let topic_id = msg.topic().to_owned();
                     trace!(?topic_id, "got msg");
                     *slot = Some((
-                        KafkaAddr {
+                        MessageQueueAddr {
                             topic_id,
                             group: key,
                         },
@@ -233,11 +315,11 @@ fn gen_resource_id() -> String {
 
 #[cfg(test)]
 mod test {
-    use super::{delete_topic, gen_resource_id, make_topic};
-    use super::{KafkaAddr, KafkaChunnel};
+    use super::{delete_topic, gen_resource_id, make_topic, KafkaConn};
     use bertha::ChunnelConnection;
     use color_eyre::eyre::WrapErr;
     use color_eyre::Report;
+    use queue_steer::MessageQueueAddr;
     use tracing::info;
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
@@ -274,10 +356,10 @@ mod test {
                 info!(?topic_name, ?kafka_addr, "making topic");
                 make_topic(&kafka_addr, &topic_name).await?;
 
-                let ch = KafkaChunnel::new(&kafka_addr)?;
+                let ch = KafkaConn::new(&kafka_addr)?;
                 ch.listen(&[&topic_name])?;
                 ch.send(std::iter::once((
-                    KafkaAddr {
+                    MessageQueueAddr {
                         topic_id: topic_name.clone(),
                         group: None,
                     },

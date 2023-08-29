@@ -12,7 +12,6 @@ azure = ["az-queues"]
 bertha = { path = "../bertha" }
 sqs = { path = "../sqs", optional = true }
 az-queues = { path = "../az-queues", optional = true }
-kafka = { path = "../kafka", optional = true }
 redis-basechunnel = { path = "../redis-basechunnel" , optional = true }
 futures-util = "0.3"
 base64 = "0.13"

@@ -14,13 +14,6 @@ impl SetGroup for sqs::SqsAddr {
     }
 }
 
-#[cfg(feature = "kafka")]
-impl SetGroup for kafka::KafkaAddr {
-    fn set_group(&mut self, group: String) {
-        self.group = Some(group);
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FakeSetGroupAddr(String, String);
 impl From<String> for FakeSetGroupAddr {

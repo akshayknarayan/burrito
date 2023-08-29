@@ -19,12 +19,32 @@ pub use aws::{BatchSqsChunnelWrap, OrderedSqsChunnelWrap, SqsChunnelWrap};
 mod azure;
 #[cfg(feature = "azure")]
 pub use azure::AzQueueChunnelWrap;
-#[cfg(feature = "kafka")]
-mod kafka_ch;
-#[cfg(feature = "kafka")]
-pub use kafka_ch::KafkaChunnelWrap;
 mod set_group;
 pub use set_group::{FakeSetGroup, FakeSetGroupAddr, FakeSetGroupCn, SetGroup};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct MessageQueueAddr {
+    pub topic_id: String,
+    pub group: Option<String>,
+}
+
+impl From<String> for MessageQueueAddr {
+    fn from(topic_id: String) -> Self {
+        Self {
+            topic_id,
+            group: None,
+        }
+    }
+}
+
+impl From<(String, String)> for MessageQueueAddr {
+    fn from((topic_id, group): (String, String)) -> Self {
+        Self {
+            topic_id,
+            group: Some(group),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum MessageQueueOrdering {

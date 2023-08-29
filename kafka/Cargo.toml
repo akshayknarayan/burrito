@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 bertha = { path = "../bertha" }
+queue-steer = { path = "../queue-steer" }
 tokio = { version = "1", features = [] }
 rdkafka = "0.33"
 color-eyre = "0.6"
