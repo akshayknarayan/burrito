@@ -1,4 +1,5 @@
 use super::{monomorphize, Apply, ApplyResult, GetOffers, NegotiateMsg, Pick, Select, StackNonce};
+use crate::negotiate::server::stack_pair_valid;
 use crate::Offer;
 use crate::{util::NeverCn, Chunnel, ChunnelConnection, Either};
 use color_eyre::eyre::{Report, WrapErr};
@@ -10,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex as TokioMutex};
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, instrument, trace};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RendezvousEntry {
@@ -312,6 +313,7 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct UpgradeEitherApply<A: Apply, B: Apply> {
     left: A,
     right: B,
@@ -456,7 +458,7 @@ where
                 let upgrade_fut = async move {
                     let mut sl = sl.unwrap();
                     sl.changed().await.wrap_err("sender dropped")?;
-                    let v = sl.borrow_and_update().clone();
+                    let v = sl.borrow().clone();
                     Ok::<_, Report>((sl, v))
                 };
 
@@ -481,7 +483,6 @@ where
                         return Ok(&mut msgs_buf[..slot_idx]);
                     }
                     future::Either::Right((x, recvr)) => {
-                        debug!("received on upgrade channel");
                         std::mem::drop(recvr); // cancel the future and drop, so its lock on inner is dropped.
                         let (sl, upgrade) = x?;
                         switch_listener = Some(sl);
@@ -507,6 +508,7 @@ where
         Into<Report>,
 {
     async fn try_upgrade(&self, new_offers: StackNonce) -> Result<(), Report> {
+        debug!(?new_offers, "received on upgrade channel");
         let new_fut = {
             let sel = Select::from((self.left.clone(), self.right.clone()));
             let ApplyResult { mut applied, .. } = sel.apply(new_offers)?;
@@ -515,7 +517,7 @@ where
 
         let new = new_fut.await.map_err(Into::into)?;
         let mut inner = self.current.lock().await;
-        debug!("applying upgraded semantics");
+        trace!("applying upgraded semantics");
         *inner = new;
         Ok(())
     }
@@ -566,7 +568,7 @@ where
             round_number,
         } => {
             // if Matched, we joined the connection.
-            debug!(matched = true, "returning upgradable connection");
+            debug!(matched = true, num_selects = ?handles.len(), "returning upgradable connection");
             (
                 RendezvousEntry { nonce: picked },
                 num_participants,
@@ -578,7 +580,7 @@ where
             round_number,
             entry,
         } => {
-            debug!(matched = false, "returning upgradable connection");
+            debug!(matched = false, num_selects = ?handles.len(), "returning upgradable connection");
             (entry, num_participants, round_number)
         }
     };
@@ -593,7 +595,11 @@ where
         round_number,
     );
 
-    let ApplyResult { mut applied, .. } = stack
+    let ApplyResult {
+        mut applied,
+        picked,
+        ..
+    } = stack
         .apply(entry.nonce)
         .expect("solo_monomorphize means self-application will work");
     let cn = applied
@@ -601,7 +607,7 @@ where
         .await
         .map_err(Into::into)?;
 
-    trace!("returning");
+    debug!(?picked, "returning");
     Ok((cn, stack_upgrade_handle))
 }
 
@@ -637,6 +643,7 @@ impl UpgradeHandle {
     }
 
     fn check_compatibility(&self, new_stack: &StackNonce) -> bool {
+        debug!(?new_stack, ?self.left_offers, ?self.right_offers, "checking stack");
         // stack_pair_valid should do a partial check based on the stack subset
         // corresponding to this upgradehandle.
         self.left_offers
@@ -647,11 +654,13 @@ impl UpgradeHandle {
 }
 
 fn stack_pair_partial_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, Offer>) -> bool {
+    let mut at_least_one_found = false;
     for (guid, offer) in client.iter() {
         // sidedness
         if let Some(univ) = &offer.sidedness {
             let mut joint = offer.available.clone();
             if let Some(srv_offer) = server.get(guid) {
+                at_least_one_found = true;
                 joint.extend(srv_offer.available.clone());
             }
 
@@ -661,6 +670,7 @@ fn stack_pair_partial_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, 
         } else {
             // two-sided, they must be equal
             if let Some(srv_offer) = server.get(guid) {
+                at_least_one_found = true;
                 if offer.impl_guid != srv_offer.impl_guid
                     || !crate::negotiate::have_all(&offer.available, &srv_offer.available)
                     || !crate::negotiate::have_all(&srv_offer.available, &offer.available)
@@ -671,7 +681,7 @@ fn stack_pair_partial_valid(client: &HashMap<u64, Offer>, server: &HashMap<u64, 
         }
     }
 
-    true
+    at_least_one_found
 }
 
 #[derive(Debug)]
@@ -741,7 +751,7 @@ where
                     return Ok(());
                 }
                 (wt, idx, _remaining_futs) = want_transition => {
-                    debug!(?idx, "remote requested transition");
+                    debug!(?idx, "local requested transition");
                     let (wanted_stack, done) = wt.expect("want_transition sender won't drop");
                     let res = self.handle_trigger(idx, wanted_stack).await;
                     debug!("done attempting transition");
@@ -772,6 +782,9 @@ where
             .await
             .map_err(Into::into)?;
         self.curr_round = new_round;
+        self.curr_entry = RendezvousEntry {
+            nonce: full_stack.clone(),
+        };
 
         self.upgrade_handles[handle_idx].switch_to_stack(full_stack);
         Ok(())
@@ -784,13 +797,13 @@ where
         debug!(?notify_res, "handling rendezvous change notification");
         // match statement returns a nonce if there was a remote update that we need to apply
         // locally. otherwise it will continue to the next loop iteration.
-        let nonce = match notify_res {
+        match notify_res {
             Ok(NegotiateRendezvousResult::Matched {
                 num_participants,
                 round_number,
             }) if num_participants == self.curr_num_participants => {
                 self.curr_round = round_number;
-                return Ok(()); // do nothing.
+                Ok(()) // do nothing.
             }
             Ok(NegotiateRendezvousResult::NoMatch {
                 entry,
@@ -799,27 +812,43 @@ where
             }) => {
                 self.curr_num_participants = num_participants;
                 self.curr_round = round_number;
-                self.curr_entry = entry.clone();
                 // Check if `entry` is compatible. If so, ACK with staged_update.
+                self.offers
+                    .iter()
+                    .any(|o| stack_pair_valid(&entry.nonce.0, &o.0));
                 let new_stack_is_compatible = self
                     .upgrade_handles
                     .iter()
                     .all(|uh| uh.check_compatibility(&entry.nonce));
+                debug!(?new_stack_is_compatible, "checked proposed stack");
                 if new_stack_is_compatible {
-                    if let Err(e) = self
+                    let new_round = self
                         .negotiator
                         .staged_update(self.addr.clone(), self.curr_round)
                         .await
-                    {
-                        let r = e.into();
-                        warn!(err = ?&r, "staged_update failed");
-                        return Err(r);
+                        .map_err(Into::into)?;
+                    self.curr_round = new_round;
+                    self.curr_entry = entry.clone();
+                    debug!(
+                        num_upgrade_handles = self.upgrade_handles.len(),
+                        "upgrade committed, channel send"
+                    );
+                    for uh in &self.upgrade_handles {
+                        uh.switch_to_stack(entry.nonce.clone());
                     }
 
-                    entry
+                    Ok(())
                 } else {
-                    debug!("Could not apply new semantics, cannot commit");
-                    return Ok(());
+                    debug!("new stack incompatible, cannot commit");
+                    // transition back to original stack
+                    let new_round = self
+                        .negotiator
+                        .transition(self.addr.clone(), self.curr_entry.clone())
+                        .await
+                        .map_err(Into::into)?;
+                    debug!("completed transition back to original stack");
+                    self.curr_round = new_round;
+                    Ok(())
                 }
             }
             Ok(NegotiateRendezvousResult::Matched {
@@ -829,20 +858,10 @@ where
                 self.conn_participants_changed_notifier
                     .send(num_participants)
                     .unwrap();
-                return Ok(());
+                Ok(())
             }
-            Err(e) => {
-                debug!(err = %format!("{:#}", &e), "notify failed");
-                return Err(e);
-            }
-        };
-
-        debug!("upgrade committed, channel send");
-        for uh in &self.upgrade_handles {
-            uh.switch_to_stack(nonce.nonce.clone());
+            Err(e) => Err(e),
         }
-
-        Ok(())
     }
 }
 
@@ -892,12 +911,12 @@ where
 mod t {
     use super::{find_stack_from_stub, NegotiateRendezvousResult, RendezvousEntry};
     use crate::{
-        mock_serve_bothsides_impl, mock_serve_impl, negotiate_rendezvous, CxList, Select,
-        UpgradeSelect,
+        mock_serve_bothsides_impl, mock_serve_impl, negotiate_rendezvous, CapabilitySet, CxList,
+        Select, UpgradeSelect,
     };
     use crate::{Chunnel, ChunnelConnection, GetOffers, Negotiate};
     use ahash::HashMap;
-    use color_eyre::eyre::{ensure, eyre, Report};
+    use color_eyre::eyre::{bail, ensure, eyre, Context, Report};
     use futures_util::future::{ready, Ready};
     use std::cmp::Ordering;
     use std::time::Duration;
@@ -907,13 +926,89 @@ mod t {
         sync::{Arc, Mutex},
     };
     use tokio::sync::oneshot;
-    use tracing::{debug, info, info_span, Instrument};
+    use tracing::{debug, info, info_span, trace, warn, Instrument};
     use tracing_error::ErrorLayer;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     mock_serve_bothsides_impl!(ChunnelA);
     mock_serve_bothsides_impl!(ChunnelB);
     mock_serve_bothsides_impl!(ChunnelC);
+    mock_serve_bothsides_impl!(ChunnelD);
+
+    #[derive(Clone, Debug, Copy)]
+    struct MockBaseChunnel;
+
+    impl<C> Chunnel<C> for MockBaseChunnel {
+        type Future = Ready<Result<Self::Connection, Self::Error>>;
+        type Connection = Self;
+        type Error = std::convert::Infallible;
+
+        fn connect_wrap(&mut self, _: C) -> Self::Future {
+            ready(Ok(MockBaseChunnel))
+        }
+    }
+
+    lazy_static::lazy_static! {
+        static ref MockBaseChunnelCapGuid: u64 = rand::random();
+        static ref MockBaseChunnelImplGuid: u64 = rand::random();
+    }
+
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    )]
+    struct MockBaseChunnelCap;
+
+    impl CapabilitySet for MockBaseChunnelCap {
+        fn universe() -> Option<Vec<Self>> {
+            None
+        }
+
+        fn guid() -> u64 {
+            *MockBaseChunnelCapGuid
+        }
+    }
+
+    impl Negotiate for MockBaseChunnel {
+        type Capability = MockBaseChunnelCap;
+        fn guid() -> u64 {
+            *MockBaseChunnelImplGuid
+        }
+        fn capabilities() -> Vec<Self::Capability> {
+            vec![MockBaseChunnelCap]
+        }
+    }
+
+    impl ChunnelConnection for MockBaseChunnel {
+        type Data = ();
+
+        fn send<'cn, B>(
+            &'cn self,
+            _: B,
+        ) -> Pin<Box<dyn Future<Output = Result<(), color_eyre::eyre::Report>> + Send + 'cn>>
+        where
+            B: IntoIterator<Item = Self::Data> + Send + 'cn,
+            <B as IntoIterator>::IntoIter: Send,
+        {
+            Box::pin(ready(Ok(()))) as _
+        }
+
+        fn recv<'cn, 'buf>(
+            &'cn self,
+            _: &'buf mut [Option<Self::Data>],
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<&'buf mut [Option<Self::Data>], color_eyre::eyre::Report>,
+                    > + Send
+                    + 'cn,
+            >,
+        >
+        where
+            'buf: 'cn,
+        {
+            Box::pin(futures_util::future::pending())
+        }
+    }
 
     #[test]
     fn stack_subset() {
@@ -957,7 +1052,7 @@ mod t {
     }
 
     #[test]
-    fn rendezvous_swap() {
+    fn single_swap() {
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -973,7 +1068,7 @@ mod t {
         rt.block_on(async move {
             let sel = Select::from((ChunnelB, ChunnelC));
             let (sel, upgrade) = UpgradeSelect::from_select(sel);
-            let stack = CxList::from(ChunnelA).wrap(sel);
+            let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
 
             let addr = "foo".to_owned();
             let addr2 = addr.clone();
@@ -981,10 +1076,9 @@ mod t {
             let r = MockRendezvous::default();
             let r2 = r.clone();
 
-            let (_cn, mut handle) = negotiate_rendezvous(stack, r, addr).await.unwrap();
+            let (cn, mut handle) = negotiate_rendezvous(stack, r, addr).await.unwrap();
 
             let mut p_changed = handle.conn_participants_changed_receiver.clone();
-
             tokio::spawn(
                 async move {
                     handle.monitor_connection_negotiation_state().await.unwrap();
@@ -998,23 +1092,9 @@ mod t {
                 async move {
                     let sel = Select::from((ChunnelB, ChunnelC));
                     let (sel, _upgrade) = UpgradeSelect::from_select(sel);
-                    let stack = CxList::from(ChunnelA).wrap(sel);
+                    let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
 
                     let (_cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await.unwrap();
-
-                    let mut p_changed = handle.conn_participants_changed_receiver.clone();
-
-                    tokio::spawn(
-                        async move {
-                            loop {
-                                p_changed.changed().await.unwrap();
-                                let new_num_participants = *p_changed.borrow_and_update();
-                                info!(?new_num_participants, "num participants change");
-                            }
-                        }
-                        .instrument(info_span!("client2-num_participants-observer")),
-                    );
-
                     wait_ready_s.send(()).unwrap();
                     handle.monitor_connection_negotiation_state().await.unwrap();
                 }
@@ -1034,9 +1114,117 @@ mod t {
                 .trigger_right()
                 .await
                 .expect("trigger right upgrade");
-
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
             info!("finished transition");
+            Ok::<_, Report>(())
+        })
+        .unwrap();
+    }
 
+    #[test]
+    fn swap_nested() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        crate::test::COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            info!(a_guid = ?ChunnelACap::guid(), b_guid = ?ChunnelBCap::guid(), c_guid = ?ChunnelCCap::guid(), d_guid = ?ChunnelDCap::guid(), base_guid = ?MockBaseChunnelCap::guid(), "chunnel ids");
+
+            let sel = Select::from((ChunnelB, ChunnelC));
+            let (sel, _upgrade) = UpgradeSelect::from_select(sel);
+            let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
+
+            let addr = "foo".to_owned();
+            let addr2 = addr.clone();
+
+            let r = MockRendezvous::default();
+            let r2 = r.clone();
+
+            let (wait_ready_s, wait_ready_r) = oneshot::channel();
+            let (wait_trans_s, wait_trans_r) = oneshot::channel();
+
+            #[tracing::instrument(skip(r2, wait_ready_s, wait_trans_s), err)]
+            async fn client2(
+                r2: MockRendezvous,
+                addr2: String,
+                wait_ready_s: oneshot::Sender<()>,
+                wait_trans_s: oneshot::Sender<()>,
+            ) -> Result<(), Report> {
+                let (inner_select, upgrade_inner) =
+                    UpgradeSelect::from_select(Select::from((ChunnelC, ChunnelD)));
+                let sel = Select::from((inner_select, ChunnelB));
+                let (sel, _upgrade) = UpgradeSelect::from_select(sel);
+                let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
+
+                let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await?;
+                let mut p_changed = handle.conn_participants_changed_receiver.clone();
+                cn.send(std::iter::empty()).await.unwrap();
+                tokio::spawn(
+                    async move {
+                        handle.monitor_connection_negotiation_state().await.unwrap();
+                    }
+                    .instrument(info_span!("client2")),
+                );
+
+                wait_ready_s.send(()).unwrap();
+                p_changed.changed().await.unwrap();
+                let new_num_participants = *p_changed.borrow_and_update();
+                info!(
+                    ?new_num_participants,
+                    "num participants change, transitioning"
+                );
+
+                if let Err(e) = upgrade_inner.trigger_right().await {
+                    info!(err = ?format!("{:#?}", e), "transition failed, as expected");
+                } else {
+                    bail!("transition should have failed");
+                }
+
+                //tokio::time::sleep(Duration::from_millis(500)).await;
+
+                wait_trans_s.send(()).unwrap();
+                cn.recv(&mut []).await.unwrap();
+                Ok(())
+            }
+
+            tokio::spawn(client2(r2, addr2, wait_ready_s, wait_trans_s));
+
+            wait_ready_r.await.unwrap();
+
+            let (cn, mut handle) = negotiate_rendezvous(stack, r, addr).await.unwrap();
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
+
+            tokio::spawn(
+                async move {
+                    handle.monitor_connection_negotiation_state().await.unwrap();
+                }
+                .instrument(info_span!("client1")),
+            );
+
+            wait_trans_r.await.unwrap();
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
             Ok::<_, Report>(())
         })
         .unwrap();
@@ -1074,8 +1262,8 @@ mod t {
                     commit_count: 0,
                 });
 
+                state.num_participants += 1;
                 if state.curr_semantics == offer {
-                    state.num_participants += 1;
                     debug!(?state.num_participants, ?state.round_number, "new compatible participant");
                     Ok(NegotiateRendezvousResult::Matched {
                         num_participants: state.num_participants,
@@ -1125,6 +1313,7 @@ mod t {
                         round_number: state.round_number,
                     })
                 } else {
+                    tracing::error!(?state.round_number, curr_round, "round counter ticked backwards");
                     panic!("round counter ticked backwards");
                 }
             })())) as _
@@ -1140,7 +1329,7 @@ mod t {
             Box::pin(async move {
                 debug!(?addr, "starting transition commit");
                 // phase 1: set
-                {
+                let round_num = {
                     let mut inner_g = self.inner.lock().unwrap();
                     let state = inner_g
                         .get_mut(&addr)
@@ -1150,7 +1339,8 @@ mod t {
                     state.round_number += 1;
                     state.commit_count = 1;
                     debug!(?state.round_number, "waiting for commit phase 2");
-                }
+                    state.round_number
+                };
 
                 // phase 2: wait for commit_count == num_participants
                 let cnt = loop {
@@ -1165,8 +1355,13 @@ mod t {
                         state.round_number += 1;
                         state.commit_count = 0;
                         state.curr_semantics = state.staged.take().unwrap();
-                        debug!(?state.round_number, ?state.num_participants, "polling commit phase 2");
+                        debug!(?state.round_number, ?state.num_participants, "transition committed");
                         break state.round_number;
+                    }
+
+                    if state.round_number > round_num {
+                        warn!(?state.commit_count, ?round_num, ?state.round_number, "commit failed");
+                        return Err(eyre!("commit failed"));
                     }
                 };
 
@@ -1181,7 +1376,9 @@ mod t {
         ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>> {
             Box::pin(async move {
                 {
+                    trace!("staged_update waiting for lock");
                     let mut inner_g = self.inner.lock().unwrap();
+                    trace!("staged_update locked");
                     let state = inner_g
                         .get_mut(&addr)
                         .ok_or_else(|| eyre!("Connection not found"))?;
@@ -1193,18 +1390,24 @@ mod t {
                             state.commit_count += 1;
                         }
                     }
-                }
+                } // drop inner_g
 
+                debug!("waiting for commit");
                 let cnt = loop {
                     tokio::time::sleep(Duration::from_millis(10)).await;
+                    trace!("staged_update waiting for lock");
                     let mut inner_g = self.inner.lock().unwrap();
+                    trace!("staged_update locked");
                     let state = inner_g
                         .get_mut(&addr)
                         .ok_or_else(|| eyre!("Connection not found"))?;
 
                     if state.staged.is_none() {
+                        trace!("done staged_update");
                         break state.round_number;
                     }
+
+                    trace!("waiting");
                 };
 
                 Ok(cnt)
