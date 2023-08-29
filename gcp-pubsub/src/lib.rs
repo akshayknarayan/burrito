@@ -141,13 +141,13 @@ impl PubSubChunnel {
     }
 }
 
-impl Chunnel<NeverCn> for PubSubChunnel {
+impl<InC> Chunnel<InC> for PubSubChunnel {
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Connection = PubSubConn;
     type Error = Report;
 
-    fn connect_wrap(&mut self, _: NeverCn) -> Self::Future {
+    fn connect_wrap(&mut self, _: InC) -> Self::Future {
         let client = self.client.clone();
         let recv_topics = self.recv_topics.clone();
         Box::pin(async move {
@@ -367,13 +367,13 @@ impl From<PubSubChunnel> for OrderedPubSubChunnel {
     }
 }
 
-impl Chunnel<NeverCn> for OrderedPubSubChunnel {
+impl<InC> Chunnel<InC> for OrderedPubSubChunnel {
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
     type Connection = OrderedPubSubConn;
     type Error = Report;
 
-    fn connect_wrap(&mut self, _: NeverCn) -> Self::Future {
+    fn connect_wrap(&mut self, _: InC) -> Self::Future {
         let client = self.0.client.clone();
         let recv_topics = self.0.recv_topics.clone();
         Box::pin(async move {
