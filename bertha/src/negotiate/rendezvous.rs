@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex as TokioMutex};
 use tracing::{debug, instrument, trace};
@@ -246,6 +247,8 @@ where
 
         let uh = Arc::new(UpgradeHandle {
             trigger_locally: stack_sender,
+            current: Default::default(),
+            was_set: Default::default(),
             left_offers: inner.left.offers().collect(),
             right_offers: inner.right.offers().collect(),
             want_transition: s,
@@ -586,22 +589,12 @@ where
         }
     };
 
-    let stack_upgrade_handle = StackUpgradeHandle::new(
-        handles,
-        rendezvous_point,
-        addr,
-        offers,
-        entry.clone(),
-        num_participants,
-        round_number,
-    );
-
     let ApplyResult {
         mut applied,
         picked,
         ..
     } = stack
-        .apply(entry.nonce)
+        .apply(entry.clone().nonce)
         .expect("solo_monomorphize means self-application will work");
     let cn = applied
         .connect_wrap(NeverCn::default())
@@ -609,12 +602,28 @@ where
         .map_err(Into::into)?;
 
     debug!(?picked, "returning");
+    for h in &handles {
+        h.set_current(&picked);
+    }
+
+    let stack_upgrade_handle = StackUpgradeHandle::new(
+        handles,
+        rendezvous_point,
+        addr,
+        offers,
+        entry,
+        num_participants,
+        round_number,
+    );
     Ok((cn, stack_upgrade_handle))
 }
 
 #[derive(Debug)]
 pub struct UpgradeHandle {
     trigger_locally: watch::Sender<StackNonce>,
+    /// true = left, false = right
+    current: AtomicBool,
+    was_set: AtomicBool,
     left_offers: Vec<StackNonce>,
     right_offers: Vec<StackNonce>,
     want_transition: flume::Sender<(Vec<StackNonce>, oneshot::Sender<Result<(), Report>>)>,
@@ -624,17 +633,70 @@ pub struct UpgradeHandle {
 
 impl UpgradeHandle {
     pub async fn trigger_left(&self) -> Result<(), Report> {
-        self.propose_change(self.left_offers.clone()).await
+        // true = left, false = right
+        if self.was_set.load(Ordering::SeqCst) && self.current.load(Ordering::SeqCst) {
+            debug!("left-side stack already set");
+            return Ok(());
+        }
+
+        let res = self.propose_change(self.left_offers.clone()).await;
+        if res.is_ok() {
+            // set to true
+            self.was_set.store(true, Ordering::SeqCst);
+            self.current.store(true, Ordering::SeqCst);
+        }
+        res
     }
 
     pub async fn trigger_right(&self) -> Result<(), Report> {
-        self.propose_change(self.right_offers.clone()).await
+        // true = left, false = right
+        if self.was_set.load(Ordering::SeqCst) && !self.current.load(Ordering::SeqCst) {
+            debug!("right-side stack already set");
+            return Ok(());
+        }
+
+        let res = self.propose_change(self.right_offers.clone()).await;
+        if res.is_ok() {
+            // set to false
+            self.was_set.store(true, Ordering::SeqCst);
+            self.current.store(false, Ordering::SeqCst);
+        }
+
+        res
     }
 
     async fn propose_change(&self, stack: Vec<StackNonce>) -> Result<(), Report> {
         let (s, r) = oneshot::channel();
         self.want_transition.send_async((stack, s)).await?;
         r.await.expect("sender won't drop")
+    }
+
+    fn set_current(&self, curr_stack: &StackNonce) {
+        let left = self
+            .left_offers
+            .iter()
+            .any(|option| stack_pair_partial_valid(&curr_stack.0, &option.0));
+        let right = self
+            .right_offers
+            .iter()
+            .any(|option| stack_pair_partial_valid(&curr_stack.0, &option.0));
+
+        match (left, right) {
+            (true, true) | (false, false) => {
+                trace!(
+                    ?left,
+                    ?right,
+                    "specified stack does not differentiate this select"
+                )
+            }
+            // true = left, false = right
+            (true, false) => self.current.store(true, Ordering::SeqCst),
+            (false, true) => self.current.store(false, Ordering::SeqCst),
+        }
+
+        if left ^ right {
+            self.was_set.store(true, Ordering::SeqCst);
+        }
     }
 
     fn switch_to_stack(&self, new_stack: StackNonce) {
