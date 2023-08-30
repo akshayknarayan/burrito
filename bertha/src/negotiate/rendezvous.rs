@@ -2,7 +2,7 @@ use super::{monomorphize, Apply, ApplyResult, GetOffers, NegotiateMsg, Pick, Sel
 use crate::negotiate::server::stack_pair_valid;
 use crate::Offer;
 use crate::{util::NeverCn, Chunnel, ChunnelConnection, Either};
-use color_eyre::eyre::{Report, WrapErr};
+use color_eyre::eyre::{Report, WrapErr, eyre};
 use futures_util::future;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -232,25 +232,33 @@ where
 pub struct UpgradeSelect<T1, T2> {
     inner: Select<T1, T2>,
     trigger: watch::Receiver<StackNonce>,
+    in_use: Arc<AtomicBool>,
     handle: Arc<UpgradeHandle>,
 }
 
 impl<T1, T2> UpgradeSelect<T1, T2>
 where
-    T1: GetOffers,
-    T2: GetOffers,
+    T1: GetOffers + CollectUpgradeHandles,
+    T2: GetOffers + CollectUpgradeHandles,
 {
     pub fn from_select(inner: Select<T1, T2>) -> (Self, Arc<UpgradeHandle>) {
         let (stack_sender, stack_receiver) = watch::channel(Default::default());
 
         let (s, r) = flume::bounded(1);
+        let in_use = Arc::new(AtomicBool::new(false));
+
+        let left_handles = inner.left.collect_handles();
+        let right_handles = inner.right.collect_handles();
 
         let uh = Arc::new(UpgradeHandle {
             trigger_locally: stack_sender,
             current: Default::default(),
             was_set: Default::default(),
+            in_use: in_use.clone(),
             left_offers: inner.left.offers().collect(),
+            left_handles,
             right_offers: inner.right.offers().collect(),
+            right_handles,
             want_transition: s,
             want_transition_listener: r,
         });
@@ -258,6 +266,7 @@ where
         let this = Self {
             inner,
             trigger: stack_receiver,
+            in_use,
             handle: uh.clone(),
         };
 
@@ -306,6 +315,7 @@ where
             touched,
             score,
         } = self.inner.apply(picked_offers)?;
+        self.in_use.store(true, Ordering::SeqCst);
         let applied = UpgradeEitherApply::new(applied, left_saved, right_saved, self.trigger);
         Ok(ApplyResult {
             applied,
@@ -361,9 +371,9 @@ where
     type Error = Report;
 
     fn connect_wrap(&mut self, cn: InC) -> Self::Future {
+        let cn = Arc::new(cn);
         let left = self.left.clone();
         let right = self.right.clone();
-        let cn = Arc::new(cn);
         let sl = self.switch_listener.clone();
         match self {
             UpgradeEitherApply {
@@ -624,8 +634,11 @@ pub struct UpgradeHandle {
     /// true = left, false = right
     current: AtomicBool,
     was_set: AtomicBool,
+    in_use: Arc<AtomicBool>,
     left_offers: Vec<StackNonce>,
+    left_handles: Vec<Arc<UpgradeHandle>>,
     right_offers: Vec<StackNonce>,
+    right_handles: Vec<Arc<UpgradeHandle>>,
     want_transition: flume::Sender<(Vec<StackNonce>, oneshot::Sender<Result<(), Report>>)>,
     want_transition_listener:
         flume::Receiver<(Vec<StackNonce>, oneshot::Sender<Result<(), Report>>)>,
@@ -641,8 +654,12 @@ impl UpgradeHandle {
 
         let res = self.propose_change(self.left_offers.clone()).await;
         if res.is_ok() {
-            // set to true
+            for right_h in &self.right_handles {
+                right_h.in_use.store(false, Ordering::SeqCst);
+            }
+
             self.was_set.store(true, Ordering::SeqCst);
+            // set to left / true
             self.current.store(true, Ordering::SeqCst);
         }
         res
@@ -657,33 +674,72 @@ impl UpgradeHandle {
 
         let res = self.propose_change(self.right_offers.clone()).await;
         if res.is_ok() {
-            // set to false
+            for left_h in &self.left_handles {
+                left_h.in_use.store(false, Ordering::SeqCst);
+            }
+
             self.was_set.store(true, Ordering::SeqCst);
+            // set to right / false
             self.current.store(false, Ordering::SeqCst);
         }
 
         res
     }
 
+    // TODO custom error enum which covers all the error cases
     async fn propose_change(&self, stack: Vec<StackNonce>) -> Result<(), Report> {
         let (s, r) = oneshot::channel();
         self.want_transition.send_async((stack, s)).await?;
         r.await.expect("sender won't drop")
     }
 
+    fn is_active(&self) -> bool {
+        self.in_use.load(Ordering::SeqCst)
+    }
+
     fn set_current(&self, curr_stack: &StackNonce) {
+        fn post_apply_check_stack_match(curr_stack: &HashMap<u64, Offer>, this: &HashMap<u64, Offer>) -> bool {
+            let mut at_least_one_found = false;
+            for (guid, offer) in curr_stack.iter() {
+                // sidedness
+                if let Some(univ) = &offer.sidedness {
+                    let mut joint = offer.available.clone();
+                    if let Some(srv_offer) = this.get(guid) {
+                        at_least_one_found = true;
+                        joint.extend(srv_offer.available.clone());
+                    }
+
+                    if !crate::negotiate::have_all(univ, &joint) {
+                        return false;
+                    }
+                } else {
+                    // two-sided, they must be equal
+                    if let Some(this_offer) = this.get(guid) {
+                        at_least_one_found = true;
+                        if offer.impl_guid != 0
+                            || !crate::negotiate::have_all(&offer.available, &this_offer.available)
+                            || !crate::negotiate::have_all(&this_offer.available, &offer.available)
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            at_least_one_found
+        }
+
         let left = self
             .left_offers
             .iter()
-            .any(|option| stack_pair_partial_valid(&curr_stack.0, &option.0));
+            .any(|option| post_apply_check_stack_match(&curr_stack.0, &option.0));
         let right = self
             .right_offers
             .iter()
-            .any(|option| stack_pair_partial_valid(&curr_stack.0, &option.0));
-
+            .any(|option| post_apply_check_stack_match(&curr_stack.0, &option.0));
         match (left, right) {
             (true, true) | (false, false) => {
-                trace!(
+                debug!(
                     ?left,
                     ?right,
                     "specified stack does not differentiate this select"
@@ -700,6 +756,10 @@ impl UpgradeHandle {
     }
 
     fn switch_to_stack(&self, new_stack: StackNonce) {
+        for h in self.left_handles.iter().chain(self.right_handles.iter()) {
+            h.in_use.store(false, Ordering::SeqCst);
+        }
+
         self.trigger_locally
             .send(new_stack)
             .expect("Sends only happen if .closed().await did not complete")
@@ -816,9 +876,13 @@ where
                 (wt, idx, _remaining_futs) = want_transition => {
                     debug!(?idx, "local requested transition");
                     let (wanted_stack, done) = wt.expect("want_transition sender won't drop");
-                    let res = self.handle_trigger(idx, wanted_stack).await;
-                    debug!("done attempting transition");
-                    done.send(res).expect("oneshot receiver won't drop");
+                    if !uhs[idx].is_active() {
+                        done.send(Err(eyre!("Select is not active"))).expect("oneshot receiver won't drop");
+                    } else {
+                        let res = self.handle_trigger(idx, wanted_stack).await;
+                        debug!(worked = ?res.is_ok(), "done attempting transition");
+                        done.send(res).expect("oneshot receiver won't drop");
+                    }
                 }
                 notify_res = self.negotiator
                     .notify(self.addr.clone(), self.curr_entry.clone(), self.curr_round) => {
@@ -833,6 +897,7 @@ where
         handle_idx: usize,
         wanted: Vec<StackNonce>,
     ) -> Result<(), Report> {
+        debug!(?wanted, ?self.offers, "calling find_stack_from_stub");
         let full_stack = find_stack_from_stub(&wanted, &self.offers);
         let new_round = self
             .negotiator
@@ -879,10 +944,12 @@ where
                 self.offers
                     .iter()
                     .any(|o| stack_pair_valid(&entry.nonce.0, &o.0));
-                let new_stack_is_compatible = self
+                let compatible_handles: Vec<_> = self
                     .upgrade_handles
                     .iter()
-                    .all(|uh| uh.check_compatibility(&entry.nonce));
+                    .filter(|uh| uh.check_compatibility(&entry.nonce))
+                    .collect();
+                let new_stack_is_compatible = !compatible_handles.is_empty();
                 debug!(?new_stack_is_compatible, "checked proposed stack");
                 if new_stack_is_compatible {
                     let new_round = self
@@ -890,13 +957,20 @@ where
                         .staged_update(self.addr.clone(), self.curr_round)
                         .await
                         .map_err(Into::into)?;
+                    if new_round > self.curr_round + 1 {
+                        // don't update curr_round. we will be called again in the next loop
+                        // iteration. 
+                        return Ok(());
+                    }
+
                     self.curr_round = new_round;
                     self.curr_entry = entry.clone();
                     debug!(
                         num_upgrade_handles = self.upgrade_handles.len(),
                         "upgrade committed, channel send"
                     );
-                    for uh in &self.upgrade_handles {
+                    for uh in &compatible_handles {
+                        uh.in_use.store(false, Ordering::SeqCst);
                         uh.switch_to_stack(entry.nonce.clone());
                     }
 
@@ -997,6 +1071,7 @@ mod t {
     mock_serve_bothsides_impl!(ChunnelB);
     mock_serve_bothsides_impl!(ChunnelC);
     mock_serve_bothsides_impl!(ChunnelD);
+    mock_serve_bothsides_impl!(ChunnelE);
 
     #[derive(Clone, Debug, Copy)]
     struct MockBaseChunnel;
@@ -1187,8 +1262,11 @@ mod t {
         .unwrap();
     }
 
+    /// What happens if we try to transition to a stack that's incompatible with the other side? In
+    /// this test, we try to use `ChunnelD` which is not present on the other side. The
+    /// `trigger_right` call should fail.
     #[test]
-    fn swap_nested() {
+    fn swap_nested_failure() {
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -1284,6 +1362,142 @@ mod t {
                 .await
                 .wrap_err("cn send")?;
             tokio::time::sleep(Duration::from_millis(500)).await;
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
+            Ok::<_, Report>(())
+        })
+        .unwrap();
+    }
+
+    /// What happens if we trigger a transition on an UpgradeHandle that is not in use? This should
+    /// be a non-fatal error (indicating option not in use), since we don't know what the
+    /// connection state might be in the future and whether the requested option would be valid at
+    /// that time.
+    #[test]
+    fn swap_nested_useless() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        crate::test::COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            info!(a_guid = ?ChunnelACap::guid(), b_guid = ?ChunnelBCap::guid(), c_guid = ?ChunnelCCap::guid(), d_guid = ?ChunnelDCap::guid(), e_guid = ?ChunnelECap::guid(), base_guid = ?MockBaseChunnelCap::guid(), "chunnel ids");
+
+            let addr = "foo".to_owned();
+            let addr2 = addr.clone();
+
+            let r = MockRendezvous::default();
+            let r2 = r.clone();
+
+            #[tracing::instrument(skip(r2), err)]
+            async fn client2(
+                r2: MockRendezvous,
+                addr2: String,
+            ) -> Result<(), Report> {
+                let (left_inner_select, _left_upgrade_inner) = 
+                    UpgradeSelect::from_select(Select::from((ChunnelB, ChunnelE)));
+                let (right_inner_select, _right_upgrade_inner) =
+                    UpgradeSelect::from_select(Select::from((ChunnelC, ChunnelD)));
+                let (sel, _upgrade_outer) = UpgradeSelect::from_select(Select::from((left_inner_select, right_inner_select)));
+                let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
+
+                let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await?;
+                use futures_util::future::Either as FEither;
+                match futures_util::future::select(
+                    Box::pin(handle.monitor_connection_negotiation_state()), 
+                    cn.recv(&mut [])
+                ).await {
+                    FEither::Left((Err(e), _)) | FEither::Right((Err(e), _)) => {
+                        return Err(e);
+                    }
+                    _ => (),
+                }
+
+                Ok(())
+            }
+
+            let (left_inner_select, left_upgrade_inner) = 
+                UpgradeSelect::from_select(Select::from((ChunnelB, ChunnelE)));
+            let (right_inner_select, right_upgrade_inner) =
+                UpgradeSelect::from_select(Select::from((ChunnelC, ChunnelD)));
+            let (sel, upgrade_outer) = UpgradeSelect::from_select(Select::from((left_inner_select, right_inner_select)));
+            let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
+
+            let (cn, mut handle) = negotiate_rendezvous(stack, r, addr).await.unwrap();
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
+            let mut p_changed = handle.conn_participants_changed_receiver.clone();
+
+            tokio::spawn(
+                async move {
+                    handle.monitor_connection_negotiation_state().await.unwrap();
+                }
+                .instrument(info_span!("client1")),
+            );
+            
+            tokio::spawn(client2(r2, addr2));
+
+            p_changed.changed().await.unwrap();
+            let new_num_participants = *p_changed.borrow_and_update();
+            info!(
+                ?new_num_participants,
+                "num participants change, transitioning"
+            );
+
+            // 1. make sure right_upgrade_inner is definitely going to be useless
+            info!("outer trigger_left");
+            upgrade_outer.trigger_left().await.wrap_err("upgrade_outer trigger left")?;
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
+            // 2. right side select is not in use, so this should fail.
+            if let Err(err) = right_upgrade_inner.trigger_right().await {
+                info!(?err, "right_upgrade_inner.trigger_right() failed as expected");
+            } else {
+                panic!("right_upgrade_inner.trigger_right() did not error");
+            }
+
+            // 3. now we switch so that the left side becomes useless
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
+            info!("outer trigger_right");
+            upgrade_outer.trigger_right().await.wrap_err("upgrade_outer trigger right")?;
+
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            info!("left_upgrade_inner trigger_right should fail");
+            // 4. left side select is not in use, so this should fail.
+            if let Err(err) = left_upgrade_inner.trigger_right().await {
+                info!(?err, "left_upgrade_inner.trigger_right() failed as expected");
+            } else {
+                panic!("left_upgrade_inner.trigger_right() did not error");
+            }
+            
+            cn.send(std::iter::empty())
+                .instrument(info_span!("connection_send"))
+                .await
+                .wrap_err("cn send")?;
+            
+            // 5. this time, this should work.
+            info!("right_upgrade_inner trigger_right should now work");
+            right_upgrade_inner.trigger_right().await?;
             cn.send(std::iter::empty())
                 .instrument(info_span!("connection_send"))
                 .await
@@ -1456,7 +1670,7 @@ mod t {
                 } // drop inner_g
 
                 debug!("waiting for commit");
-                let cnt = loop {
+                let round_num = loop {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     trace!("staged_update waiting for lock");
                     let mut inner_g = self.inner.lock().unwrap();
@@ -1464,16 +1678,16 @@ mod t {
                     let state = inner_g
                         .get_mut(&addr)
                         .ok_or_else(|| eyre!("Connection not found"))?;
-
-                    if state.staged.is_none() {
-                        trace!("done staged_update");
+                    
+                    if state.round_number > round_ctr {
                         break state.round_number;
                     }
 
-                    trace!("waiting");
+                    trace!(?state.round_number, orig_round = ?round_ctr, "waiting");
                 };
 
-                Ok(cnt)
+                debug!(?round_num, "commit done");
+                Ok(round_num)
             })
         }
     }
