@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use queue_steer::{
     MessageQueueAddr, MessageQueueCaps, MessageQueueOrdering, MessageQueueReliability,
 };
+use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::{
     admin::AdminClient,
     consumer::{stream_consumer::StreamConsumer, Consumer},
@@ -20,42 +21,47 @@ use std::sync::Arc;
 use tracing::{debug_span, trace};
 use tracing_futures::Instrument;
 
-pub async fn make_topic(addr: &str, name: &str) -> Result<(), Report> {
-    let topic = rdkafka::admin::NewTopic::new(name, 10, rdkafka::admin::TopicReplication::Fixed(1));
+pub async fn make_topics(addr: String, topics: Vec<String>) -> Result<(), Report> {
+    let topics: Vec<_> = topics
+        .iter()
+        .map(|name| {
+            rdkafka::admin::NewTopic::new(
+                name.as_str(),
+                10,
+                rdkafka::admin::TopicReplication::Fixed(1),
+            )
+        })
+        .collect();
     let client: AdminClient<_> = ClientConfig::new()
         .set("bootstrap.servers", addr)
         .create()?;
     client
-        .create_topics(
-            std::iter::once(&topic),
-            &rdkafka::admin::AdminOptions::default(),
-        )
+        .create_topics(topics.iter(), &rdkafka::admin::AdminOptions::default())
         .await
         .wrap_err("create_topics failed")?
-        .pop()
-        .unwrap()
-        .map_err(|(s, x)| {
-            let r: Report = x.into();
-            r.wrap_err(eyre!("Topic creation failed: {:?}", s))
-        })?;
-    Ok(())
+        .into_iter()
+        .map(|r| match r {
+            Ok(_) | Err((_, RDKafkaErrorCode::TopicAlreadyExists)) => Ok(()),
+            Err((t, err)) => Err(eyre!(err).wrap_err(eyre!("Failed to create topic {:?}", t))),
+        })
+        .collect()
 }
 
-pub async fn delete_topic(addr: &str, name: &str) -> Result<(), Report> {
+pub async fn delete_topic(addr: String, name: Vec<String>) -> Result<(), Report> {
     let client: AdminClient<_> = ClientConfig::new()
         .set("bootstrap.servers", addr)
         .create()?;
+    let name_str: Vec<_> = name.iter().map(|s| s.as_str()).collect();
     client
-        .delete_topics(&[name], &rdkafka::admin::AdminOptions::default())
+        .delete_topics(&name_str, &rdkafka::admin::AdminOptions::default())
         .await
         .wrap_err("delete_topics failed")?
-        .pop()
-        .unwrap()
-        .map_err(|(s, x)| {
-            let r: Report = x.into();
-            r.wrap_err(eyre!("Topic deletion failed: {:?}", s))
-        })?;
-    Ok(())
+        .into_iter()
+        .map(|r| match r {
+            Ok(_) | Err((_, RDKafkaErrorCode::UnknownTopic)) => Ok(()),
+            Err((t, err)) => Err(eyre!(err).wrap_err(eyre!("Failed to delete topic {:?}", t))),
+        })
+        .collect()
 }
 
 #[derive(Clone)]
