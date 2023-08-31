@@ -1,7 +1,7 @@
 use bertha::{
     bincode::{Base64Chunnel, SerializeChunnel},
-    negotiate_rendezvous, ChunnelConnection, CxList, Select, StackUpgradeHandle, UpgradeHandle,
-    UpgradeSelect,
+    negotiate_rendezvous, ChunnelConnection, CxList, Either, Select, StackUpgradeHandle,
+    UpgradeHandle, UpgradeSelect,
 };
 use color_eyre::Report;
 use gcp_pubsub::{GcpClient, OrderedPubSubChunnel, PubSubChunnel};
@@ -13,12 +13,25 @@ use tracing::{info, instrument, warn};
 
 use crate::parse_log::ParsedLine;
 
+#[derive(Clone, Copy, Debug)]
+pub enum ConnState {
+    KafkaOrdering,
+    GcpClientSideOrdering,
+    GcpServiceSideOrdering,
+}
+
 pub async fn connect(
     topic: &str,
     redis: RedisBase,
     gcloud_client: GcpClient,
     kafka_addr: &str,
-) -> Result<impl ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)>, Report> {
+) -> Result<
+    (
+        ConnState,
+        impl ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send + 'static,
+    ),
+    Report,
+> {
     // the chunnel stack we want:
     // serialize |> base64 |> select(
     //   select(
@@ -60,12 +73,21 @@ pub async fn connect(
 
     // 3. initial negotiation and spawn the manager task.
     let (cn, stack_negotiation_manager) = negotiate_rendezvous(st, redis, topic.to_owned()).await?;
+    let cn_state = gcp_switch_ordering_handle
+        .current()
+        .map(|e| match e {
+            Either::Left(()) => ConnState::GcpClientSideOrdering,
+            Either::Right(()) => ConnState::GcpServiceSideOrdering,
+        })
+        .or(Some(ConnState::KafkaOrdering))
+        .unwrap();
+    info!(?cn_state, "Established connection");
     tokio::spawn(conn_negotiation_manager(
         topic.to_owned(),
         stack_negotiation_manager,
         gcp_switch_ordering_handle,
     ));
-    Ok(cn)
+    Ok((cn_state, cn))
 }
 
 #[instrument(

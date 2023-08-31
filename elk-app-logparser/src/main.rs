@@ -6,7 +6,7 @@
 
 use bertha::ChunnelConnection;
 use color_eyre::eyre::{Context, Report};
-use elk_app_logparser::parse_log;
+use elk_app_logparser::{parse_log, publish_subscribe::ConnState};
 use queue_steer::MessageQueueAddr;
 use redis_basechunnel::RedisBase;
 use structopt::StructOpt;
@@ -57,22 +57,37 @@ const TOPIC_NAME: &str = "server-logs";
 
 #[instrument]
 async fn logparser(opt: Opt) -> Result<(), Report> {
-    let gcp_client = gcp_pubsub::GcpCreds::default()
+    let redis = RedisBase::new(&opt.redis_addr).await?;
+    let mut gcp_client = gcp_pubsub::GcpCreds::default()
         .with_project_name(&opt.gcp_project_name)
         .creds_path_env()
         .finish()
         .await?;
-    let redis = RedisBase::new(&opt.redis_addr).await?;
 
-    let conn = elk_app_logparser::publish_subscribe::connect(
+    let (cn_state, conn) = elk_app_logparser::publish_subscribe::connect(
         TOPIC_NAME,
         redis,
-        gcp_client,
+        gcp_client.clone(),
         &opt.kafka_addr,
     )
     .await?;
 
     if opt.subscriber {
+        match cn_state {
+            ConnState::KafkaOrdering => {
+                info!(?TOPIC_NAME, "creating kafka topic");
+                kafka::make_topics(opt.kafka_addr.clone(), vec![TOPIC_NAME.to_owned()])
+                    .await
+                    .wrap_err("make kafka topic")?;
+            }
+            ConnState::GcpClientSideOrdering | ConnState::GcpServiceSideOrdering => {
+                info!(?TOPIC_NAME, "creating GCP Pub/Sub topic");
+                gcp_pubsub::make_topic(&mut gcp_client, TOPIC_NAME.to_owned())
+                    .await
+                    .wrap_err("make GCP Pub/Sub topic")?;
+            }
+        }
+
         let mut slots = vec![None; 16];
         loop {
             let ms = conn.recv(&mut slots[..]).await?;
