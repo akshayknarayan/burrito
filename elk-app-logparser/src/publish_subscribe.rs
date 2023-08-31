@@ -11,23 +11,21 @@ use redis_basechunnel::RedisBase;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
+use crate::parse_log::ParsedLine;
+
 pub async fn connect(
     topic: &str,
-    redis_addr: &str,
+    redis: RedisBase,
     gcloud_client: GcpClient,
     kafka_addr: &str,
-) -> Result<impl ChunnelConnection<Data = (MessageQueueAddr, Vec<u8>)>, Report> {
-    let redis_base = RedisBase::new(&redis_addr).await?;
+) -> Result<impl ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)>, Report> {
     // the chunnel stack we want:
     // serialize |> base64 |> select(
-    //   ordering |> select(
-    //                 besteffort_gcp,
-    //                 besteffort_sqs
-    //               ),
-    //   nothing  |> select(
-    //                 ordered_gcp,
-    //                 ordered_sqs
-    //               )
+    //   select(
+    //     ordering |> besteffort_gcp,
+    //     nothing  |> ordered_gcp,
+    //   ),
+    //   kafka
     // )
 
     // 1. gcp-only part (no kafka option)
@@ -61,8 +59,7 @@ pub async fn connect(
     ));
 
     // 3. initial negotiation and spawn the manager task.
-    let (cn, stack_negotiation_manager) =
-        negotiate_rendezvous(st, redis_base, topic.to_owned()).await?;
+    let (cn, stack_negotiation_manager) = negotiate_rendezvous(st, redis, topic.to_owned()).await?;
     tokio::spawn(conn_negotiation_manager(
         topic.to_owned(),
         stack_negotiation_manager,

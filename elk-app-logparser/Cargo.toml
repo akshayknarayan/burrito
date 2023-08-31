@@ -9,9 +9,14 @@ queue-steer = { path = "../queue-steer"  }
 gcp-pubsub = { path = "../gcp-pubsub" }
 kafka = { path = "../kafka" }
 redis-basechunnel = { path = "../redis-basechunnel" }
-tokio = { version = "1.21", features = ["rt", "sync", "time"] }
+tokio = { version = "1.21", features = ["rt", "rt-multi-thread", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
 color-eyre = "0.6"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 tracing = { version = "0.1" }
 tracing-futures = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-error = "0.2"
 futures-util = "0.3"
+structopt = "0.3"
+itertools = "0.11"
