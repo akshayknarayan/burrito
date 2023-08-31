@@ -645,6 +645,14 @@ pub struct UpgradeHandle {
 }
 
 impl UpgradeHandle {
+    pub fn current(&self) -> Option<Either<(), ()>> {
+        if self.is_active() {
+            // true = left, false = right
+            let c = self.current.load(Ordering::SeqCst);
+            Some(if c { Either::Left(()) } else { Either::Right(()) })
+        } else { None }
+    }
+
     pub async fn trigger_left(&self) -> Result<(), Report> {
         // true = left, false = right
         if self.was_set.load(Ordering::SeqCst) && self.current.load(Ordering::SeqCst) {
