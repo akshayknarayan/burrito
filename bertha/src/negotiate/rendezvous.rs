@@ -581,50 +581,66 @@ where
     let handles = stack.collect_handles();
 
     // 2. try_init our favored semantics.
-    let (entry, num_participants, round_number) = match {
-        let rp = &mut rendezvous_point;
-        let res = rp
-            .try_init(addr.clone(), RendezvousEntry { nonce: offer })
-            .await
-            .map_err(Into::into)
-            .wrap_err("rendezvous backend try_init")?;
-        trace!(?res, "got try_init response");
-        res
-    } {
+    let (entry, num_participants, mut round_number) = match rendezvous_point
+        .try_init(addr.clone(), RendezvousEntry { nonce: offer })
+        .await
+        .map_err(Into::into)
+        .wrap_err("rendezvous backend try_init")?
+    {
         NegotiateRendezvousResult::Matched {
             num_participants,
             round_number,
         } => {
             // if Matched, we joined the connection.
-            debug!(matched = true, num_selects = ?handles.len(), "returning upgradable connection");
-            (
-                RendezvousEntry { nonce: picked },
-                num_participants,
-                round_number,
-            )
+            (None, num_participants, round_number)
         }
         NegotiateRendezvousResult::NoMatch {
             num_participants,
             round_number,
             entry,
-        } => {
-            debug!(matched = false, num_selects = ?handles.len(), "returning upgradable connection");
-            (entry, num_participants, round_number)
-        }
+        } => (Some(entry), num_participants, round_number),
     };
 
-    let ApplyResult {
-        mut applied,
-        picked,
-        ..
-    } = stack
-        .apply(entry.clone().nonce)
-        .expect("solo_monomorphize means self-application will work");
+    debug!(matched = entry.is_none(), num_selects = ?handles.len(), "try_init completed");
+    let (entry, mut applied) = if let Some(existing_remote_stack) = entry {
+        match stack.clone().apply(existing_remote_stack.clone().nonce) {
+            Ok(ApplyResult { applied, .. }) => (existing_remote_stack, applied),
+            Err(orig_apply_error) => {
+                debug!(
+                    ?existing_remote_stack,
+                    "remote stack was incompatible, attempting transition"
+                );
+                // TODO there is no way currently to ask the remote for alternate stacks. this
+                // means that if the local picked stack is not compatible, and the remote stack is
+                // not locally compatible, but there is a third option on both sides that *is*
+                // compatible, we will miss it.
+                round_number = rendezvous_point
+                    .transition(
+                        addr.clone(),
+                        RendezvousEntry {
+                            nonce: picked.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(Into::into)
+                    .wrap_err(eyre!("Transition failed after trying to apply remote stack failed. The stacks must be incompatible.").wrap_err(orig_apply_error))?;
+                let ApplyResult { applied, .. } = stack
+                    .apply(picked.clone())
+                    .expect("solo_monomorphize means self-application will work");
+                (RendezvousEntry { nonce: picked }, applied)
+            }
+        }
+    } else {
+        let ApplyResult { applied, .. } = stack
+            .apply(picked.clone())
+            .expect("solo_monomorphize means self-application will work");
+        (RendezvousEntry { nonce: picked }, applied)
+    };
+
     let cn = applied
         .connect_wrap(NeverCn::default())
         .await
         .map_err(Into::into)?;
-    debug!(?picked, "returning");
     let stack_upgrade_handle = StackUpgradeHandle::new(
         handles,
         rendezvous_point,
@@ -881,7 +897,6 @@ where
             "UpgradeHandle not compatible with own stack"
         );
 
-        //self.upgrade_handles[handle_idx].switch_to_stack(full_stack);
         let compatible_handles: Vec<_> = self
             .upgrade_handles
             .iter()
@@ -1186,7 +1201,7 @@ mod t {
             let (sel, upgrade) = UpgradeSelect::from_select(sel);
             let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
 
-            let addr = "foo".to_owned();
+            let addr = "single_swap".to_owned();
             let addr2 = addr.clone();
 
             let r = MockRendezvous::default();
@@ -1266,19 +1281,70 @@ mod t {
         let _guard = subscriber.set_default();
         crate::test::COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
+        #[tracing::instrument(skip(r2, wait_ready_s, wait_trans_s), err)]
+        async fn client2(
+            r2: MockRendezvous,
+            addr2: String,
+            wait_ready_s: oneshot::Sender<()>,
+            wait_trans_s: oneshot::Sender<()>,
+        ) -> Result<(), Report> {
+            let (inner_select, upgrade_inner) =
+                UpgradeSelect::from_select(Select::from((ChunnelC, ChunnelD)));
+            let sel = Select::from((inner_select, ChunnelB));
+            let (sel, upgrade) = UpgradeSelect::from_select(sel);
+            let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
+
+            let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await?;
+            assert!(matches!(upgrade.current(), Some(crate::Either::Left(()))));
+            assert!(matches!(
+                upgrade_inner.current(),
+                Some(crate::Either::Left(()))
+            ));
+            let mut p_changed = handle.conn_participants_changed_receiver.clone();
+            cn.send(std::iter::empty()).await.unwrap();
+            tokio::spawn(
+                async move {
+                    handle.monitor_connection_negotiation_state().await.unwrap();
+                }
+                .instrument(info_span!("client2")),
+            );
+
+            wait_ready_s.send(()).unwrap();
+            p_changed.changed().await.unwrap();
+            let new_num_participants = *p_changed.borrow_and_update();
+            info!(
+                ?new_num_participants,
+                "num participants change, transitioning"
+            );
+
+            if let Err(e) = upgrade_inner.trigger_right().await {
+                info!(err = ?format!("{:#?}", e), "transition failed, as expected");
+            } else {
+                bail!("transition should have failed");
+            }
+
+            wait_trans_s.send(()).unwrap();
+            assert!(matches!(
+                upgrade_inner.current(),
+                Some(crate::Either::Left(()))
+            ));
+            assert!(matches!(upgrade.current(), Some(crate::Either::Left(()))));
+            cn.recv(&mut []).await.unwrap();
+            Ok(())
+        }
+
+        info!(a_guid = ?ChunnelACap::guid(), b_guid = ?ChunnelBCap::guid(), c_guid = ?ChunnelCCap::guid(), d_guid = ?ChunnelDCap::guid(), base_guid = ?MockBaseChunnelCap::guid(), "chunnel ids");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         rt.block_on(async move {
-            info!(a_guid = ?ChunnelACap::guid(), b_guid = ?ChunnelBCap::guid(), c_guid = ?ChunnelCCap::guid(), d_guid = ?ChunnelDCap::guid(), base_guid = ?MockBaseChunnelCap::guid(), "chunnel ids");
-
             let sel = Select::from((ChunnelB, ChunnelC));
             let (sel, upgrade) = UpgradeSelect::from_select(sel);
             let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
 
-            let addr = "foo".to_owned();
+            let addr = "swap_nested_failure".to_owned();
             let addr2 = addr.clone();
 
             let r = MockRendezvous::default();
@@ -1286,52 +1352,6 @@ mod t {
 
             let (wait_ready_s, wait_ready_r) = oneshot::channel();
             let (wait_trans_s, wait_trans_r) = oneshot::channel();
-
-            #[tracing::instrument(skip(r2, wait_ready_s, wait_trans_s), err)]
-            async fn client2(
-                r2: MockRendezvous,
-                addr2: String,
-                wait_ready_s: oneshot::Sender<()>,
-                wait_trans_s: oneshot::Sender<()>,
-            ) -> Result<(), Report> {
-                let (inner_select, upgrade_inner) =
-                    UpgradeSelect::from_select(Select::from((ChunnelC, ChunnelD)));
-                let sel = Select::from((inner_select, ChunnelB));
-                let (sel, upgrade) = UpgradeSelect::from_select(sel);
-                let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
-
-                let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await?;
-                assert!(matches!(upgrade.current(), Some(crate::Either::Left(()))));
-                assert!(matches!(upgrade_inner.current(), Some(crate::Either::Left(()))));
-                let mut p_changed = handle.conn_participants_changed_receiver.clone();
-                cn.send(std::iter::empty()).await.unwrap();
-                tokio::spawn(
-                    async move {
-                        handle.monitor_connection_negotiation_state().await.unwrap();
-                    }
-                    .instrument(info_span!("client2")),
-                );
-
-                wait_ready_s.send(()).unwrap();
-                p_changed.changed().await.unwrap();
-                let new_num_participants = *p_changed.borrow_and_update();
-                info!(
-                    ?new_num_participants,
-                    "num participants change, transitioning"
-                );
-
-                if let Err(e) = upgrade_inner.trigger_right().await {
-                    info!(err = ?format!("{:#?}", e), "transition failed, as expected");
-                } else {
-                    bail!("transition should have failed");
-                }
-
-                wait_trans_s.send(()).unwrap();
-                assert!(matches!(upgrade_inner.current(), Some(crate::Either::Left(()))));
-                assert!(matches!(upgrade.current(), Some(crate::Either::Left(()))));
-                cn.recv(&mut []).await.unwrap();
-                Ok(())
-            }
 
             tokio::spawn(client2(r2, addr2, wait_ready_s, wait_trans_s));
             wait_ready_r.await.unwrap();
@@ -1378,81 +1398,89 @@ mod t {
         let _guard = subscriber.set_default();
         crate::test::COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
+        #[tracing::instrument(skip(r2), err)]
+        async fn client2(r2: MockRendezvous, addr2: String) -> Result<(), Report> {
+            let (left_inner_select, left_upgrade_inner) =
+                UpgradeSelect::from_select(Select::from((ChunnelB, ChunnelE)));
+            let (right_inner_select, right_upgrade_inner) =
+                UpgradeSelect::from_select(Select::from((ChunnelC, ChunnelD)));
+            let (sel, upgrade_outer) =
+                UpgradeSelect::from_select(Select::from((left_inner_select, right_inner_select)));
+            let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
+
+            let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await?;
+            assert!(matches!(
+                upgrade_outer.current(),
+                Some(crate::Either::Left(()))
+            ));
+            assert!(matches!(
+                left_upgrade_inner.current(),
+                Some(crate::Either::Left(()))
+            ));
+            assert!(right_upgrade_inner.current().is_none());
+
+            let mut monitor_fut = Box::pin(handle.monitor_connection_negotiation_state());
+            let mut recv_fut = cn.recv(&mut []);
+            let mut outer_changed = Box::pin(upgrade_outer.stack_changed());
+            let mut left_changed = Box::pin(left_upgrade_inner.stack_changed());
+            loop {
+                tokio::select! {
+                    Err(e) = &mut monitor_fut => return Err(e),
+                    Err(e) = &mut recv_fut => return Err(e),
+                    _ = &mut outer_changed => {
+                        let stack = upgrade_outer.current();
+                        if !matches!(stack, Some(crate::Either::Right(()))) {
+                            warn!(?stack, "expected Some(Right)");
+                            return Err(eyre!("mismatched stacks"));
+                        } else {
+                            info!(?stack, "outer got correct stack change notification");
+                        }
+
+                        outer_changed = Box::pin(upgrade_outer.stack_changed());
+                    }
+                    _ = &mut left_changed => {
+                        let stack = left_upgrade_inner.current();
+                        if stack.is_some() {
+                            warn!(?stack, "expected None");
+                            return Err(eyre!("mismatched stacks"));
+                        } else {
+                            info!(?stack, "left_inner got correct stack change notification");
+                        }
+
+                        left_changed = Box::pin(left_upgrade_inner.stack_changed());
+                    }
+                }
+            }
+        }
+
+        info!(a_guid = ?ChunnelACap::guid(), b_guid = ?ChunnelBCap::guid(), c_guid = ?ChunnelCCap::guid(), d_guid = ?ChunnelDCap::guid(), e_guid = ?ChunnelECap::guid(), base_guid = ?MockBaseChunnelCap::guid(), "chunnel ids");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-
         rt.block_on(async move {
-            info!(a_guid = ?ChunnelACap::guid(), b_guid = ?ChunnelBCap::guid(), c_guid = ?ChunnelCCap::guid(), d_guid = ?ChunnelDCap::guid(), e_guid = ?ChunnelECap::guid(), base_guid = ?MockBaseChunnelCap::guid(), "chunnel ids");
-
-            let addr = "foo".to_owned();
-            let addr2 = addr.clone();
-
             let r = MockRendezvous::default();
             let r2 = r.clone();
-
-            #[tracing::instrument(skip(r2), err)]
-            async fn client2(
-                r2: MockRendezvous,
-                addr2: String,
-            ) -> Result<(), Report> {
-                let (left_inner_select, left_upgrade_inner) =
-                    UpgradeSelect::from_select(Select::from((ChunnelB, ChunnelE)));
-                let (right_inner_select, right_upgrade_inner) =
-                    UpgradeSelect::from_select(Select::from((ChunnelC, ChunnelD)));
-                let (sel, upgrade_outer) = UpgradeSelect::from_select(Select::from((left_inner_select, right_inner_select)));
-                let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
-
-                let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await?;
-                assert!(matches!(upgrade_outer.current(), Some(crate::Either::Left(()))));
-                assert!(matches!(left_upgrade_inner.current(), Some(crate::Either::Left(()))));
-                assert!(right_upgrade_inner.current().is_none());
-
-                let mut monitor_fut = Box::pin(handle.monitor_connection_negotiation_state());
-                let mut recv_fut = cn.recv(&mut []);
-                let mut outer_changed = Box::pin(upgrade_outer.stack_changed());
-                let mut left_changed = Box::pin(left_upgrade_inner.stack_changed());
-                loop {
-                    tokio::select! {
-                        Err(e) = &mut monitor_fut => return Err(e),
-                        Err(e) = &mut recv_fut => return Err(e),
-                        _ = &mut outer_changed => {
-                            let stack = upgrade_outer.current();
-                            if !matches!(stack, Some(crate::Either::Right(()))) {
-                                warn!(?stack, "expected Some(Right)");
-                                return Err(eyre!("mismatched stacks"));
-                            } else {
-                                info!(?stack, "outer got correct stack change notification");
-                            }
-
-                            outer_changed = Box::pin(upgrade_outer.stack_changed());
-                        }
-                        _ = &mut left_changed => {
-                            let stack = left_upgrade_inner.current();
-                            if stack.is_some() {
-                                warn!(?stack, "expected None");
-                                return Err(eyre!("mismatched stacks"));
-                            } else {
-                                info!(?stack, "left_inner got correct stack change notification");
-                            }
-
-                            left_changed = Box::pin(left_upgrade_inner.stack_changed());
-                        }
-                    }
-                }
-            }
+            let addr = "swap_nested_useless".to_owned();
+            let addr2 = addr.clone();
 
             let (left_inner_select, left_upgrade_inner) =
                 UpgradeSelect::from_select(Select::from((ChunnelB, ChunnelE)));
             let (right_inner_select, right_upgrade_inner) =
                 UpgradeSelect::from_select(Select::from((ChunnelC, ChunnelD)));
-            let (sel, upgrade_outer) = UpgradeSelect::from_select(Select::from((left_inner_select, right_inner_select)));
+            let (sel, upgrade_outer) =
+                UpgradeSelect::from_select(Select::from((left_inner_select, right_inner_select)));
             let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
 
             let (cn, mut handle) = negotiate_rendezvous(stack, r, addr).await.unwrap();
-            assert!(matches!(upgrade_outer.current(), Some(crate::Either::Left(()))));
-            assert!(matches!(left_upgrade_inner.current(), Some(crate::Either::Left(()))));
+            assert!(matches!(
+                upgrade_outer.current(),
+                Some(crate::Either::Left(()))
+            ));
+            assert!(matches!(
+                left_upgrade_inner.current(),
+                Some(crate::Either::Left(()))
+            ));
             assert!(right_upgrade_inner.current().is_none());
             cn.send(std::iter::empty())
                 .instrument(info_span!("connection_send"))
@@ -1478,42 +1506,67 @@ mod t {
 
             // 1. make sure right_upgrade_inner is definitely going to be useless
             info!("outer trigger_left");
-            upgrade_outer.trigger_left().await.wrap_err("upgrade_outer trigger left")?;
+            upgrade_outer
+                .trigger_left()
+                .await
+                .wrap_err("upgrade_outer trigger left")?;
             cn.send(std::iter::empty())
                 .instrument(info_span!("connection_send"))
                 .await
                 .wrap_err("cn send")?;
-            assert!(matches!(upgrade_outer.current(), Some(crate::Either::Left(()))));
-            assert!(matches!(left_upgrade_inner.current(), Some(crate::Either::Left(()))));
+            assert!(matches!(
+                upgrade_outer.current(),
+                Some(crate::Either::Left(()))
+            ));
+            assert!(matches!(
+                left_upgrade_inner.current(),
+                Some(crate::Either::Left(()))
+            ));
             assert!(right_upgrade_inner.current().is_none());
 
             // 2. right side select is not in use, so this should fail.
             if let Err(err) = right_upgrade_inner.trigger_right().await {
-                info!(?err, "right_upgrade_inner.trigger_right() failed as expected");
-            cn.send(std::iter::empty())
-                .instrument(info_span!("connection_send"))
-                .await
-                .wrap_err("cn send")?;
+                info!(
+                    ?err,
+                    "right_upgrade_inner.trigger_right() failed as expected"
+                );
+                cn.send(std::iter::empty())
+                    .instrument(info_span!("connection_send"))
+                    .await
+                    .wrap_err("cn send")?;
             } else {
                 panic!("right_upgrade_inner.trigger_right() did not error");
             }
 
             // 3. now we switch so that the left side becomes useless
             info!("outer trigger_right");
-            upgrade_outer.trigger_right().await.wrap_err("upgrade_outer trigger right")?;
+            upgrade_outer
+                .trigger_right()
+                .await
+                .wrap_err("upgrade_outer trigger right")?;
             cn.send(std::iter::empty())
                 .instrument(info_span!("connection_send"))
                 .await
                 .wrap_err("cn send")?;
             tokio::time::sleep(Duration::from_millis(25)).await;
-            assert!(matches!(upgrade_outer.current(), Some(crate::Either::Right(()))), "Expected upgrade_outer to be Some(Right), got {:?}", upgrade_outer.current());
+            assert!(
+                matches!(upgrade_outer.current(), Some(crate::Either::Right(()))),
+                "Expected upgrade_outer to be Some(Right), got {:?}",
+                upgrade_outer.current()
+            );
             assert!(left_upgrade_inner.current().is_none());
-            assert!(matches!(right_upgrade_inner.current(), Some(crate::Either::Left(()))));
+            assert!(matches!(
+                right_upgrade_inner.current(),
+                Some(crate::Either::Left(()))
+            ));
 
             info!("left_upgrade_inner trigger_right should fail");
             // 4. left side select is not in use, so this should fail.
             if let Err(err) = left_upgrade_inner.trigger_right().await {
-                info!(?err, "left_upgrade_inner.trigger_right() failed as expected");
+                info!(
+                    ?err,
+                    "left_upgrade_inner.trigger_right() failed as expected"
+                );
             } else {
                 panic!("left_upgrade_inner.trigger_right() did not error");
             }
@@ -1530,9 +1583,15 @@ mod t {
                 .instrument(info_span!("connection_send"))
                 .await
                 .wrap_err("cn send")?;
-            assert!(matches!(upgrade_outer.current(), Some(crate::Either::Right(()))));
+            assert!(matches!(
+                upgrade_outer.current(),
+                Some(crate::Either::Right(()))
+            ));
             assert!(left_upgrade_inner.current().is_none());
-            assert!(matches!(right_upgrade_inner.current(), Some(crate::Either::Right(()))));
+            assert!(matches!(
+                right_upgrade_inner.current(),
+                Some(crate::Either::Right(()))
+            ));
             info!("done");
             Ok::<_, Report>(())
         })
