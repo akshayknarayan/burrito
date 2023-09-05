@@ -3,12 +3,14 @@ use bertha::{
     negotiate_rendezvous, ChunnelConnection, CxList, Either, Select, StackUpgradeHandle,
     UpgradeHandle, UpgradeSelect,
 };
-use color_eyre::Report;
+use color_eyre::{eyre::eyre, Report};
 use gcp_pubsub::{GcpClient, OrderedPubSubChunnel, PubSubChunnel};
 use kafka::KafkaChunnel;
 use queue_steer::{MessageQueueAddr, Ordered};
 use redis_basechunnel::RedisBase;
+use std::fmt::Debug;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tracing::{info, instrument, warn};
 
 use crate::parse_log::ParsedLine;
@@ -20,6 +22,37 @@ pub enum ConnState {
     GcpServiceSideOrdering,
 }
 
+impl ConnState {
+    pub fn is_kafka(&self) -> bool {
+        match self {
+            Self::KafkaOrdering => true,
+            Self::GcpClientSideOrdering | Self::GcpServiceSideOrdering => false,
+        }
+    }
+
+    pub fn is_gcp(&self) -> bool {
+        !self.is_kafka()
+    }
+}
+
+macro_rules! gcp_stack {
+    ($topic: expr, $gcloud_client: expr) => {{
+        // We repeat SerializeChunnel in both sides because the SerializeChunnel is actually different in either case due to the different data types.
+        UpgradeSelect::from_select(Select::from((
+            CxList::from(Ordered::default())
+                .wrap(SerializeChunnel::default())
+                .wrap(Base64Chunnel::default())
+                .wrap(PubSubChunnel::new($gcloud_client.clone(), [$topic])),
+            CxList::from(SerializeChunnel::default())
+                .wrap(Base64Chunnel::default())
+                .wrap(OrderedPubSubChunnel::from(PubSubChunnel::new(
+                    $gcloud_client.clone(),
+                    [$topic],
+                ))),
+        )))
+    }};
+}
+
 pub async fn connect(
     topic: &str,
     redis: RedisBase,
@@ -27,7 +60,7 @@ pub async fn connect(
     kafka_addr: &str,
 ) -> Result<
     (
-        ConnState,
+        watch::Receiver<ConnState>,
         impl ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send + 'static,
     ),
     Report,
@@ -42,34 +75,18 @@ pub async fn connect(
     // )
 
     // 1. gcp-only part (no kafka option)
-    // We repeat SerializeChunnel in both sides because the SerializeChunnel is actually different
-    // in either case due to the different data types.
-    let (gcp_st, gcp_switch_ordering_handle) = UpgradeSelect::from_select(Select::from((
-        CxList::from(Ordered::default())
-            .wrap(SerializeChunnel::default())
-            .wrap(Base64Chunnel::default())
-            .wrap(PubSubChunnel::new(gcloud_client.clone(), [topic])),
-        CxList::from(SerializeChunnel::default())
-            .wrap(Base64Chunnel::default())
-            .wrap(OrderedPubSubChunnel::from(PubSubChunnel::new(
-                gcloud_client.clone(),
-                [topic],
-            ))),
-    )));
+    let (gcp_st, gcp_switch_ordering_handle) = gcp_stack!(topic, gcloud_client);
     // 2. kafka option.
     // kafka guarantees ordering within a partition, and in the case in which client-side ordering
     // might help - a single consumer - that consumer would pull from one partition at a time
     // only anyway. so, there's no point trying to get lower latency by increasing the number
     // of partitions.
-    //
-    // Since kafka will either be available or not, we don't need an UpgradeSelect here, we just
-    // need to decide once. Select by default prefers the left (first) option.
-    let st = Select::from((
+    let (st, kafka_gcp_handle) = UpgradeSelect::from_select(Select::from((
         CxList::from(SerializeChunnel::default())
             .wrap(Base64Chunnel::default())
             .wrap(KafkaChunnel::new(kafka_addr, [topic])),
         gcp_st,
-    ));
+    )));
 
     // 3. initial negotiation and spawn the manager task.
     let (cn, stack_negotiation_manager) = negotiate_rendezvous(st, redis, topic.to_owned()).await?;
@@ -82,27 +99,70 @@ pub async fn connect(
         .or(Some(ConnState::KafkaOrdering))
         .unwrap();
     info!(?cn_state, "Established connection");
+    let (cn_state_watcher_s, cn_state_watcher_r) = watch::channel(cn_state);
     tokio::spawn(conn_negotiation_manager(
         topic.to_owned(),
+        cn_state_watcher_s,
         stack_negotiation_manager,
+        Some(kafka_gcp_handle),
         gcp_switch_ordering_handle,
     ));
-    Ok((cn_state, cn))
+    Ok((cn_state_watcher_r, cn))
+}
+
+pub async fn connect_gcp_only(
+    topic: &str,
+    redis: RedisBase,
+    gcloud_client: GcpClient,
+) -> Result<
+    (
+        watch::Receiver<ConnState>,
+        impl ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send + 'static,
+    ),
+    Report,
+> {
+    let (gcp_st, gcp_switch_ordering_handle) = gcp_stack!(topic, gcloud_client);
+    let (cn, stack_negotiation_manager) =
+        negotiate_rendezvous(gcp_st, redis, topic.to_owned()).await?;
+    let cn_state = gcp_switch_ordering_handle
+        .current()
+        .map(|e| match e {
+            Either::Left(()) => ConnState::GcpClientSideOrdering,
+            Either::Right(()) => ConnState::GcpServiceSideOrdering,
+        })
+        .ok_or_else(|| eyre!("GCP stack should be active"))?;
+    info!(?cn_state, "Established connection");
+    let (cn_state_watcher_s, cn_state_watcher_r) = watch::channel(cn_state);
+    tokio::spawn(conn_negotiation_manager(
+        topic.to_owned(),
+        cn_state_watcher_s,
+        stack_negotiation_manager,
+        None,
+        gcp_switch_ordering_handle,
+    ));
+    Ok((cn_state_watcher_r, cn))
 }
 
 #[instrument(
-    skip(stack_negotiation_manager, gcp_switch_ordering_handle,),
+    skip(
+        cn_state_watcher,
+        stack_negotiation_manager,
+        kafka_gcp_handle,
+        gcp_switch_ordering_handle,
+    ),
     level = "debug"
 )]
 async fn conn_negotiation_manager(
     topic: String,
+    cn_state_watcher: watch::Sender<ConnState>,
     mut stack_negotiation_manager: StackUpgradeHandle<RedisBase>,
+    kafka_gcp_handle: Option<Arc<UpgradeHandle>>,
     gcp_switch_ordering_handle: Arc<UpgradeHandle>,
 ) {
     let mut num_participants_changed_listener = stack_negotiation_manager
         .conn_participants_changed_receiver
         .clone();
-
+    let mut gcp_changed = Box::pin(gcp_switch_ordering_handle.stack_changed());
     loop {
         tokio::select! {
             exit = stack_negotiation_manager.monitor_connection_negotiation_state() => {
@@ -112,7 +172,9 @@ async fn conn_negotiation_manager(
 
                 return;
             }
-            _ = num_participants_changed_listener.changed() => {
+            // if the kafka stack is available and we are using it, we don't need to switch between
+            // ordering implementations based on the number of participants.
+            _ = num_participants_changed_listener.changed(), if !matches!(kafka_gcp_handle.as_ref().and_then(|h| h.current()), Some(Either::Left(()))) => {
                 let new_num_participants = *num_participants_changed_listener.borrow_and_update();
                 info!(
                     ?new_num_participants,
@@ -129,6 +191,20 @@ async fn conn_negotiation_manager(
                 if let Err(err) = res {
                     warn!(?err, "stack transition failed");
                 }
+            }
+            _ = (&mut gcp_changed), if kafka_gcp_handle.is_some() => {
+                let cn_state = gcp_switch_ordering_handle
+                    .current()
+                    .map(|e| match e {
+                        Either::Left(()) => ConnState::GcpClientSideOrdering,
+                        Either::Right(()) => ConnState::GcpServiceSideOrdering,
+                    })
+                    .or(Some(ConnState::KafkaOrdering))
+                    .unwrap();
+                cn_state_watcher.send_replace(cn_state);
+
+                // make a new future
+                gcp_changed = Box::pin(gcp_switch_ordering_handle.stack_changed());
             }
         }
     }
