@@ -1,7 +1,8 @@
 use bertha::{
     bincode::{Base64Chunnel, SerializeChunnel},
-    negotiate_rendezvous, ChunnelConnection, CxList, Either, Select, StackUpgradeHandle,
-    UpgradeHandle, UpgradeSelect,
+    negotiate_rendezvous,
+    tagger::OrderedChunnel,
+    ChunnelConnection, CxList, Either, Select, StackUpgradeHandle, UpgradeHandle, UpgradeSelect,
 };
 use color_eyre::{eyre::eyre, Report};
 use gcp_pubsub::{GcpClient, OrderedPubSubChunnel, PubSubChunnel};
@@ -38,8 +39,11 @@ impl ConnState {
 macro_rules! gcp_stack {
     ($topic: expr, $gcloud_client: expr) => {{
         // We repeat SerializeChunnel in both sides because the SerializeChunnel is actually different in either case due to the different data types.
+        let mut ord = OrderedChunnel::default();
+        ord.ordering_threshold(10);
+        let ord: Ordered = ord.into();
         UpgradeSelect::from_select(Select::from((
-            CxList::from(Ordered::default())
+            CxList::from(ord)
                 .wrap(SerializeChunnel::default())
                 .wrap(Base64Chunnel::default())
                 .wrap(PubSubChunnel::new($gcloud_client.clone(), [$topic])),

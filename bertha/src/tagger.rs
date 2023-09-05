@@ -165,26 +165,33 @@ where
                         if let Some(DataPair(seq, _)) = st.recvd.peek() {
                             let mut pop = *seq == st.expected_recv;
                             if let Some(thresh) = self.hole_thresh {
-                                pop = pop || (st.recvd.len() > thresh);
+                                let give_up = st.expected_recv + (thresh as u32) < *seq;
+                                if give_up {
+                                    trace!(?seq, ?st.expected_recv, ?thresh, "hole exceeded threshold, returning");
+                                }
+
+                                pop = pop || give_up;
                             }
 
                             if pop {
-                                trace!(addr = ?a, seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "returning ordered packet");
-                                st.expected_recv += 1;
-                                msgs_buf[slot_idx] = Some(st.recvd.pop().unwrap().1);
+                                let DataPair(seq, body) = st.recvd.pop().unwrap();
+                                st.expected_recv = seq + 1;
+                                msgs_buf[slot_idx] = Some(body);
                                 slot_idx += 1;
+                                trace!(addr = ?a, seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "returning ordered packet");
                                 continue 'peel;
-                            } else {
-                                trace!(addr = ?a, head_seq = ?seq, next_expected = ?st.expected_recv, pileup = ?st.recvd.len(), "calling inner recv");
                             }
                         }
                     }
 
-                    // need to fill.
-                    let mut slots: Vec<_> = (0..msgs_buf.len() - slot_idx).map(|_| None).collect();
-                    let msgs = self.inner.recv(&mut slots).await?;
+                    if slot_idx > 0 {
+                        return Ok(&mut msgs_buf[..slot_idx]);
+                    }
 
-                    for (from, (seq, data)) in msgs.into_iter().map_while(Option::take) {
+                    // need to fill.
+                    let mut slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+                    let msgs = self.inner.recv(&mut slots).await?;
+                    for (from, (seq, data)) in msgs.iter_mut().map_while(Option::take) {
                         trace!(seq = ?seq, ?from, "received pkt, locking state");
                         let mut st = self.state.entry(from.clone()).or_default();
                         #[allow(clippy::comparison_chain)]
@@ -201,7 +208,9 @@ where
                         }
                     }
 
-                    return Ok(msgs_buf);
+                    if slot_idx > 0 {
+                        return Ok(&mut msgs_buf[..slot_idx]);
+                    }
                 }
             }
             .instrument(tracing::trace_span!("ordered_recv")),
@@ -264,7 +273,7 @@ mod test {
     where
         C: ChunnelConnection<Data = ((), Vec<u8>)> + Send + Sync + 'static,
     {
-        let msgs: Vec<_> = (0..10).map(|i| ((), vec![i; 10])).collect();
+        let msgs: Vec<_> = (0..20).map(|i| ((), vec![i; 10])).collect();
 
         let ms = msgs.clone();
         tokio::spawn(
@@ -283,7 +292,7 @@ mod test {
         loop {
             debug!("calling recv");
             let ms = rcv_ch.recv(&mut slots).await.unwrap();
-            for m in ms.into_iter().map_while(Option::take) {
+            for m in ms.iter_mut().map_while(Option::take) {
                 debug!(m = ?m, "rcvd");
                 assert_eq!(m, msgs[cnt]);
                 cnt += 1;
@@ -301,7 +310,7 @@ mod test {
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
-        let _guard = subscriber.try_init().unwrap_or(());
+        subscriber.try_init().unwrap_or(());
         COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -337,7 +346,7 @@ mod test {
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
-        let _guard = subscriber.try_init().unwrap_or(());
+        subscriber.try_init().unwrap_or(());
         COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -398,7 +407,7 @@ mod test {
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
-        let _guard = subscriber.try_init().unwrap_or(());
+        subscriber.try_init().unwrap_or(());
         COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -433,6 +442,92 @@ mod test {
                 let snd = stack.connect_wrap(cln).await?;
 
                 do_transmit(snd, rcv).await;
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::info_span!("delivery")),
+        )
+        .unwrap();
+    }
+
+    async fn do_transmit_hole<C>(snd_ch: C, rcv_ch: C)
+    where
+        C: ChunnelConnection<Data = ((), Vec<u8>)> + Send + Sync + 'static,
+    {
+        let msgs: Vec<_> = (0..40).map(|i| ((), vec![i; 10])).collect();
+
+        let ms = msgs.clone();
+        tokio::spawn(
+            async move {
+                snd_ch.send(msgs).await?;
+                let _: () = futures_util::future::pending().await;
+                Ok::<_, Report>(())
+            }
+            .instrument(tracing::debug_span!("sender")),
+        );
+
+        let msgs = ms;
+        info!("starting receiver");
+        let mut cnt = 0;
+        let mut slots: Vec<_> = (0..8).map(|_| None).collect();
+        loop {
+            debug!("calling recv");
+            let ms = rcv_ch.recv(&mut slots).await.unwrap();
+            for m in ms.iter_mut().map_while(Option::take) {
+                if (cnt / 7) % 2 == 0 {
+                    cnt += 7;
+                }
+                debug!(m = ?m, "rcvd");
+                assert_eq!(m, msgs[cnt]);
+                cnt += 1;
+                if cnt == msgs.len() {
+                    info!("done");
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hole() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        subscriber.try_init().unwrap_or(());
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(
+            async move {
+                let mut t = Chan::<((), (u32, Vec<u8>)), _>::default();
+                t.link_conditions(move |x: Option<_>| match x {
+                    Some((_, (seq, buf))) => {
+                        if (seq / 7) % 2 == 0 {
+                            None
+                        } else {
+                            Some(((), (seq, buf)))
+                        }
+                    }
+                    None => None,
+                });
+
+                let (mut srv, mut cln) = t.split();
+
+                let mut stack = OrderedChunnel::default();
+                stack.ordering_threshold(5);
+
+                let rcv_st = srv.listen(()).await?;
+                let mut rcv_st = stack.serve(rcv_st).await?;
+                let rcv = rcv_st.next().await.unwrap().unwrap();
+
+                let cln = cln.connect(()).await?;
+                let snd = stack.connect_wrap(cln).await?;
+
+                do_transmit_hole(snd, rcv).await;
                 Ok::<_, Report>(())
             }
             .instrument(tracing::info_span!("delivery")),
