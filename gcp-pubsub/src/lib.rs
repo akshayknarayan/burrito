@@ -252,10 +252,9 @@ impl ChunnelConnection for PubSubConn {
                 };
 
                 let mut m = PublishMessage::from(body.into_bytes());
-                if let Some(g) = group.clone() {
+                if let Some(g) = group.as_ref() {
                     m = m.with_ordering_key(g);
                 }
-
                 v.entry(group).or_insert(Vec::new()).push(m);
             }
 
@@ -440,7 +439,7 @@ impl OrderedPubSubConn {
     ) -> Result<Self, Report> {
         let (subscriptions, topics) =
             make_subscriptions(ps_client.clone(), recv_topics, true).await?;
-
+        debug!(num_subs = ?subscriptions.len(), "returning new ordered gcp connection");
         Ok(OrderedPubSubConn {
             inner: PubSubConn {
                 ps_client,
@@ -472,84 +471,7 @@ impl ChunnelConnection for OrderedPubSubConn {
         B: IntoIterator<Item = Self::Data> + Send + 'cn,
         <B as IntoIterator>::IntoIter: Send,
     {
-        let mut ps_client = self.inner.ps_client.clone();
-        Box::pin(async move {
-            let msgs_with_cached_topics: Vec<_> = {
-                let mut topics_local = self.inner.topics.lock().unwrap();
-                burst
-                    .into_iter()
-                    .map(|(MessageQueueAddr { topic_id, group }, body)| {
-                        (
-                            topics_local
-                                .get_mut(&topic_id)
-                                .map(|t| {
-                                    (
-                                        MessageQueueAddr {
-                                            topic_id: topic_id.clone(),
-                                            group: group.clone(),
-                                        },
-                                        t.clone(),
-                                    )
-                                })
-                                .ok_or(MessageQueueAddr {
-                                    topic_id: topic_id.clone(),
-                                    group: group.clone(),
-                                }),
-                            body,
-                        )
-                    })
-                    .collect()
-            }; // unlock self.topics to avoid holding the lock across the await point below
-
-            let mut new_topics: HashMap<_, _> = Default::default();
-            let mut topic_batches: HashMap<_, (Topic, Vec<_>)> = Default::default();
-            for (maybe_topic, body) in msgs_with_cached_topics {
-                match maybe_topic {
-                    Ok((tname, t)) => {
-                        let (_, v) = topic_batches
-                            .entry(tname.topic_id)
-                            .or_insert((t.clone(), Vec::new()));
-                        v.push(
-                            PublishMessage::from(body.into_bytes()).with_ordering_key(
-                                tname.group.ok_or_else(|| {
-                                    eyre!("Ordered send must include ordering group")
-                                })?,
-                            ),
-                        );
-                    }
-                    Err(MessageQueueAddr { topic_id, group }) => {
-                        let t = ps_client
-                            .topic(&topic_id)
-                            .await
-                            .wrap_err_with(|| eyre!("get topic {:?}", &topic_id))?
-                            .ok_or_else(|| eyre!("topic not found: {:?}", &topic_id))?;
-                        new_topics.insert(topic_id.clone(), t.clone());
-                        let (_, v) = topic_batches.entry(topic_id).or_insert((t, Vec::new()));
-                        v.push(
-                            PublishMessage::from(body.into_bytes()).with_ordering_key(
-                                group.ok_or_else(|| {
-                                    eyre!("Ordered send must include ordering group")
-                                })?,
-                            ),
-                        );
-                    }
-                };
-            }
-
-            for (topic_id, (mut topic, msg_batch)) in topic_batches {
-                topic
-                    .publish::<_, _, Vec<u8>>(msg_batch.into_iter())
-                    .await
-                    .wrap_err_with(|| eyre!("Send on topic: {:?}", &topic_id))?;
-            }
-
-            {
-                let mut topics_local = self.inner.topics.lock().unwrap();
-                topics_local.extend(new_topics);
-            }
-
-            Ok(())
-        })
+        self.inner.send(burst)
     }
 
     fn recv<'cn, 'buf>(
