@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex as TokioMutex};
-use tracing::{debug, instrument, trace};
+use tracing::{debug, debug_span, instrument, trace, Instrument};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RendezvousEntry {
@@ -306,6 +306,7 @@ where
             applied,
             left_saved,
             right_saved,
+            picked.clone(),
             self.trigger,
             self.stack_changed,
         );
@@ -323,6 +324,7 @@ pub struct UpgradeEitherApply<A: Apply, B: Apply> {
     left: A,
     right: B,
     current: Either<A::Applied, B::Applied>,
+    picked: StackNonce,
     switch_listener: watch::Receiver<StackNonce>,
     stack_changed: Arc<watch::Sender<Option<Either<(), ()>>>>,
 }
@@ -332,6 +334,7 @@ impl<A: Apply, B: Apply> UpgradeEitherApply<A, B> {
         applied: Either<A::Applied, B::Applied>,
         a_saved: A,
         b_saved: B,
+        picked: StackNonce,
         switch_listener: watch::Receiver<StackNonce>,
         stack_changed: Arc<watch::Sender<Option<Either<(), ()>>>>,
     ) -> Self {
@@ -339,6 +342,7 @@ impl<A: Apply, B: Apply> UpgradeEitherApply<A, B> {
             left: a_saved,
             right: b_saved,
             current: applied,
+            picked,
             switch_listener,
             stack_changed,
         }
@@ -371,6 +375,7 @@ where
         let right = self.right.clone();
         let sl = self.switch_listener.clone();
         let sc = self.stack_changed.clone();
+        let p = self.picked.clone();
         match self {
             UpgradeEitherApply {
                 current: Either::Left(ref mut ach),
@@ -384,7 +389,7 @@ where
                         right,
                         base: cn,
                         current: Arc::new(TokioMutex::new(Either::Left(acn))),
-                        switch_listener: sl,
+                        switch_listener: Arc::new(TokioMutex::new((sl, p, None))),
                         stack_changed: sc,
                     })
                 })
@@ -401,7 +406,7 @@ where
                         right,
                         base: cn,
                         current: Arc::new(TokioMutex::new(Either::Right(bcn))),
-                        switch_listener: sl,
+                        switch_listener: Arc::new(TokioMutex::new((sl, p, None))),
                         stack_changed: sc,
                     })
                 })
@@ -410,14 +415,35 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct UpgradeEitherConn<A, B, Acn, Bcn, InC> {
     left: A,
     right: B,
     base: Arc<InC>,
     current: Arc<TokioMutex<Either<Acn, Bcn>>>,
-    switch_listener: watch::Receiver<StackNonce>,
+    switch_listener: Arc<
+        TokioMutex<(
+            watch::Receiver<StackNonce>,
+            StackNonce,
+            Option<Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>>>,
+        )>,
+    >,
     stack_changed: Arc<watch::Sender<Option<Either<(), ()>>>>,
+}
+
+impl<A, B, Acn, Bcn, InC> Debug for UpgradeEitherConn<A, B, Acn, Bcn, InC>
+where
+    A: Debug,
+    B: Debug,
+    InC: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpgradeEitherConn")
+            .field("left", &self.left)
+            .field("right", &self.right)
+            .field("base", &self.base)
+            .finish()
+    }
 }
 
 impl<A, B, Acn, Bcn, InC, D> ChunnelConnection for UpgradeEitherConn<A, B, Acn, Bcn, InC>
@@ -429,10 +455,10 @@ where
         Chunnel<Arc<InC>, Connection = Either<Acn, Bcn>>,
     <Either<<A as Apply>::Applied, <B as Apply>::Applied> as Chunnel<Arc<InC>>>::Error:
         Into<Report>,
-    Acn: ChunnelConnection<Data = D> + Send + Sync,
-    Bcn: ChunnelConnection<Data = D> + Send + Sync,
+    Acn: ChunnelConnection<Data = D> + Send + Sync + 'static,
+    Bcn: ChunnelConnection<Data = D> + Send + Sync + 'static,
     D: Send,
-    InC: Send + Sync,
+    InC: Send + Sync + 'static,
 {
     type Data = D;
 
@@ -444,15 +470,25 @@ where
         R: IntoIterator<Item = Self::Data> + Send + 'cn,
         <R as IntoIterator>::IntoIter: Send,
     {
-        let mut switch_listener = self.switch_listener.clone();
         Box::pin(async move {
-            if switch_listener.has_changed()? {
-                let v = switch_listener.borrow_and_update().clone();
-                self.try_upgrade(v)
-                    .await
-                    .wrap_err("UpgradeEitherConn could not apply new stack")?;
+            let mut sl_g = self.switch_listener.lock().await;
+            let (ref mut listener, ref mut curr_nonce, ref mut in_progress) = *sl_g;
+            if in_progress.is_none() {
+                if listener.has_changed()? {
+                    let v = listener.borrow_and_update();
+                    if *v != *curr_nonce {
+                        *curr_nonce = v.clone();
+                        *in_progress = Some(self.try_upgrade(v.clone()));
+                    }
+                }
             }
 
+            if let Some(f) = in_progress.as_mut() {
+                f.await?;
+                *in_progress = None;
+            }
+
+            std::mem::drop(sl_g);
             self.current.lock().await.send(burst).await
         })
     }
@@ -464,16 +500,29 @@ where
     where
         'buf: 'cn,
     {
-        let mut switch_listener = Some(self.switch_listener.clone());
         Box::pin(async move {
             // since we select on non-recv stuff, we loop back in those cases until recv() happens.
             loop {
-                let sl = switch_listener.take();
-                let upgrade_fut = async move {
-                    let mut sl = sl.unwrap();
-                    sl.changed().await.wrap_err("sender dropped")?;
-                    let v = sl.borrow_and_update().clone();
-                    Ok::<_, Report>((sl, v))
+                let upgrade_fut = async {
+                    let mut sl_g = self.switch_listener.lock().await;
+                    let (ref mut listener, ref mut curr_nonce, ref mut in_progress) = *sl_g;
+                    loop {
+                        if in_progress.is_some() {
+                            debug!("try_upgrade already in progress");
+                            break;
+                        } else {
+                            listener.changed().await.wrap_err("sender dropped")?;
+                            let v = listener.borrow_and_update();
+                            if *v != *curr_nonce {
+                                debug!("new try_upgrade");
+                                *curr_nonce = v.clone();
+                                *in_progress = Some(self.try_upgrade(v.clone()));
+                                break;
+                            }
+                        }
+                    }
+
+                    Ok::<_, Report>(())
                 };
 
                 let mut slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
@@ -497,15 +546,19 @@ where
 
                         return Ok(&mut msgs_buf[..slot_idx]);
                     }
-                    future::Either::Right((x, recvr)) => {
+                    future::Either::Right((do_upgrade, recvr)) => {
                         // important: cancel the recv() future and drop, so its lock on inner is
                         // dropped. otherwise try_upgrade() will try to take the lock and deadlock.
                         std::mem::drop(recvr);
-                        let (sl, upgrade) = x?;
-                        switch_listener = Some(sl);
-                        self.try_upgrade(upgrade)
+                        do_upgrade?;
+                        let mut sl_g = self.switch_listener.lock().await;
+                        let (_, _, ref mut in_progress) = *sl_g;
+                        in_progress
+                            .as_mut()
+                            .unwrap()
                             .await
                             .wrap_err("UpgradeEitherConn could not apply new stack")?;
+                        *in_progress = None;
                         continue;
                     }
                 };
@@ -516,32 +569,55 @@ where
 
 impl<A, B, Acn, Bcn, InC> UpgradeEitherConn<A, B, Acn, Bcn, InC>
 where
-    A: Apply + Clone,
-    B: Apply + Clone,
+    A: Apply + Clone + Send + 'static,
+    B: Apply + Clone + Send + 'static,
     Select<A, B>: Apply<Applied = Either<<A as Apply>::Applied, <B as Apply>::Applied>>,
     Either<<A as Apply>::Applied, <B as Apply>::Applied>:
         Chunnel<Arc<InC>, Connection = Either<Acn, Bcn>>,
+    InC: Send + Sync + 'static,
+    Acn: ChunnelConnection + Send + 'static,
+    Bcn: ChunnelConnection + Send + 'static,
     <Either<<A as Apply>::Applied, <B as Apply>::Applied> as Chunnel<Arc<InC>>>::Error:
         Into<Report>,
 {
-    async fn try_upgrade(&self, new_offers: StackNonce) -> Result<(), Report> {
+    fn try_upgrade(
+        &self,
+        new_offers: StackNonce,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'static>> {
         debug!(?new_offers, "received on upgrade channel");
-        let new_fut = {
-            let sel = Select::from((self.left.clone(), self.right.clone()));
-            let ApplyResult { mut applied, .. } = sel.apply(new_offers)?;
-            applied.connect_wrap(self.base.clone())
-        }; // drop applied so it is not held across await
+        let sel = Select::from((self.left.clone(), self.right.clone()));
+        let base = self.base.clone();
+        let current = self.current.clone();
+        let changed = self.stack_changed.clone();
+        Box::pin(
+            async move {
+                let new_fut = {
+                    let ApplyResult { mut applied, .. } = sel.apply(new_offers)?;
+                    debug!("applied new offers");
+                    applied.connect_wrap(base)
+                }; // drop applied so it is not held across await
 
-        let new = new_fut.await.map_err(Into::into)?;
-        let v = match new {
-            Either::Left(_) => Either::Left(()),
-            Either::Right(_) => Either::Right(()),
-        };
-        let mut inner = self.current.lock().await;
-        trace!("applying upgraded semantics");
-        *inner = new;
-        self.stack_changed.send(Some(v)).unwrap();
-        Ok(())
+                let new = new_fut.await.map_err(Into::into)?;
+                let v = match new {
+                    Either::Left(_) => Either::Left(()),
+                    Either::Right(_) => Either::Right(()),
+                };
+                let mut inner = current.lock().await;
+                debug!("applying upgraded semantics");
+                *inner = new;
+
+                changed.send_if_modified(|curr| {
+                    if *curr != Some(v) {
+                        *curr = Some(v);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                Ok(())
+            }
+            .instrument(debug_span!("try_upgrade")),
+        )
     }
 }
 
@@ -604,7 +680,10 @@ where
     debug!(matched = entry.is_none(), num_selects = ?handles.len(), "try_init completed");
     let (entry, mut applied) = if let Some(existing_remote_stack) = entry {
         match stack.clone().apply(existing_remote_stack.clone().nonce) {
-            Ok(ApplyResult { applied, .. }) => (existing_remote_stack, applied),
+            Ok(ApplyResult { applied, .. }) => {
+                debug!("remote stack was compatible, applied");
+                (existing_remote_stack, applied)
+            }
             Err(orig_apply_error) => {
                 debug!(
                     ?existing_remote_stack,
@@ -623,7 +702,7 @@ where
                     )
                     .await
                     .map_err(Into::into)
-                    .wrap_err(eyre!("Transition failed after trying to apply remote stack failed. The stacks must be incompatible.").wrap_err(orig_apply_error))?;
+                    .wrap_err_with(|| eyre!("Transition failed after trying to apply remote stack failed. The stacks must be incompatible.").wrap_err(orig_apply_error))?;
                 let ApplyResult { applied, .. } = stack
                     .apply(picked.clone())
                     .expect("solo_monomorphize means self-application will work");
@@ -739,9 +818,14 @@ impl UpgradeHandle {
     }
 
     fn switch_to_stack(&self, new_stack: StackNonce) {
-        self.trigger_locally
-            .send(new_stack)
-            .expect("Sends only happen if .closed().await did not complete");
+        self.trigger_locally.send_if_modified(|curr_val| {
+            if *curr_val != new_stack {
+                *curr_val = new_stack;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     fn check_compatibility(&self, new_stack: &StackNonce) -> bool {
@@ -863,9 +947,8 @@ where
                         done.send(res).expect("oneshot receiver won't drop");
                     }
                 }
-                notify_res = self.negotiator
-                    .notify(self.addr.clone(), self.curr_entry.clone(), self.curr_round) => {
-                        self.handle_notify(notify_res.map_err(Into::into)).await?;
+                notify_res = self.negotiator.notify(self.addr.clone(), self.curr_entry.clone(), self.curr_round) => {
+                    self.handle_notify(notify_res.map_err(Into::into)).await?;
                 }
             };
         }

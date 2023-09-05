@@ -22,7 +22,7 @@ impl RedisBase {
     pub async fn new(redis_addr: &str) -> Result<Self, Report> {
         async fn get(redis_addr: &str) -> Result<redis::aio::Connection, Report> {
             let redis_client = redis::Client::open(redis_addr)
-                .wrap_err(eyre!("Opening redis connection: {:?}", redis_addr))?;
+                .wrap_err_with(|| eyre!("Opening redis connection: {:?}", redis_addr))?;
             let mut redis_conn = redis_client
                 .get_async_connection()
                 .await
@@ -96,7 +96,7 @@ impl RendezvousBackend for RedisBase {
                     .arg(insert_time)
                     .invoke_async(&mut self.redis_conn)
                     .await
-                    .wrap_err(eyre!("try_init failed on {:?}", &addr))?;
+                    .wrap_err_with(|| eyre!("try_init failed on {:?}", &addr))?;
                 if joined {
                     Ok(NegotiateRendezvousResult::Matched {
                         num_participants: 1,
@@ -581,6 +581,7 @@ impl RedisBase {
         addr_members.push_str("-members");
         let mut round_ctr_key = addr.clone();
         round_ctr_key.push_str("-roundctr");
+        self.redis_pubsub.punsubscribe("*").await?;
         let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
         let channel_name = format!("__keyspace@*__:{}", &staged_commit_counter);
         self.redis_pubsub.psubscribe(&channel_name).await?;
@@ -601,7 +602,12 @@ impl RedisBase {
                     let event = msg
                         .get_payload::<String>()
                         .wrap_err_with(|| eyre!("Get payload from message: {:?}", &msg))?;
-                    debug!(?event, ?round_ctr, "staged-update value changed");
+                    if !msg.get_channel::<String>()?.ends_with("committed-cnt") {
+                        debug!(?msg, "got spurious notification");
+                        continue;
+                    }
+
+                    debug!(?msg, ?event, ?round_ctr, "staged-update value changed");
 
                     event.contains("del")
                 }
@@ -625,6 +631,7 @@ impl RedisBase {
                 .await
                 {
                     debug!(?err, "refresh_commit failed");
+                    break;
                 }
             }
 
@@ -666,6 +673,7 @@ impl RedisBase {
     ) -> Result<(), Report> {
         let mut addr_members = addr.clone();
         addr_members.push_str("-members");
+        self.redis_pubsub.punsubscribe("*").await?;
         let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
         let channel_name = format!("__keyspace@*__:{}", &staged_commit_counter);
         self.redis_pubsub.psubscribe(&channel_name).await?;
