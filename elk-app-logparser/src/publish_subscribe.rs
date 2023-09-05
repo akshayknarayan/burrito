@@ -195,6 +195,7 @@ async fn conn_negotiation_manager(
         stack_negotiation_manager.monitor_connection_negotiation_state();
     let mut monitor_connection_negotiation_state =
         std::pin::pin!(monitor_connection_negotiation_state);
+    let mut transition_in_progress = Either::Left(futures_util::future::pending());
     loop {
         tokio::select! {
             exit = &mut monitor_connection_negotiation_state => {
@@ -204,25 +205,45 @@ async fn conn_negotiation_manager(
 
                 return;
             }
+            res = &mut transition_in_progress, if transition_in_progress.is_right() => {
+                transition_in_progress = Either::Left(futures_util::future::pending());
+                if let Err(err) = res {
+                    warn!(?err, "stack transition failed");
+                } else {
+                    let cn_state = gcp_switch_ordering_handle
+                        .current()
+                        .map(|e| match e {
+                            Either::Left(()) => ConnState::GcpClientSideOrdering,
+                            Either::Right(()) => ConnState::GcpServiceSideOrdering,
+                        })
+                        .or(Some(ConnState::KafkaOrdering))
+                        .unwrap();
+                    info!(?cn_state, "did transition");
+                }
+            }
             // if the kafka stack is available and we are using it, we don't need to switch between
             // ordering implementations based on the number of participants.
             _ = num_participants_changed_listener.changed(), if !matches!(kafka_gcp_handle.as_ref().and_then(|h| h.current()), Some(Either::Left(()))) => {
                 let new_num_participants = *num_participants_changed_listener.borrow_and_update();
+                let cn_state = gcp_switch_ordering_handle
+                    .current()
+                    .map(|e| match e {
+                        Either::Left(()) => ConnState::GcpClientSideOrdering,
+                        Either::Right(()) => ConnState::GcpServiceSideOrdering,
+                    })
+                    .or(Some(ConnState::KafkaOrdering))
+                    .unwrap();
                 info!(
                     ?new_num_participants,
-                    "num participants change, transitioning"
+                    ?cn_state,
+                    "num participants changed"
                 );
-
-                let res = match new_num_participants {
-                    0 => unreachable!(),
-                    1 | 2 => gcp_switch_ordering_handle.trigger_left().await,
-                    3.. => gcp_switch_ordering_handle.trigger_right().await,
+                let trans_fut: Pin<Box<dyn Future<Output = Result<(), Report>> + Send>> = match new_num_participants {
+                    1 | 2 => Box::pin(gcp_switch_ordering_handle.trigger_left()) as Pin<Box<_>>,
+                    3.. => Box::pin(gcp_switch_ordering_handle.trigger_right()) as Pin<Box<_>>,
                     _ => unreachable!(),
                 };
-
-                if let Err(err) = res {
-                    warn!(?err, "stack transition failed");
-                }
+                transition_in_progress = Either::Right(trans_fut);
             }
             _ = (&mut gcp_changed), if kafka_gcp_handle.is_some() => {
                 let cn_state = gcp_switch_ordering_handle

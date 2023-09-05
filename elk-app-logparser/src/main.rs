@@ -169,7 +169,7 @@ async fn inner(
 
             conn.send(batch).await?;
             info!("sent");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
         delete_topic(curr_cn_state, &opt.kafka_addr, &mut gcp_client).await?;
