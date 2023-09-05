@@ -66,7 +66,7 @@ impl UpgradeStream {
             self.swap_barrier.read().unwrap().wait();
             self.updates
                 .recv()
-                .wrap_err(eyre!("stream update wait on port {}", self.port))
+                .wrap_err_with(|| eyre!("stream update wait on port {}", self.port))
                 .expect("datapath update sender disappeared")
         };
 

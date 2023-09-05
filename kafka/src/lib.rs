@@ -42,7 +42,9 @@ pub async fn make_topics(addr: String, topics: Vec<String>) -> Result<(), Report
         .into_iter()
         .map(|r| match r {
             Ok(_) | Err((_, RDKafkaErrorCode::TopicAlreadyExists)) => Ok(()),
-            Err((t, err)) => Err(eyre!(err).wrap_err(eyre!("Failed to create topic {:?}", t))),
+            Err((t, err)) => {
+                Err(eyre!(err)).wrap_err_with(|| eyre!("Failed to create topic {:?}", t))
+            }
         })
         .collect()
 }
@@ -59,7 +61,9 @@ pub async fn delete_topic(addr: String, name: Vec<String>) -> Result<(), Report>
         .into_iter()
         .map(|r| match r {
             Ok(_) | Err((_, RDKafkaErrorCode::UnknownTopic)) => Ok(()),
-            Err((t, err)) => Err(eyre!(err).wrap_err(eyre!("Failed to delete topic {:?}", t))),
+            Err((t, err)) => {
+                Err(eyre!(err)).wrap_err_with(|| eyre!("Failed to delete topic {:?}", t))
+            }
         })
         .collect()
 }
@@ -125,6 +129,7 @@ impl<InC> Chunnel<InC> for KafkaChunnel {
             let cn = KafkaConn::new_with_cfg(producer_cfg, consumer_cfg)?;
             let t: Vec<&str> = self.topics.iter().map(|s| s.as_str()).collect();
             cn.listen(&t[..])?;
+            tracing::info!("new kafka connection");
             Ok(cn)
         })())
     }
@@ -258,7 +263,6 @@ impl ChunnelConnection for KafkaConn {
                 trace!(?topics, "receiving");
                 use rdkafka::message::Message;
                 let kafka_stream = self.consumer.stream();
-                trace!("waiting on kafka stream");
 
                 let mut slot_idx = 0;
                 for (msg, slot) in kafka_stream
@@ -282,7 +286,6 @@ impl ChunnelConnection for KafkaConn {
                     };
 
                     let topic_id = msg.topic().to_owned();
-                    trace!(?topic_id, "got msg");
                     *slot = Some((
                         MessageQueueAddr {
                             topic_id,
@@ -293,6 +296,7 @@ impl ChunnelConnection for KafkaConn {
                     slot_idx += 1;
                 }
 
+                trace!(num_msgs = ?slot_idx, "got msgs");
                 Ok(&mut msgs_buf[..slot_idx])
             }
             .instrument(debug_span!("kafka_recv")),
