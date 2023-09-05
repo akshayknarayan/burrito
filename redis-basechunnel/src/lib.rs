@@ -10,7 +10,7 @@ use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
 
 pub struct RedisBase {
-    redis_conn: redis::aio::Connection,
+    redis_conn: redis::aio::MultiplexedConnection,
     redis_pubsub: redis::aio::PubSub,
     liveness_timeout: std::time::Duration,
     // TODO: make this configurable, it could even be queryable and represent the client address if
@@ -20,26 +20,27 @@ pub struct RedisBase {
 
 impl RedisBase {
     pub async fn new(redis_addr: &str) -> Result<Self, Report> {
-        async fn get(redis_addr: &str) -> Result<redis::aio::Connection, Report> {
-            let redis_client = redis::Client::open(redis_addr)
-                .wrap_err_with(|| eyre!("Opening redis connection: {:?}", redis_addr))?;
-            let mut redis_conn = redis_client
-                .get_async_connection()
-                .await
-                .wrap_err("Connecting to redis")?;
-            redis::cmd("CONFIG")
-                .arg("SET")
-                .arg("notify-keyspace-events")
-                .arg("KEA")
-                .query_async(&mut redis_conn)
-                .await
-                .wrap_err("Enable keyspace events on redis server")?;
-            Ok(redis_conn)
-        }
-
+        let redis_client = redis::Client::open(redis_addr)
+            .wrap_err_with(|| eyre!("Opening redis connection: {:?}", redis_addr))?;
+        let mut redis_conn = redis_client
+            .get_multiplexed_tokio_connection()
+            .await
+            .wrap_err("Connecting to redis")?;
+        redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("notify-keyspace-events")
+            .arg("KEA")
+            .query_async(&mut redis_conn)
+            .await
+            .wrap_err("Enable keyspace events on redis server")?;
+        let redis_pubsub = redis_client
+            .get_tokio_connection()
+            .await
+            .wrap_err("Connecting to redis")?
+            .into_pubsub();
         Ok(RedisBase {
-            redis_conn: get(redis_addr).await?,
-            redis_pubsub: get(redis_addr).await?.into_pubsub(),
+            redis_conn,
+            redis_pubsub,
             liveness_timeout: std::time::Duration::from_secs(10),
             client_name: rand_name(),
         })
@@ -470,7 +471,7 @@ impl RendezvousBackend for RedisBase {
             async move {
                 let neg_nonce = bincode::serialize(&new_entry).wrap_err("serialize entry")?;
                 trace!("starting transition");
-                let (locked, round_ctr): (bool, usize) = ROUND_CTR_LOCK_SCRIPT.key(&round_ctr_key).invoke_async(&mut self.redis_conn).await?;
+                let (locked, round_ctr): (bool, usize) = ROUND_CTR_LOCK_SCRIPT.key(&round_ctr_key).invoke_async(&mut self.redis_conn).await.wrap_err("start transition failed")?;
                 let staged_val = format!("{}-{}-staged", &addr, round_ctr);
                 let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
 
@@ -739,7 +740,7 @@ impl RedisBase {
 }
 
 async fn refresh_commit(
-    redis_conn: &mut redis::aio::Connection,
+    redis_conn: &mut redis::aio::MultiplexedConnection,
     liveness_timeout: Duration,
     client_name: &str,
     addr: &str,
@@ -769,7 +770,7 @@ async fn refresh_commit(
 }
 
 async fn refresh_client(
-    redis_conn: &mut redis::aio::Connection,
+    redis_conn: &mut redis::aio::MultiplexedConnection,
     liveness_timeout: Duration,
     client_name: &str,
     addr: &str,
