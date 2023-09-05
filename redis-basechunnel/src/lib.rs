@@ -4,7 +4,8 @@
 use bertha::negotiate::{NegotiateRendezvousResult, RendezvousBackend, RendezvousEntry};
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};
 use futures_util::stream::StreamExt;
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Duration};
+use tokio::time::Instant;
 use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
 
@@ -22,17 +23,24 @@ impl RedisBase {
         async fn get(redis_addr: &str) -> Result<redis::aio::Connection, Report> {
             let redis_client = redis::Client::open(redis_addr)
                 .wrap_err(eyre!("Opening redis connection: {:?}", redis_addr))?;
-            let redis_conn = redis_client
+            let mut redis_conn = redis_client
                 .get_async_connection()
                 .await
                 .wrap_err("Connecting to redis")?;
+            redis::cmd("CONFIG")
+                .arg("SET")
+                .arg("notify-keyspace-events")
+                .arg("KEA")
+                .query_async(&mut redis_conn)
+                .await
+                .wrap_err("Enable keyspace events on redis server")?;
             Ok(redis_conn)
         }
 
         Ok(RedisBase {
             redis_conn: get(redis_addr).await?,
             redis_pubsub: get(redis_addr).await?.into_pubsub(),
-            liveness_timeout: std::time::Duration::from_secs(1),
+            liveness_timeout: std::time::Duration::from_secs(10),
             client_name: rand_name(),
         })
     }
@@ -266,65 +274,162 @@ impl RendezvousBackend for RedisBase {
         round_ctr_key.push_str("-roundctr");
         Box::pin(
             async move {
+                let curr_num_participants = match self
+                    .poll_entry(addr.clone(), curr_entry.clone(), curr_round)
+                    .await?
+                {
+                    NegotiateRendezvousResult::Matched {
+                        num_participants, ..
+                    } => num_participants,
+                    x @ NegotiateRendezvousResult::NoMatch { .. } => {
+                        return Ok(x);
+                    }
+                };
+
                 // there are 2 keys to listen on:
                 // 1. -members covers cases (1) and (2) above (join or leave)
                 // 2. -roundctr covers case (3) (transition)
-                let channel_ctr_name = format!("__keyspace@*__:{}", &addr_members);
-                self.redis_pubsub.psubscribe(&channel_ctr_name).await?;
-                let channel_name = format!("__keyspace@*__:{}", &round_ctr_key);
+                let channel_name = format!("__keyspace@*__:{}", &addr_members);
+                let channel_ctr_name = format!("__keyspace@*__:{}", &round_ctr_key);
                 self.redis_pubsub.psubscribe(&channel_name).await?;
-                // wait for some event on the key.
-                loop {
-                    let refresh_to = tokio::time::sleep(self.liveness_timeout / 2);
-                    tokio::pin!(refresh_to);
-                    match futures_util::future::select(
-                        self.redis_pubsub.on_message().next(),
-                        refresh_to,
-                    )
-                    .await
-                    {
-                        futures_util::future::Either::Left((Some(m), _)) => {
-                            trace!(?channel_ctr_name, ?channel_name, ?m, "subscribe got msg");
-                            break;
-                        }
-                        futures_util::future::Either::Left((None, _)) => {
-                            return Err(eyre!("redis server shut down"))
-                        }
-                        futures_util::future::Either::Right((_, _pubsub_fut)) => (),
-                    };
+                self.redis_pubsub.psubscribe(&channel_ctr_name).await?;
+                debug!(?channel_name, ?channel_ctr_name, "waiting for events");
 
-                    self.refresh_client(addr.clone())
-                        .await
-                        .wrap_err("call to refresh_client")?;
-                }
-
-                trace!("semantics changed");
-                self.redis_pubsub.punsubscribe(&channel_name).await?;
-                self.redis_pubsub.punsubscribe(&channel_ctr_name).await?;
-                // return result of polling now
-                // there is a race between the round_ctr incremented -> our notification -> read and the staged-key being written.
+                // there is a race between the round_ctr incremented -> our notification -> read
+                // and the staged-key being written. During this time poll_entry might return the
+                // error "round counter advanced but staged key empty".
                 // try to avoid this with a sleep and a retry loop.
-                let mut poll_retries = 0;
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    match self
-                        .poll_entry(addr.clone(), curr_entry.clone(), curr_round)
-                        .await
-                    {
-                        x @ Ok(_) => return x,
-                        Err(e) => {
-                            debug!(err = %format!("{:#}", &e), ?poll_retries, "Poll failed");
-                            if poll_retries > 10 {
-                                return Err(e).wrap_err("Poll after notify failed 10 times");
-                            }
-
-                            poll_retries += 1;
-                            self.refresh_client(addr.clone())
+                async fn retry_poll_loop(
+                    this: &mut RedisBase,
+                    addr: String,
+                    curr_entry: RendezvousEntry,
+                    curr_round: usize,
+                    curr_num_participants: usize,
+                ) -> Result<NegotiateRendezvousResult, Report> {
+                    let mut round_ctr_key = addr.clone();
+                    round_ctr_key.push_str("-roundctr");
+                    let mut addr_members = addr.clone();
+                    addr_members.push_str("-members");
+                    let mut poll_retries = 0;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        let (round_ctr, conn_count) = match {
+                            let mut r = redis::pipe();
+                            r.atomic()
+                                .get(&round_ctr_key)
+                                .zcard(&addr_members)
+                                .query_async::<_, (usize, usize)>(&mut this.redis_conn)
                                 .await
-                                .wrap_err("call to refresh_client")?;
+                        } {
+                            Ok(x) => x,
+                            Err(e) => {
+                                debug!(err = %format!("{:#}", &e), ?poll_retries, "Poll failed");
+                                if poll_retries > 10 {
+                                    return Err(e).wrap_err("Poll after notify failed 10 times");
+                                }
+
+                                poll_retries += 1;
+                                continue;
+                            }
+                        };
+
+                        // first, check the round.
+                        // if the round didn't change, then no transition has happened, so the semantics
+                        // won't have changed.
+                        // if it did change, then we need to look for the staged semantics.
+                        if round_ctr == curr_round && conn_count == curr_num_participants {
+                            trace!(
+                                ?round_ctr,
+                                ?conn_count,
+                                ?curr_num_participants,
+                                "Same round"
+                            );
+                            return Ok(NegotiateRendezvousResult::Matched {
+                                num_participants: conn_count,
+                                round_number: round_ctr,
+                            });
+                        }
+
+                        match this
+                            .poll_entry(addr.clone(), curr_entry.clone(), curr_round)
+                            .await
+                        {
+                            x @ Ok(_) => return x,
+                            Err(e) => {
+                                debug!(err = %format!("{:#}", &e), ?poll_retries, "Poll failed");
+                                if poll_retries > 10 {
+                                    return Err(e).wrap_err("Poll after notify failed 10 times");
+                                }
+
+                                poll_retries += 1;
+                            }
                         }
                     }
                 }
+
+                async fn notify_refresh_loop(
+                    this: &mut RedisBase,
+                    addr: String,
+                    curr_entry: RendezvousEntry,
+                    curr_round: usize,
+                    curr_num_participants: usize,
+                ) -> Result<NegotiateRendezvousResult, Report> {
+                    // wait for some event on the key.
+                    let mut next_refresh_time = Instant::now() + (this.liveness_timeout / 2);
+                    loop {
+                        let mut message_stream = this.redis_pubsub.on_message();
+                        'notify: loop {
+                            let refresh_to = tokio::time::sleep_until(next_refresh_time);
+                            tokio::pin!(refresh_to);
+                            match futures_util::future::select(message_stream.next(), refresh_to)
+                                .await
+                            {
+                                futures_util::future::Either::Left((Some(m), _)) => {
+                                    debug!(?m, "subscribe got msg");
+                                    break 'notify;
+                                }
+                                futures_util::future::Either::Left((None, _)) => {
+                                    return Err(eyre!("redis server shut down"))
+                                }
+                                futures_util::future::Either::Right((_, _pubsub_fut)) => {
+                                    refresh_client(
+                                        &mut this.redis_conn,
+                                        this.liveness_timeout,
+                                        &this.client_name,
+                                        &addr,
+                                    )
+                                    .await
+                                    .wrap_err("call to refresh_client")?;
+                                    next_refresh_time =
+                                        Instant::now() + (this.liveness_timeout / 2);
+                                }
+                            };
+                        }
+
+                        std::mem::drop(message_stream);
+                        match retry_poll_loop(
+                            this,
+                            addr.clone(),
+                            curr_entry.clone(),
+                            curr_round,
+                            curr_num_participants,
+                        )
+                        .await?
+                        {
+                            NegotiateRendezvousResult::Matched {
+                                num_participants, ..
+                            } if num_participants == curr_num_participants => continue,
+                            x => return Ok(x),
+                        }
+                    }
+                }
+
+                let res =
+                    notify_refresh_loop(self, addr, curr_entry, curr_round, curr_num_participants)
+                        .await;
+                self.redis_pubsub.punsubscribe(&channel_name).await?;
+                self.redis_pubsub.punsubscribe(&channel_ctr_name).await?;
+                res
             }
             .instrument(debug_span!("redis_notify", addr = ?&a)),
         )
@@ -412,7 +517,7 @@ impl RendezvousBackend for RedisBase {
                 } else {
                     debug!(?round_ctr, "Existing in-progress transition, try converting to applier");
                     // we can be an applier if -staged matches what we are trying to commit.
-                    // otherwise, we will error out. 
+                    // otherwise, we will error out.
                     let mut r = redis::pipe();
                     let (present_semantics, curr_count, _, _, conn_count): (Vec<u8>, usize, isize, isize, usize) = r
                         .atomic()
@@ -479,8 +584,8 @@ impl RedisBase {
         let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
         let channel_name = format!("__keyspace@*__:{}", &staged_commit_counter);
         self.redis_pubsub.psubscribe(&channel_name).await?;
+        debug!(this = "applier", "waiting on further updates");
         loop {
-            debug!("waiting on further updates");
             // wait for some event on the key.
             // redis subscribe will never return None.
             let refresh_to = tokio::time::sleep(self.liveness_timeout / 2);
@@ -493,7 +598,9 @@ impl RedisBase {
             .await
             {
                 futures_util::future::Either::Left((Some(msg), _)) => {
-                    let event = msg.get_payload::<String>()?;
+                    let event = msg
+                        .get_payload::<String>()
+                        .wrap_err_with(|| eyre!("Get payload from message: {:?}", &msg))?;
                     debug!(?event, ?round_ctr, "staged-update value changed");
 
                     event.contains("del")
@@ -508,30 +615,46 @@ impl RedisBase {
             };
 
             if do_refresh {
-                self.refresh_commit(addr.clone(), round_ctr).await?;
+                if let Err(err) = refresh_commit(
+                    &mut self.redis_conn,
+                    self.liveness_timeout,
+                    &self.client_name,
+                    &addr,
+                    round_ctr,
+                )
+                .await
+                {
+                    debug!(?err, "refresh_commit failed");
+                }
             }
 
             if done {
-                self.redis_pubsub.punsubscribe(&channel_name).await?;
-                debug!("observed commit, fetching new round_ctr");
-                let mut r = redis::pipe();
-                let insert_time = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                    .as_millis() as u64;
-                let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                    .as_millis() as u64;
-                let (round_ctr, _, _): (usize, isize, isize) = r
-                    .atomic()
-                    .get(&round_ctr_key)
-                    .zrembyscore(&addr_members, 0usize, expiry_time)
-                    .zadd(&addr_members, &self.client_name, insert_time as usize)
-                    .query_async(&mut self.redis_conn)
-                    .await?;
-                debug!(?round_ctr, "done applying");
-                return Ok(round_ctr);
+                break;
             }
         }
+
+        self.redis_pubsub
+            .punsubscribe(&channel_name)
+            .await
+            .wrap_err("punsubscribe")?;
+        debug!("observed commit, fetching new round_ctr");
+        let mut r = redis::pipe();
+        let insert_time = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+            .as_millis() as u64;
+        let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+            .as_millis() as u64;
+        let (round_ctr, _, _): (usize, isize, isize) = r
+            .atomic()
+            .get(&round_ctr_key)
+            .zrembyscore(&addr_members, 0usize, expiry_time)
+            .zadd(&addr_members, &self.client_name, insert_time as usize)
+            .query_async(&mut self.redis_conn)
+            .await
+            .wrap_err("fetching new round_ctr")?;
+        debug!(?round_ctr, "done applying");
+        return Ok(round_ctr);
     }
 
     async fn wait_committer(
@@ -546,8 +669,8 @@ impl RedisBase {
         let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
         let channel_name = format!("__keyspace@*__:{}", &staged_commit_counter);
         self.redis_pubsub.psubscribe(&channel_name).await?;
+        debug!(this = "committer", "waiting on further updates");
         loop {
-            debug!("waiting on further updates");
             // wait for some event on the key.
             // redis subscribe will never return None.
             let refresh_to = tokio::time::sleep(self.liveness_timeout / 2);
@@ -586,7 +709,14 @@ impl RedisBase {
             };
 
             if do_refresh {
-                let (staged, conn_count) = self.refresh_commit(addr.clone(), round_ctr).await?;
+                let (staged, conn_count) = refresh_commit(
+                    &mut self.redis_conn,
+                    self.liveness_timeout,
+                    &self.client_name,
+                    &addr,
+                    round_ctr,
+                )
+                .await?;
                 curr_commit_count = staged;
                 tot_participant_count = conn_count;
             }
@@ -598,56 +728,62 @@ impl RedisBase {
             }
         }
     }
+}
 
-    async fn refresh_commit(
-        &mut self,
-        addr: String,
-        round_ctr: usize,
-    ) -> Result<(usize, usize), Report> {
-        let mut addr_members = addr.clone();
-        addr_members.push_str("-members");
-        let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
-        let mut r = redis::pipe();
-        let insert_time = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-            .as_millis() as u64;
-        let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-            .as_millis() as u64;
-        let (staged, _, _, conn_count): (usize, isize, isize, usize) = r
-            .atomic()
-            .get(&staged_commit_counter)
-            .zrembyscore(&addr_members, 0usize, expiry_time)
-            .zadd(&addr_members, &self.client_name, insert_time as usize)
-            .zcard(&addr_members)
-            .query_async(&mut self.redis_conn)
-            .await?;
-        debug!(?staged, ?conn_count, "refreshed client expiry");
-        Ok((staged, conn_count))
-    }
+async fn refresh_commit(
+    redis_conn: &mut redis::aio::Connection,
+    liveness_timeout: Duration,
+    client_name: &str,
+    addr: &str,
+    round_ctr: usize,
+) -> Result<(usize, usize), Report> {
+    let mut addr_members = addr.to_owned();
+    addr_members.push_str("-members");
+    let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
+    let mut r = redis::pipe();
+    let insert_time = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+        .as_millis() as u64;
+    let expiry_time = (std::time::SystemTime::now() - liveness_timeout)
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+        .as_millis() as u64;
+    let (staged, _, _, conn_count): (usize, isize, isize, usize) = r
+        .atomic()
+        .get(&staged_commit_counter)
+        .zrembyscore(&addr_members, 0usize, expiry_time)
+        .zadd(&addr_members, client_name, insert_time as usize)
+        .zcard(&addr_members)
+        .query_async(redis_conn)
+        .await
+        .wrap_err("refresh_commit failed")?;
+    trace!(?staged, ?conn_count, "refreshed client expiry");
+    Ok((staged, conn_count))
+}
 
-    async fn refresh_client(&mut self, addr: String) -> Result<(), Report> {
-        let mut addr_members = addr.clone();
-        addr_members.push_str("-members");
-
-        debug!("refresh connection membership");
-        let mut r = redis::pipe();
-        let insert_time = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-            .as_millis() as u64;
-        let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-            .as_millis() as u64;
-        let (_, _, _): (isize, isize, usize) = r
-            .atomic()
-            .zrembyscore(&addr_members, 0usize, expiry_time)
-            .zadd(&addr_members, &self.client_name, insert_time as usize)
-            .zcard(&addr_members)
-            .query_async(&mut self.redis_conn)
-            .await
-            .wrap_err("refresh_client redis query failed")?;
-        Ok(())
-    }
+async fn refresh_client(
+    redis_conn: &mut redis::aio::Connection,
+    liveness_timeout: Duration,
+    client_name: &str,
+    addr: &str,
+) -> Result<(), Report> {
+    let mut addr_members = addr.to_owned();
+    addr_members.push_str("-members");
+    let mut r = redis::pipe();
+    let insert_time = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+        .as_millis() as u64;
+    let expiry_time = (std::time::SystemTime::now() - liveness_timeout)
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+        .as_millis() as u64;
+    let (_, _, _): (isize, isize, usize) = r
+        .atomic()
+        .zrembyscore(&addr_members, 0usize, expiry_time)
+        .zadd(&addr_members, client_name, insert_time as usize)
+        .zcard(&addr_members)
+        .query_async(redis_conn)
+        .await
+        .wrap_err("refresh_client redis query failed")?;
+    Ok(())
 }
 
 fn rand_name() -> String {
@@ -683,10 +819,11 @@ mod t {
             .enable_all()
             .build()
             .unwrap();
+        //let redis = start_redis(13521);
+        let redis_addr = "redis://192.168.64.2:6379";
 
         rt.block_on(async move {
-            let redis = start_redis(13521);
-            let redis_addr = redis.get_addr();
+            //let redis_addr = redis.get_addr();
             let bertha_addr = super::rand_name();
             let offer1 = dummy_unique_rendezvous_entry();
             let offer2 = dummy_unique_rendezvous_entry();
@@ -751,8 +888,9 @@ mod t {
 
         rt.block_on(
             async move {
-                let redis = start_redis(13522);
-                let redis_addr = redis.get_addr();
+                //let redis = start_redis(13522);
+                //let redis_addr = redis.get_addr();
+                let redis_addr = "redis://192.168.64.2:6379";
                 let bertha_addr = super::rand_name();
                 let ba = bertha_addr.clone();
                 let offer1 = dummy_unique_rendezvous_entry();
@@ -815,7 +953,7 @@ mod t {
                     return Err(err.wrap_err("client 1 failed"));
                 }
 
-                let redis_addr = redis.get_addr();
+                //let redis_addr = redis.get_addr();
                 let bertha_addr = ba;
                 let mut client2 = RedisBase::new(&redis_addr).await?;
                 client2.set_liveness_expiration(std::time::Duration::from_millis(500));
@@ -882,8 +1020,8 @@ mod t {
         }
     }
 
-    fn start_redis(port: u16) -> test_util::Redis {
-        info!(?port, "start redis");
-        test_util::start_redis(port)
-    }
+    //fn start_redis(port: u16) -> test_util::Redis {
+    //    info!(?port, "start redis");
+    //    test_util::start_redis(port)
+    //}
 }

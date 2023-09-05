@@ -7,6 +7,7 @@ edition = "2021"
 [dependencies]
 # cargo version as of 0.20.1 has a bug. Patch with this fork until https://github.com/mitsuhiko/redis-rs/pull/486 is merged and there's a release with that fix.
 redis = { git = "https://github.com/akshayknarayan/redis-rs", branch="async-pubsub-hang-fix", default-features = false, features = ["aio", "tokio-comp", "script"] }
+#redis = { version = "0.23.3", features = ["aio", "tokio-comp", "script"] }
 tokio = { version = "1", features = ["sync"] }
 bertha = { path = "../bertha" }
 lazy_static = "1.4"
@@ -20,5 +21,5 @@ rand = "0.8"
 [dev-dependencies]
 test-util = { path = "../test-util" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-tracing-subscriber = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-error = "0.2"

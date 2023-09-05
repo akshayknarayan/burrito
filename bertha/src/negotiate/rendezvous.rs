@@ -472,7 +472,7 @@ where
                 let upgrade_fut = async move {
                     let mut sl = sl.unwrap();
                     sl.changed().await.wrap_err("sender dropped")?;
-                    let v = sl.borrow().clone();
+                    let v = sl.borrow_and_update().clone();
                     Ok::<_, Report>((sl, v))
                 };
 
