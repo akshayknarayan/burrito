@@ -6,5 +6,6 @@ edition = "2021"
 
 [dependencies]
 eyre = "0.6"
-redis = "0.20"
+redis = { git = "https://github.com/akshayknarayan/redis-rs", branch="async-pubsub-hang-fix", default-features = false, features = ["aio", "tokio-comp", "script"] }
 tracing = "0.1"
+tempfile = "3"
