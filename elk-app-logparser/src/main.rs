@@ -4,8 +4,10 @@
 //! Listen on HTTP/HTTPS/QUIC (with load balancing across multiple instances / threads) and publish
 //! on pub/sub chunnel with reconfigurable ordering.
 
+use std::time::Duration;
+
 use bertha::ChunnelConnection;
-use color_eyre::eyre::{Context, Report};
+use color_eyre::eyre::{Report, WrapErr};
 use elk_app_logparser::{
     parse_log::{self, ParsedLine},
     publish_subscribe::ConnState,
@@ -14,7 +16,7 @@ use gcp_pubsub::GcpClient;
 use queue_steer::MessageQueueAddr;
 use redis_basechunnel::RedisBase;
 use structopt::StructOpt;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::{info, instrument, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
@@ -60,8 +62,9 @@ fn main() -> Result<(), Report> {
 
 const TOPIC_NAME: &str = "server-logs";
 
-#[instrument(level = "info")]
+#[instrument(level = "info", skip(opt))]
 async fn logparser(opt: Opt) -> Result<(), Report> {
+    info!(?opt, "starting logparser");
     let redis = RedisBase::new(&opt.redis_addr).await?;
     let mut gcp_client = gcp_pubsub::GcpCreds::default()
         .with_project_name(&opt.gcp_project_name)
@@ -109,13 +112,12 @@ async fn logparser(opt: Opt) -> Result<(), Report> {
 
 async fn inner(
     opt: Opt,
-    gcp_client: GcpClient,
+    mut gcp_client: GcpClient,
     conn: impl ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send,
     mut cn_state_watcher: watch::Receiver<ConnState>,
 ) -> Result<(), Report> {
+    let mut curr_cn_state = *cn_state_watcher.borrow_and_update();
     if opt.subscriber {
-        let mut curr_cn_state = *cn_state_watcher.borrow_and_update();
-        //make_topic(curr_cn_state, &opt.kafka_addr, &mut gcp_client).await?;
         let mut slots = vec![None; 16];
         loop {
             tokio::select! {
@@ -128,8 +130,8 @@ async fn inner(
                     let cn_state = *cn_state_watcher.borrow_and_update();
                     if curr_cn_state.is_kafka() && cn_state.is_gcp() || curr_cn_state.is_gcp() && cn_state.is_kafka() {
                         info!(?cn_state, "reconfiguring connection");
-                        //make_topic(cn_state, &opt.kafka_addr, &mut gcp_client).await?;
-                        //delete_topic(curr_cn_state, &opt.kafka_addr, &mut gcp_client).await?;
+                    } else {
+                        info!(?cn_state, ?curr_cn_state, "irrelevant connection update");
                     }
 
                     curr_cn_state = cn_state;
@@ -150,12 +152,28 @@ async fn inner(
                 )
             })
             .batching(|i| Some(i.take(16).collect::<Vec<_>>()));
+        let (s, mut r) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.unwrap();
+            s.send(()).unwrap();
+        });
 
         for batch in line_groups {
+            if r.try_recv().is_ok() {
+                break;
+            }
+
+            if cn_state_watcher.has_changed()? {
+                curr_cn_state = *cn_state_watcher.borrow_and_update();
+            }
+
             conn.send(batch).await?;
+            info!("sent");
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        unreachable!()
+        delete_topic(curr_cn_state, &opt.kafka_addr, &mut gcp_client).await?;
+        Ok(())
     }
 }
 

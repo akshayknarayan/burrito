@@ -163,9 +163,13 @@ async fn conn_negotiation_manager(
         .conn_participants_changed_receiver
         .clone();
     let mut gcp_changed = Box::pin(gcp_switch_ordering_handle.stack_changed());
+    let monitor_connection_negotiation_state =
+        stack_negotiation_manager.monitor_connection_negotiation_state();
+    let mut monitor_connection_negotiation_state =
+        std::pin::pin!(monitor_connection_negotiation_state);
     loop {
         tokio::select! {
-            exit = stack_negotiation_manager.monitor_connection_negotiation_state() => {
+            exit = &mut monitor_connection_negotiation_state => {
                 if let Err(e) = exit {
                     warn!(negotiation_manager_exit = ?e, "Exiting negotiation manager");
                 }

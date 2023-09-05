@@ -19,7 +19,7 @@ if __name__ == '__main__':
 
     while True:
         try:
-            sh.run("microk8s kubectl port-forward deployment.apps/kafka-deployment 9092:9092", shell=True, check=True)
+            sh.run("microk8s kubectl port-forward deployment.apps/kafka-deployment 9093:9092", shell=True, check=True)
         except Exception as e:
             print("port-forward failed to start")
             time.sleep(1)

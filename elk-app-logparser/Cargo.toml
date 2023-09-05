@@ -9,7 +9,7 @@ queue-steer = { path = "../queue-steer"  }
 gcp-pubsub = { path = "../gcp-pubsub" }
 kafka = { path = "../kafka" }
 redis-basechunnel = { path = "../redis-basechunnel" }
-tokio = { version = "1.21", features = ["rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.21", features = ["rt", "rt-multi-thread", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 color-eyre = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
