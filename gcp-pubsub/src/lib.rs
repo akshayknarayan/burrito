@@ -5,6 +5,8 @@
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{eyre, Report, WrapErr};
+use futures_util::future::ready;
+use futures_util::stream::{FuturesUnordered, TryStreamExt};
 use google_cloud::pubsub::{Client, PublishMessage, Subscription, SubscriptionConfig, Topic};
 use queue_steer::{
     MessageQueueAddr, MessageQueueCaps, MessageQueueOrdering, MessageQueueReliability,
@@ -14,7 +16,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// The underlying client to Google PubSub.
 pub use google_cloud::pubsub::Client as GcpClient;
@@ -179,6 +181,7 @@ impl PubSubConn {
     ) -> Result<Self, Report> {
         let (subscriptions, topics_cached) =
             make_subscriptions(ps_client.clone(), recv_topics, false).await?;
+        debug!(num_subs = ?subscriptions.len(), "returning new gcp connection");
         Ok(PubSubConn {
             ps_client,
             subscriptions,
@@ -212,46 +215,57 @@ impl ChunnelConnection for PubSubConn {
                 let mut topics_local = self.topics.lock().unwrap();
                 burst
                     .into_iter()
-                    .map(|(MessageQueueAddr { topic_id, .. }, body)| {
+                    .map(|(MessageQueueAddr { topic_id, group }, body)| {
                         (
                             topics_local
                                 .get_mut(&topic_id)
                                 .map(|t| (topic_id.clone(), t.clone()))
                                 .ok_or(topic_id),
-                            body,
+                            (group, body),
                         )
                     })
                     .collect()
             }; // unlock self.topics to avoid holding the lock across the await point below
 
             let mut new_topics: HashMap<_, _> = Default::default();
-            let mut topic_batches: HashMap<_, (Topic, Vec<_>)> = Default::default();
-            for (maybe_topic, body) in msgs_with_cached_topics {
-                match maybe_topic {
+            let mut topic_batches: HashMap<_, (Topic, HashMap<_, Vec<_>>)> = Default::default();
+            for (maybe_topic, (group, body)) in msgs_with_cached_topics {
+                let v = match maybe_topic {
                     Ok((tname, t)) => {
                         let (_, v) = topic_batches
                             .entry(tname)
-                            .or_insert((t.clone(), Vec::new()));
-                        v.push(body.into_bytes());
+                            .or_insert((t.clone(), Default::default()));
+                        v
                     }
                     Err(topic_name) => {
                         let t = ps_client
                             .topic(&topic_name)
                             .await
-                            .wrap_err(eyre!("get topic {:?}", &topic_name))?
+                            .wrap_err_with(|| eyre!("get topic {:?}", &topic_name))?
                             .ok_or_else(|| eyre!("topic not found: {:?}", &topic_name))?;
                         new_topics.insert(topic_name.clone(), t.clone());
-                        let (_, v) = topic_batches.entry(topic_name).or_insert((t, Vec::new()));
-                        v.push(body.into_bytes());
+                        let (_, v) = topic_batches
+                            .entry(topic_name)
+                            .or_insert((t, Default::default()));
+                        v
                     }
                 };
+
+                let mut m = PublishMessage::from(body.into_bytes());
+                if let Some(g) = group.clone() {
+                    m = m.with_ordering_key(g);
+                }
+
+                v.entry(group).or_insert(Vec::new()).push(m);
             }
 
-            for (topic_id, (mut topic, msg_batch)) in topic_batches {
-                topic
-                    .publish(msg_batch.into_iter())
-                    .await
-                    .wrap_err(eyre!("Send on topic: {:?}", &topic_id))?;
+            for (topic_id, (mut topic, groups)) in topic_batches {
+                for (_, msg_batch) in groups {
+                    topic
+                        .publish::<_, _, Vec<u8>>(msg_batch.into_iter())
+                        .await
+                        .wrap_err_with(|| eyre!("Send on topic: {:?}", &topic_id))?;
+                }
             }
 
             {
@@ -271,6 +285,7 @@ impl ChunnelConnection for PubSubConn {
         'buf: 'cn,
     {
         let mut subs = self.subscriptions.clone();
+        trace!("called recv");
         Box::pin(async move {
             // first check for things we can return immediately.
             let mut remaining_slots = msgs_buf.len();
@@ -280,12 +295,11 @@ impl ChunnelConnection for PubSubConn {
                     for mut m in sub.drain_buffer(msgs_buf.len()) {
                         m.ack()
                             .await
-                            .wrap_err(eyre!("ACKing message {:?}", m.id()))?;
+                            .wrap_err_with(|| eyre!("ACKing message {:?}", m.id()))?;
                         let body = std::string::String::from_utf8(m.take_data())?;
                         // ordering_key is empty string if none was set
                         let group = m.take_ordering_key();
                         let group = if group.is_empty() { None } else { Some(group) };
-                        trace!(?topic_id, ?group, "recvd msg");
                         msgs_buf[msgs_buf.len() - remaining_slots] = Some((
                             MessageQueueAddr {
                                 topic_id: topic_id.clone(),
@@ -295,19 +309,33 @@ impl ChunnelConnection for PubSubConn {
                         ));
                         remaining_slots -= 1;
                         if remaining_slots == 0 {
+                            trace!(num_msgs = ?msgs_buf.len(), "returning");
                             return Ok(&mut msgs_buf[..]);
                         }
                     }
                 }
             }
 
+            if remaining_slots < msgs_buf.len() {
+                let num_msgs = msgs_buf.len() - remaining_slots;
+                trace!(?num_msgs, "returning");
+                return Ok(&mut msgs_buf[..num_msgs]);
+            }
+
             // now poll everything
             let futs = subs.iter_mut().map(|(topic, sub)| {
                 Box::pin(async move {
+                    let sub_id = sub.id().to_owned();
                     let msgs = sub
                         .receive_multiple(remaining_slots)
                         .await
-                        .wrap_err_with(|| eyre!(""))?;
+                        .wrap_err_with(|| {
+                            eyre!(
+                                "receive messages topic={:?} subscription={:?}",
+                                topic,
+                                sub_id,
+                            )
+                        })?;
                     Ok::<_, Report>((topic.clone(), msgs))
                 })
             });
@@ -317,30 +345,45 @@ impl ChunnelConnection for PubSubConn {
                     futures_util::future::select_ok(futs).await?;
                 Ok::<_, Report>((topic_received_on, msgs_recvd_iter.collect()))
             }?;
+            trace!(?topic_received_on, "got messages");
 
-            for mut m in msgs_recvd {
-                m.ack()
-                    .await
-                    .wrap_err(eyre!("ACKing message {:?}", m.id()))?;
-                let body = std::string::String::from_utf8(m.take_data())?;
-                // ordering_key is empty string if none was set
-                let group = m.take_ordering_key();
-                let group = if group.is_empty() { None } else { Some(group) };
-                trace!(?topic_received_on, ?group, "recvd msg");
-                msgs_buf[msgs_buf.len() - remaining_slots] = Some((
-                    MessageQueueAddr {
-                        topic_id: topic_received_on.clone(),
-                        group,
-                    },
-                    body,
-                ));
-                remaining_slots -= 1;
-                if remaining_slots == 0 {
-                    break;
-                }
-            }
-
+            let acked: FuturesUnordered<_> = msgs_recvd
+                .into_iter()
+                .map(|mut m| {
+                    let topic_received_on = topic_received_on.clone();
+                    async move {
+                        m.ack()
+                            .await
+                            .wrap_err_with(|| eyre!("ACKing message {:?}", m.id()))?;
+                        let body = std::string::String::from_utf8(m.take_data())?;
+                        // ordering_key is empty string if none was set
+                        let group = m.take_ordering_key();
+                        let group = if group.is_empty() { None } else { Some(group) };
+                        trace!(?topic_received_on, ?group, "recvd msg");
+                        Ok::<_, Report>((
+                            MessageQueueAddr {
+                                topic_id: topic_received_on.clone(),
+                                group,
+                            },
+                            body,
+                        ))
+                    }
+                })
+                .collect();
+            acked
+                .try_for_each(|m| {
+                    msgs_buf[msgs_buf.len() - remaining_slots] = Some(m);
+                    remaining_slots -= 1;
+                    if remaining_slots == 0 {
+                        ready(Err(eyre!("")))
+                    } else {
+                        ready(Ok(()))
+                    }
+                })
+                .await
+                .unwrap_or(());
             let num_msgs = msgs_buf.len() - remaining_slots;
+            trace!(?num_msgs, "returning");
             return Ok(&mut msgs_buf[..num_msgs]);
         })
     }
@@ -478,7 +521,7 @@ impl ChunnelConnection for OrderedPubSubConn {
                         let t = ps_client
                             .topic(&topic_id)
                             .await
-                            .wrap_err(eyre!("get topic {:?}", &topic_id))?
+                            .wrap_err_with(|| eyre!("get topic {:?}", &topic_id))?
                             .ok_or_else(|| eyre!("topic not found: {:?}", &topic_id))?;
                         new_topics.insert(topic_id.clone(), t.clone());
                         let (_, v) = topic_batches.entry(topic_id).or_insert((t, Vec::new()));
@@ -497,7 +540,7 @@ impl ChunnelConnection for OrderedPubSubConn {
                 topic
                     .publish::<_, _, Vec<u8>>(msg_batch.into_iter())
                     .await
-                    .wrap_err(eyre!("Send on topic: {:?}", &topic_id))?;
+                    .wrap_err_with(|| eyre!("Send on topic: {:?}", &topic_id))?;
             }
 
             {
@@ -525,14 +568,17 @@ async fn make_subscriptions<'a>(
     topics: impl IntoIterator<Item = &'a str>,
     with_ordering: bool,
 ) -> Result<(HashMap<String, Subscription>, HashMap<String, Topic>), Report> {
+    trace!(?with_ordering, "starting make_subscriptions");
     let mut topic_handles: HashMap<_, _> =
         futures_util::future::try_join_all(topics.into_iter().map(|topic_id| {
             let mut ps_client = ps_client.clone();
             async move {
+                trace!(?topic_id, "get topic handle");
                 let topic = ps_client
                     .topic(topic_id)
                     .await
-                    .wrap_err(eyre!("get topic {:?}", &topic_id))?;
+                    .wrap_err_with(|| eyre!("get topic {:?}", &topic_id))?;
+                trace!(?topic_id, "retrieved topic handle");
 
                 Ok::<_, Report>((
                     topic_id.to_owned(),
@@ -543,6 +589,7 @@ async fn make_subscriptions<'a>(
         .await?
         .into_iter()
         .collect();
+    trace!("done getting topic handles");
 
     let subs = futures_util::future::try_join_all(topic_handles.iter_mut().map(
         |(topic_id, topic)| async move {
@@ -555,12 +602,13 @@ async fn make_subscriptions<'a>(
                 sub_conf
             };
 
+            debug!(?topic_id, ?sub_id, "create subscription");
             Ok::<_, Report>((
                 topic.id().to_owned(),
                 topic
                     .create_subscription(&sub_id, sub_conf)
                     .await
-                    .wrap_err(eyre!("create_subscription {:?}", &topic_id))?,
+                    .wrap_err_with(|| eyre!("create_subscription {:?}", &topic_id))?,
             ))
         },
     ))
