@@ -93,7 +93,19 @@ pub async fn connect(
     )));
 
     // 3. initial negotiation and spawn the manager task.
-    let (cn, stack_negotiation_manager) = negotiate_rendezvous(st, redis, topic.to_owned()).await?;
+    let (cn, stack_negotiation_manager) =
+        negotiate_rendezvous(st, redis, topic.to_owned(), |np, select| {
+            if Arc::ptr_eq(select, &gcp_switch_ordering_handle) {
+                match np {
+                    1 | 2 => Some(Either::Left(())),
+                    3.. => Some(Either::Right(())),
+                    _ => unreachable!(),
+                }
+            } else {
+                None
+            }
+        })
+        .await?;
     let cn_state = gcp_switch_ordering_handle
         .current()
         .map(|e| match e {
@@ -127,7 +139,19 @@ pub async fn connect_gcp_only(
 > {
     let (gcp_st, gcp_switch_ordering_handle) = gcp_stack!(topic, gcloud_client);
     let (cn, stack_negotiation_manager) =
-        negotiate_rendezvous(gcp_st, redis, topic.to_owned()).await?;
+        negotiate_rendezvous(gcp_st, redis, topic.to_owned(), |np, select| {
+            if Arc::ptr_eq(select, &gcp_switch_ordering_handle) {
+                info!(?np, "prefer Right when np >= 3");
+                match np {
+                    1 | 2 => Some(Either::Left(())),
+                    3.. => Some(Either::Right(())),
+                    _ => unreachable!(),
+                }
+            } else {
+                None
+            }
+        })
+        .await?;
     let cn_state = gcp_switch_ordering_handle
         .current()
         .map(|e| match e {

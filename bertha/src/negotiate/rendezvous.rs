@@ -219,6 +219,64 @@ where
     }
 }
 
+pub trait Prefer {
+    fn prefer(
+        &mut self,
+        _num_participants: usize,
+        _selector: impl Fn(usize, &Arc<UpgradeHandle>) -> Option<Either<(), ()>>,
+    ) {
+    }
+}
+
+impl<N> Prefer for N where N: crate::Negotiate {}
+
+impl<H, T> Prefer for crate::CxList<H, T>
+where
+    H: Prefer,
+    T: Prefer,
+{
+    fn prefer(
+        &mut self,
+        num_participants: usize,
+        selector: impl Fn(usize, &Arc<UpgradeHandle>) -> Option<Either<(), ()>>,
+    ) {
+        self.head.prefer(num_participants, &selector);
+        self.tail.prefer(num_participants, &selector);
+    }
+}
+
+impl<T1, T2> Prefer for UpgradeSelect<T1, T2>
+where
+    T1: Prefer,
+    T2: Prefer,
+{
+    fn prefer(
+        &mut self,
+        num_participants: usize,
+        selector: impl Fn(usize, &Arc<UpgradeHandle>) -> Option<Either<(), ()>>,
+    ) {
+        <Select<T1, T2> as Prefer>::prefer(&mut self.inner, num_participants, &selector);
+        if let Some(opt) = selector(num_participants, &self.handle) {
+            self.inner.prefer = opt;
+        }
+    }
+}
+
+impl<T1, T2> Prefer for Select<T1, T2>
+where
+    T1: Prefer,
+    T2: Prefer,
+{
+    fn prefer(
+        &mut self,
+        num_participants: usize,
+        selector: impl Fn(usize, &Arc<UpgradeHandle>) -> Option<Either<(), ()>>,
+    ) {
+        self.left.prefer(num_participants, &selector);
+        self.right.prefer(num_participants, &selector);
+    }
+}
+
 /// Negotiation type to choose between T1 and T2 which can change its mind later.
 ///
 /// `UpgradeSelect` implements `Apply` => `UpgradeEitherApply`
@@ -473,13 +531,11 @@ where
         Box::pin(async move {
             let mut sl_g = self.switch_listener.lock().await;
             let (ref mut listener, ref mut curr_nonce, ref mut in_progress) = *sl_g;
-            if in_progress.is_none() {
-                if listener.has_changed()? {
-                    let v = listener.borrow_and_update();
-                    if *v != *curr_nonce {
-                        *curr_nonce = v.clone();
-                        *in_progress = Some(self.try_upgrade(v.clone()));
-                    }
+            if in_progress.is_none() && listener.has_changed()? {
+                let v = listener.borrow_and_update();
+                if *v != *curr_nonce {
+                    *curr_nonce = v.clone();
+                    *in_progress = Some(self.try_upgrade(v.clone()));
                 }
             }
 
@@ -632,14 +688,29 @@ impl<A, B, Acn, Bcn, InC> Drop for UpgradeEitherConn<A, B, Acn, Bcn, InC> {
 /// Returns a connection to use, and a `StackUpgradeHandle` to manage the negotiation update task.
 /// Triggering a change with an individual `UpgradeHandle` will also cause a negotiation commit
 /// cycle.
-#[instrument(skip(stack, rendezvous_point))]
+///
+/// The provided `selector` callback is called during connection establishment if (a) there is an
+/// existing stack in the `rendezvous_point` and (b) it does not `Apply` to `stack`. The first
+/// arugment is the current number of connection participants, and the second is the
+/// `UpgradeHandle` corresponding to the `UpgradeSelect` to optionally express a preference for.
+#[instrument(skip(stack, rendezvous_point, selector))]
 pub async fn negotiate_rendezvous<Srv, Cn, R, E>(
-    stack: Srv,
+    mut stack: Srv,
     mut rendezvous_point: R,
     addr: String,
+    selector: impl Fn(usize, &Arc<UpgradeHandle>) -> Option<Either<(), ()>>,
 ) -> Result<(Cn, StackUpgradeHandle<R>), Report>
 where
-    Srv: CollectUpgradeHandles + Pick + Apply + GetOffers + Debug + Clone + Send + Sync + 'static,
+    Srv: CollectUpgradeHandles
+        + Pick
+        + Apply
+        + GetOffers
+        + Prefer
+        + Debug
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     <Srv as Pick>::Picked: Debug,
     <Srv as Apply>::Applied: Chunnel<NeverCn, Connection = Cn, Error = E>,
     E: Into<Report>,
@@ -687,12 +758,23 @@ where
             Err(orig_apply_error) => {
                 debug!(
                     ?existing_remote_stack,
-                    "remote stack was incompatible, attempting transition"
+                    "remote stack was incompatible, asking for selection input"
                 );
+
                 // TODO there is no way currently to ask the remote for alternate stacks. this
                 // means that if the local picked stack is not compatible, and the remote stack is
                 // not locally compatible, but there is a third option on both sides that *is*
                 // compatible, we will miss it.
+                //
+                // here, we give the caller a chance to react to new connection information (the
+                // number of participants) before we try to transition the connection to a new
+                // stack. we have only called `try_init`, which does *not* increment
+                // num_participants if the semantics did not match, so we have to +1 to include
+                // ourselves here.
+                stack.prefer(num_participants + 1, selector);
+                let picked =
+                    solo_monomorphize(stack.clone()).wrap_err("Malformed chunnel stack")?;
+                debug!(?picked, "transition to new stack");
                 round_number = rendezvous_point
                     .transition(
                         addr.clone(),
@@ -996,7 +1078,7 @@ where
         &mut self,
         notify_res: Result<NegotiateRendezvousResult, Report>,
     ) -> Result<(), Report> {
-        debug!(?notify_res, "handling rendezvous change notification");
+        debug!(?notify_res, ?self.curr_num_participants, ?self.curr_round, "handling rendezvous change notification");
         // match statement returns a nonce if there was a remote update that we need to apply
         // locally. otherwise it will continue to the next loop iteration.
         match notify_res {
@@ -1006,6 +1088,15 @@ where
             }) if num_participants == self.curr_num_participants => {
                 self.curr_round = round_number;
                 Ok(()) // do nothing.
+            }
+            Ok(NegotiateRendezvousResult::Matched {
+                num_participants, ..
+            }) => {
+                // the semantics are the same, but the number of participants changed.
+                self.conn_participants_changed_notifier
+                    .send(num_participants)
+                    .unwrap();
+                Ok(())
             }
             Ok(NegotiateRendezvousResult::NoMatch {
                 entry,
@@ -1063,15 +1154,6 @@ where
                     self.curr_round = new_round;
                     Ok(())
                 }
-            }
-            Ok(NegotiateRendezvousResult::Matched {
-                num_participants, ..
-            }) => {
-                // the semantics are the same, but the number of participants changed.
-                self.conn_participants_changed_notifier
-                    .send(num_participants)
-                    .unwrap();
-                Ok(())
             }
             Err(e) => Err(e),
         }
@@ -1290,7 +1372,9 @@ mod t {
             let r = MockRendezvous::default();
             let r2 = r.clone();
 
-            let (cn, mut handle) = negotiate_rendezvous(stack, r, addr).await.unwrap();
+            let (cn, mut handle) = negotiate_rendezvous(stack, r, addr, |_, _| None)
+                .await
+                .unwrap();
 
             let mut p_changed = handle.conn_participants_changed_receiver.clone();
             tokio::spawn(
@@ -1308,7 +1392,9 @@ mod t {
                     let (sel, _upgrade) = UpgradeSelect::from_select(sel);
                     let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
 
-                    let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await.unwrap();
+                    let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2, |_, _| None)
+                        .await
+                        .unwrap();
                     wait_ready_s.send(()).unwrap();
                     use futures_util::future::Either as FEither;
                     match futures_util::future::select(
@@ -1377,7 +1463,7 @@ mod t {
             let (sel, upgrade) = UpgradeSelect::from_select(sel);
             let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
 
-            let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await?;
+            let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2, |_, _| None).await?;
             assert!(matches!(upgrade.current(), Some(crate::Either::Left(()))));
             assert!(matches!(
                 upgrade_inner.current(),
@@ -1438,7 +1524,9 @@ mod t {
 
             tokio::spawn(client2(r2, addr2, wait_ready_s, wait_trans_s));
             wait_ready_r.await.unwrap();
-            let (cn, mut handle) = negotiate_rendezvous(stack, r, addr).await.unwrap();
+            let (cn, mut handle) = negotiate_rendezvous(stack, r, addr, |_, _| None)
+                .await
+                .unwrap();
             cn.send(std::iter::empty())
                 .instrument(info_span!("connection_send"))
                 .await
@@ -1491,7 +1579,7 @@ mod t {
                 UpgradeSelect::from_select(Select::from((left_inner_select, right_inner_select)));
             let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
 
-            let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2).await?;
+            let (cn, mut handle) = negotiate_rendezvous(stack, r2, addr2, |_, _| None).await?;
             assert!(matches!(
                 upgrade_outer.current(),
                 Some(crate::Either::Left(()))
@@ -1555,7 +1643,9 @@ mod t {
                 UpgradeSelect::from_select(Select::from((left_inner_select, right_inner_select)));
             let stack = CxList::from(ChunnelA).wrap(sel).wrap(MockBaseChunnel);
 
-            let (cn, mut handle) = negotiate_rendezvous(stack, r, addr).await.unwrap();
+            let (cn, mut handle) = negotiate_rendezvous(stack, r, addr, |_, _| None)
+                .await
+                .unwrap();
             assert!(matches!(
                 upgrade_outer.current(),
                 Some(crate::Either::Left(()))
