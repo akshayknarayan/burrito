@@ -16,7 +16,7 @@ use tracing::{info, instrument, warn};
 
 use crate::parse_log::ParsedLine;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConnState {
     KafkaOrdering,
     GcpClientSideOrdering,

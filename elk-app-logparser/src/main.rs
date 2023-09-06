@@ -131,7 +131,7 @@ async fn inner(
                     if curr_cn_state.is_kafka() && cn_state.is_gcp() || curr_cn_state.is_gcp() && cn_state.is_kafka() {
                         info!(?cn_state, "reconfiguring connection");
                     } else {
-                        info!(?cn_state, ?curr_cn_state, "irrelevant connection update");
+                        info!(?cn_state, ?curr_cn_state, "connection update");
                     }
 
                     curr_cn_state = cn_state;
