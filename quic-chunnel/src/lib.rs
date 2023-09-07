@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tcp::Connected;
+use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -32,8 +33,13 @@ impl bertha::negotiate::CapabilitySet for QuicProto {
 
 #[derive(Clone)]
 pub enum QuicChunnel {
-    Server { cfg: Arc<StdMutex<Config>> },
-    Client { cfg: Arc<StdMutex<Config>> },
+    Server {
+        cfg: Arc<StdMutex<Config>>,
+        _temp_cert_files: Vec<Arc<NamedTempFile>>,
+    },
+    Client {
+        cfg: Arc<StdMutex<Config>>,
+    },
 }
 
 impl Debug for QuicChunnel {
@@ -47,11 +53,12 @@ impl Debug for QuicChunnel {
 }
 
 impl QuicChunnel {
-    pub fn server(mut cfg: Config) -> Self {
+    pub fn server(mut cfg: Config, cert_files: impl IntoIterator<Item = NamedTempFile>) -> Self {
         cfg.set_application_protos(&[b"QuicChunnelProto"]).unwrap();
         cfg.enable_dgram(true, 1500, 1500);
         QuicChunnel::Server {
             cfg: Arc::new(StdMutex::new(cfg)),
+            _temp_cert_files: cert_files.into_iter().map(Arc::new).collect(),
         }
     }
 
@@ -93,7 +100,7 @@ where
                 .peer_addr()
                 .ok_or_else(|| eyre!("require a connected connection"))?;
             let quic = match self {
-                Self::Server { cfg } => quiche::accept(
+                Self::Server { cfg, .. } => quiche::accept(
                     &quic_conn_id,
                     None,
                     local_addr,
@@ -365,7 +372,11 @@ mod t {
         let mut udp = UdpReqChunnel;
         let base_st = udp.listen(addr).await?;
         start.wait().await;
-        let st = negotiate_server(QuicChunnel::server(server_cfg), base_st).await?;
+        let st = negotiate_server(
+            QuicChunnel::server(server_cfg, [cert_file, key_file]),
+            base_st,
+        )
+        .await?;
         st.try_for_each_concurrent(None, |cn| async move {
             info!("established connection");
             let mut slot = [None];
