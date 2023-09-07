@@ -129,9 +129,9 @@ pub(crate) fn peel_one<S: TokioDatagramSk, A: From<S::Addr>>(
     }
 }
 
-pub(crate) fn peel_rest<'buf, S: TokioDatagramSk, A: From<S::Addr>>(
+pub(crate) fn peel_rest<S: TokioDatagramSk, A: From<S::Addr>>(
     sk: &S,
-    msgs_buf: &'buf mut [Option<(A, Vec<u8>)>],
+    msgs_buf: &mut [Option<(A, Vec<u8>)>],
 ) -> Result<usize, Report> {
     let mut num_recveived = 0;
     for slot in &mut msgs_buf[..] {

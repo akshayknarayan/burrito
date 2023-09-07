@@ -206,6 +206,7 @@ pub use apply::ApplyResult;
 mod server;
 pub use server::monomorphize;
 pub use server::negotiate_server;
+pub use server::negotiate_server_shared_state;
 mod client;
 pub use client::{
     negotiate_client, negotiate_client_fixed_stack, negotiate_client_nonce, ClientNegotiator,

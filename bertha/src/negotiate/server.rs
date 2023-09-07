@@ -14,7 +14,7 @@ use tracing::{debug, debug_span, instrument, trace, trace_span, warn};
 use tracing_futures::Instrument;
 
 /// Return a stream of connections with `stack`'s semantics, listening on `raw_cn_st`.
-#[allow(clippy::manual_async_fn)] // we need the + 'static which async fn does not do.
+#[allow(clippy::manual_async_fn)] // TODO remove this, this function is not even async anymore
 pub fn negotiate_server<Srv, Sc, Se, C, A>(
     stack: Srv,
     raw_cn_st: Sc,
@@ -52,24 +52,59 @@ where
         Into<Report> + Send + Sync + 'static,
     A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
 {
-    async move {
-        // 1. serve (A, Vec<u8>) connections.
-        let st = raw_cn_st.map_err(Into::into); // stream of incoming Vec<u8> conns.
-        let pending_negotiated_connections: Arc<Mutex<HashMap<A, StackNonce>>> = Default::default();
-        Ok(st
-            .map_err(Into::into)
-            // and_then_concurrent will concurrently poll the stream, and any futures returned by
-            // this closure. The futures returned by the closure will form the basis for the output
-            // stream. Note that the `process_nonces_connection` case means that some of the
-            // futures will never resolve, so and_then_concurrent cannot poll them in order. So,
-            // the output stream may be reordered compared to the input stream.
-            .and_then_concurrent(move |cn| {
-                let stack = stack.clone();
-                let pending_negotiated_connections = Arc::clone(&pending_negotiated_connections);
-                negotiate_server_connection(cn, stack, pending_negotiated_connections)
-            })
-            .try_filter_map(|v| futures_util::future::ready(Ok(v))))
-    }
+    let pending_negotiated_connections: Arc<Mutex<HashMap<A, StackNonce>>> = Default::default();
+    async move { negotiate_server_shared_state(stack, raw_cn_st, pending_negotiated_connections) }
+}
+
+pub fn negotiate_server_shared_state<Srv, Sc, Se, C, A>(
+    stack: Srv,
+    raw_cn_st: Sc,
+    pending_negotiated_connections: Arc<Mutex<HashMap<A, StackNonce>>>,
+) -> Result<
+    impl Stream<
+            Item = Result<
+                Either<
+                    <<Srv as Pick>::Picked as Chunnel<ClientInput<C, A>>>::Connection,
+                    <<Srv as Apply>::Applied as Chunnel<ClientInput<C, A>>>::Connection,
+                >,
+                Report,
+            >,
+        > + Send
+        + 'static,
+    Report,
+>
+where
+    Sc: Stream<Item = Result<C, Se>> + Send + 'static,
+    Se: Into<Report> + Send + Sync + 'static,
+    C: ChunnelConnection<Data = (A, Vec<u8>)> + Send + Sync + 'static,
+    Srv: Pick + Apply + GetOffers + Clone + Debug + Send + 'static,
+    // main-line branch: Pick on incoming negotiation handshake.
+    <Srv as Pick>::Picked:
+        NegotiatePicked + Chunnel<ClientInput<C, A>> + Clone + Debug + Send + 'static,
+    <<Srv as Pick>::Picked as Chunnel<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<Srv as Pick>::Picked as Chunnel<ClientInput<C, A>>>::Error:
+        Into<Report> + Send + Sync + 'static,
+    // nonce branch: Apply stack from nonce on indicated connections.
+    <Srv as Apply>::Applied: Chunnel<ClientInput<C, A>> + Clone + Debug + Send + 'static,
+    <<Srv as Apply>::Applied as Chunnel<ClientInput<C, A>>>::Connection: Send + Sync + 'static,
+    <<Srv as Apply>::Applied as Chunnel<ClientInput<C, A>>>::Error:
+        Into<Report> + Send + Sync + 'static,
+    A: Serialize + DeserializeOwned + Eq + std::hash::Hash + Debug + Send + Sync + 'static,
+{
+    // 1. serve (A, Vec<u8>) connections.
+    Ok(raw_cn_st
+        .map_err(Into::into)
+        // and_then_concurrent will concurrently poll the stream, and any futures returned by
+        // this closure. The futures returned by the closure will form the basis for the output
+        // stream. Note that the `process_nonces_connection` case means that some of the
+        // futures will never resolve, so and_then_concurrent cannot poll them in order. So,
+        // the output stream may be reordered compared to the input stream.
+        .and_then_concurrent(move |cn| {
+            let stack = stack.clone();
+            let pending_negotiated_connections = Arc::clone(&pending_negotiated_connections);
+            negotiate_server_connection(cn, stack, pending_negotiated_connections)
+        })
+        .try_filter_map(|v| futures_util::future::ready(Ok(v))))
 }
 
 #[instrument(skip(cn, stack, pending_negotiated_connections), level = "debug", err)]
