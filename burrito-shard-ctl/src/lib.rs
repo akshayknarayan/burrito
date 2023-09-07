@@ -6,7 +6,7 @@
 use bertha::{
     enumerate_enum,
     negotiate::{Apply, GetOffers, StackNonce},
-    Chunnel, ChunnelConnection, ChunnelConnector, IpPort, Negotiate,
+    CapabilitySet, Chunnel, ChunnelConnection, ChunnelConnector, IpPort, Negotiate,
 };
 use color_eyre::eyre;
 use eyre::{eyre, Error, WrapErr};
@@ -107,7 +107,7 @@ pub struct ShardCanonicalServer<A, S, Ss, D> {
     internal_addr: Vec<A>,
     shards_inner: Arc<StdMutex<S>>,
     shards_inner_stack: Ss,
-    shards_extern_nonce: StackNonce,
+    shards_extern_nonce: Option<StackNonce>,
     redis_listen_connection: Arc<Mutex<redis::aio::MultiplexedConnection>>,
     _phantom: std::marker::PhantomData<D>,
 }
@@ -149,7 +149,7 @@ where
         internal_addr: Option<Vec<A>>,
         shards_inner: S,
         shards_inner_stack: Ss,
-        shards_extern_nonce: StackNonce,
+        shards_extern_nonce: Option<StackNonce>,
         redis_addr: &str,
     ) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)
@@ -221,10 +221,16 @@ where
         };
 
         let msg = match msg {
-            bertha::negotiate::NegotiateMsg::ServerNonce { addr, .. } => {
-                bertha::negotiate::NegotiateMsg::ServerNonce {
-                    addr,
-                    picked: offer,
+            bertha::negotiate::NegotiateMsg::ServerNonce { addr, picked } => {
+                if let Some(o) = offer {
+                    bertha::negotiate::NegotiateMsg::ServerNonce { addr, picked: o }
+                } else {
+                    let mut p = picked.__into_inner();
+                    p.remove(&ShardFns::guid());
+                    bertha::negotiate::NegotiateMsg::ServerNonce {
+                        addr,
+                        picked: StackNonce::__from_inner(p),
+                    }
                 }
             }
             _ => {
