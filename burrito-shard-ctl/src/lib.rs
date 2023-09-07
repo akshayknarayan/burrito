@@ -108,7 +108,7 @@ pub struct ShardCanonicalServer<A, S, Ss, D> {
     shards_inner: Arc<StdMutex<S>>,
     shards_inner_stack: Ss,
     shards_extern_nonce: StackNonce,
-    redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
+    redis_listen_connection: Arc<Mutex<redis::aio::MultiplexedConnection>>,
     _phantom: std::marker::PhantomData<D>,
 }
 
@@ -153,10 +153,10 @@ where
         redis_addr: &str,
     ) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)
-            .wrap_err(eyre!("Opening redis connection: {:?}", redis_addr))?;
+            .wrap_err_with(|| eyre!("Opening redis connection: {:?}", redis_addr))?;
         let redis_listen_connection = Arc::new(Mutex::new(
             redis_client
-                .get_async_connection()
+                .get_multiplexed_tokio_connection()
                 .await
                 .wrap_err("Connecting to redis")?,
         ));
@@ -363,7 +363,7 @@ where
                         let cn = connect_fut
                             .await
                             .map_err(Into::into)
-                            .wrap_err(eyre!("Could not connect to {}", a.clone()))?;
+                            .wrap_err_with(|| eyre!("Could not connect to {}", a.clone()))?;
                         let cn = bertha::negotiate::negotiate_client(
                             shards_inner_stack.clone(),
                             cn,
@@ -377,7 +377,6 @@ where
                     .into_iter()
                     .collect::<Result<_, Error>>()
                     .wrap_err("Could not connect to at least one shard")?;
-
                 debug!("connected to shards");
 
                 // serve canonical address
@@ -714,7 +713,7 @@ where
 #[derive(Clone)]
 pub struct ClientShardChunnelClient<A, A2> {
     addr: A,
-    redis_listen_connection: Arc<Mutex<redis::aio::Connection>>,
+    redis_listen_connection: Arc<Mutex<redis::aio::MultiplexedConnection>>,
     _phantom: std::marker::PhantomData<A2>,
 }
 
@@ -732,12 +731,12 @@ where
 impl<A, A2> ClientShardChunnelClient<A, A2> {
     pub async fn new(addr: A, redis_addr: &str) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)
-            .wrap_err(eyre!("Opening redis connection: {:?}", redis_addr))?;
+            .wrap_err_with(|| eyre!("Opening redis connection: {:?}", redis_addr))?;
         let redis_listen_connection = Arc::new(Mutex::new(
             redis_client
-                .get_async_connection()
+                .get_multiplexed_tokio_connection()
                 .await
-                .wrap_err(eyre!("Opening redis async connection: {:?}", redis_addr))?,
+                .wrap_err_with(|| eyre!("Opening redis async connection: {:?}", redis_addr))?,
         ));
 
         Ok(ClientShardChunnelClient {
@@ -1133,12 +1132,12 @@ mod test {
                         let ms: &mut [Option<(_, Msg)>] = cn
                             .recv(&mut slots)
                             .await
-                            .wrap_err(eyre!("receive message error"))?;
+                            .wrap_err("receive message error")?;
                         debug!("got msg batch");
                         // just echo.
                         cn.send(ms.iter_mut().map_while(Option::take))
                             .await
-                            .wrap_err(eyre!("send response err"))?;
+                            .wrap_err("send response err")?;
                         debug!("sent echo");
                     }
                 }
@@ -1208,7 +1207,7 @@ mod test {
                     let cn = UdpSkChunnel::default()
                         .connect(addr)
                         .await
-                        .wrap_err(eyre!("client connect"))
+                        .wrap_err("client connect")
                         .unwrap();
                     let cn = bertha::negotiate::negotiate_client(stack.clone(), cn, addr)
                         .await
@@ -1225,7 +1224,7 @@ mod test {
                     let cn = internal_cli
                         .connect(addr)
                         .await
-                        .wrap_err(eyre!("client connect"))
+                        .wrap_err("client connect")
                         .unwrap();
                     let cn = bertha::negotiate::negotiate_client(stack.clone(), cn, addr)
                         .await

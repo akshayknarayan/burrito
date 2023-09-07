@@ -15,7 +15,7 @@ where
 
 #[tracing::instrument(level = "trace", skip(conn))]
 pub async fn redis_insert<A>(
-    conn: Arc<Mutex<redis::aio::Connection>>,
+    conn: Arc<Mutex<redis::aio::MultiplexedConnection>>,
     serv: &ShardInfo<A>,
 ) -> Result<(), Error>
 where
@@ -41,7 +41,7 @@ where
 #[tracing::instrument(level = "trace", err, skip(con))]
 pub async fn redis_query<A>(
     canonical_addr: &A,
-    mut con: impl std::ops::DerefMut<Target = redis::aio::Connection>,
+    mut con: impl std::ops::DerefMut<Target = redis::aio::MultiplexedConnection>,
 ) -> Result<Option<ShardInfo<A>>, Error>
 where
     A: Serialize

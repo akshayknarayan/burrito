@@ -18,7 +18,8 @@ tracing-futures = "0.2"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["sync", "time"] }
-redis = { version = "0.22", default-features = false, features = ["aio", "tokio-comp"] }
+#redis = { version = "0.23.3", features = ["aio", "tokio-comp"] }
+redis = { git = "https://github.com/akshayknarayan/redis-rs", branch="async-pubsub-hang-fix", default-features = false, features = ["aio", "tokio-comp"] }
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
