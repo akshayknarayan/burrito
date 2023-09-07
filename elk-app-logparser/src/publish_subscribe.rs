@@ -210,15 +210,7 @@ async fn conn_negotiation_manager(
                 if let Err(err) = res {
                     warn!(?err, "stack transition failed");
                 } else {
-                    let cn_state = gcp_switch_ordering_handle
-                        .current()
-                        .map(|e| match e {
-                            Either::Left(()) => ConnState::GcpClientSideOrdering,
-                            Either::Right(()) => ConnState::GcpServiceSideOrdering,
-                        })
-                        .or(Some(ConnState::KafkaOrdering))
-                        .unwrap();
-                    info!(?cn_state, "did transition");
+                    info!("did transition");
                 }
             }
             // if the kafka stack is available and we are using it, we don't need to switch between
@@ -255,7 +247,6 @@ async fn conn_negotiation_manager(
                     .or(Some(ConnState::KafkaOrdering))
                     .unwrap();
                 cn_state_watcher.send_replace(cn_state);
-
                 // make a new future
                 gcp_changed = Box::pin(gcp_switch_ordering_handle.stack_changed());
             }
