@@ -27,7 +27,7 @@ use tls_tunnel::rustls::TLSChunnel;
 use tracing::{debug, debug_span, error, info, instrument, trace, trace_span, warn, Instrument};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct Line(String);
+pub struct Line(pub String);
 
 impl Kv for Line {
     type Key = String;
@@ -61,13 +61,12 @@ pub fn serve(
     };
 
     let cert_rc = Arc::new(
-        rcgen::generate_simple_self_signed([hostname.to_string()])
+        rcgen::generate_simple_self_signed([hostname.to_string(), listen_addr.ip().to_string()])
             .wrap_err("test certificate generation failed")?,
     );
 
     // start the workers
     for worker in worker_addrs {
-        info!(addr = ?&worker, "start worker");
         let int_srv = internal_srv.clone();
         let cert = cert_rc.clone();
         std::thread::spawn(move || {
@@ -231,7 +230,8 @@ async fn serve_canonical(
     .wrap_err("Create ShardCanonicalServer")?;
     let stack = CxList::from(cnsrv)
         .wrap(SerializeChunnel::<Line>::default())
-        .wrap(Select::from((Nothing::<()>::default(), enc_stack)));
+        //.wrap(Select::from((Nothing::<()>::default(), enc_stack)));
+        .wrap(enc_stack);
 
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
     info!(shard_info = ?&si, "start canonical server");
@@ -248,17 +248,17 @@ async fn serve_canonical(
         async move {
             let ctr = ctr.fetch_add(1, Ordering::SeqCst);
             loop {
-                match tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                match async {
                     r
                     .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
                     .instrument(trace_span!("shard-canonical-server-connection", ?ctr))
                     .await
                     .wrap_err("logparser/server: Error while processing requests")
-                })
+                }
                 .await
                 .wrap_err("logparser/server: Error in serving canonical connection")
                 {
-                    Ok(Err(e)) | Err(e) => {
+                    Err(e) => {
                         warn!(err = ?e, ?ctr, "exiting connection loop");
                         break Ok(());
                     }
