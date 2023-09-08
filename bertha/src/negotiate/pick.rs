@@ -151,7 +151,6 @@ where
 
             // if client has something with sidedness none, that means the server has to match its
             // capabilities. So if we didn't touch it, then invalid.
-
             if !client_m
                 .iter()
                 .all(|(guid, of)| of.sidedness.is_some() || touched.get(guid).is_some())
@@ -176,7 +175,11 @@ where
 
             let impls_matched = touched.iter().all(|t| {
                 // for all the things we did touch, the impls should match.
-                let of = server_m.get(t).unwrap();
+                let of = if let Some(o) = server_m.get(t) {
+                    o
+                } else {
+                    return false;
+                };
                 match of {
                     Offer { impl_guid, .. } if *impl_guid == 0 => true,
                     Offer {
@@ -243,11 +246,16 @@ where
             let server_m = &server.0;
 
             let impls_matched = touched.iter().all(|t| {
+                // if the server has touched something not available on the client, that is invalid.
+                match client_m.get(t) {
+                    Some(Offer { .. }) => (),
+                    None => return false,
+                }
+
                 // for all the things we did touch, the impls should match.
                 // We cannot check exhaustively (we might be mid-stack), so don't error on a
-                // missing entry
-                let of = server_m.get(t);
-                match of {
+                // missing entry on the server side
+                match server_m.get(t) {
                     Some(Offer { impl_guid, .. }) if *impl_guid == 0 => true,
                     Some(Offer {
                         sidedness: Some(univ),
