@@ -429,7 +429,7 @@ impl ChunnelConnection for TcpCn {
                         );
                         match self.inner.try_read(&mut len_buf[partial_header_len..]) {
                             Ok(0) => {
-                                unreachable!()
+                                bail!("connection closed by peer");
                             }
                             Ok(n) => {
                                 partial_header_len += n;
