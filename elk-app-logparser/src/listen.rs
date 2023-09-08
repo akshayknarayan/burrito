@@ -17,7 +17,7 @@ use bertha::{
     util::Nothing,
     ChunnelConnection, ChunnelListener, CxList, Either, Select,
 };
-use burrito_shard_ctl::{Kv, ShardInfo, SimpleShardPolicy};
+use burrito_shard_ctl::{Kv, ShardInfo};
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::TryStreamExt;
 use rcgen::Certificate;
@@ -54,10 +54,6 @@ pub fn serve(
     let si = ShardInfo {
         canonical_addr: listen_addr,
         shard_addrs: worker_addrs.clone(),
-        shard_info: SimpleShardPolicy {
-            packet_data_offset: 18,
-            packet_data_length: 4,
-        },
     };
 
     let cert_rc = Arc::new(

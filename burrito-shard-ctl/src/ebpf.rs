@@ -377,10 +377,6 @@ mod test {
                 format!("127.0.0.1:{}", shard1_port).parse().unwrap(),
                 format!("127.0.0.1:{}", shard2_port).parse().unwrap(),
             ],
-            shard_info: crate::SimpleShardPolicy {
-                packet_data_offset: 18,
-                packet_data_length: 4,
-            },
         };
 
         // 3. start shard serv

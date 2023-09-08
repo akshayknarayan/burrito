@@ -5,7 +5,7 @@ use bertha::{
     bincode::SerializeChunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     GetOffers,
 };
-use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
+use burrito_shard_ctl::ShardInfo;
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::TryStreamExt;
 use std::net::SocketAddr;
@@ -85,10 +85,6 @@ pub async fn serve_lb(
     let si = ShardInfo {
         canonical_addr: addr,
         shard_addrs: shards,
-        shard_info: SimpleShardPolicy {
-            packet_data_offset: 18,
-            packet_data_length: 4,
-        },
     };
 
     info!(?si, "starting serve_lb");

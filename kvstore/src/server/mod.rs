@@ -6,7 +6,7 @@ use bertha::{
     bincode::SerializeChunnel, chan_transport::RendezvousChannel, negotiate::StackNonce,
     ChunnelConnection, ChunnelListener, CxList,
 };
-use burrito_shard_ctl::{ShardInfo, SimpleShardPolicy};
+use burrito_shard_ctl::ShardInfo;
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::{Stream, TryStreamExt};
 use std::net::{IpAddr, SocketAddr};
@@ -219,10 +219,5 @@ fn make_shardinfo(srv_ip: IpAddr, srv_port: u16, num_shards: u16) -> ShardInfo<S
     ShardInfo {
         canonical_addr: SocketAddr::new(srv_ip, srv_port),
         shard_addrs,
-        // TODO fix this
-        shard_info: SimpleShardPolicy {
-            packet_data_offset: 18,
-            packet_data_length: 4,
-        },
     }
 }

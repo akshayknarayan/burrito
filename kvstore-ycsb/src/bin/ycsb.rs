@@ -204,10 +204,6 @@ fn do_exp(
                                 .iter()
                                 .map(|p| SocketAddr::new(opt.addr.ip(), *p))
                                 .collect(),
-                            shard_info: burrito_shard_ctl::SimpleShardPolicy {
-                                packet_data_offset: 18,
-                                packet_data_length: 4,
-                            },
                         },
                     )
                     .await?;
@@ -263,10 +259,6 @@ fn do_exp(
                                 .into_iter()
                                 .map(|p| SocketAddr::new(opt.addr.ip(), p))
                                 .collect(),
-                            shard_info: burrito_shard_ctl::SimpleShardPolicy {
-                                packet_data_offset: 18,
-                                packet_data_length: 4,
-                            },
                         },
                     )
                     .await
