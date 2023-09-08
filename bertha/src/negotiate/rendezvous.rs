@@ -1341,7 +1341,7 @@ mod t {
             CxList::from(ChunnelC).wrap(ChunnelA),
         ));
 
-        let stack2 = CxList::from(ChunnelA).wrap(Select::from((ChunnelB, ChunnelC)));
+        let stack2 = CxList::from(Select::from((ChunnelB, ChunnelC))).wrap(ChunnelA);
 
         super::solo_monomorphize(stack1).expect("stack 1");
         super::solo_monomorphize(stack2).expect("stack 2");

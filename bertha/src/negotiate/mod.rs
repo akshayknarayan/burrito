@@ -224,18 +224,18 @@ mod test {
     use super::{negotiate_client, negotiate_server, CapabilitySet, Negotiate, Select};
     use crate::test::COLOR_EYRE;
     use crate::udp::{UdpReqChunnel, UdpSkChunnel};
-    use crate::GetOffers;
     use crate::{
         chan_transport::Chan, Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, CxList,
     };
+    use crate::{monomorphize, GetOffers};
     use color_eyre::eyre::{eyre, Report};
     use futures_util::TryStreamExt;
     use futures_util::{
         future::{ready, Ready},
         stream::StreamExt,
     };
-    use std::net::SocketAddr;
     use std::net::ToSocketAddrs;
+    use std::net::{Ipv4Addr, SocketAddr};
     use tracing::{debug, debug_span, info, info_span};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
@@ -321,15 +321,32 @@ mod test {
             CxList::from(ChunnelC).wrap(ChunnelA),
         ));
 
-        let stack2 = CxList::from(ChunnelA).wrap(Select::from((ChunnelB, ChunnelC)));
+        let stack2 = CxList::from(Select::from((ChunnelB, ChunnelC))).wrap(ChunnelA);
 
         let stack1_offers: Vec<_> = stack1.offers().collect();
         let stack2_offers: Vec<_> = stack2.offers().collect();
 
-        dbg!(&stack1_offers);
-        dbg!(&stack2_offers);
-
         assert_eq!(stack1_offers, stack2_offers);
+
+        let a = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
+        let _p = monomorphize(stack1.clone(), stack2_offers.clone(), &a)
+            .expect("monomorphize Sel(A|>B, A|>C) with A|>Sel(B,C) offers");
+        let _p = monomorphize(stack2.clone(), stack1_offers.clone(), &a)
+            .expect("monomorphize A|>Sel(B,C) with Sel(A|>B, A|>C) offers");
+
+        let left_only = CxList::from(ChunnelB).wrap(ChunnelA);
+        let left_only_offers: Vec<_> = left_only.offers().collect();
+        let _p = monomorphize(stack1.clone(), left_only_offers.clone(), &a)
+            .expect("monomorphize Sel(A|>B, A|>C) with A|>B offers");
+        let _p = monomorphize(stack2.clone(), left_only_offers.clone(), &a)
+            .expect("monomorphize A|>Sel(B,C) with A|>B offers");
+
+        let right_only = CxList::from(ChunnelC).wrap(ChunnelA);
+        let right_only_offers: Vec<_> = right_only.offers().collect();
+        let _p = monomorphize(stack1.clone(), right_only_offers.clone(), &a)
+            .expect("monomorphize Sel(A|>B, A|>C) with A|>C offers");
+        let _p = monomorphize(stack2.clone(), right_only_offers.clone(), &a)
+            .expect("monomorphize A|>Sel(B,C) with A|>C offers");
     }
 
     #[test]
