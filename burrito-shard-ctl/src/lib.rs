@@ -556,7 +556,7 @@ where
 impl<A, A2> ClientShardChunnelClient<A, A2> {
     pub async fn new(addr: A, redis_addr: &str) -> Result<Self, Error> {
         let redis_client = redis::Client::open(redis_addr)
-            .wrap_err_with(|| eyre!("Opening redis connection: {:?}", redis_addr))?;
+            .wrap_err_with(|| eyre!("Opening redis client: {:?}", redis_addr))?;
         let redis_listen_connection = Arc::new(Mutex::new(
             redis_client
                 .get_multiplexed_tokio_connection()
