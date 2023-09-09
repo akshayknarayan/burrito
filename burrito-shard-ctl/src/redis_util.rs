@@ -22,16 +22,12 @@ where
     A: std::fmt::Display + std::fmt::Debug + Serialize + DeserializeOwned,
 {
     let name = redis_key(&serv.canonical_addr);
+    let shard_blob = bincode::serialize(serv)?;
     let mut r = redis::pipe();
     r.atomic()
-        .cmd("SADD")
-        .arg("shard-services")
-        .arg(&name)
+        .sadd("shard-services", &name)
+        .set(&name, shard_blob)
         .ignore();
-
-    let shard_blob = bincode::serialize(serv)?;
-    r.set(&name, shard_blob).ignore();
-
     trace!("adding");
     r.query_async(&mut *conn.lock().await).await?;
     trace!("done");
