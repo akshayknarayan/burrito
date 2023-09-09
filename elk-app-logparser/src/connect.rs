@@ -10,10 +10,7 @@ use std::{
 };
 
 use bertha::{
-    bincode::SerializeChunnel,
-    negotiate_client,
-    udp::UdpSkChunnel,
-    util::{Nothing, ProjectLeft},
+    bincode::SerializeChunnel, negotiate_client, udp::UdpSkChunnel, util::ProjectLeft,
     ChunnelConnection, ChunnelConnector, CxList, Select,
 };
 use burrito_shard_ctl::ClientShardChunnelClient;
@@ -100,7 +97,6 @@ macro_rules! encr_stack {
         let quic_stack = quic_chunnel::QuicChunnel::client(quic_client_cfg);
 
         Ok::<_, Report>(Select::from((quic_stack, tls_stack)))
-        //Ok::<_, Report>(tls_stack)
     }};
 }
 
@@ -114,10 +110,16 @@ pub async fn connect(
     let cl_shard = ClientShardChunnelClient::new(addr, &redis_addr)
         .await
         .wrap_err("make ClientShardChunnelClient")?;
-    let stack = CxList::from(cl_shard)
-        .wrap(SerializeChunnel::default())
-        //    .wrap(Select::from((Nothing::<()>::default(), enc_stack)));
-        .wrap(enc_stack);
+    // (
+    //   client_sharding |> serialize |> udp,
+    //   serialize |> ( tls |> tcp [replace udp], quic ) |> udp
+    // )
+    // client_sharding is not compatible with enc_stack since it requires send_to, which Connected
+    // types don't support.
+    let stack = Select::from((
+        CxList::from(cl_shard).wrap(SerializeChunnel::default()),
+        CxList::from(SerializeChunnel::default()).wrap(enc_stack),
+    ));
     let cn = negotiate_client(stack, base, addr).await?;
     debug!("returning connection");
     let cn = ProjectLeft::new(addr, cn);

@@ -3,6 +3,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use chrono::{DateTime, Duration, Utc};
+use color_eyre::{eyre::eyre, Report};
+use common_log_format::LogEntry;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ParsedLine {
@@ -40,7 +42,19 @@ pub fn sample_lines() -> impl Iterator<Item = ParsedLine> {
     })
 }
 
-/// TODO what format are the log lines going to be in?
-pub fn parse_lines(_lines: impl Iterator<Item = String>) -> impl Iterator<Item = ParsedLine> {
-    std::iter::empty()
+pub fn parse_lines(
+    lines: impl Iterator<Item = String>,
+) -> impl Iterator<Item = Result<ParsedLine, Report>> {
+    lines
+        .map(|line| line.parse())
+        .map(|le: Result<LogEntry, _>| match le {
+            Err(e) => Err(Report::from(e)),
+            Ok(le) => Ok(ParsedLine {
+                client_ip: le.host.ok_or_else(|| eyre!("missing client ip"))?,
+                timestamp: le.time.ok_or_else(|| eyre!("missing timestamp"))?,
+                text: le
+                    .request_line
+                    .ok_or_else(|| eyre!("missing request line"))?,
+            }),
+        })
 }

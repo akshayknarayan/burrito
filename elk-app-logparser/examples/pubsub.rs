@@ -7,7 +7,7 @@ use bertha::ChunnelConnection;
 use color_eyre::eyre::{Report, WrapErr};
 use elk_app_logparser::{
     parse_log::{self, ParsedLine},
-    publish_subscribe::ConnState,
+    publish_subscribe::{delete_topic, make_topic, ConnState},
 };
 use gcp_pubsub::GcpClient;
 use queue_steer::MessageQueueAddr;
@@ -70,8 +70,13 @@ async fn logparser(opt: Opt) -> Result<(), Report> {
         .await?;
 
     if opt.kafka_addr.is_some() {
-        if let Err(err) =
-            make_topic(ConnState::KafkaOrdering, &opt.kafka_addr, &mut gcp_client).await
+        if let Err(err) = make_topic(
+            ConnState::KafkaOrdering,
+            &opt.kafka_addr,
+            &mut gcp_client,
+            TOPIC_NAME,
+        )
+        .await
         {
             warn!(?err, "make kafka topic errored");
         }
@@ -81,6 +86,7 @@ async fn logparser(opt: Opt) -> Result<(), Report> {
         ConnState::GcpClientSideOrdering,
         &opt.kafka_addr,
         &mut gcp_client,
+        TOPIC_NAME,
     )
     .await
     {
@@ -169,55 +175,7 @@ async fn inner(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        delete_topic(curr_cn_state, &opt.kafka_addr, &mut gcp_client).await?;
+        delete_topic(curr_cn_state, &opt.kafka_addr, &mut gcp_client, TOPIC_NAME).await?;
         Ok(())
     }
-}
-
-async fn make_topic(
-    cn: ConnState,
-    kafka_addr: &Option<String>,
-    gcp_client: &mut GcpClient,
-) -> Result<(), Report> {
-    match cn {
-        ConnState::KafkaOrdering => {
-            info!(?TOPIC_NAME, "creating kafka topic");
-            kafka::make_topics(
-                    kafka_addr.clone().expect("if kafka_addr was not provided, we cannot have ended up with ConnState::KafkaOrdering"),
-                    vec![TOPIC_NAME.to_owned()]
-                ).await.wrap_err("make kafka topic")?;
-        }
-        ConnState::GcpClientSideOrdering | ConnState::GcpServiceSideOrdering => {
-            info!(?TOPIC_NAME, "creating GCP Pub/Sub topic");
-            gcp_pubsub::make_topic(gcp_client, TOPIC_NAME.to_owned())
-                .await
-                .wrap_err("make GCP Pub/Sub topic")?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn delete_topic(
-    cn: ConnState,
-    kafka_addr: &Option<String>,
-    gcp_client: &mut GcpClient,
-) -> Result<(), Report> {
-    match cn {
-        ConnState::KafkaOrdering => {
-            info!(?TOPIC_NAME, "delete kafka topic");
-            kafka::delete_topic(
-                    kafka_addr.clone().expect("if kafka_addr was not provided, we cannot have ended up with ConnState::KafkaOrdering"),
-                    vec![TOPIC_NAME.to_owned()]
-                ).await.wrap_err("delete kafka topic")?;
-        }
-        ConnState::GcpClientSideOrdering | ConnState::GcpServiceSideOrdering => {
-            info!(?TOPIC_NAME, "delete GCP Pub/Sub topic");
-            gcp_pubsub::delete_topic(gcp_client, TOPIC_NAME.to_owned())
-                .await
-                .wrap_err("delete GCP Pub/Sub topic")?;
-        }
-    }
-
-    Ok(())
 }

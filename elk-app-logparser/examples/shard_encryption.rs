@@ -1,5 +1,6 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    future::{ready, Ready},
+    net::SocketAddr,
     time::Duration,
 };
 
@@ -7,7 +8,7 @@ use bertha::ChunnelConnection;
 use color_eyre::eyre::{Report, WrapErr};
 use elk_app_logparser::{
     connect,
-    listen::{self, Line},
+    listen::{self, Line, ProcessLine},
 };
 use structopt::{clap::ArgGroup, StructOpt};
 use tracing::info;
@@ -24,7 +25,7 @@ struct Opt {
     connect_addr: Option<SocketAddr>,
 
     #[structopt(long, group = "addr", requires_all(&["hostname", "num-workers"]))]
-    listen_port: Option<u16>,
+    listen_addr: Option<SocketAddr>,
 
     #[structopt(long)]
     hostname: Option<String>,
@@ -51,9 +52,9 @@ fn main() -> Result<(), Report> {
 
     if let Some(addr) = opt.connect_addr {
         client(addr, opt.redis_addr)
-    } else if let Some(port) = opt.listen_port {
+    } else if let Some(addr) = opt.listen_addr {
         server(
-            port,
+            addr,
             opt.hostname.unwrap(),
             opt.num_workers.unwrap(),
             opt.redis_addr,
@@ -63,15 +64,34 @@ fn main() -> Result<(), Report> {
     }
 }
 
+struct DoNothing;
+impl ProcessLine for DoNothing {
+    type Error = std::convert::Infallible;
+    type Future<'a> = Ready<Result<(), Self::Error>>;
+
+    fn process_lines<'a>(
+        &'a self,
+        _line_batch: &'a mut [Option<(SocketAddr, Line)>],
+    ) -> Self::Future<'a> {
+        ready(Ok(()))
+    }
+}
+
 fn server(
-    listen_port: u16,
+    listen_addr: SocketAddr,
     hostname: String,
     num_workers: usize,
     redis_addr: String,
 ) -> Result<(), Report> {
     info!("starting server");
-    let listen_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), listen_port);
-    listen::serve(listen_addr, hostname, num_workers, redis_addr)
+    listen::serve(
+        listen_addr,
+        hostname,
+        num_workers,
+        redis_addr,
+        DoNothing,
+        None,
+    )
 }
 
 fn client(connect_addr: SocketAddr, redis_addr: String) -> Result<(), Report> {

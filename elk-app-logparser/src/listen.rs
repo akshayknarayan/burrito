@@ -3,6 +3,7 @@
 //! Take in raw messages, parse them with `crate::parse_log`, and produce them.
 
 use std::{
+    future::Future,
     io::Write,
     net::SocketAddr,
     sync::{
@@ -24,6 +25,7 @@ use rcgen::Certificate;
 use rustls::PrivateKey;
 use tcp::TcpChunnelWrapServer;
 use tls_tunnel::rustls::TLSChunnel;
+use tokio::runtime::Runtime;
 use tracing::{debug, debug_span, error, info, instrument, trace, trace_span, warn, Instrument};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -41,11 +43,24 @@ impl Kv for Line {
     }
 }
 
+pub trait ProcessLine {
+    type Future<'a>: Future<Output = Result<(), Self::Error>>
+    where
+        Self: 'a;
+    type Error: Into<Report> + Send + Sync + 'static;
+    fn process_lines<'a>(
+        &'a self,
+        line_batch: &'a mut [Option<(SocketAddr, Line)>],
+    ) -> Self::Future<'a>;
+}
+
 pub fn serve(
     listen_addr: SocketAddr,
     hostname: impl ToString,
     num_workers: usize,
     redis_addr: String,
+    process_message: impl ProcessLine + Send + Sync + 'static,
+    runtime: Option<Runtime>,
 ) -> Result<(), Report> {
     let (internal_srv, internal_cli) = RendezvousChannel::<SocketAddr, _, _>::new(100).split();
     let worker_addrs: Vec<_> = (1..=(num_workers as u16))
@@ -61,10 +76,12 @@ pub fn serve(
             .wrap_err("test certificate generation failed")?,
     );
 
+    let line_processor = Arc::new(process_message);
     // start the workers
     for worker in worker_addrs {
         let int_srv = internal_srv.clone();
         let cert = cert_rc.clone();
+        let lp = Arc::clone(&line_processor);
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -77,7 +94,7 @@ pub fn serve(
                 }
             };
             match rt.block_on(
-                single_worker(worker, int_srv, cert)
+                single_worker(worker, int_srv, cert, lp)
                     .instrument(debug_span!("worker", addr = ?&worker)),
             ) {
                 Ok(_) => (),
@@ -89,9 +106,13 @@ pub fn serve(
     }
 
     // start the base address listener
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let rt = if let Some(r) = runtime {
+        r
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+    };
     rt.block_on(serve_canonical(
         si,
         internal_cli,
@@ -145,15 +166,17 @@ macro_rules! encr_stack {
     }};
 }
 
-#[instrument(skip(internal_srv, cert), level = "info", err)]
+#[instrument(skip(internal_srv, cert, line_processor), level = "info", err)]
 async fn single_worker(
     addr: SocketAddr,
     mut internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, Srv>,
     cert: Arc<Certificate>,
+    line_processor: Arc<impl ProcessLine + Send + Sync + 'static>,
 ) -> Result<(), Report> {
     info!(?addr, "listening");
     let enc_stack = encr_stack!(addr, cert).wrap_err("creating encryption stack")?;
     let stack = CxList::from(SerializeChunnel::default())
+        //.wrap(enc_stack);
         .wrap(Select::from((Nothing::<()>::default(), enc_stack)));
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
     let negotiation_state = Default::default();
@@ -175,13 +198,14 @@ async fn single_worker(
         internal_conn_stream.map_ok(|cn| Either::Right(cn)),
     );
     let st = std::pin::pin!(joined_stream);
-    st.try_for_each_concurrent(None, |cn| serve_one_cn(cn))
+    st.try_for_each_concurrent(None, |cn| serve_one_cn(cn, &line_processor))
         .await?;
     unreachable!()
 }
 
 async fn serve_one_cn(
     cn: impl ChunnelConnection<Data = (SocketAddr, Line)> + Send + 'static,
+    line_processor: &Arc<impl ProcessLine + Send + Sync + 'static>,
 ) -> Result<(), Report> {
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
     debug!("new");
@@ -200,8 +224,10 @@ async fn serve_one_cn(
         };
 
         trace!(sz = ?msgs.iter().map_while(|x| x.as_ref().map(|_| 1)).sum::<usize>(), "got batch");
-
-        // TODO do something with this message
+        line_processor
+            .process_lines(msgs)
+            .await
+            .map_err(Into::into)?;
     }
 }
 
@@ -226,8 +252,7 @@ async fn serve_canonical(
     .wrap_err("Create ShardCanonicalServer")?;
     let stack = CxList::from(cnsrv)
         .wrap(SerializeChunnel::<Line>::default())
-        //.wrap(Select::from((Nothing::<()>::default(), enc_stack)));
-        .wrap(enc_stack);
+        .wrap(Select::from((Nothing::<()>::default(), enc_stack)));
 
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
     info!(shard_info = ?&si, "start canonical server");

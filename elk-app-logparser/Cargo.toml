@@ -12,6 +12,7 @@ redis-basechunnel = { path = "../redis-basechunnel" }
 burrito-shard-ctl = { path = "../burrito-shard-ctl" }
 quic-chunnel = { path = "../quic-chunnel" }
 tcp = { path = "../tcp" }
+common-log-format = { git = "https://github.com/akshayknarayan/common-log-format", branch = "main" }
 tls-tunnel = { path = "../tls-tunnel", features = ["rustls"] }
 rcgen = { version = "0.10.0", features = ["pem"] }
 tempfile = "3"

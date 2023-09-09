@@ -4,7 +4,10 @@ use bertha::{
     tagger::OrderedChunnel,
     ChunnelConnection, CxList, Either, Select, StackUpgradeHandle, UpgradeHandle, UpgradeSelect,
 };
-use color_eyre::{eyre::eyre, Report};
+use color_eyre::{
+    eyre::{eyre, WrapErr},
+    Report,
+};
 use gcp_pubsub::{GcpClient, OrderedPubSubChunnel, PubSubChunnel};
 use kafka::KafkaChunnel;
 use queue_steer::{MessageQueueAddr, Ordered};
@@ -252,4 +255,54 @@ async fn conn_negotiation_manager(
             }
         }
     }
+}
+
+pub async fn make_topic(
+    cn: ConnState,
+    kafka_addr: &Option<String>,
+    gcp_client: &mut GcpClient,
+    topic_name: &str,
+) -> Result<(), Report> {
+    match cn {
+        ConnState::KafkaOrdering => {
+            info!(?topic_name, "creating kafka topic");
+            kafka::make_topics(
+                    kafka_addr.clone().expect("if kafka_addr was not provided, we cannot have ended up with ConnState::KafkaOrdering"),
+                    vec![topic_name.to_owned()]
+                ).await.wrap_err("make kafka topic")?;
+        }
+        ConnState::GcpClientSideOrdering | ConnState::GcpServiceSideOrdering => {
+            info!(?topic_name, "creating GCP Pub/Sub topic");
+            gcp_pubsub::make_topic(gcp_client, topic_name.to_owned())
+                .await
+                .wrap_err("make GCP Pub/Sub topic")?;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn delete_topic(
+    cn: ConnState,
+    kafka_addr: &Option<String>,
+    gcp_client: &mut GcpClient,
+    topic_name: &str,
+) -> Result<(), Report> {
+    match cn {
+        ConnState::KafkaOrdering => {
+            info!(?topic_name, "delete kafka topic");
+            kafka::delete_topic(
+                    kafka_addr.clone().expect("if kafka_addr was not provided, we cannot have ended up with ConnState::KafkaOrdering"),
+                    vec![topic_name.to_owned()]
+                ).await.wrap_err("delete kafka topic")?;
+        }
+        ConnState::GcpClientSideOrdering | ConnState::GcpServiceSideOrdering => {
+            info!(?topic_name, "delete GCP Pub/Sub topic");
+            gcp_pubsub::delete_topic(gcp_client, topic_name.to_owned())
+                .await
+                .wrap_err("delete GCP Pub/Sub topic")?;
+        }
+    }
+
+    Ok(())
 }
