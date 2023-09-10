@@ -17,6 +17,7 @@ use gcp_pubsub::GcpClient;
 use queue_steer::MessageQueueAddr;
 use redis_basechunnel::RedisBase;
 use structopt::StructOpt;
+use tokio::sync::watch::Receiver;
 use tracing::{info, instrument, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
@@ -91,6 +92,7 @@ fn main() -> Result<(), Report> {
     let handler = PublishLines {
         inner: cn,
         topic_id: opt.topic_name,
+        cn_state_watcher,
     };
 
     info!(?curr_publish_state, "starting server");
@@ -107,6 +109,7 @@ fn main() -> Result<(), Report> {
 struct PublishLines<C> {
     inner: C,
     topic_id: String,
+    cn_state_watcher: Receiver<ConnState>,
 }
 
 impl<C> ProcessLine for PublishLines<C>
@@ -123,7 +126,10 @@ where
         let str_msgs = line_batch
             .iter_mut()
             .map_while(Option::take)
-            .map(|x| x.1 .0);
+            .filter_map(|x| match x.1 {
+                Line::Report(s) => Some(s),
+                Line::Ack => None,
+            });
         let lines = parse_lines(str_msgs);
         Box::pin(async move {
             let parsed_lines = lines.filter_map(|p| {
@@ -136,7 +142,10 @@ where
                     p,
                 ))
             });
-            self.inner.send(parsed_lines).await
+            let cn_state = *self.cn_state_watcher.borrow();
+            self.inner.send(parsed_lines).await?;
+            tracing::debug!(?cn_state, ?self.topic_id,  "sent lines");
+            Ok(())
         })
     }
 }

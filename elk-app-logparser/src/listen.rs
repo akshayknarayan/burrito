@@ -29,12 +29,18 @@ use tokio::runtime::Runtime;
 use tracing::{debug, debug_span, error, info, instrument, trace, trace_span, warn, Instrument};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct Line(pub String);
+pub enum Line {
+    Report(String),
+    Ack,
+}
 
 impl Kv for Line {
     type Key = String;
     fn key(&self) -> Self::Key {
-        self.0.clone()
+        match self {
+            Self::Report(s) => s.clone(),
+            Self::Ack => "ack".to_owned(),
+        }
     }
 
     type Val = ();
@@ -203,12 +209,14 @@ async fn single_worker(
     unreachable!()
 }
 
+#[instrument(skip(cn, line_processor), level = "info", err)]
 async fn serve_one_cn(
     cn: impl ChunnelConnection<Data = (SocketAddr, Line)> + Send + 'static,
     line_processor: &Arc<impl ProcessLine + Send + Sync + 'static>,
 ) -> Result<(), Report> {
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
-    debug!("new");
+    let mut acks = Vec::with_capacity(16);
+    debug!("new connection");
     loop {
         trace!("call recv");
         let msgs = match cn
@@ -224,10 +232,17 @@ async fn serve_one_cn(
         };
 
         trace!(sz = ?msgs.iter().map_while(|x| x.as_ref().map(|_| 1)).sum::<usize>(), "got batch");
+        acks.clear();
+        acks.extend(
+            msgs.iter()
+                .filter_map(|m| m.as_ref().map(|(a, _)| (*a, Line::Ack))),
+        );
         line_processor
             .process_lines(msgs)
             .await
             .map_err(Into::into)?;
+        cn.send(acks.drain(..)).await?;
+        trace!("done processing batch");
     }
 }
 
@@ -268,16 +283,14 @@ async fn serve_canonical(
         let mut slot = [None];
         async move {
             let ctr = ctr.fetch_add(1, Ordering::SeqCst);
+            info!(?ctr, "starting shard-canonical-server-connection");
             loop {
-                match async {
-                    r
+                trace!("calling recv");
+                match r
                     .recv(&mut slot) // ShardCanonicalServerConnection is recv-only
                     .instrument(trace_span!("shard-canonical-server-connection", ?ctr))
                     .await
-                    .wrap_err("logparser/server: Error while processing requests")
-                }
-                .await
-                .wrap_err("logparser/server: Error in serving canonical connection")
+                    .wrap_err("logparser/server: Error in serving canonical connection")
                 {
                     Err(e) => {
                         warn!(err = ?e, ?ctr, "exiting connection loop");

@@ -26,7 +26,7 @@ const SAMPLE_IPS: [IpAddr; 10] = [
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
 ];
 
-pub fn sample_lines() -> impl Iterator<Item = ParsedLine> {
+pub fn sample_parsed_lines() -> impl Iterator<Item = ParsedLine> {
     let sample_start_time: DateTime<Utc> =
         DateTime::parse_from_rfc2822("Wed, 18 Feb 2015 23:16:09 GMT")
             .unwrap()
@@ -40,6 +40,23 @@ pub fn sample_lines() -> impl Iterator<Item = ParsedLine> {
             text: "foo".to_owned(),
         }
     })
+}
+
+pub fn sample_logentry_lines() -> impl Iterator<Item = String> {
+    sample_parsed_lines().map(
+        |ParsedLine {
+             client_ip,
+             timestamp,
+             text,
+         }| {
+            format!(
+                "{ip} - - [{ts}] \"{txt}\" 200 100",
+                ip = client_ip,
+                ts = timestamp.format("%d/%b/%Y:%H:%M:%S %z"),
+                txt = text
+            )
+        },
+    )
 }
 
 pub fn parse_lines(

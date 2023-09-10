@@ -106,7 +106,7 @@ fn client(connect_addr: SocketAddr, redis_addr: String) -> Result<(), Report> {
             .wrap_err("connect error")?;
         info!(?connect_addr, "got connection, starting");
         for _ in 0..100 {
-            cn.send((0..10).map(|i| Line(format!("{} abcdefg", i))))
+            cn.send((0..10).map(|i| Line::Report(format!("{} abcdefg", i))))
                 .await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

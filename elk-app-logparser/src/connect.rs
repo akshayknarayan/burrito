@@ -16,7 +16,7 @@ use bertha::{
 use burrito_shard_ctl::ClientShardChunnelClient;
 use color_eyre::eyre::{Report, WrapErr};
 use rustls::{ClientConfig, RootCertStore, ServerName};
-use tcp::{Connect, TcpChunnelWrapClient};
+use tcp::{ConnectChunnel, TcpChunnelWrapClient};
 use tls_tunnel::rustls::TLSChunnel;
 use tracing::debug;
 
@@ -96,7 +96,9 @@ macro_rules! encr_stack {
         quic_client_cfg.set_disable_active_migration(true);
         let quic_stack = quic_chunnel::QuicChunnel::client(quic_client_cfg);
 
-        Ok::<_, Report>(Select::from((quic_stack, tls_stack)))
+        Ok::<_, Report>(
+            CxList::from(Select::from((quic_stack, tls_stack))).wrap(ConnectChunnel($connect_addr)),
+        )
     }};
 }
 
@@ -105,7 +107,6 @@ pub async fn connect(
     redis_addr: String,
 ) -> Result<impl ChunnelConnection<Data = Line> + Send + 'static, Report> {
     let base = UdpSkChunnel.connect(addr).await?;
-    let base = Connect::new(addr, base);
     let enc_stack = encr_stack!(addr).wrap_err("creating encryption stack")?;
     let cl_shard = ClientShardChunnelClient::new(addr, &redis_addr)
         .await

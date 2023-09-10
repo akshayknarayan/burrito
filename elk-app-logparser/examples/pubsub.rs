@@ -143,7 +143,7 @@ async fn inner(
         }
     } else {
         use itertools::Itertools;
-        let lines = parse_log::sample_lines();
+        let lines = parse_log::sample_parsed_lines();
         let line_groups = lines
             .map(|i| {
                 (
