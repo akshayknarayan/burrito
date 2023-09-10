@@ -5,9 +5,9 @@ use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre;
 use eyre::{eyre, Error, WrapErr};
 use serde::{de::DeserializeOwned, Serialize};
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{fmt::Debug, future::Future};
 use tokio::sync::Mutex;
 use tracing::{debug, debug_span, trace};
 use tracing_futures::Instrument;
@@ -22,9 +22,9 @@ pub struct ClientShardChunnelClient<A, A2> {
     _phantom: std::marker::PhantomData<A2>,
 }
 
-impl<A, A2> std::fmt::Debug for ClientShardChunnelClient<A, A2>
+impl<A, A2> Debug for ClientShardChunnelClient<A, A2>
 where
-    A: std::fmt::Debug,
+    A: Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientShardChunnelClient")
@@ -70,13 +70,13 @@ where
         + DeserializeOwned
         + Clone
         + std::cmp::PartialEq
-        + std::fmt::Debug
+        + Debug
         + std::fmt::Display
         + Send
         + Sync
         + 'static,
     A: Into<A2>,
-    A2: Clone + std::fmt::Debug + std::fmt::Display + Send + Sync + 'static,
+    A2: Clone + Debug + std::fmt::Display + Send + Sync + 'static,
     I: ChunnelConnection<Data = (A2, D)> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
     <D as Kv>::Key: AsRef<str>,
@@ -178,7 +178,7 @@ where
 
 impl<A, C, D> ChunnelConnection for ClientShardClientConnection<A, D, C>
 where
-    A: Clone + Send + Sync + 'static,
+    A: Clone + Debug + Send + Sync + 'static,
     C: ChunnelConnection<Data = (A, D)> + Send + Sync + 'static,
     D: Kv + Send + Sync + 'static,
 {
@@ -195,6 +195,7 @@ where
         self.inner.send(burst.into_iter().map(|(_, payload)| {
             let shard_idx = (self.shard_fn)(&payload);
             let a = self.shard_addrs[shard_idx].clone();
+            trace!(?a, ?shard_idx, "picked shard");
             (a, payload)
         }))
     }
