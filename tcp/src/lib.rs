@@ -533,6 +533,30 @@ impl<C: Connected, D> Connected for bertha::negotiate::InjectWithChannel<C, D> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectChunnel(pub SocketAddr);
+
+impl Negotiate for ConnectChunnel {
+    type Capability = ();
+    fn guid() -> u64 {
+        0x851affd43103507a
+    }
+}
+
+impl<C, D> Chunnel<C> for ConnectChunnel
+where
+    C: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
+    D: Send + 'static,
+{
+    type Future = Ready<Result<Self::Connection, Self::Error>>;
+    type Connection = Connect<C>;
+    type Error = std::convert::Infallible;
+
+    fn connect_wrap(&mut self, inner: C) -> Self::Future {
+        ready(Ok(Connect::new(self.0, inner)))
+    }
+}
+
 pub struct Connect<C>(SocketAddr, C);
 
 impl<C> Connect<C> {
