@@ -14,11 +14,11 @@
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{future::FutureExt, stream::Stream};
-use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{fmt::Debug, net::Ipv4Addr};
 use tracing::{debug, trace};
 
 /// UDP Chunnel connector.
@@ -201,7 +201,7 @@ where
             }
 
             num_recveived += peel_rest(&self.sk, &mut msgs_buf[1..])?;
-            trace!(from = ?msgs_buf[0].as_ref().map(|x| &x.0), ?num_recveived, "recv");
+            trace!(from = ?msgs_buf[0].as_ref().map(|x| &x.0), ?num_recveived, local_addr = ?self.local_addr(), "recv");
             Ok(msgs_buf)
         })
     }
@@ -350,7 +350,7 @@ mod test {
         rt.block_on(
             async move {
                 let addr = "127.0.0.1:35133".to_socket_addrs().unwrap().next().unwrap();
-                let srv = UdpSkChunnel::default()
+                let srv = UdpSkChunnel
                     .listen(addr)
                     .await
                     .unwrap()
@@ -359,13 +359,13 @@ mod test {
                     .unwrap()
                     .unwrap();
 
-                let cli = UdpSkChunnel::default().connect(addr).await.unwrap();
+                let cli = UdpSkChunnel.connect(addr).await.unwrap();
 
                 tokio::spawn(async move {
                     let mut recv_slots = [None, None];
                     loop {
                         let msgs = srv.recv(&mut recv_slots).await.unwrap();
-                        srv.send(msgs.into_iter().map_while(Option::take))
+                        srv.send(msgs.iter_mut().map_while(Option::take))
                             .await
                             .unwrap();
                     }
@@ -404,18 +404,18 @@ mod test {
                 let addr = "127.0.0.1:35134".to_socket_addrs().unwrap().next().unwrap();
 
                 tokio::spawn(async move {
-                    let srv = UdpReqChunnel::default().listen(addr).await.unwrap();
+                    let srv = UdpReqChunnel.listen(addr).await.unwrap();
                     srv.try_for_each_concurrent(None, |cn| async move {
                         let mut recv_slots = [None, None];
                         let msgs = cn.recv(&mut recv_slots).await?;
-                        cn.send(msgs.into_iter().map_while(Option::take)).await?;
+                        cn.send(msgs.iter_mut().map_while(Option::take)).await?;
                         Ok(())
                     })
                     .await
                     .unwrap();
                 });
 
-                let cli = UdpSkChunnel::default().connect(addr).await.unwrap();
+                let cli = UdpSkChunnel.connect(addr).await.unwrap();
                 cli.send(std::iter::once((addr, vec![1u8; 12])))
                     .await
                     .unwrap();
