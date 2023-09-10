@@ -129,7 +129,7 @@ impl<InC> Chunnel<InC> for KafkaChunnel {
             let cn = KafkaConn::new_with_cfg(producer_cfg, consumer_cfg)?;
             let t: Vec<&str> = self.topics.iter().map(|s| s.as_str()).collect();
             cn.listen(&t[..])?;
-            tracing::info!("new kafka connection");
+            tracing::info!(?t, ?self.addr,  "new kafka connection");
             Ok(cn)
         })())
     }
