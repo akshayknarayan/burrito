@@ -7,10 +7,9 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::RwLock;
 use tower_service as tower;
 use tracing::{error, info};
 
@@ -118,41 +117,40 @@ impl tower::Service<proto::Request> for BurritoNet {
         Box::pin(async move {
             Ok(match req {
                 proto::Request::Register(proto::RegisterRequest { addrs }) => {
-                    proto::Reply::Register(this.do_register(addrs).await.into())
+                    proto::Reply::Register(this.do_register(addrs).into())
                 }
-                proto::Request::Query(sk) => match this.query(&sk).await {
-                    Ok(rep) => proto::Reply::Query(
-                        Ok(proto::QueryNameReplyOk {
-                            addr: sk,
-                            local_addr: rep,
-                        })
-                        .into(),
-                    ),
-                    Err(e) => proto::Reply::Query(Err(e).into()),
-                },
+                proto::Request::Query(sks) => {
+                    let ans: Vec<_> = {
+                        let tbl = this.name_table.read().unwrap();
+                        sks.into_iter()
+                            .map(|addr| proto::QueryNameReplyEntry {
+                                addr,
+                                local_addr: tbl.get(&addr).cloned(),
+                            })
+                            .collect()
+                    };
+
+                    proto::Reply::Query(Ok(proto::QueryNameReplyOk(ans)).into())
+                }
             })
         })
     }
 }
 
 impl BurritoNet {
-    async fn do_register(
-        &self,
-        register: Vec<SocketAddr>,
-    ) -> Result<proto::RegisterReplyOk, String> {
+    fn do_register(&self, register: Vec<SocketAddr>) -> Result<proto::RegisterReplyOk, String> {
         self.assign_insert(register.clone())
-            .await
             .map(|rep| proto::RegisterReplyOk {
                 register_addr: register,
                 local_addr: rep,
             })
     }
 
-    async fn assign_insert(&self, service_addrs: Vec<SocketAddr>) -> Result<PathBuf, String> {
+    fn assign_insert(&self, service_addrs: Vec<SocketAddr>) -> Result<PathBuf, String> {
         let a = get_addr();
         let p = PathBuf::from(&a);
         for service_addr in &service_addrs {
-            self.name_table_insert(*service_addr, p.clone()).await?;
+            self.name_table_insert(*service_addr, p.clone())?;
         }
 
         info!(
@@ -164,21 +162,14 @@ impl BurritoNet {
         Ok(p)
     }
 
-    async fn name_table_insert(
+    fn name_table_insert(
         &self,
         service_addr: SocketAddr,
         listen_addr: PathBuf,
     ) -> Result<(), String> {
-        let mut tbl = self.name_table.write().await;
+        let mut tbl = self.name_table.write().unwrap();
         tbl.insert(service_addr, listen_addr);
         Ok(())
-    }
-
-    async fn query(&self, dst_addr: &SocketAddr) -> Result<Option<PathBuf>, String> {
-        // Look up the service addr to translate.
-        let tbl = self.name_table.read().await;
-        let addr = tbl.get(dst_addr).cloned();
-        Ok(addr)
     }
 }
 
@@ -189,6 +180,7 @@ fn get_addr() -> String {
     let listen_addr: String = rng
         .sample_iter(&rand::distributions::Alphanumeric)
         .take(10)
+        .map(|x| x as char)
         .collect();
     listen_addr
 }
@@ -222,10 +214,14 @@ mod test {
 
         let st = negotiate_server(lch_s, UdpSkChunnel.listen(addr).await?).await?;
         st.try_for_each_concurrent(None, |cn| async move {
+            let mut slots = [None, None, None, None];
             loop {
-                let m = cn.recv().await?;
-                info!(?m, "got msg");
-                cn.send(m).await?;
+                let ms = cn.recv(&mut slots).await.unwrap();
+                cn.send(ms.iter_mut().map_while(Option::take).inspect(|m| {
+                    info!(?m, "got msg");
+                }))
+                .await
+                .unwrap();
             }
         })
         .await?;
@@ -239,7 +235,7 @@ mod test {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(ErrorLayer::default());
         let _guard = subscriber.set_default();
-        color_eyre::install().unwrap_or(());
+        crate::t::COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -268,13 +264,17 @@ mod test {
                 )
                 .await
                 .unwrap();
-                let cn = negotiate_client(lch, UdpSkChunnel.connect(()).await.unwrap(), addr)
+                let cn = negotiate_client(lch, UdpSkChunnel.connect(addr).await.unwrap(), addr)
                     .await
                     .unwrap();
 
-                cn.send((Either::Left(addr), vec![0u8; 10])).await.unwrap();
-                let m = cn.recv().await.unwrap();
-                assert_eq!(m, (Either::Left(addr), vec![0u8; 10]));
+                cn.send(std::iter::once((Either::Left(addr), vec![0u8; 10])))
+                    .await
+                    .unwrap();
+                let mut slot = [None];
+                let m = cn.recv(&mut slot).await.unwrap();
+                assert!(!m.is_empty());
+                assert_eq!(m[0].take().unwrap(), (Either::Left(addr), vec![0u8; 10]));
             }
             .instrument(info_span!("with_ctl")),
         );

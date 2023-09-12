@@ -27,11 +27,22 @@ impl<A> GetSockAddr for (SocketAddr, A) {
     }
 }
 
+#[cfg(feature = "runtime")]
 mod runtime_fastpath;
+#[cfg(feature = "runtime")]
 pub use runtime_fastpath::*;
 
+#[cfg(feature = "conntime")]
 mod static_fastpath;
+#[cfg(feature = "conntime")]
 pub use static_fastpath::*;
 
+#[cfg(feature = "tls-tunnel")]
 mod fused_tls_fastpath;
+#[cfg(feature = "tls-tunnel")]
 pub use fused_tls_fastpath::*;
+
+#[cfg(test)]
+mod t {
+    pub static COLOR_EYRE: std::sync::Once = std::sync::Once::new();
+}

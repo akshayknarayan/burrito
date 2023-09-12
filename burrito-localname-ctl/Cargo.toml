@@ -5,18 +5,23 @@ authors = ["Akshay Narayan <akshayn@mit.edu>"]
 edition = "2021"
 
 [features]
-default = []
+default = ["runtime", "conntime"]
 ctl = ["tokio/rt-multi-thread", "tokio-stream", "tokio-stream", "ctrlc", "structopt", "rand", "tracing-subscriber", "tracing-error", "tracing-futures"]
+rustls = ["tls-tunnel", "tls-tunnel/rustls"]
+ghostunnel = ["tls-tunnel", "tls-tunnel/ghostunnel"]
+runtime = []
+conntime = []
 
 [dependencies]
 bertha = { path = "../bertha" }
-tls-tunnel = { path = "../tls-tunnel" }
+tls-tunnel = { path = "../tls-tunnel", optional=true }
+tcp = { path = "../tcp" }
 bincode = "1"
 tracing = "0.1"
 color-eyre = "0.6"
 serde  = { version = "1", features = ["derive"]}
 futures-util = { version = "0.3" }
-pnet = "0.27"
+pnet = "0.34"
 tokio = { version = "1", features = ["sync", "time"] }
 async-bincode = "0.6"
 tokio-tower = "0.5"
@@ -31,7 +36,7 @@ structopt = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time", "net"] }
-tracing-subscriber = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-error = "0.2"
 test-util = { path = "../test-util" }
 

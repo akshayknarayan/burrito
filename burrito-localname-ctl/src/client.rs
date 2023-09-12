@@ -68,20 +68,22 @@ impl LocalNameClient {
         }
     }
 
-    pub async fn query(&mut self, req: SocketAddr) -> Result<Option<PathBuf>, Error> {
+    pub async fn query(
+        &mut self,
+        req: Vec<SocketAddr>,
+    ) -> Result<Vec<(SocketAddr, Option<PathBuf>)>, Error> {
         futures_util::future::poll_fn(|cx| self.cl.poll_ready(cx)).await?;
         match self.cl.call(proto::Request::Query(req)).await {
             Ok(proto::Reply::Query(r)) => {
-                let r: Result<proto::QueryNameReplyOk, String> = r.into();
-                r.map_err(|s| eyre!("{}", s)).and_then(
-                    |proto::QueryNameReplyOk { addr, local_addr }| {
-                        if addr != req {
-                            bail!("Reply mismatched request address")
-                        }
-
-                        Ok(local_addr.map(|a| self.root.join(a)))
-                    },
-                )
+                let rp: Result<proto::QueryNameReplyOk, String> = r.into();
+                let rp = rp.map_err(|s| eyre!("{}", s))?;
+                Ok(rp
+                    .0
+                    .into_iter()
+                    .map(|proto::QueryNameReplyEntry { addr, local_addr }| {
+                        (addr, local_addr.map(|a| self.root.join(a)))
+                    })
+                    .collect())
             }
             _ => bail!("Reply mismatched request type"),
         }

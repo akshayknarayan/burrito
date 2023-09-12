@@ -34,7 +34,10 @@ impl From<RegisterReply> for Result<RegisterReplyOk, String> {
 ///
 /// Returns all service entries matching the query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryNameReplyOk {
+pub struct QueryNameReplyOk(pub Vec<QueryNameReplyEntry>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryNameReplyEntry {
     pub addr: SocketAddr,
     pub local_addr: Option<PathBuf>,
 }
@@ -57,7 +60,7 @@ impl From<QueryNameReply> for Result<QueryNameReplyOk, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Register(RegisterRequest),
-    Query(SocketAddr),
+    Query(Vec<SocketAddr>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
