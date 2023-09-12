@@ -16,7 +16,7 @@ use tracing_subscriber::prelude::*;
 #[derive(Debug, StructOpt)]
 #[structopt(name = "consumer")]
 struct Opt {
-    #[structopt(long)]
+    #[structopt(long, default_value = "/tmp/burrito")]
     local_root: PathBuf,
 
     #[structopt(long)]
@@ -46,6 +46,7 @@ fn main() -> Result<(), Report> {
         .enable_all()
         .build()
         .wrap_err("Building tokio runtime")?;
+
     rt.block_on(consumer(opt))
 }
 
@@ -69,8 +70,8 @@ impl ProcessLine<EstOutputRateHist> for Process {
                         let cnt = iv.count_since_last_iteration();
                         (quantile, value, cnt)
                     })
-                    .fold(format!("Hist({})", num_records), |mut acc, (q, v, c)| {
-                        let m = format!("[{}]({}): {}", q, v, c);
+                    .fold(format!("Hist({}) | ", num_records), |mut acc, (q, v, c)| {
+                        let m = format!("[{}]({}): {} | ", q, v, c);
                         acc.push_str(&m);
                         acc
                     });
@@ -85,6 +86,10 @@ impl ProcessLine<EstOutputRateHist> for Process {
 
 #[instrument(level = "info", skip(opt))]
 async fn consumer(opt: Opt) -> Result<(), Report> {
+    tokio::spawn(burrito_localname_ctl::ctl::serve_ctl(
+        Some(opt.local_root.clone()),
+        true,
+    ));
     info!(?opt, "starting consumer");
     serve_local(opt.listen_addr, opt.hostname, opt.local_root, Process).await
 }

@@ -188,7 +188,6 @@ async fn single_worker(
     info!(?addr, "listening");
     let enc_stack = encr_stack!(addr, cert).wrap_err("creating encryption stack")?;
     let stack = CxList::from(SerializeChunnel::default())
-        //.wrap(enc_stack);
         .wrap(Select::from((Nothing::<()>::default(), enc_stack)));
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
     let negotiation_state = Default::default();
@@ -330,8 +329,8 @@ pub async fn serve_local(
     )
     .await?;
     let stack = CxList::from(EstOutputRateSerializeChunnel)
-        .wrap(enc)
-        .wrap(lch);
+        .wrap(lch)
+        .wrap(enc);
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
     info!(?listen_addr, "start server");
     let st = base_udp.listen(listen_addr).await?;

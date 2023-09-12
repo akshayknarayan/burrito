@@ -32,7 +32,7 @@ struct Opt {
     #[structopt(long)]
     topic_name: String,
 
-    #[structopt(long)]
+    #[structopt(long, default_value = "/tmp/burrito")]
     local_root: PathBuf,
 
     #[structopt(long)]
@@ -137,13 +137,13 @@ async fn inner(
                 )
                 .filter_map(Result::ok);
                 if processed_entries == 0 {
-                    send_wait = Either::Right(Box::pin(tokio::time::sleep(Duration::from_secs(30))));
+                    send_wait = Either::Right(Box::pin(tokio::time::sleep(Duration::from_secs(10))));
                 }
 
                 processed_entries += est_output_rate.new_entries(log_entries);
                 debug!(?processed_entries, "received");
             }
-            // dump output 30 seconds after we see an entry, then reset the counter
+            // dump output 10 seconds after we see an entry, then reset the counter
             _ = &mut send_wait, if send_wait.is_right() => {
                 let hist = est_output_rate.take_hist();
                 info!(?processed_entries, "sending histogram");

@@ -16,6 +16,7 @@ use hdrhistogram::{
     serialization::{Deserializer, Serializer, V2Serializer},
     Histogram,
 };
+use tracing::{trace, warn};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ParsedLine {
@@ -46,20 +47,27 @@ pub fn sample_parsed_lines() -> impl Iterator<Item = ParsedLine> {
     })
 }
 
+const SAMPLE_STATUS_CODE: usize = 200;
+const SAMPLE_OBJ_SIZE: usize = 100;
+const SAMPLE_INTERARRIVAL_MS: usize = 19;
+
 pub fn sample_logentry_lines() -> impl Iterator<Item = String> {
     let sample_start_time: DateTime<Utc> =
-        DateTime::parse_from_rfc2822("Wed, 18 Feb 2015 23:16:09 GMT")
+        DateTime::parse_from_rfc3339("1996-12-19T16:39:57.125-08:00")
             .unwrap()
             .into();
     sample_parsed_lines()
         .enumerate()
         .map(move |(i, ParsedLine { client_ip, text })| {
-            let timestamp = sample_start_time + Duration::milliseconds((i * 19) as i64);
+            let timestamp =
+                sample_start_time + Duration::milliseconds((i * SAMPLE_INTERARRIVAL_MS) as i64);
             format!(
-                "{ip} - - [{ts}] \"{txt}\" 200 100",
+                "{ip} - - [{ts}] \"{txt}\" {sc} {os}",
                 ip = client_ip,
-                ts = timestamp.format("%d/%b/%Y:%H:%M:%S %z"),
-                txt = text
+                ts = timestamp.to_rfc3339(),
+                txt = text,
+                sc = SAMPLE_STATUS_CODE,
+                os = SAMPLE_OBJ_SIZE,
             )
         })
 }
@@ -91,7 +99,7 @@ pub struct EstOutputRate {
 impl Default for EstOutputRate {
     fn default() -> Self {
         Self {
-            hist: Histogram::new(2).expect("make new histogram"),
+            hist: Histogram::new(3).expect("make new histogram"),
             prev_ts: None,
         }
     }
@@ -112,7 +120,10 @@ impl EstOutputRate {
                 let el = ts - prev_ts;
                 let est_rate = obj_size as f64 / el.to_std().unwrap().as_secs_f64();
                 let est_rate_int = est_rate as _;
-                self.hist.saturating_record(est_rate_int);
+                trace!(?obj_size, ?el, ?est_rate, ?est_rate_int, "rate sample");
+                if let Err(err) = self.hist.record(est_rate_int) {
+                    warn!(?err, "histogram error");
+                }
             }
 
             self.prev_ts = Some(ts);
@@ -123,7 +134,7 @@ impl EstOutputRate {
     }
 
     pub fn take_hist(&mut self) -> EstOutputRateHist {
-        let h = std::mem::replace(&mut self.hist, Histogram::new(2).unwrap());
+        let h = std::mem::replace(&mut self.hist, Histogram::new(3).unwrap());
         EstOutputRateHist { h }
     }
 }
@@ -237,5 +248,68 @@ where
 
             Ok(&mut msgs_buf[..slot_idx])
         })
+    }
+}
+
+#[cfg(test)]
+mod t {
+    use std::sync::Once;
+
+    use tracing::{info, warn};
+    use tracing_error::ErrorLayer;
+    use tracing_subscriber::prelude::*;
+
+    use crate::parse_log::{SAMPLE_INTERARRIVAL_MS, SAMPLE_OBJ_SIZE};
+
+    use super::{parse_lines, parse_raw, sample_logentry_lines, EstOutputRate};
+
+    pub static COLOR_EYRE: Once = Once::new();
+
+    #[test]
+    fn pipeline() {
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+
+        let raw = sample_logentry_lines();
+        let lines = parse_raw(raw);
+        let entries = parse_lines(lines);
+
+        let mut or = EstOutputRate::default();
+        const NUM_ENTRIES: usize = 25;
+        let proc = or.new_entries(entries.take(NUM_ENTRIES).filter_map(|e| {
+            if e.is_err() {
+                warn!(?e, "entry");
+            }
+            e.ok()
+        }));
+        assert_eq!(proc, NUM_ENTRIES);
+
+        let h = or.take_hist();
+        let expected_rate = SAMPLE_OBJ_SIZE * 1000 / SAMPLE_INTERARRIVAL_MS;
+        let quantile_matching_expected = h.quantile_below(expected_rate as u64);
+        info!(?quantile_matching_expected, ?expected_rate, "checking hist");
+        assert!(0.95 < quantile_matching_expected);
+        let num_records = h.len();
+        if num_records > 0 {
+            let msg = h
+                .iter_quantiles(2)
+                .map(|iv| {
+                    let quantile = iv.quantile_iterated_to();
+                    let value = iv.value_iterated_to();
+                    let cnt = iv.count_since_last_iteration();
+                    (quantile, value, cnt)
+                })
+                .fold(format!("Hist({}) | ", num_records), |mut acc, (q, v, c)| {
+                    let m = format!("[{}]({}): {} | ", q, v, c);
+                    acc.push_str(&m);
+                    acc
+                });
+
+            info!(?msg, maxval=?h.max(), "got histogram update");
+        }
     }
 }

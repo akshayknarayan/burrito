@@ -11,8 +11,8 @@ use std::{
 };
 
 use bertha::{
-    bincode::SerializeChunnel, negotiate_client, udp::UdpSkChunnel, uds::UnixSkChunnel,
-    util::ProjectLeft, ChunnelConnection, ChunnelConnector, CxList, Select,
+    bincode::SerializeChunnel, udp::UdpSkChunnel, uds::UnixSkChunnel, util::ProjectLeft,
+    ChunnelConnection, ChunnelConnector, CxList, Select,
 };
 use burrito_localname_ctl::LocalNameChunnel;
 use burrito_shard_ctl::ClientShardChunnelClient;
@@ -126,7 +126,7 @@ pub async fn connect(
         CxList::from(cl_shard).wrap(SerializeChunnel::default()),
         CxList::from(SerializeChunnel::default()).wrap(enc_stack),
     ));
-    let cn = negotiate_client(stack, base, addr).await?;
+    let cn = bertha::negotiate_client(stack, base, addr).await?;
     debug!("returning connection");
     let cn = ProjectLeft::new(addr, cn);
     Ok(cn)
@@ -145,8 +145,8 @@ pub async fn connect_local(
     )
     .await?;
     let stack = CxList::from(EstOutputRateSerializeChunnel)
-        .wrap(enc)
-        .wrap(lch);
+        .wrap(lch)
+        .wrap(enc);
     let cn = bertha::negotiate_client(stack, sk, addr).await?;
     Ok(ProjectLeft::new(addr, cn))
 }

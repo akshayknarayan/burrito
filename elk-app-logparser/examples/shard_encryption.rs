@@ -65,7 +65,10 @@ fn main() -> Result<(), Report> {
 }
 
 struct DoNothing;
-impl ProcessLine for DoNothing {
+impl<Line> ProcessLine<Line> for DoNothing
+where
+    Line: 'static,
+{
     type Error = std::convert::Infallible;
     type Future<'a> = Ready<Result<(), Self::Error>>;
 
