@@ -533,6 +533,26 @@ impl<C: Connected, D> Connected for bertha::negotiate::InjectWithChannel<C, D> {
     }
 }
 
+impl<L, R> Connected for bertha::Either<L, R>
+where
+    L: Connected,
+    R: Connected,
+{
+    fn local_addr(&self) -> SocketAddr {
+        match self {
+            bertha::Either::Left(l) => l.local_addr(),
+            bertha::Either::Right(r) => r.local_addr(),
+        }
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        match self {
+            bertha::Either::Left(l) => l.peer_addr(),
+            bertha::Either::Right(r) => r.peer_addr(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ConnectChunnel(pub SocketAddr);
 
