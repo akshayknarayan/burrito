@@ -20,12 +20,28 @@ use tracing::{debug, instrument, trace};
 /// LocalNameChunnel fast-paths data bound to local destinations.
 ///
 /// `local_chunnel` is the fast-path chunnel.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LocalNameChunnel<Lch, Lr, Side = ()> {
     cl: Option<Arc<Mutex<client::LocalNameClient>>>,
     side: Side,
     local_raw: Lr,
     local_chunnel: Lch,
+}
+
+impl<Lch, Lr, S> Debug for LocalNameChunnel<Lch, Lr, S>
+where
+    Lch: Debug,
+    Lr: Debug,
+    S: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalNameChunnel")
+            .field("side", &self.side)
+            .field("local_raw", &self.local_raw)
+            .field("local_chunnel", &self.local_chunnel)
+            .field("has_client", &self.cl.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

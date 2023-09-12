@@ -1,7 +1,7 @@
 //! SocketAddr -> Path with local scope.
 
 use crate::proto;
-use color_eyre::eyre::Error;
+use color_eyre::eyre::{eyre, Error, WrapErr};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -18,10 +18,10 @@ use tracing::{error, info};
 /// See also [`BurritoNet`].
 ///
 /// `force`: If true, root will be removed before attempting to listen.
-#[tracing::instrument]
+#[tracing::instrument(err)]
 pub async fn serve_ctl(root: Option<PathBuf>, force: bool) -> Result<(), Error> {
     // get burrito-localname-ctl serving future
-    let burrito = BurritoNet::new(root);
+    let burrito = BurritoNet::new(root)?;
     let burrito_addr = burrito.listen_path();
 
     // if force_burrito, then we are ok with hijacking /controller, potentially from another
@@ -66,12 +66,13 @@ impl BurritoNet {
     ///
     /// # Arguments
     /// root: The filesystem root of BurritoNet's unix pipes. Default is /tmp/burrito
-    pub fn new(root: Option<PathBuf>) -> Self {
+    pub fn new(root: Option<PathBuf>) -> Result<Self, Error> {
         let root = root.unwrap_or_else(|| std::path::PathBuf::from("/tmp/burrito"));
-        BurritoNet {
+        std::fs::create_dir_all(&root).wrap_err_with(|| eyre!("create directory {:?}", &root))?;
+        Ok(BurritoNet {
             root,
             name_table: Default::default(),
-        }
+        })
     }
 
     /// Get burrito-ctl's listening path.
