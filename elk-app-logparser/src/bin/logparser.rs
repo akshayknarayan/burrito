@@ -1,24 +1,19 @@
-//! Take in messages containing one or more server log lines, and publish messages grouped by
-//! client IP, ordered by timestamp.
-//!
-//! Listen on HTTP/HTTPS/QUIC (with load balancing across multiple instances / threads) and publish
-//! on pub/sub chunnel with reconfigurable ordering.
+//! Subscribe to a pub/sub topic with logs ordered by client and calculate statistics.
 
-use std::{future::Future, net::SocketAddr, pin::Pin};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use bertha::{ChunnelConnection, Either};
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{Report, WrapErr};
 use elk_app_logparser::{
-    listen::{self, Line, ProcessLine},
-    parse_log::{parse_lines, ParsedLine},
-    publish_subscribe::{self, make_topic, ConnState},
+    connect::{self},
+    parse_log::{self, EstOutputRate, ParsedLine},
+    publish_subscribe::{make_topic, ConnState},
 };
-use gcp_pubsub::GcpClient;
 use queue_steer::MessageQueueAddr;
 use redis_basechunnel::RedisBase;
 use structopt::StructOpt;
-use tokio::sync::watch::Receiver;
-use tracing::{info, instrument, warn};
+use tokio::sync::watch;
+use tracing::{debug, info, instrument, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
@@ -35,16 +30,13 @@ struct Opt {
     gcp_project_name: String,
 
     #[structopt(long)]
-    listen_addr: SocketAddr,
-
-    #[structopt(long)]
-    hostname: String,
-
-    #[structopt(long)]
-    num_workers: usize,
-
-    #[structopt(long)]
     topic_name: String,
+
+    #[structopt(long)]
+    local_root: PathBuf,
+
+    #[structopt(long)]
+    forward_addr: SocketAddr,
 
     #[structopt(long)]
     logging: bool,
@@ -63,115 +55,29 @@ fn main() -> Result<(), Report> {
         d.init();
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .wrap_err("Building tokio runtime")?;
-    let redis_addr = opt.redis_addr.clone();
-    let topic_name = opt.topic_name.clone();
-    let (cn, mut cn_state_watcher) = rt.block_on(async move {
-        let (redis, gcp_client) = setup_subscriber(
-            redis_addr,
-            opt.gcp_project_name,
-            opt.kafka_addr.clone(),
-            &topic_name,
-        )
-        .await?;
-        if let Some(ref kafka_addr) = opt.kafka_addr {
-            let (cn_state_watcher, conn) =
-                publish_subscribe::connect(&topic_name, redis, gcp_client, kafka_addr).await?;
-            Ok::<_, Report>((Either::Left(conn), cn_state_watcher))
-        } else {
-            let (cn_state_watcher, conn) =
-                publish_subscribe::connect_gcp_only(&topic_name, redis, gcp_client).await?;
-            Ok::<_, Report>((Either::Right(conn), cn_state_watcher))
-        }
-    })?;
-
-    let curr_publish_state = *cn_state_watcher.borrow_and_update();
-    let handler = PublishLines {
-        inner: cn,
-        topic_id: opt.topic_name,
-        cn_state_watcher,
-    };
-
-    info!(?curr_publish_state, "starting server");
-    listen::serve(
-        opt.listen_addr,
-        opt.hostname,
-        opt.num_workers,
-        opt.redis_addr,
-        handler,
-        Some(rt),
-    )
+    rt.block_on(logparser(opt))
 }
 
-struct PublishLines<C> {
-    inner: C,
-    topic_id: String,
-    cn_state_watcher: Receiver<ConnState>,
-}
-
-impl<C> ProcessLine for PublishLines<C>
-where
-    C: ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send + Sync + 'static,
-{
-    type Error = Report;
-    type Future<'a> = Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
-
-    fn process_lines<'a>(
-        &'a self,
-        line_batch: &'a mut [Option<(SocketAddr, Line)>],
-    ) -> Self::Future<'a> {
-        let str_msgs = line_batch
-            .iter_mut()
-            .map_while(Option::take)
-            .filter_map(|x| match x.1 {
-                Line::Report(s) => Some(s),
-                Line::Ack => None,
-            });
-        let lines = parse_lines(str_msgs);
-        Box::pin(async move {
-            let parsed_lines = lines.filter_map(|p| {
-                let p = p.ok()?;
-                Some((
-                    MessageQueueAddr {
-                        topic_id: self.topic_id.clone(),
-                        group: Some(p.client_ip.to_string()),
-                    },
-                    p,
-                ))
-            });
-            let cn_state = *self.cn_state_watcher.borrow();
-            self.inner.send(parsed_lines).await?;
-            tracing::debug!(?cn_state, ?self.topic_id,  "sent lines");
-            Ok(())
-        })
-    }
-}
-
-#[instrument(level = "debug", err)]
-async fn setup_subscriber(
-    redis_addr: String,
-    gcp_project_name: String,
-    kafka_addr: Option<String>,
-    topic_name: &str,
-) -> Result<(RedisBase, GcpClient), Report> {
-    let redis = RedisBase::new(&redis_addr)
-        .await
-        .wrap_err_with(|| eyre!("Connect to redis at {}", redis_addr))?;
+#[instrument(level = "info", skip(opt))]
+async fn logparser(opt: Opt) -> Result<(), Report> {
+    info!(?opt, "starting logparser");
+    let redis = RedisBase::new(&opt.redis_addr).await?;
     let mut gcp_client = gcp_pubsub::GcpCreds::default()
-        .with_project_name(gcp_project_name)
+        .with_project_name(&opt.gcp_project_name)
         .creds_path_env()
         .finish()
         .await?;
 
-    if kafka_addr.is_some() {
+    if opt.kafka_addr.is_some() {
         if let Err(err) = make_topic(
             ConnState::KafkaOrdering,
-            &kafka_addr,
+            &opt.kafka_addr,
             &mut gcp_client,
-            topic_name,
+            &opt.topic_name,
         )
         .await
         {
@@ -181,14 +87,80 @@ async fn setup_subscriber(
 
     if let Err(err) = make_topic(
         ConnState::GcpClientSideOrdering,
-        &kafka_addr,
+        &opt.kafka_addr,
         &mut gcp_client,
-        topic_name,
+        &opt.topic_name,
     )
     .await
     {
         warn!(?err, "make gcp topic errored");
     }
 
-    Ok((redis, gcp_client))
+    if let Some(ref kafka_addr) = opt.kafka_addr {
+        let (cn_state_watcher, conn) = elk_app_logparser::publish_subscribe::connect(
+            &opt.topic_name,
+            redis,
+            gcp_client.clone(),
+            kafka_addr,
+        )
+        .await?;
+        inner(opt, conn, cn_state_watcher).await
+    } else {
+        let (cn_state_watcher, conn) = elk_app_logparser::publish_subscribe::connect_gcp_only(
+            &opt.topic_name,
+            redis,
+            gcp_client.clone(),
+        )
+        .await?;
+        inner(opt, conn, cn_state_watcher).await
+    }
+}
+
+async fn inner(
+    opt: Opt,
+    conn: impl ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send,
+    mut cn_state_watcher: watch::Receiver<ConnState>,
+) -> Result<(), Report> {
+    let mut curr_cn_state = *cn_state_watcher.borrow_and_update();
+
+    let fwd_conn = connect::connect_local(opt.forward_addr, opt.local_root).await?;
+
+    let mut slots = vec![None; 16];
+    let mut processed_entries = 0;
+    let mut est_output_rate: EstOutputRate = Default::default();
+    let mut send_wait = Either::Left(futures_util::future::pending());
+    loop {
+        tokio::select! {
+            ms = conn.recv(&mut slots[..]) => {
+                let log_entries = parse_log::parse_lines(
+                    ms?.iter_mut().map_while(|m| m.take().map(|(_, pl)| pl)),
+                )
+                .filter_map(Result::ok);
+                if processed_entries == 0 {
+                    send_wait = Either::Right(Box::pin(tokio::time::sleep(Duration::from_secs(30))));
+                }
+
+                processed_entries += est_output_rate.new_entries(log_entries);
+                debug!(?processed_entries, "received");
+            }
+            // dump output 30 seconds after we see an entry, then reset the counter
+            _ = &mut send_wait, if send_wait.is_right() => {
+                let hist = est_output_rate.take_hist();
+                info!(?processed_entries, "sending histogram");
+                fwd_conn.send(std::iter::once(hist)).await?;
+                processed_entries = 0;
+                send_wait = Either::Left(futures_util::future::pending());
+            }
+            _ = cn_state_watcher.changed() => {
+                let cn_state = *cn_state_watcher.borrow_and_update();
+                if curr_cn_state.is_kafka() && cn_state.is_gcp() || curr_cn_state.is_gcp() && cn_state.is_kafka() {
+                    info!(?cn_state, "reconfiguring connection");
+                } else {
+                    info!(?cn_state, ?curr_cn_state, "connection update");
+                }
+
+                curr_cn_state = cn_state;
+            }
+        }
+    }
 }

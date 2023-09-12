@@ -21,7 +21,7 @@ use tracing_subscriber::prelude::*;
 use elk_app_logparser::{connect, listen::Line, parse_log::sample_logentry_lines};
 
 #[derive(Debug, StructOpt)]
-#[structopt(name = "logparser")]
+#[structopt(name = "logproducer")]
 struct Opt {
     #[structopt(long)]
     redis_addr: String,
@@ -74,7 +74,6 @@ fn main() -> Result<(), Report> {
         let mut producer = std::pin::pin!(producer);
         let mut rem_line_count = opt.tot_message_limit;
         info!(?opt.connect_addr, ?rem_line_count, "got connection, starting");
-        //loop {
         let mut slots: Vec<_> = (0..16).map(|_| None).collect();
         while let Some(burst) = producer.next().await {
             let burst_len = burst.len();

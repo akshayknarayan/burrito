@@ -6,13 +6,15 @@ use std::{
     error::Error,
     fmt::Display,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::Arc,
 };
 
 use bertha::{
-    bincode::SerializeChunnel, negotiate_client, udp::UdpSkChunnel, util::ProjectLeft,
-    ChunnelConnection, ChunnelConnector, CxList, Select,
+    bincode::SerializeChunnel, negotiate_client, udp::UdpSkChunnel, uds::UnixSkChunnel,
+    util::ProjectLeft, ChunnelConnection, ChunnelConnector, CxList, Select,
 };
+use burrito_localname_ctl::LocalNameChunnel;
 use burrito_shard_ctl::ClientShardChunnelClient;
 use color_eyre::eyre::{Report, WrapErr};
 use rustls::{ClientConfig, RootCertStore, ServerName};
@@ -20,7 +22,10 @@ use tcp::{ConnectChunnel, TcpChunnelWrapClient};
 use tls_tunnel::rustls::TLSChunnel;
 use tracing::debug;
 
-use crate::listen::Line;
+use crate::{
+    listen::Line,
+    parse_log::{EstOutputRateHist, EstOutputRateSerializeChunnel},
+};
 
 #[derive(Clone, Copy, Debug)]
 struct DontVerify(pub IpAddr);
@@ -125,4 +130,23 @@ pub async fn connect(
     debug!("returning connection");
     let cn = ProjectLeft::new(addr, cn);
     Ok(cn)
+}
+
+pub async fn connect_local(
+    addr: SocketAddr,
+    localname_root: PathBuf,
+) -> Result<impl ChunnelConnection<Data = EstOutputRateHist>, Report> {
+    let enc = encr_stack!(addr)?;
+    let sk = UdpSkChunnel.connect(addr).await?;
+    let lch = LocalNameChunnel::<_, _, ()>::client(
+        localname_root.clone(),
+        UnixSkChunnel::with_root(localname_root),
+        bertha::CxNil,
+    )
+    .await?;
+    let stack = CxList::from(EstOutputRateSerializeChunnel)
+        .wrap(enc)
+        .wrap(lch);
+    let cn = bertha::negotiate_client(stack, sk, addr).await?;
+    Ok(ProjectLeft::new(addr, cn))
 }

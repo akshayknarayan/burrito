@@ -6,6 +6,7 @@ use std::{
     future::Future,
     io::Write,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -15,9 +16,11 @@ use std::{
 use bertha::{
     bincode::SerializeChunnel,
     chan_transport::{Cln, RendezvousChannel, Srv},
+    uds::UnixSkChunnel,
     util::Nothing,
     ChunnelConnection, ChunnelListener, CxList, Either, Select,
 };
+use burrito_localname_ctl::LocalNameChunnel;
 use burrito_shard_ctl::{Kv, ShardInfo};
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::stream::TryStreamExt;
@@ -27,6 +30,8 @@ use tcp::TcpChunnelWrapServer;
 use tls_tunnel::rustls::TLSChunnel;
 use tokio::runtime::Runtime;
 use tracing::{debug, debug_span, error, info, instrument, trace, trace_span, warn, Instrument};
+
+use crate::parse_log::{EstOutputRateHist, EstOutputRateSerializeChunnel};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub enum Line {
@@ -49,14 +54,15 @@ impl Kv for Line {
     }
 }
 
-pub trait ProcessLine {
+pub trait ProcessLine<L> {
     type Future<'a>: Future<Output = Result<(), Self::Error>>
     where
-        Self: 'a;
+        Self: 'a,
+        L: 'a;
     type Error: Into<Report> + Send + Sync + 'static;
     fn process_lines<'a>(
         &'a self,
-        line_batch: &'a mut [Option<(SocketAddr, Line)>],
+        line_batch: &'a mut [Option<(SocketAddr, L)>],
     ) -> Self::Future<'a>;
 }
 
@@ -65,7 +71,7 @@ pub fn serve(
     hostname: impl ToString,
     num_workers: usize,
     redis_addr: String,
-    process_message: impl ProcessLine + Send + Sync + 'static,
+    process_message: impl ProcessLine<Line> + Send + Sync + 'static,
     runtime: Option<Runtime>,
 ) -> Result<(), Report> {
     let (internal_srv, internal_cli) = RendezvousChannel::<SocketAddr, _, _>::new(100).split();
@@ -177,7 +183,7 @@ async fn single_worker(
     addr: SocketAddr,
     mut internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, Srv>,
     cert: Arc<Certificate>,
-    line_processor: Arc<impl ProcessLine + Send + Sync + 'static>,
+    line_processor: Arc<impl ProcessLine<Line> + Send + Sync + 'static>,
 ) -> Result<(), Report> {
     info!(?addr, "listening");
     let enc_stack = encr_stack!(addr, cert).wrap_err("creating encryption stack")?;
@@ -212,7 +218,7 @@ async fn single_worker(
 #[instrument(skip(cn, line_processor), level = "info", err)]
 async fn serve_one_cn(
     cn: impl ChunnelConnection<Data = (SocketAddr, Line)> + Send + 'static,
-    line_processor: &Arc<impl ProcessLine + Send + Sync + 'static>,
+    line_processor: &Arc<impl ProcessLine<Line> + Send + Sync + 'static>,
 ) -> Result<(), Report> {
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
     let mut acks = Vec::with_capacity(16);
@@ -298,6 +304,53 @@ async fn serve_canonical(
                     }
                     Ok(_) => {}
                 }
+            }
+        }
+    })
+    .await?;
+    unreachable!()
+}
+
+pub async fn serve_local(
+    listen_addr: SocketAddr,
+    hostname: impl ToString,
+    localname_root: PathBuf,
+    recvs: impl ProcessLine<EstOutputRateHist> + Send + Sync + 'static,
+) -> Result<(), Report> {
+    let cert = Arc::new(
+        rcgen::generate_simple_self_signed([hostname.to_string(), listen_addr.ip().to_string()])
+            .wrap_err("test certificate generation failed")?,
+    );
+    let enc = encr_stack!(listen_addr, cert).wrap_err("creating encryption stack")?;
+    let lch = LocalNameChunnel::<_, _, ()>::server(
+        localname_root.clone(),
+        listen_addr,
+        UnixSkChunnel::with_root(localname_root),
+        bertha::CxNil,
+    )
+    .await?;
+    let stack = CxList::from(EstOutputRateSerializeChunnel)
+        .wrap(enc)
+        .wrap(lch);
+    let mut base_udp = bertha::udp::UdpReqChunnel::default();
+    info!(?listen_addr, "start server");
+    let st = base_udp.listen(listen_addr).await?;
+    let st = bertha::negotiate_server(stack, st)
+        .await
+        .wrap_err("negotiate_server")?;
+    let st = std::pin::pin!(st);
+    let recvs = Arc::new(recvs);
+    st.try_for_each_concurrent(None, |cn| {
+        let mut slot = [None];
+        let recvs = Arc::clone(&recvs);
+        async move {
+            loop {
+                let ms = cn.recv(&mut slot).await?;
+                if ms.is_empty() || ms[0].is_none() {
+                    continue;
+                }
+
+                recvs.process_lines(ms).await.map_err(Into::into)?;
             }
         }
     })
