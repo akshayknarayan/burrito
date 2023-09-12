@@ -14,11 +14,11 @@
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::{future::FutureExt, stream::Stream};
+use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{fmt::Debug, net::Ipv4Addr};
 use tracing::{debug, trace};
 
 /// UDP Chunnel connector.

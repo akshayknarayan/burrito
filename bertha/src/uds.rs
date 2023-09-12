@@ -2,7 +2,10 @@
 
 use crate::{ChunnelConnection, ChunnelConnector, ChunnelListener};
 use color_eyre::eyre::{eyre, Report, WrapErr};
-use futures_util::stream::Stream;
+use futures_util::{
+    future::{ready, Ready},
+    stream::{once, Once, Stream},
+};
 use std::fmt::Debug;
 use std::future::Future;
 use std::path::PathBuf;
@@ -36,21 +39,16 @@ impl Default for UnixSkChunnel {
 impl ChunnelListener for UnixSkChunnel {
     type Addr = PathBuf;
     type Connection = UnixSk;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Stream, Self::Error>> + Send + 'static>>;
-    type Stream =
-        Pin<Box<dyn Stream<Item = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Future = Ready<Result<Self::Stream, Self::Error>>;
+    type Stream = Once<Ready<Result<Self::Connection, Self::Error>>>;
     type Error = Report;
 
     fn listen(&mut self, a: Self::Addr) -> Self::Future {
-        Box::pin(async move {
-            std::fs::remove_file(a.as_path()).unwrap_or(());
-            let sk = tokio::net::UnixDatagram::bind(a)?;
-            Ok(
-                Box::pin(futures_util::stream::once(futures_util::future::ready(Ok(
-                    UnixSk::new(sk),
-                )))) as _,
-            )
-        })
+        std::fs::remove_file(a.as_path()).unwrap_or(());
+        match tokio::net::UnixDatagram::bind(a) {
+            Ok(sk) => ready(Ok(once(ready(Ok(UnixSk::new(sk)))))),
+            Err(e) => ready(Err(Report::from(e))),
+        }
     }
 }
 
