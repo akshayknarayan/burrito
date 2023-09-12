@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, debug_span, instrument, trace, trace_span, warn};
+use tracing::{debug, debug_span, info, instrument, trace, trace_span, warn};
 use tracing_futures::Instrument;
 
 /// Return a stream of connections with `stack`'s semantics, listening on `raw_cn_st`.
@@ -242,7 +242,7 @@ where
                 cn.send(std::iter::once((a, buf))).await?;
                 debug!(?a_str, "sent client response");
                 if let Some(mut new_stack) = new_stack {
-                    debug!(stack = ?&new_stack, "handshake done, picked stack");
+                    info!(stack = ?&new_stack, addr = ?a_str, "negotiated stack");
                     let new_cn = new_stack.connect_wrap(cn).await.map_err(Into::into)?;
                     debug!(?a_str, "returning connection");
                     return Ok(Some(Either::Left(new_cn)));

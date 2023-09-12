@@ -13,7 +13,7 @@ use std::sync::{
     Arc,
 };
 use std::{future::Future, pin::Pin};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 pub type NegotiatedConn<C, S> = <<S as Apply>::Applied as Chunnel<C>>::Connection;
 
@@ -190,7 +190,7 @@ where
 
             let (mut applied, nonce) = applied
                 .ok_or_else(|| apply_err.wrap_err("All received options failed to apply"))?;
-            debug!(?applied, "applied to stack");
+            info!(?applied, ?addr, "negotiated stack");
             let inform_picked_nonce_buf = bincode::serialize(&NegotiateMsg::ServerNonce {
                 addr: bincode::serialize(&addr)?,
                 picked: nonce.clone(),
