@@ -1,15 +1,17 @@
 //! Parse server log lines for Client IP and timestamp.
 
 use std::{
+    future::Future,
     io::Cursor,
     net::{IpAddr, Ipv4Addr},
     ops::Deref,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use chrono::{DateTime, Duration, Utc};
-use color_eyre::Report;
+use color_eyre::{eyre::bail, Report};
 use common_log_format::LogEntry;
 use futures_util::future::{ready, Ready};
 use hdrhistogram::{
@@ -25,6 +27,7 @@ pub struct ParsedLine {
 }
 
 const SAMPLE_IPS: [IpAddr; 10] = [
+    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
@@ -34,7 +37,6 @@ const SAMPLE_IPS: [IpAddr; 10] = [
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8)),
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
-    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
 ];
 
 pub fn sample_parsed_lines() -> impl Iterator<Item = ParsedLine> {
@@ -117,8 +119,17 @@ impl EstOutputRate {
             }
         }) {
             if let Some(prev_ts) = self.prev_ts {
+                // we are supposed to be guaranteed that ts > prev_ts.
+                if ts < prev_ts {
+                    warn!(?ts, ?prev_ts, "time ticked backwards");
+                    continue;
+                }
+
                 let el = ts - prev_ts;
-                let est_rate = obj_size as f64 / el.to_std().unwrap().as_secs_f64();
+                let est_rate = obj_size as f64
+                    / el.to_std()
+                        .expect("negative condition checked above")
+                        .as_secs_f64();
                 let est_rate_int = est_rate as _;
                 trace!(?obj_size, ?el, ?est_rate, ?est_rate_int, "rate sample");
                 if let Err(err) = self.hist.record(est_rate_int) {
@@ -132,16 +143,21 @@ impl EstOutputRate {
 
         proc_cnt
     }
-
-    pub fn take_hist(&mut self) -> EstOutputRateHist {
-        let h = std::mem::replace(&mut self.hist, Histogram::new(3).unwrap());
-        EstOutputRateHist { h }
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct EstOutputRateHist {
+    pub client_ip: IpAddr,
     h: Histogram<u64>,
+}
+
+impl EstOutputRateHist {
+    pub fn new(client_ip: IpAddr, h: EstOutputRate) -> Self {
+        EstOutputRateHist {
+            client_ip,
+            h: h.hist,
+        }
+    }
 }
 
 impl Deref for EstOutputRateHist {
@@ -196,9 +212,7 @@ where
     fn send<'cn, B>(
         &'cn self,
         burst: B,
-    ) -> std::pin::Pin<
-        Box<dyn futures_util::Future<Output = Result<(), color_eyre::eyre::Report>> + Send + 'cn>,
-    >
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
     where
         B: IntoIterator<Item = Self::Data> + Send + 'cn,
         <B as IntoIterator>::IntoIter: Send,
@@ -208,8 +222,24 @@ where
             burst
                 .into_iter()
                 .map(|(a, h)| {
-                    let mut buf = Vec::new();
-                    s.serialize(&h.h, &mut buf)?;
+                    let mut buf = Vec::with_capacity(16);
+                    match h.client_ip {
+                        IpAddr::V4(ipv4) => {
+                            let oct = ipv4.octets();
+                            buf.push(32);
+                            buf.extend_from_slice(&oct);
+                        }
+                        IpAddr::V6(ipv6) => {
+                            let oct = ipv6.octets();
+                            buf.push(128);
+                            buf.extend_from_slice(&oct);
+                        }
+                    }
+
+                    let curr_len = buf.len();
+                    let mut c = Cursor::new(&mut buf);
+                    c.set_position(curr_len as u64);
+                    s.serialize(&h.h, &mut c)?;
                     Ok::<_, Report>((a, buf))
                 })
                 .collect() // collect to unlock
@@ -223,14 +253,7 @@ where
     fn recv<'cn, 'buf>(
         &'cn self,
         msgs_buf: &'buf mut [Option<Self::Data>],
-    ) -> std::pin::Pin<
-        Box<
-            dyn futures_util::Future<
-                    Output = Result<&'buf mut [Option<Self::Data>], color_eyre::eyre::Report>,
-                > + Send
-                + 'cn,
-        >,
-    >
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
     where
         'buf: 'cn,
     {
@@ -240,9 +263,34 @@ where
             let mut d = self.des.lock().unwrap();
             let mut slot_idx = 0;
             for (a, v) in ms.iter_mut().map_while(Option::take) {
-                let mut c = Cursor::new(v);
+                let l = v[0];
+                let (client_ip, offset) = match l as u32 {
+                    32 => (
+                        IpAddr::V4(
+                            {
+                                let x: [u8; 4] = v[1..5].try_into()?;
+                                x
+                            }
+                            .into(),
+                        ),
+                        5,
+                    ),
+                    128 => (
+                        IpAddr::V6(
+                            {
+                                let x: [u8; 16] = v[1..17].try_into()?;
+                                x
+                            }
+                            .into(),
+                        ),
+                        17,
+                    ),
+                    x => bail!("Unknown address size {}", x),
+                };
+
+                let mut c = Cursor::new(&v[offset..]);
                 let h: Histogram<u64> = d.deserialize(&mut c)?;
-                msgs_buf[slot_idx] = Some((a, EstOutputRateHist { h }));
+                msgs_buf[slot_idx] = Some((a, EstOutputRateHist { client_ip, h }));
                 slot_idx += 1;
             }
 
@@ -253,13 +301,25 @@ where
 
 #[cfg(test)]
 mod t {
-    use std::sync::Once;
+    use std::{
+        cell::Cell,
+        future::Future,
+        net::{Ipv4Addr, SocketAddr},
+        pin::Pin,
+        sync::{Arc, Mutex, Once},
+    };
 
+    use bertha::ChunnelConnection;
+    use color_eyre::eyre::Report;
+    use futures_util::future::ready;
+    use hdrhistogram::serialization::{Deserializer, V2Serializer};
     use tracing::{info, warn};
     use tracing_error::ErrorLayer;
     use tracing_subscriber::prelude::*;
 
-    use crate::parse_log::{SAMPLE_INTERARRIVAL_MS, SAMPLE_OBJ_SIZE};
+    use crate::parse_log::{
+        EstOutputRateCn, EstOutputRateHist, SAMPLE_INTERARRIVAL_MS, SAMPLE_OBJ_SIZE,
+    };
 
     use super::{parse_lines, parse_raw, sample_logentry_lines, EstOutputRate};
 
@@ -288,7 +348,7 @@ mod t {
         }));
         assert_eq!(proc, NUM_ENTRIES);
 
-        let h = or.take_hist();
+        let h = or.hist;
         let expected_rate = SAMPLE_OBJ_SIZE * 1000 / SAMPLE_INTERARRIVAL_MS;
         let quantile_matching_expected = h.quantile_below(expected_rate as u64);
         info!(?quantile_matching_expected, ?expected_rate, "checking hist");
@@ -310,6 +370,106 @@ mod t {
                 });
 
             info!(?msg, maxval=?h.max(), "got histogram update");
+        }
+    }
+
+    #[test]
+    fn chunnel() {
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+
+        let raw = sample_logentry_lines();
+        let lines = parse_raw(raw);
+        let entries = parse_lines(lines);
+        let mut or = EstOutputRate::default();
+        const NUM_ENTRIES: usize = 25;
+        let proc = or.new_entries(entries.take(NUM_ENTRIES).filter_map(|e| {
+            if e.is_err() {
+                warn!(?e, "entry");
+            }
+            e.ok()
+        }));
+        assert_eq!(proc, NUM_ENTRIES);
+
+        let cn = EstOutputRateCn {
+            ser: Arc::new(Mutex::new(V2Serializer::new())),
+            des: Arc::new(Mutex::new(Deserializer::new())),
+            inner: FakeConn::default(),
+        };
+
+        let h = EstOutputRateHist {
+            client_ip: "127.0.0.1".parse().unwrap(),
+            h: or.hist.clone(),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Building tokio runtime");
+        let r = rt.block_on(async move {
+            cn.send(std::iter::once((
+                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+                h,
+            )))
+            .await
+            .unwrap();
+
+            let mut slot = [None];
+            let m = cn.recv(&mut slot).await.unwrap();
+            m[0].take().unwrap().1
+        });
+        assert_eq!(r.h, or.hist);
+
+        #[derive(Default)]
+        struct FakeConn(Cell<Vec<u8>>);
+
+        // SAFETY: we use a current_thread runtime, so there's only one thread anyway.
+        unsafe impl Send for FakeConn {}
+        unsafe impl Sync for FakeConn {}
+
+        impl ChunnelConnection for FakeConn {
+            type Data = (SocketAddr, Vec<u8>);
+
+            fn send<'cn, B>(
+                &'cn self,
+                burst: B,
+            ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+            where
+                B: IntoIterator<Item = Self::Data> + Send + 'cn,
+                <B as IntoIterator>::IntoIter: Send,
+            {
+                Box::pin(ready((|| {
+                    for (_, v) in burst {
+                        self.0.set(v);
+                    }
+
+                    Ok(())
+                })()))
+            }
+
+            fn recv<'cn, 'buf>(
+                &'cn self,
+                msgs_buf: &'buf mut [Option<Self::Data>],
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>>
+                        + Send
+                        + 'cn,
+                >,
+            >
+            where
+                'buf: 'cn,
+            {
+                let a = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
+                Box::pin(async move {
+                    msgs_buf[0] = Some((a, self.0.take()));
+                    Ok(&mut msgs_buf[..1])
+                })
+            }
         }
     }
 }

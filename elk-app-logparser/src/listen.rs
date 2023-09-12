@@ -72,6 +72,7 @@ pub fn serve(
     num_workers: usize,
     redis_addr: String,
     process_message: impl ProcessLine<Line> + Send + Sync + 'static,
+    encr_only: bool,
     runtime: Option<Runtime>,
 ) -> Result<(), Report> {
     let (internal_srv, internal_cli) = RendezvousChannel::<SocketAddr, _, _>::new(100).split();
@@ -106,7 +107,7 @@ pub fn serve(
                 }
             };
             match rt.block_on(
-                single_worker(worker, int_srv, cert, lp)
+                single_worker(worker, int_srv, cert, lp, encr_only)
                     .instrument(debug_span!("worker", addr = ?&worker)),
             ) {
                 Ok(_) => (),
@@ -131,6 +132,7 @@ pub fn serve(
         listen_addr,
         redis_addr,
         cert_rc,
+        encr_only,
     ))
 }
 
@@ -184,18 +186,31 @@ async fn single_worker(
     mut internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, Srv>,
     cert: Arc<Certificate>,
     line_processor: Arc<impl ProcessLine<Line> + Send + Sync + 'static>,
+    encr_only: bool,
 ) -> Result<(), Report> {
     info!(?addr, "listening");
     let enc_stack = encr_stack!(addr, cert).wrap_err("creating encryption stack")?;
-    let stack = CxList::from(SerializeChunnel::default())
-        .wrap(Select::from((Nothing::<()>::default(), enc_stack)));
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
     let negotiation_state = Default::default();
-    let external_conn_stream = bertha::negotiate::negotiate_server_shared_state(
-        stack,
-        base_udp.listen(addr).await?,
-        Arc::clone(&negotiation_state),
-    )?;
+    let external_conn_stream = if encr_only {
+        let stack = CxList::from(SerializeChunnel::default()).wrap(enc_stack);
+        let st = bertha::negotiate::negotiate_server_shared_state(
+            stack,
+            base_udp.listen(addr).await?,
+            Arc::clone(&negotiation_state),
+        )?;
+        Either::Left(st.map_ok(|cn| Either::Left(cn)))
+    } else {
+        let stack = CxList::from(SerializeChunnel::default())
+            .wrap(Select::from((Nothing::<()>::default(), enc_stack)));
+        let st = bertha::negotiate::negotiate_server_shared_state(
+            stack,
+            base_udp.listen(addr).await?,
+            Arc::clone(&negotiation_state),
+        )?;
+        Either::Right(st.map_ok(|cn| Either::Right(cn)))
+    };
+
     let internal_conn_stream = internal_srv.listen(addr).await?;
     // negotiating on the internal connection is required because ShardCanonicalServer has to be
     // able to send a StackNonce. we don't want the encryption stuff here.
@@ -258,6 +273,7 @@ async fn serve_canonical(
     listen_addr: SocketAddr,
     redis_addr: String,
     cert: Arc<Certificate>,
+    encr_only: bool,
 ) -> Result<(), Report> {
     let enc_stack = encr_stack!(si.canonical_addr, cert).wrap_err("creating encryption stack")?;
     let cnsrv = burrito_shard_ctl::ShardCanonicalServer::new(
@@ -270,17 +286,27 @@ async fn serve_canonical(
     )
     .await
     .wrap_err("Create ShardCanonicalServer")?;
-    let stack = CxList::from(cnsrv)
-        .wrap(SerializeChunnel::<Line>::default())
-        .wrap(Select::from((Nothing::<()>::default(), enc_stack)));
-
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
-    info!(shard_info = ?&si, "start canonical server");
     let st = base_udp.listen(listen_addr).await?;
-    let st = bertha::negotiate_server(stack, st)
-        .await
-        .wrap_err("negotiate_server")?;
+    let st = if encr_only {
+        let stack = CxList::from(cnsrv)
+            .wrap(SerializeChunnel::<Line>::default())
+            .wrap(enc_stack);
+        let st = bertha::negotiate_server(stack, st)
+            .await
+            .wrap_err("negotiate_server")?;
+        Either::Left(st.map_ok(|cn| Either::Left(cn)))
+    } else {
+        let stack = CxList::from(cnsrv)
+            .wrap(SerializeChunnel::<Line>::default())
+            .wrap(Select::from((Nothing::<()>::default(), enc_stack)));
+        let st = bertha::negotiate_server(stack, st)
+            .await
+            .wrap_err("negotiate_server")?;
+        Either::Right(st.map_ok(|cn| Either::Right(cn)))
+    };
 
+    info!(shard_info = ?&si, "start canonical server");
     let ctr: Arc<AtomicUsize> = Default::default();
     let st = std::pin::pin!(st);
     st.try_for_each_concurrent(None, |r| {
@@ -313,7 +339,7 @@ async fn serve_canonical(
 pub async fn serve_local(
     listen_addr: SocketAddr,
     hostname: impl ToString,
-    localname_root: PathBuf,
+    localname_root: Option<PathBuf>,
     recvs: impl ProcessLine<EstOutputRateHist> + Send + Sync + 'static,
 ) -> Result<(), Report> {
     let cert = Arc::new(
@@ -321,22 +347,32 @@ pub async fn serve_local(
             .wrap_err("test certificate generation failed")?,
     );
     let enc = encr_stack!(listen_addr, cert).wrap_err("creating encryption stack")?;
-    let lch = LocalNameChunnel::<_, _, ()>::server(
-        localname_root.clone(),
-        listen_addr,
-        UnixSkChunnel::with_root(localname_root),
-        bertha::CxNil,
-    )
-    .await?;
-    let stack = CxList::from(EstOutputRateSerializeChunnel)
-        .wrap(lch)
-        .wrap(enc);
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
-    info!(?listen_addr, "start server");
     let st = base_udp.listen(listen_addr).await?;
-    let st = bertha::negotiate_server(stack, st)
-        .await
-        .wrap_err("negotiate_server")?;
+    let st = if let Some(lr) = localname_root {
+        let lch = LocalNameChunnel::<_, _, ()>::server(
+            lr.clone(),
+            listen_addr,
+            UnixSkChunnel::with_root(lr),
+            bertha::CxNil,
+        )
+        .await?;
+        let stack = CxList::from(EstOutputRateSerializeChunnel)
+            .wrap(lch)
+            .wrap(enc);
+        info!(?listen_addr, "start server");
+        let st = bertha::negotiate_server(stack, st)
+            .await
+            .wrap_err("negotiate_server")?;
+        Either::Left(st.map_ok(|cn| Either::Left(cn)))
+    } else {
+        let stack = CxList::from(EstOutputRateSerializeChunnel).wrap(enc);
+        info!(?listen_addr, "start server");
+        let st = bertha::negotiate_server(stack, st)
+            .await
+            .wrap_err("negotiate_server")?;
+        Either::Right(st.map_ok(|cn| Either::Right(cn)))
+    };
     let st = std::pin::pin!(st);
     let recvs = Arc::new(recvs);
     st.try_for_each_concurrent(None, |cn| {

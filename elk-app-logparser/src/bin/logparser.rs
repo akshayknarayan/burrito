@@ -1,12 +1,19 @@
 //! Subscribe to a pub/sub topic with logs ordered by client and calculate statistics.
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    pin::Pin,
+    time::Duration,
+};
 
 use bertha::{ChunnelConnection, Either};
 use color_eyre::eyre::{Report, WrapErr};
 use elk_app_logparser::{
     connect::{self},
-    parse_log::{self, EstOutputRate, ParsedLine},
+    parse_log::{self, EstOutputRate, EstOutputRateHist, ParsedLine},
     publish_subscribe::{make_topic, ConnState},
 };
 use queue_steer::MessageQueueAddr;
@@ -32,8 +39,8 @@ struct Opt {
     #[structopt(long)]
     topic_name: String,
 
-    #[structopt(long, default_value = "/tmp/burrito")]
-    local_root: PathBuf,
+    #[structopt(long)]
+    local_root: Option<PathBuf>,
 
     #[structopt(long)]
     forward_addr: SocketAddr,
@@ -127,27 +134,18 @@ async fn inner(
 
     let mut slots = vec![None; 16];
     let mut processed_entries = 0;
-    let mut est_output_rate: EstOutputRate = Default::default();
+    let mut received_lines: HashMap<IpAddr, Vec<ParsedLine>> = Default::default();
+    let mut est_output_rates: HashMap<IpAddr, EstOutputRate> = Default::default();
     let mut send_wait = Either::Left(futures_util::future::pending());
     loop {
         tokio::select! {
             ms = conn.recv(&mut slots[..]) => {
-                let log_entries = parse_log::parse_lines(
-                    ms?.iter_mut().map_while(|m| m.take().map(|(_, pl)| pl)),
-                )
-                .filter_map(Result::ok);
-                if processed_entries == 0 {
-                    send_wait = Either::Right(Box::pin(tokio::time::sleep(Duration::from_secs(10))));
-                }
-
-                processed_entries += est_output_rate.new_entries(log_entries);
-                debug!(?processed_entries, "received");
+                handle_recv(ms?, &mut received_lines, &mut est_output_rates, &mut send_wait, &mut processed_entries)?;
             }
             // dump output 10 seconds after we see an entry, then reset the counter
             _ = &mut send_wait, if send_wait.is_right() => {
-                let hist = est_output_rate.take_hist();
-                info!(?processed_entries, "sending histogram");
-                fwd_conn.send(std::iter::once(hist)).await?;
+                info!(?processed_entries, "sending histograms");
+                fwd_conn.send(est_output_rates.drain().map(|(group, est_output)| EstOutputRateHist::new(group, est_output))).await?;
                 processed_entries = 0;
                 send_wait = Either::Left(futures_util::future::pending());
             }
@@ -162,5 +160,48 @@ async fn inner(
                 curr_cn_state = cn_state;
             }
         }
+    }
+
+    fn handle_recv(
+        ms: &mut [Option<(MessageQueueAddr, ParsedLine)>],
+        received_lines: &mut HashMap<IpAddr, Vec<ParsedLine>>,
+        est_output_rates: &mut HashMap<IpAddr, EstOutputRate>,
+        send_wait: &mut Either<
+            futures_util::future::Pending<()>,
+            Pin<Box<dyn Future<Output = ()>>>,
+        >,
+        processed_entries: &mut usize,
+    ) -> Result<(), Report> {
+        for v in received_lines.values_mut() {
+            v.clear();
+        }
+
+        for (group, pl) in ms.iter_mut().map_while(|m| {
+            m.take().and_then(|(MessageQueueAddr { group, .. }, pl)| {
+                group.and_then(|g| {
+                    if g.parse().ok() != Some(pl.client_ip) {
+                        warn!(group = ?g, line = ?pl, "group and line mismatched");
+                        None
+                    } else {
+                        Some((pl.client_ip, pl))
+                    }
+                })
+            })
+        }) {
+            received_lines.entry(group).or_default().push(pl);
+        }
+
+        for (group, pls) in received_lines.iter_mut() {
+            let log_entries = parse_log::parse_lines(pls.drain(..)).filter_map(Result::ok);
+            let h = est_output_rates.entry(*group).or_default();
+            *processed_entries += h.new_entries(log_entries);
+        }
+
+        if *processed_entries > 0 && send_wait.is_left() {
+            *send_wait = Either::Right(Box::pin(tokio::time::sleep(Duration::from_secs(10))));
+        }
+
+        debug!(?processed_entries, "received");
+        Ok(())
     }
 }

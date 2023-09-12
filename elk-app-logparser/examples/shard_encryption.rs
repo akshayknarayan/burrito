@@ -93,6 +93,7 @@ fn server(
         num_workers,
         redis_addr,
         DoNothing,
+        false,
         None,
     )
 }
@@ -104,7 +105,7 @@ fn client(connect_addr: SocketAddr, redis_addr: String) -> Result<(), Report> {
         .wrap_err("Building tokio runtime")?;
     rt.block_on(async move {
         info!("starting client");
-        let cn = connect::connect(connect_addr, redis_addr)
+        let cn = connect::connect(connect_addr, redis_addr, false)
             .await
             .wrap_err("connect error")?;
         info!(?connect_addr, "got connection, starting");

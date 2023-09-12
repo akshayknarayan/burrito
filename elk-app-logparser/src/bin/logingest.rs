@@ -18,7 +18,7 @@ use queue_steer::MessageQueueAddr;
 use redis_basechunnel::RedisBase;
 use structopt::StructOpt;
 use tokio::sync::watch::Receiver;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument, trace, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
@@ -45,6 +45,9 @@ struct Opt {
 
     #[structopt(long)]
     topic_name: String,
+
+    #[structopt(long)]
+    encr_only: bool,
 
     #[structopt(long)]
     logging: bool,
@@ -102,6 +105,7 @@ fn main() -> Result<(), Report> {
         opt.num_workers,
         opt.redis_addr,
         handler,
+        opt.encr_only,
         Some(rt),
     )
 }
@@ -143,7 +147,7 @@ where
             });
             let cn_state = *self.cn_state_watcher.borrow();
             self.inner.send(parsed_lines).await?;
-            tracing::debug!(?cn_state, ?self.topic_id,  "sent lines");
+            trace!(?cn_state, ?self.topic_id,  "sent lines");
             Ok(())
         })
     }

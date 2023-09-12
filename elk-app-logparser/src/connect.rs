@@ -12,7 +12,7 @@ use std::{
 
 use bertha::{
     bincode::SerializeChunnel, udp::UdpSkChunnel, uds::UnixSkChunnel, util::ProjectLeft,
-    ChunnelConnection, ChunnelConnector, CxList, Select,
+    ChunnelConnection, ChunnelConnector, CxList, Either, Select,
 };
 use burrito_localname_ctl::LocalNameChunnel;
 use burrito_shard_ctl::ClientShardChunnelClient;
@@ -110,6 +110,7 @@ macro_rules! encr_stack {
 pub async fn connect(
     addr: SocketAddr,
     redis_addr: String,
+    encr_only: bool,
 ) -> Result<impl ChunnelConnection<Data = Line> + Send + 'static, Report> {
     let base = UdpSkChunnel.connect(addr).await?;
     let enc_stack = encr_stack!(addr).wrap_err("creating encryption stack")?;
@@ -122,11 +123,18 @@ pub async fn connect(
     // )
     // client_sharding is not compatible with enc_stack since it requires send_to, which Connected
     // types don't support.
-    let stack = Select::from((
-        CxList::from(cl_shard).wrap(SerializeChunnel::default()),
-        CxList::from(SerializeChunnel::default()).wrap(enc_stack),
-    ));
-    let cn = bertha::negotiate_client(stack, base, addr).await?;
+    let cn = if encr_only {
+        let stack = CxList::from(SerializeChunnel::default()).wrap(enc_stack);
+        let cn = bertha::negotiate_client(stack, base, addr).await?;
+        Either::Left(cn)
+    } else {
+        let stack = Select::from((
+            CxList::from(cl_shard).wrap(SerializeChunnel::default()),
+            CxList::from(SerializeChunnel::default()).wrap(enc_stack),
+        ));
+        let cn = bertha::negotiate_client(stack, base, addr).await?;
+        Either::Right(cn)
+    };
     debug!("returning connection");
     let cn = ProjectLeft::new(addr, cn);
     Ok(cn)
@@ -134,19 +142,26 @@ pub async fn connect(
 
 pub async fn connect_local(
     addr: SocketAddr,
-    localname_root: PathBuf,
+    localname_root: Option<PathBuf>,
 ) -> Result<impl ChunnelConnection<Data = EstOutputRateHist>, Report> {
     let enc = encr_stack!(addr)?;
     let sk = UdpSkChunnel.connect(addr).await?;
-    let lch = LocalNameChunnel::<_, _, ()>::client(
-        localname_root.clone(),
-        UnixSkChunnel::with_root(localname_root),
-        bertha::CxNil,
-    )
-    .await?;
-    let stack = CxList::from(EstOutputRateSerializeChunnel)
-        .wrap(lch)
-        .wrap(enc);
-    let cn = bertha::negotiate_client(stack, sk, addr).await?;
+    let cn = if let Some(lr) = localname_root {
+        let lch = LocalNameChunnel::<_, _, ()>::client(
+            lr.clone(),
+            UnixSkChunnel::with_root(lr),
+            bertha::CxNil,
+        )
+        .await?;
+        let stack = CxList::from(EstOutputRateSerializeChunnel)
+            .wrap(lch)
+            .wrap(enc);
+        let cn = bertha::negotiate_client(stack, sk, addr).await?;
+        Either::Left(cn)
+    } else {
+        let stack = CxList::from(EstOutputRateSerializeChunnel).wrap(enc);
+        let cn = bertha::negotiate_client(stack, sk, addr).await?;
+        Either::Right(cn)
+    };
     Ok(ProjectLeft::new(addr, cn))
 }

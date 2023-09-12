@@ -16,14 +16,14 @@ use tracing_subscriber::prelude::*;
 #[derive(Debug, StructOpt)]
 #[structopt(name = "consumer")]
 struct Opt {
-    #[structopt(long, default_value = "/tmp/burrito")]
-    local_root: PathBuf,
-
     #[structopt(long)]
     listen_addr: SocketAddr,
 
     #[structopt(long)]
     hostname: String,
+
+    #[structopt(long)]
+    local_root: Option<PathBuf>,
 
     #[structopt(long)]
     logging: bool,
@@ -46,7 +46,6 @@ fn main() -> Result<(), Report> {
         .enable_all()
         .build()
         .wrap_err("Building tokio runtime")?;
-
     rt.block_on(consumer(opt))
 }
 
@@ -60,6 +59,7 @@ impl ProcessLine<EstOutputRateHist> for Process {
         line_batch: &'a mut [Option<(SocketAddr, EstOutputRateHist)>],
     ) -> Self::Future<'a> {
         for (_, est_output) in line_batch.iter_mut().map_while(Option::take) {
+            let client_ip = est_output.client_ip;
             let num_records = est_output.len();
             if num_records > 0 {
                 let msg = est_output
@@ -70,12 +70,14 @@ impl ProcessLine<EstOutputRateHist> for Process {
                         let cnt = iv.count_since_last_iteration();
                         (quantile, value, cnt)
                     })
-                    .fold(format!("Hist({}) | ", num_records), |mut acc, (q, v, c)| {
-                        let m = format!("[{}]({}): {} | ", q, v, c);
-                        acc.push_str(&m);
-                        acc
-                    });
-
+                    .fold(
+                        format!("[{}]: Hist({}) | ", client_ip, num_records),
+                        |mut acc, (q, v, c)| {
+                            let m = format!("[{}]({}): {} | ", q, v, c);
+                            acc.push_str(&m);
+                            acc
+                        },
+                    );
                 info!(?msg, "got histogram update");
             }
         }
@@ -87,7 +89,7 @@ impl ProcessLine<EstOutputRateHist> for Process {
 #[instrument(level = "info", skip(opt))]
 async fn consumer(opt: Opt) -> Result<(), Report> {
     tokio::spawn(burrito_localname_ctl::ctl::serve_ctl(
-        Some(opt.local_root.clone()),
+        opt.local_root.clone(),
         true,
     ));
     info!(?opt, "starting consumer");

@@ -39,6 +39,9 @@ struct Opt {
     tot_message_limit: Option<usize>,
 
     #[structopt(long)]
+    encr_only: bool,
+
+    #[structopt(long)]
     logging: bool,
 }
 
@@ -61,7 +64,7 @@ fn main() -> Result<(), Report> {
         .wrap_err("Building tokio runtime")?;
     rt.block_on(async move {
         info!("starting client");
-        let cn = connect::connect(opt.connect_addr, opt.redis_addr)
+        let cn = connect::connect(opt.connect_addr, opt.redis_addr, opt.encr_only)
             .await
             .wrap_err("connect error")?;
         let producer = get_line_producer(
