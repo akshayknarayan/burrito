@@ -205,9 +205,9 @@ mod test {
     #[allow(clippy::unit_arg)] // https://github.com/tokio-rs/tracing/issues/1093
     #[tracing::instrument(err)]
     async fn server(addr: SocketAddr, root: PathBuf) -> Result<(), Report> {
-        let lch_s = LocalNameChunnel::new(
+        let lch_s = LocalNameChunnel::server(
             root.clone(),
-            Some(addr),
+            addr,
             UnixSkChunnel::with_root(root.clone()),
             Nothing::<()>::default(),
         )
@@ -257,9 +257,8 @@ mod test {
                 tokio::spawn(server(addr, root.clone()));
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-                let lch = LocalNameChunnel::new(
+                let lch = LocalNameChunnel::client(
                     root.clone(),
-                    None,
                     UnixSkChunnel::with_root(root),
                     Nothing::<()>::default(),
                 )

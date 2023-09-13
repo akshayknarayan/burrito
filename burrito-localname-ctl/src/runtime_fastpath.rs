@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
+use tcp::Connected;
 use tokio::sync::Mutex;
 use tracing::{debug, instrument, trace};
 
@@ -58,7 +60,7 @@ impl<Lch, Lr, S> Negotiate for LocalNameChunnel<Lch, Lr, S> {
     }
 }
 
-impl<Lch, Lr, T> LocalNameChunnel<Lch, Lr, T> {
+impl<Lch, Lr> LocalNameChunnel<Lch, Lr, ()> {
     async fn new<S>(
         root: impl AsRef<Path>,
         side: S,
@@ -128,6 +130,66 @@ impl<Lch, Lr, T> LocalNameChunnel<Lch, Lr, T> {
     }
 }
 
+pub struct AddrWrap<C>(C);
+impl<C, D> ChunnelConnection for AddrWrap<C>
+where
+    C: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync,
+    D: Send,
+{
+    type Data = (Either<SocketAddr, PathBuf>, D);
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        self.0.send(burst.into_iter().filter_map(|(a, d)| match a {
+            Either::Left(sk) => Some((sk, d)),
+            _ => None,
+        }))
+    }
+
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        Box::pin(async move {
+            let mut slots: Vec<_> = (0..msgs_buf.len()).map(|_| None).collect();
+            let ms = self.0.recv(&mut slots).await?;
+            let mut slot_idx = 0;
+            for (r, slot) in ms
+                .iter_mut()
+                .map_while(Option::take)
+                .map(|(gaddr, data)| (Either::Left(gaddr), data))
+                .zip(msgs_buf.iter_mut())
+            {
+                *slot = Some(r);
+                slot_idx += 1;
+            }
+
+            Ok(&mut msgs_buf[..slot_idx])
+        })
+    }
+}
+
+impl<C> Connected for AddrWrap<C>
+where
+    C: Connected,
+{
+    fn local_addr(&self) -> SocketAddr {
+        self.0.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.0.peer_addr()
+    }
+}
+
 impl<Gc, Lr, LrCn, LrErr, Lrd, Lch, Lcn, LchErr, D> Chunnel<Gc> for LocalNameChunnel<Lch, Lr, ()>
 where
     Gc: ChunnelConnection<Data = (SocketAddr, D)> + Send + Sync + 'static,
@@ -142,7 +204,7 @@ where
     Lcn: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
     LchErr: Into<Report> + Send + Sync + 'static,
 {
-    type Connection = Either<LocalNameCn<Gc, Lcn>, Gc>;
+    type Connection = Either<LocalNameCn<Gc, Lcn>, AddrWrap<Gc>>;
     type Error = Report;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -155,7 +217,7 @@ where
             let local_raw_cn = if cl.is_some() {
                 local_raw.connect(()).await.map_err(Into::into)?
             } else {
-                return Ok(Either::Right(inner));
+                return Ok(Either::Right(AddrWrap(inner)));
             };
 
             let local_cn = local_chunnel
@@ -189,7 +251,7 @@ where
     Lcn: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
     LchErr: Into<Report> + Send + Sync + 'static,
 {
-    type Connection = Either<LocalNameCn<Gc, Lcn>, Gc>;
+    type Connection = Either<LocalNameCn<Gc, Lcn>, AddrWrap<Gc>>;
     type Error = Report;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
@@ -202,8 +264,8 @@ where
         let listen_addr = self.side.listen_addr;
         Box::pin(async move {
             let local_raw_cn = if let Some(laddr) = laddr_opt {
-                // a Once stream is ok because we only need a single connection, not a stream: one to the peer of
-                // inner.
+                // a Once stream is ok because we only need a single connection, not a stream: one
+                // to the peer of inner.
                 local_raw
                     .listen(laddr)
                     .await
@@ -213,7 +275,7 @@ where
                     .unwrap()?
             } else {
                 debug!(?listen_addr, "returning global-only connection");
-                return Ok(Either::Right(inner));
+                return Ok(Either::Right(AddrWrap(inner)));
             };
 
             let local_cn = local_chunnel
@@ -239,8 +301,8 @@ enum LocalAddrCacheEntry<A> {
 
 pub struct LocalNameCn<Gc, Lc> {
     cl: Option<Arc<Mutex<client::LocalNameClient>>>,
-    global_cn: Arc<Gc>,
-    local_cn: Arc<Lc>,
+    global_cn: Gc,
+    local_cn: Lc,
     addr_cache: Arc<StdMutex<HashMap<SocketAddr, LocalAddrCacheEntry<PathBuf>>>>,
     rev_addr_map: Arc<StdMutex<HashMap<PathBuf, SocketAddr>>>,
 }
@@ -249,8 +311,8 @@ impl<Gc, Lc> LocalNameCn<Gc, Lc> {
     fn new(cl: Option<Arc<Mutex<client::LocalNameClient>>>, global_cn: Gc, local_cn: Lc) -> Self {
         Self {
             cl,
-            global_cn: Arc::new(global_cn),
-            local_cn: Arc::new(local_cn),
+            global_cn,
+            local_cn,
             addr_cache: Default::default(),
             rev_addr_map: Default::default(),
         }
@@ -276,7 +338,7 @@ where
     Lc: ChunnelConnection<Data = (PathBuf, D)> + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    type Data = (SocketAddr, D);
+    type Data = (Either<SocketAddr, PathBuf>, D);
 
     fn send<'cn, B>(
         &'cn self,
@@ -287,12 +349,23 @@ where
         <B as IntoIterator>::IntoIter: Send,
     {
         Box::pin(async move {
+            let (global, local_addr): (
+                Vec<(Either<SocketAddr, PathBuf>, D)>,
+                Vec<(Either<SocketAddr, PathBuf>, D)>,
+            ) = burst
+                .into_iter()
+                .partition(|(either_addr, _)| either_addr.is_left());
+
             let mut misses = Vec::new();
-            let (global, local): (Vec<_>, Vec<_>) = {
+            let (global_rem, local_lookup): (Vec<(Either<SocketAddr, PathBuf>, D)>, Vec<_>) = {
                 let ac_g = self.addr_cache.lock().unwrap();
-                burst
+                global
                     .into_iter()
                     .map(|(skaddr, d)| {
+                        let skaddr = match skaddr {
+                            Either::Left(a) => a,
+                            _ => unreachable!(),
+                        };
                         // 1. check local cache
                         let entry = ac_g.get(&skaddr).map(Clone::clone);
                         // 2. if match, send on correct connection.
@@ -301,7 +374,7 @@ where
                             // now.
                             None => {
                                 misses.push(skaddr);
-                                Either::Left((skaddr, d))
+                                (Either::Left(skaddr), d)
                             }
                             Some(LocalAddrCacheEntry::Hit { expiry, .. })
                             | Some(LocalAddrCacheEntry::AntiHit {
@@ -309,42 +382,56 @@ where
                                 ..
                             }) if expiry < std::time::Instant::now() => {
                                 misses.push(skaddr);
-                                Either::Left((skaddr, d))
+                                (Either::Left(skaddr), d)
                             }
                             // Hit cases.
                             Some(LocalAddrCacheEntry::Hit { laddr, .. }) => {
                                 trace!(?laddr, kind = "local", "determined send hit");
-                                Either::Right((laddr.clone(), d))
+                                (Either::Right(laddr.clone()), d)
                             }
                             Some(LocalAddrCacheEntry::AntiHit { .. }) => {
                                 trace!(?skaddr, kind = "global", "determined send hit");
-                                Either::Left((skaddr, d))
+                                (Either::Left(skaddr), d)
                             }
                         }
                     })
-                    .partition(Either::is_left)
+                    .partition(|(e, _)| e.is_left())
             };
-            self.local_cn
-                .send(local.into_iter().map(|x| match x {
-                    Either::Right((l, d)) => (l, d),
-                    _ => unreachable!(),
-                }))
-                .await?;
-            self.global_cn
-                .send(global.into_iter().map(|x| match x {
-                    Either::Left((a, d)) => (a, d),
-                    _ => unreachable!(),
-                }))
-                .await?;
+
+            if !local_addr.is_empty() || !local_lookup.is_empty() {
+                self.local_cn
+                    .send(
+                        local_addr
+                            .into_iter()
+                            .chain(local_lookup.into_iter())
+                            .map(|x| match x {
+                                (Either::Right(l), d) => (l, d),
+                                _ => unreachable!(),
+                            }),
+                    )
+                    .await?;
+            }
+
+            if !global_rem.is_empty() {
+                self.global_cn
+                    .send(global_rem.into_iter().map(|x| match x {
+                        (Either::Left(a), d) => (a, d),
+                        _ => unreachable!(),
+                    }))
+                    .await?;
+            }
 
             // 3. Spawn off lookup.
             if let Some(cl) = &self.cl {
-                tokio::spawn(query_ctl(
-                    misses,
-                    Arc::clone(&cl),
-                    Arc::clone(&self.addr_cache),
-                    Arc::clone(&self.rev_addr_map),
-                ));
+                misses.dedup();
+                if !misses.is_empty() {
+                    tokio::spawn(query_ctl(
+                        misses,
+                        Arc::clone(&cl),
+                        Arc::clone(&self.addr_cache),
+                        Arc::clone(&self.rev_addr_map),
+                    ));
+                }
             } else {
                 let mut c = self.addr_cache.lock().unwrap();
                 for a in misses {
@@ -381,7 +468,7 @@ where
                     for (r, slot) in ms
                         .iter_mut()
                         .map_while(Option::take)
-                        .map(|(gaddr, data)| (gaddr, data))
+                        .map(|(gaddr, data)| (Either::Left(gaddr), data))
                         .zip(msgs_buf.iter_mut())
                     {
                         *slot = Some(r);
@@ -393,9 +480,9 @@ where
                     for (r, slot) in ms
                         .iter_mut()
                         .map_while(Option::take)
-                        .filter_map(|(laddr, data)| match c.get(&laddr) {
-                            Some(addr) => Some((addr.clone(), data)),
-                            None => None,
+                        .map(|(laddr, data)| match c.get(&laddr) {
+                            Some(addr) => (Either::Left(*addr), data),
+                            None => (Either::Right(laddr), data),
                         })
                         .zip(msgs_buf.iter_mut())
                     {
@@ -427,7 +514,7 @@ async fn query_ctl(
     let mut cl_g = cl.lock().await;
     let res = cl_g.query(addrs).await;
     std::mem::drop(cl_g);
-    trace!(?res, "queried localname-ctl");
+    debug!(?res, "queried localname-ctl");
 
     fn insert_antihit(
         skaddr: SocketAddr,
@@ -447,14 +534,31 @@ async fn query_ctl(
             let mut r = rev_addr_map.lock().unwrap();
             for (skaddr, laddr_opt) in entries {
                 if let Some(laddr) = laddr_opt {
-                    c.insert(
-                        skaddr,
+                    let e = c.entry(skaddr).or_insert_with(|| LocalAddrCacheEntry::Hit {
+                        laddr: laddr.clone(),
+                        expiry: std::time::Instant::now() + Duration::from_millis(100),
+                    });
+                    match e {
                         LocalAddrCacheEntry::Hit {
-                            laddr: laddr.clone(),
-                            expiry: std::time::Instant::now()
-                                + std::time::Duration::from_millis(100),
-                        },
-                    );
+                            laddr: ref existing_laddr,
+                            expiry: ref mut existing_expiry,
+                        } if laddr == *existing_laddr
+                            && existing_expiry.elapsed() > Duration::from_millis(100) =>
+                        {
+                            *existing_expiry = Instant::now()
+                                + std::cmp::max(
+                                    existing_expiry.elapsed() * 2,
+                                    Duration::from_secs(10),
+                                );
+                        }
+                        _ => {
+                            *e = LocalAddrCacheEntry::Hit {
+                                laddr: laddr.clone(),
+                                expiry: std::time::Instant::now()
+                                    + std::time::Duration::from_millis(100),
+                            };
+                        }
+                    }
 
                     r.insert(laddr, skaddr);
                 } else {
@@ -498,16 +602,17 @@ mod test {
             .unwrap();
 
         let addr = "127.0.0.1:19052".parse().unwrap();
-        let lch = LocalNameChunnel::<_, _> {
-            cl: None,
-            listen_addr: None,
-            local_raw: UnixSkChunnel::default(),
-            local_chunnel: Nothing::<()>::default(),
-        };
 
         rt.block_on(async move {
-            let lch_s = lch.clone();
             tokio::spawn(async move {
+                let lch_s = LocalNameChunnel::server(
+                    "./nonexistent",
+                    addr,
+                    UnixSkChunnel::default(),
+                    Nothing::<()>::default(),
+                )
+                .await
+                .unwrap();
                 let st = negotiate_server(lch_s, UdpSkChunnel.listen(addr).await.unwrap())
                     .await
                     .unwrap();
@@ -527,6 +632,13 @@ mod test {
             });
 
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let lch = LocalNameChunnel::client(
+                "./nonexistent",
+                UnixSkChunnel::default(),
+                Nothing::<()>::default(),
+            )
+            .await
+            .unwrap();
             let cn = negotiate_client(lch, UdpSkChunnel.connect(addr).await.unwrap(), addr)
                 .await
                 .unwrap();

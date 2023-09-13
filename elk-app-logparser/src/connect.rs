@@ -147,21 +147,17 @@ pub async fn connect_local(
     let enc = encr_stack!(addr)?;
     let sk = UdpSkChunnel.connect(addr).await?;
     let cn = if let Some(lr) = localname_root {
-        let lch = LocalNameChunnel::<_, _, ()>::client(
-            lr.clone(),
-            UnixSkChunnel::with_root(lr),
-            bertha::CxNil,
-        )
-        .await?;
+        let lch = LocalNameChunnel::client(lr.clone(), UnixSkChunnel::with_root(lr), bertha::CxNil)
+            .await?;
         let stack = CxList::from(EstOutputRateSerializeChunnel)
             .wrap(lch)
             .wrap(enc);
         let cn = bertha::negotiate_client(stack, sk, addr).await?;
-        Either::Left(cn)
+        Either::Left(ProjectLeft::new(Either::Left(addr), cn))
     } else {
         let stack = CxList::from(EstOutputRateSerializeChunnel).wrap(enc);
         let cn = bertha::negotiate_client(stack, sk, addr).await?;
-        Either::Right(cn)
+        Either::Right(ProjectLeft::new(addr, cn))
     };
-    Ok(ProjectLeft::new(addr, cn))
+    Ok(cn)
 }

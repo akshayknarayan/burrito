@@ -3,7 +3,7 @@
 use std::{
     future::Future,
     io::Cursor,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -143,6 +143,10 @@ impl EstOutputRate {
 
         proc_cnt
     }
+
+    pub fn len(&self) -> u64 {
+        self.hist.len()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +204,19 @@ pub struct EstOutputRateCn<C> {
     ser: Arc<Mutex<V2Serializer>>,
     des: Arc<Mutex<Deserializer>>,
     inner: C,
+}
+
+impl<C> tcp::Connected for EstOutputRateCn<C>
+where
+    C: tcp::Connected,
+{
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr()
+    }
 }
 
 impl<A, C> ChunnelConnection for EstOutputRateCn<C>

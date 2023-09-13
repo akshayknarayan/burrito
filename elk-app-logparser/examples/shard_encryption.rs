@@ -65,7 +65,7 @@ fn main() -> Result<(), Report> {
 }
 
 struct DoNothing;
-impl<Line> ProcessLine<Line> for DoNothing
+impl<Line> ProcessLine<(SocketAddr, Line)> for DoNothing
 where
     Line: 'static,
 {

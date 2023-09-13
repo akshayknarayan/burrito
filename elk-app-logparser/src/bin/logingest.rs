@@ -116,7 +116,7 @@ struct PublishLines<C> {
     cn_state_watcher: Receiver<ConnState>,
 }
 
-impl<C> ProcessLine<Line> for PublishLines<C>
+impl<C> ProcessLine<(SocketAddr, Line)> for PublishLines<C>
 where
     C: ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send + Sync + 'static,
 {

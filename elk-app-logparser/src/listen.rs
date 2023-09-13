@@ -17,16 +17,16 @@ use bertha::{
     bincode::SerializeChunnel,
     chan_transport::{Cln, RendezvousChannel, Srv},
     uds::UnixSkChunnel,
-    util::Nothing,
+    util::{Nothing, ProjectLeft},
     ChunnelConnection, ChunnelListener, CxList, Either, Select,
 };
 use burrito_localname_ctl::LocalNameChunnel;
 use burrito_shard_ctl::{Kv, ShardInfo};
 use color_eyre::eyre::{Report, WrapErr};
-use futures_util::stream::TryStreamExt;
+use futures_util::{stream::TryStreamExt, Stream};
 use rcgen::Certificate;
 use rustls::PrivateKey;
-use tcp::TcpChunnelWrapServer;
+use tcp::{Connected, TcpChunnelWrapServer};
 use tls_tunnel::rustls::TLSChunnel;
 use tokio::runtime::Runtime;
 use tracing::{debug, debug_span, error, info, instrument, trace, trace_span, warn, Instrument};
@@ -60,10 +60,7 @@ pub trait ProcessLine<L> {
         Self: 'a,
         L: 'a;
     type Error: Into<Report> + Send + Sync + 'static;
-    fn process_lines<'a>(
-        &'a self,
-        line_batch: &'a mut [Option<(SocketAddr, L)>],
-    ) -> Self::Future<'a>;
+    fn process_lines<'a>(&'a self, line_batch: &'a mut [Option<L>]) -> Self::Future<'a>;
 }
 
 pub fn serve(
@@ -71,7 +68,7 @@ pub fn serve(
     hostname: impl ToString,
     num_workers: usize,
     redis_addr: String,
-    process_message: impl ProcessLine<Line> + Send + Sync + 'static,
+    process_message: impl ProcessLine<(SocketAddr, Line)> + Send + Sync + 'static,
     encr_only: bool,
     runtime: Option<Runtime>,
 ) -> Result<(), Report> {
@@ -185,10 +182,9 @@ async fn single_worker(
     addr: SocketAddr,
     mut internal_srv: RendezvousChannel<SocketAddr, Vec<u8>, Srv>,
     cert: Arc<Certificate>,
-    line_processor: Arc<impl ProcessLine<Line> + Send + Sync + 'static>,
+    line_processor: Arc<impl ProcessLine<(SocketAddr, Line)> + Send + Sync + 'static>,
     encr_only: bool,
 ) -> Result<(), Report> {
-    info!(?addr, "listening");
     let enc_stack = encr_stack!(addr, cert).wrap_err("creating encryption stack")?;
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
     let negotiation_state = Default::default();
@@ -223,6 +219,7 @@ async fn single_worker(
         external_conn_stream.map_ok(|cn| Either::Left(cn)),
         internal_conn_stream.map_ok(|cn| Either::Right(cn)),
     );
+    info!(?addr, "ready");
     let st = std::pin::pin!(joined_stream);
     st.try_for_each_concurrent(None, |cn| serve_one_cn(cn, &line_processor))
         .await?;
@@ -232,7 +229,7 @@ async fn single_worker(
 #[instrument(skip(cn, line_processor), level = "info", err)]
 async fn serve_one_cn(
     cn: impl ChunnelConnection<Data = (SocketAddr, Line)> + Send + 'static,
-    line_processor: &Arc<impl ProcessLine<Line> + Send + Sync + 'static>,
+    line_processor: &Arc<impl ProcessLine<(SocketAddr, Line)> + Send + Sync + 'static>,
 ) -> Result<(), Report> {
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
     let mut acks = Vec::with_capacity(16);
@@ -306,7 +303,7 @@ async fn serve_canonical(
         Either::Right(st.map_ok(|cn| Either::Right(cn)))
     };
 
-    info!(shard_info = ?&si, "start canonical server");
+    info!(shard_info = ?&si, "ready");
     let ctr: Arc<AtomicUsize> = Default::default();
     let st = std::pin::pin!(st);
     st.try_for_each_concurrent(None, |r| {
@@ -349,8 +346,8 @@ pub async fn serve_local(
     let enc = encr_stack!(listen_addr, cert).wrap_err("creating encryption stack")?;
     let mut base_udp = bertha::udp::UdpReqChunnel::default();
     let st = base_udp.listen(listen_addr).await?;
-    let st = if let Some(lr) = localname_root {
-        let lch = LocalNameChunnel::<_, _, ()>::server(
+    if let Some(lr) = localname_root {
+        let lch = LocalNameChunnel::server(
             lr.clone(),
             listen_addr,
             UnixSkChunnel::with_root(lr),
@@ -360,19 +357,37 @@ pub async fn serve_local(
         let stack = CxList::from(EstOutputRateSerializeChunnel)
             .wrap(lch)
             .wrap(enc);
-        info!(?listen_addr, "start server");
         let st = bertha::negotiate_server(stack, st)
             .await
             .wrap_err("negotiate_server")?;
-        Either::Left(st.map_ok(|cn| Either::Left(cn)))
+        let st = st.map_ok(|cn| {
+            let a = cn.peer_addr().unwrap();
+            ProjectLeft::new(Either::Left(a), cn)
+        });
+        serve_local_inner(listen_addr, st, recvs).await
     } else {
         let stack = CxList::from(EstOutputRateSerializeChunnel).wrap(enc);
-        info!(?listen_addr, "start server");
         let st = bertha::negotiate_server(stack, st)
             .await
             .wrap_err("negotiate_server")?;
-        Either::Right(st.map_ok(|cn| Either::Right(cn)))
-    };
+        let st = st.map_ok(|cn| {
+            let a = cn.peer_addr().unwrap();
+            ProjectLeft::new(a, cn)
+        });
+        serve_local_inner(listen_addr, st, recvs).await
+    }
+}
+
+async fn serve_local_inner<S, C>(
+    listen_addr: SocketAddr,
+    st: S,
+    recvs: impl ProcessLine<EstOutputRateHist> + Send + Sync + 'static,
+) -> Result<(), Report>
+where
+    S: Stream<Item = Result<C, Report>>,
+    C: ChunnelConnection<Data = EstOutputRateHist>,
+{
+    info!(?listen_addr, "ready");
     let st = std::pin::pin!(st);
     let recvs = Arc::new(recvs);
     st.try_for_each_concurrent(None, |cn| {
@@ -380,15 +395,23 @@ pub async fn serve_local(
         let recvs = Arc::clone(&recvs);
         async move {
             loop {
-                let ms = cn.recv(&mut slot).await?;
+                let ms = cn
+                    .recv(&mut slot)
+                    .await
+                    .wrap_err("serve_local: inner connection recv")?;
                 if ms.is_empty() || ms[0].is_none() {
                     continue;
                 }
 
-                recvs.process_lines(ms).await.map_err(Into::into)?;
+                recvs
+                    .process_lines(ms)
+                    .await
+                    .map_err(Into::into)
+                    .wrap_err("serve_local: process lines handler")?;
             }
         }
     })
-    .await?;
+    .await
+    .wrap_err("serve_local: stream error")?;
     unreachable!()
 }

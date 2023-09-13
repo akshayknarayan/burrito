@@ -40,10 +40,13 @@ struct Opt {
     topic_name: String,
 
     #[structopt(long)]
-    local_root: Option<PathBuf>,
+    local_root: Option<Option<PathBuf>>,
 
     #[structopt(long)]
     forward_addr: SocketAddr,
+
+    #[structopt(long)]
+    interval_ms: u64,
 
     #[structopt(long)]
     logging: bool,
@@ -130,22 +133,35 @@ async fn inner(
 ) -> Result<(), Report> {
     let mut curr_cn_state = *cn_state_watcher.borrow_and_update();
 
-    let fwd_conn = connect::connect_local(opt.forward_addr, opt.local_root).await?;
+    let local_root = opt
+        .local_root
+        .map(|o| o.unwrap_or_else(|| "/tmp/burrito".parse().unwrap()));
+    let fwd_conn = connect::connect_local(opt.forward_addr, local_root).await?;
 
+    info!(?curr_cn_state, "ready");
     let mut slots = vec![None; 16];
     let mut processed_entries = 0;
     let mut received_lines: HashMap<IpAddr, Vec<ParsedLine>> = Default::default();
     let mut est_output_rates: HashMap<IpAddr, EstOutputRate> = Default::default();
     let mut send_wait = Either::Left(futures_util::future::pending());
+    let interval = Duration::from_millis(opt.interval_ms);
     loop {
         tokio::select! {
             ms = conn.recv(&mut slots[..]) => {
-                handle_recv(ms?, &mut received_lines, &mut est_output_rates, &mut send_wait, &mut processed_entries)?;
+                handle_recv(ms?, &mut received_lines, &mut est_output_rates, &mut send_wait, &mut processed_entries, interval)?;
             }
-            // dump output 10 seconds after we see an entry, then reset the counter
+            // dump output <interval> after we see an entry, then reset the counter
             _ = &mut send_wait, if send_wait.is_right() => {
                 info!(?processed_entries, "sending histograms");
-                fwd_conn.send(est_output_rates.drain().map(|(group, est_output)| EstOutputRateHist::new(group, est_output))).await?;
+                fwd_conn
+                    .send(est_output_rates.drain().filter_map(|(group, est_output)| {
+                        if est_output.len() > 0 {
+                            Some(EstOutputRateHist::new(group, est_output))
+                        } else {
+                            None
+                        }
+                    }))
+                    .await?;
                 processed_entries = 0;
                 send_wait = Either::Left(futures_util::future::pending());
             }
@@ -171,6 +187,7 @@ async fn inner(
             Pin<Box<dyn Future<Output = ()>>>,
         >,
         processed_entries: &mut usize,
+        interval: Duration,
     ) -> Result<(), Report> {
         for v in received_lines.values_mut() {
             v.clear();
@@ -198,7 +215,7 @@ async fn inner(
         }
 
         if *processed_entries > 0 && send_wait.is_left() {
-            *send_wait = Either::Right(Box::pin(tokio::time::sleep(Duration::from_secs(10))));
+            *send_wait = Either::Right(Box::pin(tokio::time::sleep(interval)));
         }
 
         debug!(?processed_entries, "received");
