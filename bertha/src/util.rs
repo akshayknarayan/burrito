@@ -209,8 +209,8 @@ where
         Box::pin(async move {
             let msgs = self.1.recv(&mut slots[..]).await?;
             for (slot, (_, d)) in msgs_buf
-                .into_iter()
-                .zip(msgs.into_iter().map_while(Option::take))
+                .iter_mut()
+                .zip(msgs.iter_mut().map_while(Option::take))
             {
                 *slot = Some(d);
             }
