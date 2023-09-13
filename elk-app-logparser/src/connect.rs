@@ -22,10 +22,7 @@ use tcp::{ConnectChunnel, TcpChunnelWrapClient};
 use tls_tunnel::rustls::TLSChunnel;
 use tracing::debug;
 
-use crate::{
-    listen::Line,
-    parse_log::{EstOutputRateHist, EstOutputRateSerializeChunnel},
-};
+use crate::parse_log::{EstOutputRateHist, EstOutputRateSerializeChunnel, Line};
 
 #[derive(Clone, Copy, Debug)]
 struct DontVerify(pub IpAddr);
@@ -70,12 +67,7 @@ impl rustls::client::ServerCertVerifier for DontVerify {
 }
 
 macro_rules! encr_stack {
-    ($connect_addr: expr) => {{
-        // either:
-        // base |> quic |> serialize
-        // base |> tcp |> tls |> serialize
-        // base |> serialize (no encryption)
-
+    (tls => $connect_addr: expr) => {{
         // tcp |> tls
         let mut tls_client_cfg = ClientConfig::builder()
             .with_safe_defaults()
@@ -86,7 +78,9 @@ macro_rules! encr_stack {
         let sn: ServerName = ServerName::IpAddress($connect_addr.ip());
         let tls_stack = CxList::from(TLSChunnel::client(tls_client_cfg, sn))
             .wrap(TcpChunnelWrapClient::new($connect_addr));
-
+        tls_stack
+    }};
+    (quic => $connect_addr: expr) => {{
         // quic
         let mut quic_client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
         quic_client_cfg.verify_peer(false);
@@ -100,9 +94,14 @@ macro_rules! encr_stack {
         quic_client_cfg.set_initial_max_streams_uni(100);
         quic_client_cfg.set_disable_active_migration(true);
         let quic_stack = quic_chunnel::QuicChunnel::client(quic_client_cfg);
-
+        quic_stack
+    }};
+    ($connect_addr: expr) => {{
+        // either:
+        // base |> quic
+        // base |> tcp |> tls
         Ok::<_, Report>(
-            CxList::from(Select::from((quic_stack, tls_stack))).wrap(ConnectChunnel($connect_addr)),
+            CxList::from(Select::from((encr_stack!(quic => $connect_addr), encr_stack!(tls => $connect_addr)))).wrap(ConnectChunnel($connect_addr)),
         )
     }};
 }

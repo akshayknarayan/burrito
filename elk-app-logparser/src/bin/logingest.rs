@@ -9,8 +9,8 @@ use std::{future::Future, net::SocketAddr, pin::Pin};
 use bertha::{ChunnelConnection, Either};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use elk_app_logparser::{
-    listen::{self, Line, ProcessLine},
-    parse_log::{parse_raw, ParsedLine},
+    listen::{self, ProcessLine},
+    parse_log::{parse_raw, Line, ParsedLine},
     publish_subscribe::{self, make_topic, ConnState},
 };
 use gcp_pubsub::GcpClient;

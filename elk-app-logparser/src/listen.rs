@@ -21,7 +21,7 @@ use bertha::{
     ChunnelConnection, ChunnelListener, CxList, Either, Select,
 };
 use burrito_localname_ctl::LocalNameChunnel;
-use burrito_shard_ctl::{Kv, ShardInfo};
+use burrito_shard_ctl::ShardInfo;
 use color_eyre::eyre::{Report, WrapErr};
 use futures_util::{stream::TryStreamExt, Stream};
 use rcgen::Certificate;
@@ -31,28 +31,7 @@ use tls_tunnel::rustls::TLSChunnel;
 use tokio::runtime::Runtime;
 use tracing::{debug, debug_span, error, info, instrument, trace, trace_span, warn, Instrument};
 
-use crate::parse_log::{EstOutputRateHist, EstOutputRateSerializeChunnel};
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub enum Line {
-    Report(String),
-    Ack,
-}
-
-impl Kv for Line {
-    type Key = String;
-    fn key(&self) -> Self::Key {
-        match self {
-            Self::Report(s) => s.clone(),
-            Self::Ack => "ack".to_owned(),
-        }
-    }
-
-    type Val = ();
-    fn val(&self) -> Self::Val {
-        ()
-    }
-}
+use crate::parse_log::{EstOutputRateHist, EstOutputRateSerializeChunnel, Line};
 
 pub trait ProcessLine<L> {
     type Future<'a>: Future<Output = Result<(), Self::Error>>
@@ -134,12 +113,7 @@ pub fn serve(
 }
 
 macro_rules! encr_stack {
-    ($listen_addr: expr, $cert_rc: expr) => {{
-        // either:
-        // base |> quic |> serialize
-        // base |> tcp |> tls |> serialize
-        // base |> serialize (no encryption)
-
+    (tls => $listen_addr: expr, $cert_rc: expr) => {{
         // tcp |> tls
         let private_key = PrivateKey($cert_rc.serialize_private_key_der());
         let cert = rustls::Certificate($cert_rc.serialize_der()?);
@@ -150,7 +124,9 @@ macro_rules! encr_stack {
             .expect("bad certificate/key");
         let tls_stack = CxList::from(TLSChunnel::server(tls_server_cfg))
             .wrap(TcpChunnelWrapServer::new($listen_addr)?);
-
+        tls_stack
+    }};
+    (quic => $listen_addr: expr, $cert_rc: expr) => {{
         // quic
         let mut quic_server_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
         quic_server_cfg.verify_peer(false);
@@ -172,8 +148,13 @@ macro_rules! encr_stack {
         quic_server_cfg.set_initial_max_streams_uni(100);
         quic_server_cfg.set_disable_active_migration(true);
         let quic_stack = quic_chunnel::QuicChunnel::server(quic_server_cfg, [cert_file, key_file]);
-
-        Ok::<_, Report>(Select::from((quic_stack, tls_stack)))
+        quic_stack
+    }};
+    ($listen_addr: expr, $cert_rc: expr) => {{
+        // either:
+        // base |> quic
+        // base |> tcp |> tls
+        Ok::<_, Report>(Select::from((encr_stack!(quic => $listen_addr, $cert_rc), encr_stack!(tls => $listen_addr, $cert_rc))))
     }};
 }
 

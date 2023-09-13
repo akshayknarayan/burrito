@@ -10,6 +10,7 @@ use std::{
 };
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
+use burrito_shard_ctl::Kv;
 use chrono::{DateTime, Duration, Utc};
 use color_eyre::{eyre::bail, Report};
 use common_log_format::LogEntry;
@@ -19,6 +20,27 @@ use hdrhistogram::{
     Histogram,
 };
 use tracing::{trace, warn};
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub enum Line {
+    Report(String),
+    Ack,
+}
+
+impl Kv for Line {
+    type Key = String;
+    fn key(&self) -> Self::Key {
+        match self {
+            Self::Report(s) => s.clone(),
+            Self::Ack => "ack".to_owned(),
+        }
+    }
+
+    type Val = ();
+    fn val(&self) -> Self::Val {
+        ()
+    }
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ParsedLine {

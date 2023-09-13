@@ -18,7 +18,10 @@ use tracing::{debug, info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
-use elk_app_logparser::{connect, listen::Line, parse_log::sample_logentry_lines};
+use elk_app_logparser::{
+    connect,
+    parse_log::{sample_logentry_lines, Line},
+};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "logproducer")]
