@@ -278,6 +278,19 @@ where
     }
 }
 
+impl<C> Connected for IgnoreAddr<C>
+where
+    C: Connected,
+{
+    fn local_addr(&self) -> SocketAddr {
+        self.1.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        Some(self.0)
+    }
+}
+
 pub struct TcpCn {
     inner: TcpStream,
 }

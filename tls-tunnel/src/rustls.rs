@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::{future::Future, pin::Pin};
+use tcp::Connected;
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
@@ -85,6 +86,19 @@ impl<C> TLSConnection<C> {
             tls: Arc::new(Mutex::new(tls)),
             inner,
         }
+    }
+}
+
+impl<C> Connected for TLSConnection<C>
+where
+    C: Connected,
+{
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr()
     }
 }
 

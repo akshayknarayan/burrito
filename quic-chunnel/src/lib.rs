@@ -134,6 +134,19 @@ impl<C> QuicConn<C> {
     }
 }
 
+impl<C> Connected for QuicConn<C>
+where
+    C: Connected,
+{
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr()
+    }
+}
+
 fn get_quic_error(quic_g: &mut quiche::Connection) -> Report {
     if let Some(quiche::ConnectionError {
         is_app,

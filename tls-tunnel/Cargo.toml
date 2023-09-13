@@ -8,6 +8,7 @@ ghostunnel = ["rand", "tokio/net", "tokio/io-util", "tokio/process"]
 
 [dependencies]
 bertha = { path = "../bertha" }
+tcp = { path = "../tcp" }
 futures-util = "0.3"
 color-eyre = "0.6"
 tracing = "0.1"
@@ -22,4 +23,3 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-error = "0.2"
 rcgen = "0.10.0"
-tcp = { path = "../tcp" }
