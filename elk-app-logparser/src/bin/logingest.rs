@@ -4,7 +4,7 @@
 //! Listen on HTTP/HTTPS/QUIC (with load balancing across multiple instances / threads) and publish
 //! on pub/sub chunnel with reconfigurable ordering.
 
-use std::{future::Future, net::SocketAddr, pin::Pin};
+use std::{future::Future, net::SocketAddr, path::PathBuf, pin::Pin};
 
 use bertha::{ChunnelConnection, Either};
 use color_eyre::eyre::{eyre, Report, WrapErr};
@@ -12,13 +12,14 @@ use elk_app_logparser::{
     listen::{self, ProcessLine},
     parse_log::{parse_raw, Line, ParsedLine},
     publish_subscribe::{self, make_topic, ConnState},
+    stats, EncrSpec, ProcessRecord,
 };
 use gcp_pubsub::GcpClient;
 use queue_steer::MessageQueueAddr;
 use redis_basechunnel::RedisBase;
 use structopt::StructOpt;
 use tokio::sync::watch::Receiver;
-use tracing::{info, instrument, trace, warn};
+use tracing::{error, info, instrument, trace, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
@@ -46,8 +47,11 @@ struct Opt {
     #[structopt(long)]
     topic_name: String,
 
+    #[structopt(long, default_value = "allow-none")]
+    encr_spec: EncrSpec,
+
     #[structopt(long)]
-    encr_only: bool,
+    stats_file: Option<PathBuf>,
 
     #[structopt(long)]
     logging: bool,
@@ -72,7 +76,8 @@ fn main() -> Result<(), Report> {
         .wrap_err("Building tokio runtime")?;
     let redis_addr = opt.redis_addr.clone();
     let topic_name = opt.topic_name.clone();
-    let (cn, mut cn_state_watcher) = rt.block_on(async move {
+    let clk = quanta::Clock::new();
+    let (cn, mut cn_state_watcher, sender, clk) = rt.block_on(async move {
         let (redis, gcp_client) = setup_subscriber(
             redis_addr,
             opt.gcp_project_name,
@@ -80,14 +85,18 @@ fn main() -> Result<(), Report> {
             &topic_name,
         )
         .await?;
+
+        let (s, r) = flume::unbounded();
+        tokio::spawn(stats(r, clk.clone(), opt.stats_file));
+
         if let Some(ref kafka_addr) = opt.kafka_addr {
             let (cn_state_watcher, conn) =
                 publish_subscribe::connect(&topic_name, redis, gcp_client, kafka_addr).await?;
-            Ok::<_, Report>((Either::Left(conn), cn_state_watcher))
+            Ok::<_, Report>((Either::Left(conn), cn_state_watcher, s, clk))
         } else {
             let (cn_state_watcher, conn) =
                 publish_subscribe::connect_gcp_only(&topic_name, redis, gcp_client).await?;
-            Ok::<_, Report>((Either::Right(conn), cn_state_watcher))
+            Ok::<_, Report>((Either::Right(conn), cn_state_watcher, s, clk))
         }
     })?;
 
@@ -96,6 +105,8 @@ fn main() -> Result<(), Report> {
         inner: cn,
         topic_id: opt.topic_name,
         cn_state_watcher,
+        sender,
+        clk,
     };
 
     info!(?curr_publish_state, "starting server");
@@ -105,7 +116,7 @@ fn main() -> Result<(), Report> {
         opt.num_workers,
         opt.redis_addr,
         handler,
-        opt.encr_only,
+        opt.encr_spec,
         Some(rt),
     )
 }
@@ -114,6 +125,8 @@ struct PublishLines<C> {
     inner: C,
     topic_id: String,
     cn_state_watcher: Receiver<ConnState>,
+    sender: flume::Sender<ProcessRecord>,
+    clk: quanta::Clock,
 }
 
 impl<C> ProcessLine<(SocketAddr, Line)> for PublishLines<C>
@@ -136,7 +149,11 @@ where
             });
         let lines = parse_raw(str_msgs);
         Box::pin(async move {
+            let mut num_records = 0;
+            let mut num_bytes = 0;
             let parsed_lines = lines.filter_map(|p| {
+                num_records += 1;
+                num_bytes += p.text.len();
                 Some((
                     MessageQueueAddr {
                         topic_id: self.topic_id.clone(),
@@ -148,6 +165,18 @@ where
             let cn_state = *self.cn_state_watcher.borrow();
             self.inner.send(parsed_lines).await?;
             trace!(?cn_state, ?self.topic_id,  "sent lines");
+
+            let recv_ts = self.clk.raw();
+            // blocking not possible on unbounded channel
+            if let Err(err) = self.sender.try_send(ProcessRecord {
+                recv_ts,
+                num_records_observed: num_records,
+                num_bytes_observed: Some(num_bytes),
+            }) {
+                error!(?err, "Receiver dropped, exiting");
+                return Err(eyre!("Exiting due to channel send failure"));
+            }
+
             Ok(())
         })
     }

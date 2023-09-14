@@ -11,7 +11,10 @@ use std::{
 };
 
 use bertha::{
-    bincode::SerializeChunnel, udp::UdpSkChunnel, uds::UnixSkChunnel, util::ProjectLeft,
+    bincode::SerializeChunnel,
+    udp::UdpSkChunnel,
+    uds::UnixSkChunnel,
+    util::{Nothing, ProjectLeft},
     ChunnelConnection, ChunnelConnector, CxList, Either, Select,
 };
 use burrito_localname_ctl::LocalNameChunnel;
@@ -22,7 +25,10 @@ use tcp::{ConnectChunnel, TcpChunnelWrapClient};
 use tls_tunnel::rustls::TLSChunnel;
 use tracing::debug;
 
-use crate::parse_log::{EstOutputRateHist, EstOutputRateSerializeChunnel, Line};
+use crate::{
+    parse_log::{EstOutputRateHist, EstOutputRateSerializeChunnel, Line},
+    EncrSpec,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct DontVerify(pub IpAddr);
@@ -100,40 +106,61 @@ macro_rules! encr_stack {
         // either:
         // base |> quic
         // base |> tcp |> tls
-        Ok::<_, Report>(
-            CxList::from(Select::from((encr_stack!(quic => $connect_addr), encr_stack!(tls => $connect_addr)))).wrap(ConnectChunnel($connect_addr)),
-        )
+        CxList::from(Select::from((encr_stack!(quic => $connect_addr), encr_stack!(tls => $connect_addr)))).wrap(ConnectChunnel($connect_addr))
     }};
 }
 
 pub async fn connect(
     addr: SocketAddr,
-    redis_addr: String,
-    encr_only: bool,
+    redis_addr: Option<String>,
+    encr_spec: EncrSpec,
 ) -> Result<impl ChunnelConnection<Data = Line> + Send + 'static, Report> {
     let base = UdpSkChunnel.connect(addr).await?;
-    let enc_stack = encr_stack!(addr).wrap_err("creating encryption stack")?;
-    let cl_shard = ClientShardChunnelClient::new(addr, &redis_addr)
-        .await
-        .wrap_err("make ClientShardChunnelClient")?;
+    let cl_shard = if let Some(ra) = redis_addr {
+        Some(
+            ClientShardChunnelClient::new(addr, &ra)
+                .await
+                .wrap_err("make ClientShardChunnelClient")?,
+        )
+    } else {
+        None
+    };
     // (
     //   client_sharding |> serialize |> udp,
     //   serialize |> ( tls |> tcp [replace udp], quic ) |> udp
     // )
     // client_sharding is not compatible with enc_stack since it requires send_to, which Connected
     // types don't support.
-    let cn = if encr_only {
-        let stack = CxList::from(SerializeChunnel::default()).wrap(enc_stack);
-        let cn = bertha::negotiate_client(stack, base, addr).await?;
-        Either::Left(cn)
-    } else {
-        let stack = Select::from((
-            CxList::from(cl_shard).wrap(SerializeChunnel::default()),
-            CxList::from(SerializeChunnel::default()).wrap(enc_stack),
-        ));
-        let cn = bertha::negotiate_client(stack, base, addr).await?;
-        Either::Right(cn)
+    let cn = match encr_spec {
+        EncrSpec::AllowNone => {
+            let enc_stack = encr_stack!(addr);
+            let stack = Select::from((
+                CxList::from(cl_shard).wrap(SerializeChunnel::default()),
+                CxList::from(SerializeChunnel::default()).wrap(enc_stack),
+            ));
+            let cn = bertha::negotiate_client(stack, base, addr).await?;
+            Either::Left(Either::Left(cn))
+        }
+        EncrSpec::AutoOnly => {
+            let enc_stack = encr_stack!(addr);
+            let stack = CxList::from(SerializeChunnel::default()).wrap(enc_stack);
+            let cn = bertha::negotiate_client(stack, base, addr).await?;
+            Either::Left(Either::Right(cn))
+        }
+        EncrSpec::TlsOnly => {
+            let enc_stack = encr_stack!(tls => addr);
+            let stack = CxList::from(SerializeChunnel::default()).wrap(enc_stack);
+            let cn = bertha::negotiate_client(stack, base, addr).await?;
+            Either::Right(Either::Left(cn))
+        }
+        EncrSpec::QuicOnly => {
+            let enc_stack = encr_stack!(quic => addr);
+            let stack = CxList::from(SerializeChunnel::default()).wrap(enc_stack);
+            let cn = bertha::negotiate_client(stack, base, addr).await?;
+            Either::Right(Either::Right(cn))
+        }
     };
+
     debug!("returning connection");
     let cn = ProjectLeft::new(addr, cn);
     Ok(cn)
@@ -142,21 +169,84 @@ pub async fn connect(
 pub async fn connect_local(
     addr: SocketAddr,
     localname_root: Option<PathBuf>,
+    encr_spec: EncrSpec,
 ) -> Result<impl ChunnelConnection<Data = EstOutputRateHist>, Report> {
-    let enc = encr_stack!(addr)?;
     let sk = UdpSkChunnel.connect(addr).await?;
-    let cn = if let Some(lr) = localname_root {
-        let lch = LocalNameChunnel::client(lr.clone(), UnixSkChunnel::with_root(lr), bertha::CxNil)
-            .await?;
-        let stack = CxList::from(EstOutputRateSerializeChunnel)
-            .wrap(lch)
-            .wrap(enc);
-        let cn = bertha::negotiate_client(stack, sk, addr).await?;
-        Either::Left(ProjectLeft::new(Either::Left(addr), cn))
+    let local_chunnel = if let Some(lr) = localname_root {
+        Some(
+            LocalNameChunnel::client(lr.clone(), UnixSkChunnel::with_root(lr), bertha::CxNil)
+                .await?,
+        )
     } else {
-        let stack = CxList::from(EstOutputRateSerializeChunnel).wrap(enc);
-        let cn = bertha::negotiate_client(stack, sk, addr).await?;
-        Either::Right(ProjectLeft::new(addr, cn))
+        None
+    };
+
+    let cn = match (encr_spec, local_chunnel) {
+        (EncrSpec::AllowNone, Some(lch)) => {
+            let enc = encr_stack!(addr);
+            let stack = CxList::from(EstOutputRateSerializeChunnel)
+                .wrap(lch)
+                .wrap(Select::from((Nothing::<()>::default(), enc)));
+            let cn = bertha::negotiate_client(stack, sk, addr).await?;
+            let cn = ProjectLeft::new(Either::Left(addr), cn);
+            Either::Left(Either::Left(Either::Left(cn)))
+        }
+        (EncrSpec::AllowNone, None) => {
+            let enc = encr_stack!(addr);
+            let stack = CxList::from(EstOutputRateSerializeChunnel)
+                .wrap(Select::from((Nothing::<()>::default(), enc)));
+            let cn = bertha::negotiate_client(stack, sk, addr).await?;
+            let cn = ProjectLeft::new(addr, cn);
+            Either::Left(Either::Left(Either::Right(cn)))
+        }
+        (EncrSpec::AutoOnly, Some(lch)) => {
+            let enc = encr_stack!(addr);
+            let stack = CxList::from(EstOutputRateSerializeChunnel)
+                .wrap(lch)
+                .wrap(enc);
+            let cn = bertha::negotiate_client(stack, sk, addr).await?;
+            let cn = ProjectLeft::new(Either::Left(addr), cn);
+            Either::Left(Either::Right(Either::Left(cn)))
+        }
+        (EncrSpec::AutoOnly, None) => {
+            let enc = encr_stack!(addr);
+            let stack = CxList::from(EstOutputRateSerializeChunnel).wrap(enc);
+            let cn = bertha::negotiate_client(stack, sk, addr).await?;
+            let cn = ProjectLeft::new(addr, cn);
+            Either::Left(Either::Right(Either::Right(cn)))
+        }
+        (EncrSpec::TlsOnly, Some(lch)) => {
+            let enc = encr_stack!(tls => addr);
+            let stack = CxList::from(EstOutputRateSerializeChunnel)
+                .wrap(lch)
+                .wrap(enc);
+            let cn = bertha::negotiate_client(stack, sk, addr).await?;
+            let cn = ProjectLeft::new(Either::Left(addr), cn);
+            Either::Right(Either::Left(Either::Left(cn)))
+        }
+        (EncrSpec::TlsOnly, None) => {
+            let enc = encr_stack!(tls => addr);
+            let stack = CxList::from(EstOutputRateSerializeChunnel).wrap(enc);
+            let cn = bertha::negotiate_client(stack, sk, addr).await?;
+            let cn = ProjectLeft::new(addr, cn);
+            Either::Right(Either::Left(Either::Right(cn)))
+        }
+        (EncrSpec::QuicOnly, Some(lch)) => {
+            let enc = encr_stack!(quic => addr);
+            let stack = CxList::from(EstOutputRateSerializeChunnel)
+                .wrap(lch)
+                .wrap(enc);
+            let cn = bertha::negotiate_client(stack, sk, addr).await?;
+            let cn = ProjectLeft::new(Either::Left(addr), cn);
+            Either::Right(Either::Right(Either::Left(cn)))
+        }
+        (EncrSpec::QuicOnly, None) => {
+            let enc = encr_stack!(quic => addr);
+            let stack = CxList::from(EstOutputRateSerializeChunnel).wrap(enc);
+            let cn = bertha::negotiate_client(stack, sk, addr).await?;
+            let cn = ProjectLeft::new(addr, cn);
+            Either::Right(Either::Right(Either::Right(cn)))
+        }
     };
     Ok(cn)
 }

@@ -6,10 +6,10 @@ use color_eyre::eyre::{eyre, Report, WrapErr};
 use elk_app_logparser::{
     listen::{serve_local, ProcessLine},
     parse_log::EstOutputRateHist,
+    stats, EncrSpec, ProcessRecord,
 };
 use futures_util::future::ready;
 use structopt::StructOpt;
-use tokio::fs::File;
 use tracing::{debug, error, info, instrument};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
@@ -25,6 +25,9 @@ struct Opt {
 
     #[structopt(long)]
     local_root: Option<Option<PathBuf>>,
+
+    #[structopt(long, default_value = "allow-none")]
+    encr_spec: EncrSpec,
 
     #[structopt(long)]
     out_file: Option<PathBuf>,
@@ -51,12 +54,6 @@ fn main() -> Result<(), Report> {
         .build()
         .wrap_err("Building tokio runtime")?;
     rt.block_on(consumer(opt))
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ProcessRecord {
-    recv_ts: u64,
-    num_records_observed: usize,
 }
 
 #[derive(Debug)]
@@ -105,6 +102,7 @@ impl ProcessLine<EstOutputRateHist> for Process {
             if let Err(err) = self.s.try_send(ProcessRecord {
                 recv_ts,
                 num_records_observed: num_records_observed as _,
+                num_bytes_observed: None,
             }) {
                 error!(?err, "Receiver dropped, exiting");
                 return Box::pin(ready(Err(eyre!("Exiting due to channel send failure"))));
@@ -134,64 +132,6 @@ async fn consumer(opt: Opt) -> Result<(), Report> {
         s,
     };
 
-    let of = if let Some(p) = opt.out_file {
-        Some(File::create(p).await?)
-    } else {
-        None
-    };
-
-    tokio::spawn(stats(r, clk, of));
-    serve_local(opt.listen_addr, opt.hostname, local_root, p).await
-}
-
-#[instrument(level = "info", skip(r, clk, outf), err)]
-async fn stats(
-    r: flume::Receiver<ProcessRecord>,
-    clk: quanta::Clock,
-    mut outf: Option<tokio::fs::File>,
-) -> Result<(), Report> {
-    use tokio::io::AsyncWriteExt;
-    info!("starting");
-    let start = clk.now();
-    let mut last_recv_time: Option<u64> = None;
-    let mut records_observed = 0;
-    if let Some(ref mut f) = outf {
-        f.write_all(b"since_start_us,tot_records_observed,records_observed,elapsed_us,rate_records_per_sec\n")
-            .await?;
-    }
-
-    while let Ok(ProcessRecord {
-        recv_ts,
-        num_records_observed,
-    }) = r.recv_async().await
-    {
-        records_observed += num_records_observed;
-        if last_recv_time.is_none() {
-            last_recv_time = Some(recv_ts);
-            continue;
-        }
-
-        let el = clk.delta(last_recv_time.unwrap(), clk.raw());
-        let samp = (num_records_observed as f64) / el.as_secs_f64();
-        if let Some(ref mut f) = outf {
-            let line = format!(
-                "{},{},{},{},{}\n",
-                start.elapsed().as_micros(),
-                records_observed,
-                num_records_observed,
-                el.as_micros(),
-                samp,
-            );
-            f.write_all(line.as_bytes())
-                .await
-                .wrap_err("write to out file")?;
-        } else {
-            info!(time = ?start.elapsed(), ?records_observed, ?el, ?samp, "stats");
-        }
-
-        last_recv_time = Some(recv_ts);
-    }
-
-    info!("exiting");
-    Ok(())
+    tokio::spawn(stats(r, clk, opt.out_file));
+    serve_local(opt.listen_addr, opt.hostname, local_root, opt.encr_spec, p).await
 }
