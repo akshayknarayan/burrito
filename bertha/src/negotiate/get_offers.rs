@@ -127,3 +127,14 @@ where
         left.chain(right)
     }
 }
+
+impl<T> GetOffers for Option<T>
+where
+    T: GetOffers,
+{
+    type Iter = std::iter::Flatten<<Option<T::Iter> as IntoIterator>::IntoIter>;
+
+    fn offers(&self) -> Self::Iter {
+        self.as_ref().map(|x| x.offers()).into_iter().flatten()
+    }
+}

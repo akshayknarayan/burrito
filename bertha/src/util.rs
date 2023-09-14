@@ -1,5 +1,7 @@
 //! Helper Chunnel types to transform Data types, etc.
 
+use crate::{CapabilitySet, Either, Negotiate};
+
 use super::{Chunnel, ChunnelConnection};
 use ahash::AHashMap;
 use color_eyre::eyre::{eyre, Report};
@@ -220,6 +222,30 @@ where
     }
 }
 
+impl<I, C, Cn, D> Chunnel<I> for Option<C>
+where
+    C: Chunnel<I, Connection = Cn> + Send,
+    Cn: ChunnelConnection<Data = D> + Send + 'static,
+    I: ChunnelConnection<Data = D> + Send + 'static,
+{
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send + 'static>>;
+    type Connection = Either<I, Cn>;
+    type Error = C::Error;
+
+    fn connect_wrap(&mut self, inner: I) -> Self::Future {
+        if let Some(c) = self {
+            let cn_fut = c.connect_wrap(inner);
+            Box::pin(async move {
+                let cn = cn_fut.await?;
+                Ok(Either::Right(cn))
+            })
+        } else {
+            Box::pin(ready(Ok(Either::Left(inner))))
+        }
+    }
+}
+
 /// Does nothing.
 #[derive(Debug, Clone)]
 pub struct Nothing<N = ()>(std::marker::PhantomData<N>);
@@ -230,9 +256,9 @@ impl<N> Default for Nothing<N> {
     }
 }
 
-impl<N> crate::negotiate::Negotiate for Nothing<N>
+impl<N> Negotiate for Nothing<N>
 where
-    N: crate::negotiate::CapabilitySet,
+    N: CapabilitySet,
 {
     type Capability = N;
     fn guid() -> u64 {

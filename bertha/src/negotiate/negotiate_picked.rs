@@ -1,5 +1,7 @@
 //! Internal `NegotiatePicked` trait.
 
+use futures_util::future::ready;
+
 use super::Negotiate;
 use crate::{CxList, DataEither, Either};
 use std::future::Future;
@@ -21,6 +23,22 @@ where
         nonce: &'s [u8],
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
         self.picked(nonce)
+    }
+}
+
+impl<T> NegotiatePicked for Option<T>
+where
+    T: NegotiatePicked,
+{
+    fn call_negotiate_picked<'s>(
+        &mut self,
+        nonce: &'s [u8],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        if let Some(inner) = self {
+            inner.call_negotiate_picked(nonce)
+        } else {
+            Box::pin(ready(()))
+        }
     }
 }
 

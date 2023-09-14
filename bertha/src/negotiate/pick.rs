@@ -92,6 +92,37 @@ where
     }
 }
 
+impl<T> Pick for Option<T>
+where
+    T: Pick,
+{
+    type Picked = Option<T::Picked>;
+
+    fn pick(
+        self,
+        offer_pairs: Vec<(StackNonce, StackNonce)>,
+    ) -> Result<PickResult<Self::Picked>, Report> {
+        if let Some(inner) = self {
+            let PickResult {
+                stack,
+                filtered_pairs,
+                touched_cap_guids,
+            } = inner.pick(offer_pairs)?;
+            Ok(PickResult {
+                stack: Some(stack),
+                filtered_pairs,
+                touched_cap_guids,
+            })
+        } else {
+            Ok(PickResult {
+                stack: None,
+                filtered_pairs: offer_pairs,
+                touched_cap_guids: Default::default(),
+            })
+        }
+    }
+}
+
 impl<H, T> Pick for CxList<H, T>
 where
     H: Pick,

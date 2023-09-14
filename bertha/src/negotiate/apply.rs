@@ -58,6 +58,37 @@ where
     }
 }
 
+impl<T> Apply for Option<T>
+where
+    T: Apply,
+{
+    type Applied = Option<T::Applied>;
+
+    fn apply(self, picked_offers: StackNonce) -> Result<ApplyResult<Self::Applied>, Report> {
+        if let Some(inner) = self {
+            let ApplyResult {
+                applied,
+                picked,
+                touched,
+                score,
+            } = inner.apply(picked_offers)?;
+            Ok(ApplyResult {
+                applied: Some(applied),
+                picked,
+                touched,
+                score,
+            })
+        } else {
+            Ok(ApplyResult {
+                applied: None,
+                picked: picked_offers,
+                touched: Default::default(),
+                score: 0,
+            })
+        }
+    }
+}
+
 impl<H, T> Apply for CxList<H, T>
 where
     H: Apply,
