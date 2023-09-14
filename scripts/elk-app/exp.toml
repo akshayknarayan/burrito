@@ -1,0 +1,50 @@
+[machines]
+producer = { connect = { ip = "127.0.0.1", dir = "/Users/akshay/research/burrito" } }
+logparser = [
+    { connect = { ip = "127.0.0.1", dir = "/Users/akshay/research/burrito" } },
+]
+
+[machines.logingest]
+connect = { ip = "127.0.0.1", dir = "/Users/akshay/research/burrito" }
+port = 21441
+hostname = "localhost"
+[machines.consumer]
+connect = { ip = "127.0.0.1", dir = "/Users/akshay/research/burrito" }
+port = 15151 
+hostname = "localhost"
+[machines.kafka]
+connect = { ip = "127.0.0.1", dir = "/Users/akshay/research/burrito" }
+access = "localhost:9092"
+[machines.redis]
+connect = { ip = "127.0.0.1", dir = "/Users/akshay/research/burrito" }
+access = "redis://192.168.64.2"
+
+[conf]
+gcp-project-name = "WTF-marx"
+gcp-credentials-path="/Users/akshay/.config/gcloud/wtf-marx-52bffd8a6508.json"
+topic-name = "server-logs"
+
+# total number of experiments is [iterations] * [cartesian product of all other keys]
+[exp]
+iterations = 1
+pubsub-kafka = [true, false]
+local-fastpath = [true, false]
+
+[exp.producer]
+allow-client-sharding = [true, false]
+msg-limit = [2500]
+msg-interarrival-ms = [100]
+encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]
+
+[exp.logingest]
+workers = [2]
+encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]
+
+[exp.logparser]
+machines = [1]
+processes-per-machine = [1]
+interval-ms = [500]
+encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]
+
+[exp.consumer]
+encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]

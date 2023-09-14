@@ -89,6 +89,9 @@ class ConnectionWrapper(Connection):
         # Finally actually run it
         return super().run(full_cmd, *args, hide=True, warn=True, pty=pty, **kwargs)
 
+    def check_code(self, ret) -> bool:
+        return ret.exited == 0
+
     def file_exists(self, fname):
         res = self.run(f"ls {fname}")
         return res.exited == 0
