@@ -136,7 +136,8 @@ pub async fn connect(
             let enc_stack = encr_stack!(addr);
             let stack = Select::from((
                 CxList::from(cl_shard).wrap(SerializeChunnel::default()),
-                CxList::from(SerializeChunnel::default()).wrap(enc_stack),
+                CxList::from(SerializeChunnel::default())
+                    .wrap(Select::from((Nothing::<()>::default(), enc_stack))),
             ));
             let cn = bertha::negotiate_client(stack, base, addr).await?;
             Either::Left(Either::Left(cn))
