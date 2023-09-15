@@ -162,8 +162,8 @@ where
                     p,
                 ))
             });
-            let cn_state = *self.cn_state_watcher.borrow();
             self.inner.send(parsed_lines).await?;
+            let cn_state = *self.cn_state_watcher.borrow();
             trace!(?cn_state, ?self.topic_id,  "sent lines");
 
             let recv_ts = self.clk.raw();

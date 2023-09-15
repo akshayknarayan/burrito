@@ -240,15 +240,18 @@ async fn conn_negotiation_manager(
                 };
                 transition_in_progress = Either::Right(trans_fut);
             }
-            _ = (&mut gcp_changed), if kafka_gcp_handle.is_some() => {
+            _ = (&mut gcp_changed) => {
                 let cn_state = gcp_switch_ordering_handle
                     .current()
                     .map(|e| match e {
                         Either::Left(()) => ConnState::GcpClientSideOrdering,
                         Either::Right(()) => ConnState::GcpServiceSideOrdering,
-                    })
-                    .or(Some(ConnState::KafkaOrdering))
-                    .unwrap();
+                    });
+                let cn_state = if kafka_gcp_handle.is_some() {
+                    cn_state.unwrap_or(ConnState::KafkaOrdering)
+                } else {
+                    cn_state.expect("if no kafka, gcp must be active")
+                };
                 cn_state_watcher.send_replace(cn_state);
                 // make a new future
                 gcp_changed = Box::pin(gcp_switch_ordering_handle.stack_changed());
