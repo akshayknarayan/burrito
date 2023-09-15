@@ -269,9 +269,14 @@ where
             // since we are sending dgrams, dump all the messages into quic state now.
             // Afterwards we can slurp out actual packets to forward to self.inner
             for (_, msg) in burst.into_iter() {
-                quic_g
-                    .dgram_send_vec(msg)
-                    .wrap_err_with(|| eyre!("QUIC dgram send"))?;
+                match quic_g.dgram_send_vec(msg) {
+                    Ok(_) => (),
+                    Err(quiche::Error::Done) => {
+                        // we filled up quiche's internal buffer.
+                        self.quic_send_drain(&mut quic_g).await?;
+                    }
+                    Err(err) => return Err(err).wrap_err("QUIC dgram send"),
+                }
             }
 
             // now it is sending time.
