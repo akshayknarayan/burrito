@@ -322,14 +322,13 @@ def num_confs(cfg):
     tot = exp['iterations']
     tot *= len(exp['pubsub-kafka'])
     tot *= len(exp['local-fastpath'])
+    tot *= len(exp['encrypt'])
     for k in exp['producer']:
         tot *= len(exp['producer'][k])
     for k in exp['logingest']:
         tot *= len(exp['logingest'][k])
     for k in exp['logparser']:
         tot *= len(exp['logparser'][k])
-    for k in exp['consumer']:
-        tot *= len(exp['consumer'][k])
     return tot
 
 def iter_confs(cfg):
