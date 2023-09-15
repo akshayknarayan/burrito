@@ -155,7 +155,7 @@ pub async fn connect(
             Either::Right(Either::Left(cn))
         }
         EncrSpec::QuicOnly => {
-            let enc_stack = encr_stack!(quic => addr);
+            let enc_stack = CxList::from(encr_stack!(quic => addr)).wrap(ConnectChunnel(addr));
             let stack = CxList::from(SerializeChunnel::default()).wrap(enc_stack);
             let cn = bertha::negotiate_client(stack, base, addr).await?;
             Either::Right(Either::Right(cn))
@@ -233,7 +233,7 @@ pub async fn connect_local(
             Either::Right(Either::Left(Either::Right(cn)))
         }
         (EncrSpec::QuicOnly, Some(lch)) => {
-            let enc = encr_stack!(quic => addr);
+            let enc = CxList::from(encr_stack!(quic => addr)).wrap(ConnectChunnel(addr));
             let stack = CxList::from(EstOutputRateSerializeChunnel)
                 .wrap(lch)
                 .wrap(enc);
@@ -242,7 +242,7 @@ pub async fn connect_local(
             Either::Right(Either::Right(Either::Left(cn)))
         }
         (EncrSpec::QuicOnly, None) => {
-            let enc = encr_stack!(quic => addr);
+            let enc = CxList::from(encr_stack!(quic => addr)).wrap(ConnectChunnel(addr));
             let stack = CxList::from(EstOutputRateSerializeChunnel).wrap(enc);
             let cn = bertha::negotiate_client(stack, sk, addr).await?;
             let cn = ProjectLeft::new(addr, cn);
