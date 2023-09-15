@@ -4,7 +4,7 @@
 //! Chunnel data type = (String, String) -> (queue URL, msg_string)
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use futures_util::future::ready;
 use futures_util::stream::{FuturesUnordered, TryStreamExt};
 use google_cloud::pubsub::{Client, PublishMessage, Subscription, SubscriptionConfig, Topic};
@@ -89,22 +89,50 @@ pub async fn default_gcloud_client() -> Result<Client, Report> {
     GcpCreds::default().with_env_vars().finish().await
 }
 
-pub async fn make_topic(client: &mut Client, name: String) -> Result<String, Report> {
-    Ok(client
+const ORDERING_TOPIC_SUFFIX: &str = ".ord";
+
+pub async fn make_topic(client: &mut Client, mut name: String) -> Result<String, Report> {
+    ensure!(
+        !name.ends_with(ORDERING_TOPIC_SUFFIX),
+        "topic name cannot end with .ord"
+    );
+    let topic = client
         .create_topic(&name, Default::default())
-        .await?
-        .id()
-        .to_owned())
+        .await
+        .wrap_err("create default topic");
+    name.push_str(ORDERING_TOPIC_SUFFIX);
+    let ord_topic = client
+        .create_topic(&name, Default::default())
+        .await
+        .wrap_err("create topic for ordered subscriptions");
+    match (topic, ord_topic) {
+        (Ok(t), Ok(_)) => Ok(t.id().to_owned()),
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e.into()),
+        (Err(e1), Err(e2)) => Err(e1).wrap_err(e2),
+    }
 }
 
-pub async fn delete_topic(client: &mut Client, name: String) -> Result<(), Report> {
-    client
-        .topic(&name)
-        .await?
-        .ok_or_else(|| eyre!("Topic not found"))?
-        .delete()
-        .await
-        .map_err(Into::into)
+pub async fn delete_topic(client: &mut Client, mut name: String) -> Result<(), Report> {
+    let t = client.topic(&name).await;
+    let topic = match t {
+        Ok(Some(top)) => top.delete().await,
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    };
+
+    name.push_str(ORDERING_TOPIC_SUFFIX);
+    let t_ord = client.topic(&name).await;
+    let ord_topic = match t_ord {
+        Ok(Some(top)) => top.delete().await,
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    };
+
+    match (topic, ord_topic) {
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e.into()),
+        (Err(e1), Err(e2)) => Err(e1).wrap_err(e2),
+    }
 }
 
 #[derive(Clone)]
@@ -122,10 +150,13 @@ impl Debug for PubSubChunnel {
 }
 
 impl PubSubChunnel {
-    pub fn new<'a>(client: Client, recv_topics: impl IntoIterator<Item = &'a str>) -> Self {
+    pub fn new(client: Client, recv_topics: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         Self {
             client,
-            recv_topics: recv_topics.into_iter().map(|s| s.to_owned()).collect(),
+            recv_topics: recv_topics
+                .into_iter()
+                .map(|s| s.as_ref().to_owned())
+                .collect(),
         }
     }
 }
@@ -139,10 +170,7 @@ impl<InC> Chunnel<InC> for PubSubChunnel {
     fn connect_wrap(&mut self, _: InC) -> Self::Future {
         let client = self.client.clone();
         let recv_topics = self.recv_topics.clone();
-        Box::pin(async move {
-            let rt: Vec<_> = recv_topics.iter().map(|s| s.as_str()).collect();
-            Ok(PubSubConn::new(client, rt).await?)
-        })
+        Box::pin(async move { Ok(PubSubConn::new(client, recv_topics).await?) })
     }
 }
 
@@ -175,9 +203,9 @@ impl std::fmt::Debug for PubSubConn {
 }
 
 impl PubSubConn {
-    pub async fn new<'a>(
+    pub async fn new(
         ps_client: Client,
-        recv_topics: impl IntoIterator<Item = &'a str>,
+        recv_topics: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<Self, Report> {
         let (subscriptions, topics_cached) =
             make_subscriptions(ps_client.clone(), recv_topics, false).await?;
@@ -405,10 +433,7 @@ impl<InC> Chunnel<InC> for OrderedPubSubChunnel {
     fn connect_wrap(&mut self, _: InC) -> Self::Future {
         let client = self.0.client.clone();
         let recv_topics = self.0.recv_topics.clone();
-        Box::pin(async move {
-            let rt: Vec<_> = recv_topics.iter().map(|s| s.as_str()).collect();
-            Ok(OrderedPubSubConn::new(client, rt).await?)
-        })
+        Box::pin(async move { Ok(OrderedPubSubConn::new(client, recv_topics).await?) })
     }
 }
 
@@ -433,12 +458,17 @@ pub struct OrderedPubSubConn {
 }
 
 impl OrderedPubSubConn {
-    pub async fn new<'a>(
+    pub async fn new(
         ps_client: Client,
-        recv_topics: impl IntoIterator<Item = &'a str>,
+        recv_topics: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<Self, Report> {
+        let recv_ordered_topics = recv_topics.into_iter().map(|t| {
+            let mut s = t.as_ref().to_owned();
+            s.push_str(ORDERING_TOPIC_SUFFIX);
+            s
+        });
         let (subscriptions, topics) =
-            make_subscriptions(ps_client.clone(), recv_topics, true).await?;
+            make_subscriptions(ps_client.clone(), recv_ordered_topics, true).await?;
         debug!(num_subs = ?subscriptions.len(), "returning new ordered gcp connection");
         Ok(OrderedPubSubConn {
             inner: PubSubConn {
@@ -471,7 +501,18 @@ impl ChunnelConnection for OrderedPubSubConn {
         B: IntoIterator<Item = Self::Data> + Send + 'cn,
         <B as IntoIterator>::IntoIter: Send,
     {
-        self.inner.send(burst)
+        self.inner.send(burst.into_iter().map(
+            |(
+                MessageQueueAddr {
+                    mut topic_id,
+                    group,
+                },
+                s,
+            )| {
+                topic_id.push_str(ORDERING_TOPIC_SUFFIX);
+                (MessageQueueAddr { topic_id, group }, s)
+            },
+        ))
     }
 
     fn recv<'cn, 'buf>(
@@ -481,13 +522,32 @@ impl ChunnelConnection for OrderedPubSubConn {
     where
         'buf: 'cn,
     {
-        self.inner.recv(msgs_buf)
+        Box::pin(async move {
+            let ms = self.inner.recv(msgs_buf).await?;
+            for (
+                MessageQueueAddr {
+                    ref mut topic_id, ..
+                },
+                _,
+            ) in ms.iter_mut().map_while(Option::as_mut)
+            {
+                ensure!(
+                    topic_id.ends_with(ORDERING_TOPIC_SUFFIX),
+                    "Received on non-ordered topic"
+                );
+
+                let new_len = topic_id.len() - ORDERING_TOPIC_SUFFIX.len();
+                topic_id.truncate(new_len);
+            }
+
+            Ok(ms)
+        })
     }
 }
 
-async fn make_subscriptions<'a>(
+async fn make_subscriptions(
     ps_client: Client,
-    topics: impl IntoIterator<Item = &'a str>,
+    topics: impl IntoIterator<Item = impl AsRef<str>>,
     with_ordering: bool,
 ) -> Result<(HashMap<String, Subscription>, HashMap<String, Topic>), Report> {
     trace!(?with_ordering, "starting make_subscriptions");
@@ -495,6 +555,7 @@ async fn make_subscriptions<'a>(
         futures_util::future::try_join_all(topics.into_iter().map(|topic_id| {
             let mut ps_client = ps_client.clone();
             async move {
+                let topic_id = topic_id.as_ref();
                 trace!(?topic_id, "get topic handle");
                 let topic = ps_client
                     .topic(topic_id)
