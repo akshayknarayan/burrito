@@ -1,4 +1,5 @@
 import argparse
+import threading
 import shutil
 import toml
 import os
@@ -44,8 +45,15 @@ def start_kafka(cfg):
         except Exception:
             m.run("microk8s kubectl get all")
             time.sleep(1)
+    def monitor_proc(m, p):
+        while True:
+            time.sleep(5)
+            if not m.check_code(p):
+                agenda.subfailure(f"{p} exited")
+                return
+
     kafka_port_forward = m.run("microk8s kubectl port-forward deployment.apps/kafka-deployment 9092:9092", background=True)
-    agenda.subtask(f"kafka port forward: {kafka_port_forward}")
+    agenda.subtask("starting kafka port forward")
     start = time.time()
     while True:
         time.sleep(1)
@@ -58,6 +66,8 @@ def start_kafka(cfg):
         out = kafka_port_forward.stdout.readline()
         if "Forwarding" in out.decode('utf-8'):
             break
+    t = threading.Thread(target=monitor_proc, args=(m, kafka_port_forward))
+    t.start()
     agenda.subtask("started kafka")
 
 def stop_kafka(cfg):
@@ -370,6 +380,12 @@ def iter_confs(cfg):
                 },
                 'iteration': conf[10],
         }
+        if type(exp['producer']['msg-limit']) == str:
+            assert exp['producer']['msg-limit'][-1] == 's', 'time-based msg-limit must be in seconds'
+            target_seconds = int(exp['producer']['msg-limit'][:-1])
+            inter_seconds = float(int(exp['producer']['msg-interarrival-ms'])) / 1000
+            exp['producer']['msg-limit'] = int(target_seconds / inter_seconds) * 16
+            agenda.subtask(f"set producer msg-limit to {exp['producer']['msg-limit']} from target {target_seconds}")
         template = (
             "kafka={kafka}-"
             + "localfp={localfp}-"

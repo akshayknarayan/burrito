@@ -131,7 +131,7 @@ fn main() -> Result<(), Report> {
 
             tot_bytes += burst_bytes;
             tot_msgs += burst_len;
-            if clk.delta(last_log, now) > Duration::from_secs(5) {
+            if clk.delta(last_log, now) > Duration::from_secs(1) {
                 let t = clk.delta_as_nanos(start, now) / 1_000;
                 if let Some(ref mut f) = outf {
                     let line = format!("{},{},{},{},{},{},{},{}\n",

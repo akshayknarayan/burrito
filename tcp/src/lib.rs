@@ -224,7 +224,8 @@ where
         debug!(?self.addr, "connecting tcp");
         Box::pin(async move {
             let sk = TcpSocket::new_v4()?;
-            sk.bind(inner_local_addr)?;
+            sk.bind(inner_local_addr)
+                .wrap_err_with(|| eyre!("bind to {}", inner_local_addr))?;
             let sk = sk.connect(addr).await?;
             debug!(peer = ?sk.peer_addr(), local = ?sk.local_addr(), "established connection");
             Ok(IgnoreAddr(addr, TcpCn::new(sk)))
