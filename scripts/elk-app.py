@@ -10,67 +10,60 @@ import itertools
 import subprocess as sh
 
 def start_redis(cfg):
-    assert cfg['machines']['redis']['connect']['ip'] == '127.0.0.1', "non-local redis not implemented"
-    sh.run("microk8s kubectl apply -f ./scripts/elk-app/redis.yaml", shell=True)
+    m = cfg['machines']['redis']['conn']
+    m.run("microk8s kubectl apply -f ./scripts/elk-app/redis.yaml")
     while True:
         try:
-            s = sh.run("microk8s kubectl get -o jsonpath='{.status.phase}' pod/redis", shell=True, capture_output=True)
+            s = m.run("microk8s kubectl get -o jsonpath='{.status.phase}' pod/redis")
             st = s.stdout.decode('utf-8')
             assert st == 'Running'
             break
         except Exception:
-            sh.run("microk8s kubectl get all", shell=True)
+            m.run("microk8s kubectl get all")
             time.sleep(1)
     agenda.subtask("started redis")
 
 def stop_redis(cfg):
-    assert cfg['machines']['redis']['connect']['ip'] == '127.0.0.1', "non-local redis not implemented"
-    sh.run("microk8s kubectl delete -f ./scripts/elk-app/redis.yaml", shell=True)
+    m = cfg['machines']['redis']['conn']
+    m.run("microk8s kubectl delete -f ./scripts/elk-app/redis.yaml")
     agenda.subtask("stopped redis")
 
 def start_kafka(cfg):
-    assert cfg['machines']['kafka']['connect']['ip'] == '127.0.0.1', "non-local kafka not implemented"
     if not cfg['exp']['pubsub-kafka']:
+        stop_kafka(cfg)
         agenda.subtask("skipping kafka")
-        return None
-    sh.run("microk8s kubectl apply -f ./scripts/elk-app/kafka-deployment.yml", shell=True)
+        return
+    m = cfg['machines']['redis']['conn']
+    m.run("microk8s kubectl apply -f ./scripts/elk-app/kafka-deployment.yml")
     while True:
         try:
-            s = sh.run("microk8s kubectl get -o jsonpath='{.status.readyReplicas}' deployment.apps/kafka-deployment", shell=True, capture_output=True)
+            s = m.run("microk8s kubectl get -o jsonpath='{.status.readyReplicas}' deployment.apps/kafka-deployment")
             st = s.stdout.decode('utf-8')
             assert st == '1'
             break
         except Exception:
-            sh.run("microk8s kubectl get all", shell=True)
+            m.run("microk8s kubectl get all")
             time.sleep(1)
-    agenda.subtask("kafka port forward")
-    kafka_port_forward = sh.Popen("microk8s kubectl port-forward deployment.apps/kafka-deployment 9092:9092", shell=True, stdout=sh.PIPE, text=True)
+    kafka_port_forward = m.run("microk8s kubectl port-forward deployment.apps/kafka-deployment 9092:9092", background=True)
+    agenda.subtask(f"kafka port forward: {kafka_port_forward}")
     start = time.time()
     while True:
         time.sleep(1)
-        if kafka_port_forward.poll() != None:
+        if not m.check_code(kafka_port_forward):
             agenda.subtask("restarting kafka port-forward")
             if time.time() - start > 5:
-                sh.run("pkill -9 kubectl", shell=True)
-            kafka_port_forward = sh.Popen("microk8s kubectl port-forward deployment.apps/kafka-deployment 9092:9092", shell=True, stdout=sh.PIPE, text=True)
+                m.run("pkill -9 kubectl", shell=True)
+            kafka_port_forward = m.run("microk8s kubectl port-forward deployment.apps/kafka-deployment 9092:9092", background=True)
         agenda.subtask("waiting for kafka port-forward")
         out = kafka_port_forward.stdout.readline()
-        if "Forwarding" in out:
+        if "Forwarding" in out.decode('utf-8'):
             break
     agenda.subtask("started kafka")
-    return kafka_port_forward
 
-def stop_kafka(cfg, kafka_port_forward):
-    assert cfg['machines']['kafka']['connect']['ip'] == '127.0.0.1', "non-local kafka not implemented"
-    if kafka_port_forward != None:
-        agenda.subtask("wait for kafka port-forward to stop")
-        kafka_port_forward.kill()
-        kafka_port_forward.wait()
-        agenda.subtask("kafka port-forward stopped")
-    else:
-        agenda.subtask("kafka port-forward process handle not provided")
-        sh.run("pkill -9 kubectl", shell=True)
-    sh.run("microk8s kubectl delete -f ./scripts/elk-app/kafka-deployment.yml", shell=True)
+def stop_kafka(cfg):
+    m = cfg['machines']['redis']['conn']
+    m.run("pkill -INT kubectl")
+    m.run("microk8s kubectl delete -f ./scripts/elk-app/kafka-deployment.yml")
     agenda.subtask("stopped kafka")
 
 def wait_ready(m: ConnectionWrapper, outf, search_string="ready"):
@@ -177,26 +170,30 @@ def start_logparser(m, cfg, outf, bin_root = "./target/release"):
     interval_ms = cfg['exp']['logparser']['interval-ms']
     encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
-    ok = m.run(f"RUST_LOG=info GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logparser \
-        --logging \
-        --gcp-project-name={gcp_project} \
-        --redis-addr={redis_addr} \
-        {kafka} \
-        {local_root} \
-        --topic-name={topic_name} \
-        --forward-addr={forward_ip}:{forward_port} \
-        --interval-ms={interval_ms} \
-        --encr-spec={encr_spec} \
-        --stats-file={outf}.data",
-        background=True,
-        wd=m.dir,
-        stdout=f"{outf}.out",
-        stderr=f"{outf}.err"
-        )
-    if not m.check_code(ok):
-        raise Exception("failed to start logparser")
-    agenda.subtask(f"[{m.addr}] wait for logparser start")
-    wait_ready(m, f"{outf}.out")
+
+    num_parsers = cfg['exp']['logparser']['processes-per-machine']
+    for proc_num in range(num_parsers):
+        ok = m.run(f"RUST_LOG=info GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logparser \
+            --logging \
+            --gcp-project-name={gcp_project} \
+            --redis-addr={redis_addr} \
+            {kafka} \
+            {local_root} \
+            --topic-name={topic_name} \
+            --forward-addr={forward_ip}:{forward_port} \
+            --interval-ms={interval_ms} \
+            --encr-spec={encr_spec} \
+            --stats-file={outf}-{proc_num}.data",
+            background=True,
+            wd=m.dir,
+            stdout=f"{outf}-{proc_num}.out",
+            stderr=f"{outf}-{proc_num}.err"
+            )
+        if not m.check_code(ok):
+            raise Exception(f"failed to start logparser {proc_num}")
+    agenda.subtask(f"[{m.addr}] wait for {num_parsers} logparsers start")
+    for proc_num in range(num_parsers):
+        wait_ready(m, f"{outf}-{proc_num}.out")
 
 def start_consumer(cfg, outf, bin_root = "./target/release"):
     m = cfg['machines']['consumer']['conn']
@@ -234,11 +231,14 @@ def exp(cfg, outdir, overwrite=False):
         cfg["exp"]["logparser"]['machines']
         <= len(cfg['machines']['logparser'])
         ), 'not enough logparser machines'
+    logparser_fls = []
+    for i in range(cfg["exp"]["logparser"]['machines']):
+        for j in range(cfg['exp']['logparser']['processes-per-machine']):
+            logparser_fls.append(f'logparser-{i}-{j}')
     fls = [
-        f"{outdir}/{desc}-{i}.data"
-        for i in
-        ["consumer", "logingest", "producer"]
-        + [f'logparser-{i}' for i in range(cfg["exp"]["logparser"]['machines'])]
+        f"{outdir}/{desc}-{n}.data"
+        for n in
+        ["consumer", "logingest", "producer"] + logparser_fls
     ]
     if not overwrite and all(os.path.exists(f) for f in fls):
         agenda.task(f"skipping: {desc}")
@@ -246,13 +246,13 @@ def exp(cfg, outdir, overwrite=False):
 
     agenda.task(f"running: {desc}")
     failed = None
-    kafka_pf = None
     try:
         start_redis(cfg)
-        kafka_pf = start_kafka(cfg)
+        start_kafka(cfg)
         start_consumer(cfg, f"{outdir}/{desc}-consumer")
         i = 0
-        for c in cfg["machines"]["logparser"]:
+        for logparser_machine_idx in range(cfg["exp"]["logparser"]["machines"]):
+            c = cfg['machines']['logparser'][logparser_machine_idx]
             start_logparser(c['conn'], cfg, f"{outdir}/{desc}-logparser-{i}")
             i += 1
         start_logingest(cfg, f"{outdir}/{desc}-logingest")
@@ -280,7 +280,7 @@ def exp(cfg, outdir, overwrite=False):
     for c in cfg["machines"]["logparser"]:
         c["conn"].run("pkill -INT logparser")
     cfg["machines"]["consumer"]["conn"].run("pkill -INT consumer")
-    stop_kafka(cfg, kafka_pf)
+    stop_kafka(cfg)
     stop_redis(cfg)
     if failed != None:
         raise failed
@@ -483,13 +483,17 @@ if __name__ == '__main__':
         agenda.subfailure(f"not all commits equal: {[logingest_commit, consumer_commit] + list(logparser_commits)}")
         raise Exception("Commits mismatched on machines")
 
+    # connect to the redis and kafka machines.
+    (cfg['machines']['redis']['conn'], _) = connect(cfg['machines']['redis'])
+    (cfg['machines']['kafka']['conn'], _) = connect(cfg['machines']['kafka'])
+
     agenda.task("Connected to machines")
     for c in all_conns:
         all_conns[c].run(f"mkdir -p {args.outdir}")
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
 
-    stop_kafka(cfg, None)
+    stop_kafka(cfg)
     stop_redis(cfg)
 
     num_remaining = num_confs(cfg)

@@ -41,5 +41,5 @@ workers = [2]
 
 [exp.logparser]
 machines = [1]
-processes-per-machine = [1]
+processes-per-machine = [1, 2]
 interval-ms = [100, 500]

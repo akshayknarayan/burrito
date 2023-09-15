@@ -48,6 +48,9 @@ class LocalCn:
         if type(stderr) == str:
             stderr = open(stderr, 'w')
         if background:
+            if capture_output:
+                stderr = subprocess.PIPE
+                stdout = subprocess.PIPE
             return subprocess.Popen(cmd, *args, stdin=stdin, stdout=stdout, stderr=stderr, cwd=wd, shell=True, **kwargs)
         else:
             return subprocess.run(cmd, *args, stdin=stdin, stdout=stdout, stderr=stderr, capture_output=capture_output, cwd=wd, shell=True, **kwargs)
