@@ -29,22 +29,17 @@ topic-name = "server-logs"
 iterations = 1
 pubsub-kafka = [true, false]
 local-fastpath = [true, false]
+encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]
 
 [exp.producer]
 allow-client-sharding = [true, false]
 msg-limit = [2500]
-msg-interarrival-ms = [100]
-encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]
+msg-interarrival-ms = [50, 100]
 
 [exp.logingest]
 workers = [2]
-encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]
 
 [exp.logparser]
 machines = [1]
 processes-per-machine = [1]
-interval-ms = [500]
-encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]
-
-[exp.consumer]
-encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]
+interval-ms = [100, 500]

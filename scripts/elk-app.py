@@ -45,10 +45,13 @@ def start_kafka(cfg):
             time.sleep(1)
     agenda.subtask("kafka port forward")
     kafka_port_forward = sh.Popen("microk8s kubectl port-forward deployment.apps/kafka-deployment 9092:9092", shell=True, stdout=sh.PIPE, text=True)
+    start = time.time()
     while True:
         time.sleep(1)
         if kafka_port_forward.poll() != None:
             agenda.subtask("restarting kafka port-forward")
+            if time.time() - start > 5:
+                sh.run("pkill -9 kubectl", shell=True)
             kafka_port_forward = sh.Popen("microk8s kubectl port-forward deployment.apps/kafka-deployment 9092:9092", shell=True, stdout=sh.PIPE, text=True)
         agenda.subtask("waiting for kafka port-forward")
         out = kafka_port_forward.stdout.readline()
@@ -66,6 +69,7 @@ def stop_kafka(cfg, kafka_port_forward):
         agenda.subtask("kafka port-forward stopped")
     else:
         agenda.subtask("kafka port-forward process handle not provided")
+        sh.run("pkill -9 kubectl", shell=True)
     sh.run("microk8s kubectl delete -f ./scripts/elk-app/kafka-deployment.yml", shell=True)
     agenda.subtask("stopped kafka")
 
@@ -73,10 +77,10 @@ def wait_ready(m: ConnectionWrapper, outf, search_string="ready"):
     agenda.subtask(f"[{m.addr}] wait for {search_string} in {m.dir}/{outf}")
     now = time.time()
     while True:
-        sc = m.run(f"grep -q {search_string} {outf}", wd=m.dir)
+        sc = m.run(f"grep -q {search_string} {outf}", wd=m.dir, quiet=True)
         if m.check_code(sc):
             break
-        if time.time() - now > 30:
+        if time.time() - now > 15:
             raise Exception(f"timed out waiting on {outf}")
         time.sleep(1)
     agenda.subtask(f"[{m.addr}] waited for {search_string} in {outf}")
@@ -93,7 +97,7 @@ def run_producer(cfg, outf, bin_root = "./target/release"):
     connect_port = cfg['machines']['logingest']['port']
     msg_limit = cfg['exp']['producer']['msg-limit']
     msg_interarrival_ms = cfg['exp']['producer']['msg-interarrival-ms']
-    encr_spec = cfg["exp"]["producer"]["encrypt"]
+    encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
     ok = m.run(f"RUST_LOG=info {bin_root}/producer \
         --logging \
@@ -129,7 +133,7 @@ def start_logingest(cfg, outf, bin_root = "./target/release"):
     gcp_project = cfg['conf']['gcp-project-name']
     gcp_key_path = cfg['conf']['gcp-credentials-path']
     num_workers = cfg['exp']['logingest']['workers']
-    encr_spec = cfg["exp"]["logingest"]["encrypt"]
+    encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
     ok = m.run(f"RUST_LOG=info GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logingest \
         --logging \
@@ -171,7 +175,7 @@ def start_logparser(m, cfg, outf, bin_root = "./target/release"):
     gcp_project = cfg['conf']['gcp-project-name']
     gcp_key_path = cfg['conf']['gcp-credentials-path']
     interval_ms = cfg['exp']['logparser']['interval-ms']
-    encr_spec = cfg["exp"]["logparser"]["encrypt"]
+    encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
     ok = m.run(f"RUST_LOG=info GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logparser \
         --logging \
@@ -205,7 +209,7 @@ def start_consumer(cfg, outf, bin_root = "./target/release"):
         local_root = "--local-root"
     hostname = cfg["machines"]["consumer"]["hostname"]
     port = cfg["machines"]["consumer"]["port"]
-    encr_spec = cfg["exp"]["consumer"]["encrypt"]
+    encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
     ok = m.run(f"env RUST_LOG=info {bin_root}/consumer \
         --logging \
@@ -253,6 +257,21 @@ def exp(cfg, outdir, overwrite=False):
             i += 1
         start_logingest(cfg, f"{outdir}/{desc}-logingest")
         run_producer(cfg, f"{outdir}/{desc}-producer")
+
+        # wait for some messages to drain from the consumer,
+		# but don't wait longer than 60 seconds overall
+        start_wait = time.time()
+        cons_data_out_lines = 0
+        with open(fls[0], 'r') as f:
+            cons_data_out_lines = len(list(itertools.islice(f, 0, 10)))
+        agenda.subtask("drain consumer")
+        while cons_data_out_lines < 5 or time.time() - os.path.getmtime(fls[0]) < 20:
+            time.sleep(2)
+            if time.time() - start_wait > 60:
+                break
+            with open(fls[0], 'r') as f:
+                cons_data_out_lines = len(list(itertools.islice(f, 0, 10)))
+        agenda.subtask(f"consumer drained after {time.time() - start_wait}s")
     except Exception as e:
         agenda.failure(f"failed: {desc}")
         failed = e
@@ -319,66 +338,55 @@ def iter_confs(cfg):
     prod = exp['producer']
     ing = exp['logingest']
     par = exp['logparser']
-    con = exp['consumer']
     confs = itertools.product(
         exp['pubsub-kafka'],
         exp['local-fastpath'],
+        exp['encrypt'],
         prod['allow-client-sharding'],
         prod['msg-limit'],
         prod['msg-interarrival-ms'],
-        prod['encrypt'],
         ing['workers'],
-        ing['encrypt'],
         par['machines'],
         par['processes-per-machine'],
         par['interval-ms'],
-        par['encrypt'],
-        con['encrypt'],
         range(i),
     )
     for conf in confs:
         exp = {
                 'pubsub-kafka': conf[0],
                 'local-fastpath': conf[1],
+                'encrypt': conf[2],
                 'producer': {
-                    'allow-client-sharding': conf[2],
-                    'msg-limit': conf[3],
-                    'msg-interarrival-ms': conf[4],
-                    'encrypt': conf[5],
+                    'allow-client-sharding': conf[3],
+                    'msg-limit': conf[4],
+                    'msg-interarrival-ms': conf[5],
                 },
                 'logingest': {
                     'workers': conf[6],
-                    'encrypt': conf[7],
                 },
                 'logparser': {
-                    'machines': conf[8],
-                    'processes-per-machine': conf[9],
-                    'interval-ms': conf[10],
-                    'encrypt': conf[11],
+                    'machines': conf[7],
+                    'processes-per-machine': conf[8],
+                    'interval-ms': conf[9],
                 },
-                'consumer': {
-                    'encrypt': conf[12],
-                },
-                'iteration': conf[13],
+                'iteration': conf[10],
         }
         template = (
             "kafka={kafka}-"
             + "localfp={localfp}-"
             + "clshrd={client_shard}-"
+            + "enc={encrypt}-"
             + "nmsg={num_msg}-"
             + "msg_inter_ms={msg_inter_ms}-"
             + "ing_wrk={ingest_workers}-"
             + "par_num={parser_machines}-"
             + "par_pcs={parser_procs}-"
             + "par_rep_int_ms={parser_report_interval_ms}-"
-            + "prd_enc={prod_encrypt}-"
-            + "ing_enc={ingest_encrypt}-"
-            + "par_enc={parser_encrypt}-"
-            + "con_enc={consumer_encrypt}-"
             + "i={i}")
         desc = template.format(
             kafka=exp['pubsub-kafka'],
             localfp=exp['local-fastpath'],
+            encrypt=exp['encrypt'].replace('-',''),
             client_shard=exp['producer']['allow-client-sharding'],
             num_msg=exp['producer']['msg-limit'],
             msg_inter_ms=exp['producer']['msg-interarrival-ms'],
@@ -386,10 +394,6 @@ def iter_confs(cfg):
             parser_machines=exp['logparser']['machines'],
             parser_procs=exp['logparser']['processes-per-machine'],
             parser_report_interval_ms=exp['logparser']['interval-ms'],
-            prod_encrypt=exp['producer']['encrypt'].replace('-',''),
-            ingest_encrypt=exp['logingest']['encrypt'].replace('-',''),
-            parser_encrypt=exp['logparser']['encrypt'].replace('-',''),
-            consumer_encrypt=exp['consumer']['encrypt'].replace('-',''),
             i=0,
         )
         exp['desc'] = desc
@@ -428,25 +432,20 @@ def iter_confs(cfg):
 # iterations = 1
 # pubsub-kafka = [true, false]
 # local-fastpath = [true, false]
+# encrypt = ["allow-none", "auto-only", "rustls-only", "quic-only"]
 #
 # [exp.producer]
 # allow-client-sharding = [true, false]
 # msg-limit = [2500]
 # msg-interarrival-ms = [1000]
-# encrypt = ["allow-none", "auto-only", "rustls-only", "quic-only"]
 #
 # [exp.logingest]
 # workers = [2]
-# encrypt = ["allow-none", "auto-only", "rustls-only", "quic-only"]
 #
 # [exp.logparser]
 # machines = [1]
 # processes-per-machine = [1]
 # interval-ms = [1000]
-# encrypt = ["allow-none", "auto-only", "rustls-only", "quic-only"]
-#
-# [exp.consumer]
-# encrypt = ["allow-none", "auto-only", "rustls-only", "quic-only"]
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
