@@ -93,13 +93,16 @@ fn main() -> Result<(), Report> {
 
         info!(?opt.connect_addr, ?rem_line_count, "got connection, starting");
         let clk = quanta::Clock::new();
-        let start = clk.raw();
-        let mut then = start;
+        let mut slots: Vec<_> = (0..16).map(|_| None).collect();
         let mut tot_bytes = 0;
         let mut tot_msgs = 0;
-        let mut last_log = start;
-        let mut slots: Vec<_> = (0..16).map(|_| None).collect();
+        let start = clk.raw();
+        let mut then = start;
         while let Some(burst) = producer.next().await {
+            if rem_line_count.as_ref().map(|c| *c == 0).unwrap_or(false) {
+                break;
+            }
+
             let burst_len = burst.len();
             let burst_bytes: usize = burst
                 .iter()
@@ -109,9 +112,6 @@ fn main() -> Result<(), Report> {
                 })
                 .sum();
             rem_line_count = rem_line_count.map(|c| c.saturating_sub(burst_len));
-            if rem_line_count.as_ref().map(|c| *c == 0).unwrap_or(false) {
-                break;
-            }
 
             cn.send(burst.into_iter()).await?;
             debug!(?burst_len, ?burst_bytes, "sent lines");
@@ -131,30 +131,34 @@ fn main() -> Result<(), Report> {
 
             tot_bytes += burst_bytes;
             tot_msgs += burst_len;
-            if clk.delta(last_log, now) > Duration::from_secs(1) {
-                let t = clk.delta_as_nanos(start, now) / 1_000;
-                if let Some(ref mut f) = outf {
-                    let line = format!("{},{},{},{},{},{},{},{}\n",
-                        t,
-                        tot_msgs,
-                        tot_bytes,
-                        burst_len,
-                        burst_bytes,
-                        el.as_micros(),
-                        (burst_len as f64) / el.as_secs_f64(),
-                        (burst_bytes as f64) / el.as_secs_f64());
-                    f.write_all(line.as_bytes()).await?;
-                } else {
-                    info!(?t, ?tot_msgs, ?tot_bytes, "stats");
-                }
-
-                last_log = now;
+            let t = clk.delta_as_nanos(start, now) / 1_000;
+            if let Some(ref mut f) = outf {
+                let line = format!("{},{},{},{},{},{},{},{}\n",
+                    t,
+                    tot_msgs,
+                    tot_bytes,
+                    burst_len,
+                    burst_bytes,
+                    el.as_micros(),
+                    (burst_len as f64) / el.as_secs_f64(),
+                    (burst_bytes as f64) / el.as_secs_f64());
+                f.write_all(line.as_bytes()).await?;
+            } else {
+                info!(?t, ?tot_msgs, ?tot_bytes, "stats");
             }
         }
 
         let tot_elapsed = clk.delta(start, clk.raw());
         if let Some(ref mut f) = outf {
-            let line = format!("{},{},{},{},{}", tot_elapsed.as_micros(), tot_msgs, (tot_msgs as f64) / tot_elapsed.as_secs_f64(), tot_bytes, (tot_bytes as f64) / tot_elapsed.as_secs_f64());
+            let line = format!("{},{},{},{},{},{},{},{}\n",
+                tot_elapsed.as_micros(),
+                tot_msgs,
+                tot_bytes,
+                0,
+                0,
+                0,
+                (tot_msgs as f64) / tot_elapsed.as_secs_f64(),
+                (tot_bytes as f64) / tot_elapsed.as_secs_f64());
             f.write_all(line.as_bytes()).await?;
         } else {
             info!(?tot_elapsed, ?tot_msgs, ?tot_bytes, "stats");

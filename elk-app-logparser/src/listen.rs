@@ -275,11 +275,11 @@ async fn serve_one_cn(
             msgs.iter()
                 .filter_map(|m| m.as_ref().map(|(a, _)| (*a, Line::Ack))),
         );
+        cn.send(acks.drain(..)).await?;
         line_processor
             .process_lines(msgs)
             .await
             .map_err(Into::into)?;
-        cn.send(acks.drain(..)).await?;
         trace!("done processing batch");
     }
 }
