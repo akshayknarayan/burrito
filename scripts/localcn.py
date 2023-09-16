@@ -63,12 +63,12 @@ class LocalCn:
         else:
             raise Exception("Unknown value to check process")
 
-    def file_exists(self, fname):
-        res = self.run(f"ls {fname}")
+    def file_exists(self, fname, **kwargs):
+        res = self.run(f"ls {fname}", **kwargs)
         return res.returncode == 0
 
-    def prog_exists(self, prog):
-        res = self.run(f"which {prog}")
+    def prog_exists(self, prog, **kwargs):
+        res = self.run(f"which {prog}", **kwargs)
         return res.returncode == 0
 
     def check_proc(self, proc_name, proc_outs):
@@ -99,7 +99,7 @@ class LocalCn:
         return path
 
     def put(self, local_file, remote=None, preserve_mode=True):
-        pass
+        agenda.subtask("local put no-op")
 
     def get(self, remote_file, local=None, preserve_mode=True):
-        pass
+        agenda.subtask("local get no-op")

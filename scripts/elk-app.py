@@ -7,6 +7,7 @@ from kv import ConnectionWrapper
 from localcn import LocalCn
 import time
 import itertools
+import subprocess as sh
 from rich.console import Console
 
 def start_redis(cfg):
@@ -38,19 +39,101 @@ def stop_redis(cfg):
     m.run("microk8s kubectl delete -f ./scripts/elk-app/redis.yaml", wd=m.dir, quiet=True)
     agenda.subtask("stopped redis")
 
+kafka_yaml_template = '''
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-service
+  labels:
+    app: kafka
+spec:
+  type: NodePort
+  selector:
+    app: kafka
+  ports:
+    - port: 9092
+      targetPort: 9092
+      nodePort: {port}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+      - name: kafka
+        image: ubuntu/kafka:edge
+        env:
+          - name: ZOOKEEPER_HOST
+            value: zookeeper-service
+        args: ["/etc/kafka/server.properties", "--override", "advertised.listeners=PLAINTEXT://{ip}:{port}"]
+        ports:
+        - containerPort: 9092
+          name: kafka
+          protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zookeeper-service
+  labels:
+    app: zookeeper
+spec:
+  ports:
+  - port: 2181
+  selector:
+    app: zookeeper
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zookeeper-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zookeeper
+  template:
+    metadata:
+      labels:
+        app: zookeeper
+    spec:
+      containers:
+      - name: zookeeper
+        image: ubuntu/zookeeper:edge
+        ports:
+        - containerPort: 2181
+          name: zookeeper
+          protocol: TCP
+'''
+
 def start_kafka(cfg):
     if not cfg['exp']['pubsub-kafka']:
         stop_kafka(cfg)
         agenda.subtask("skipping kafka")
         return
     m = cfg['machines']['kafka']['conn']
-    is_local = 'localhost' in cfg['machines']['kafka']['access']
+    kafka_access = cfg['machines']['kafka']['access']
+    is_local = 'localhost' in kafka_access
 
     out = None
     if is_local:
         out = m.run("microk8s kubectl apply -f ./scripts/elk-app/kafka-deployment.yml", wd=m.dir, quiet=True)
     else:
-        out = m.run("microk8s kubectl apply -f ./scripts/elk-app/kafka-remote-deployment.yml", wd=m.dir, quiet=True)
+        ip, port = kafka_access.split(':')
+        kafka_yml = kafka_yaml_template.format(ip=ip, port=port)
+        out = m.run(f"echo \"{kafka_yml}\" > ./scripts/elk-app/{ip}-kafka-deployment.yml", wd=m.dir, quiet=True)
+        out = m.run(f"microk8s kubectl apply -f ./scripts/elk-app/{ip}-kafka-deployment.yml", wd=m.dir, quiet=True)
     assert m.check_code(out), f"kubectl apply kafka failed:\nstdout:\n{out.stdout}\nstderr:\n{out.stderr}"
     console = Console()
     with console.status("waiting for kafka") as status:
@@ -252,7 +335,6 @@ def start_consumer(cfg, outf, bin_root = "./target/release"):
         )
     if not m.check_code(ok):
         raise Exception("failed to start consumer")
-    agenda.subtask(f"[{m.name}] wait for consumer start")
     wait_ready(m, f"{outf}.out")
 
 def exp(cfg, outdir, overwrite=False, setup_only=False):
@@ -292,20 +374,36 @@ def exp(cfg, outdir, overwrite=False, setup_only=False):
 
         # wait for some messages to drain from the consumer,
 		# but don't wait longer than 60 seconds overall
-        start_wait = time.time()
         cons_data_out_lines = 0
-        with open(fls[0], 'r') as f:
-            cons_data_out_lines = len(list(itertools.islice(f, 0, 10)))
-        agenda.subtask("drain consumer")
-        while cons_data_out_lines < 5 or time.time() - os.path.getmtime(fls[0]) < 20:
-            time.sleep(2)
-            if time.time() - start_wait > 60:
-                break
-            with open(fls[0], 'r') as f:
-                cons_data_out_lines = len(list(itertools.islice(f, 0, 10)))
+        cons_was_remote = None
+        console = Console()
+        with console.status("draining consumer") as status:
+            while True:
+                try:
+                    with open(fls[0], 'r') as f:
+                        cons_data_out_lines = len(list(itertools.islice(f, 0, 10)))
+                        assert cons_data_out_lines > 0 # local will at least write header
+                        break
+                except Exception as e:
+                    root = cfg['machines']['consumer']['conn'].dir + '/'
+                    cons_was_remote = root
+                    cfg['machines']['consumer']['conn'].get(root + fls[0], local=fls[0])
+            start_wait = time.time()
+            while (
+                cons_data_out_lines < 5
+                or (cons_was_remote == None and time.time() - os.path.getmtime(fls[0]) < 20)
+            ):
+                time.sleep(2)
+                if time.time() - start_wait > 60:
+                    break
+                if cons_was_remote != None:
+                    cfg['machines']['consumer']['conn'].get(cons_was_remote + fls[0], local=fls[0])
+                with open(fls[0], 'r') as f:
+                    cons_data_out_lines = len(list(itertools.islice(f, 0, 10)))
         agenda.subtask(f"consumer drained after {time.time() - start_wait}s")
     except Exception as e:
         agenda.failure(f"failed: {desc}")
+        cons_was_remote = None
         failed = e
     agenda.subtask("stopping processes")
     cfg['machines']['logingest']['conn'].run("pkill -INT logingest")
@@ -318,11 +416,46 @@ def exp(cfg, outdir, overwrite=False, setup_only=False):
         raise failed
 
     # are there at least 5 lines in the out file?
-    if not setup_only:
-        for fl in fls:
-            agenda.subtask(f"checking {fl}")
-            with open(fl, 'r') as f:
-                assert 5 <= len(list(itertools.islice(f, 0, 10)))
+    # get file if necessary
+    if setup_only:
+        return
+    if cons_was_remote is not None:
+        c = cfg['machines']['consumer']['conn']
+        root = c.dir + '/'
+        out = fls[0].replace('.data', '.out')
+        c.get(root + out, local=out) #.out
+        err = fls[0].replace('.data', '.err')
+        c.get(root + err, local=err) #.err
+    for fl in fls:
+        while True:
+            try:
+                with open(fl, 'r') as f:
+                    assert 5 <= len(list(itertools.islice(f, 0, 10)))
+                agenda.subtask(f"{fl} has at least 5 lines")
+                break
+            except AssertionError as e:
+                raise e # if we got to the assertion, the file is local
+            except Exception as e:
+                pass # try getting the file
+            name = fl.split('.')[0].split('-')
+            if name[-1] in ['consumer', 'logingest', 'producer']:
+                c = cfg['machines'][name[-1]]['conn']
+                root = c.dir + '/'
+                c.get(root + fl, local=fl) #.data
+                out = fl.replace('.data', '.out')
+                c.get(root + out, local=out) #.out
+                err = fl.replace('.data', '.err')
+                c.get(root + err, local=err) #.err
+            elif name[-3] == 'logparser':
+                c = cfg['machines']['logparser'][int(name[-2])]['conn']
+                root = c.dir + '/'
+                c.get(root + fl, local=fl)
+                out = fl.replace('.data', '.out')
+                c.get(root + fl.replace('.data', '.out'), local=out) #.out
+                err = fl.replace('.data', '.err')
+                c.get(root + fl.replace('.data', '.err'), local=err) #.err
+            else:
+                raise Exception(f"Unknown file {fl}")
     agenda.task(f"exp done: {desc}")
 
 def connect(machine_cfg):
@@ -338,10 +471,10 @@ def connect(machine_cfg):
             port=conn_cfg['port'] if 'port' in conn_cfg else None
         )
     conn.dir = conn_cfg["dir"] if "dir" in conn_cfg else "~/burrito"
-    if not conn.file_exists(conn.dir):
+    if not conn.file_exists(conn.dir, quiet=True):
         agenda.failure(f"No burrito on {ip}")
         raise Exception(f"No burrito on {ip}")
-    commit = conn.run("git rev-parse --short HEAD", wd = conn.dir)
+    commit = conn.run("git rev-parse --short HEAD", wd = conn.dir, quiet=True)
     if conn.check_code(commit):
         commit = commit.stdout.strip()
     else:
@@ -411,16 +544,16 @@ def iter_confs(cfg):
             exp['producer']['msg-limit'] = int(target_seconds / inter_seconds) * 16
             agenda.subtask(f"set producer msg-limit to {exp['producer']['msg-limit']} from target {target_seconds}")
         template = (
-            "kafka={kafka}-"
-            + "localfp={localfp}-"
-            + "clshrd={client_shard}-"
+            "kfka={kafka}-"
+            + "fp={localfp}-"
+            + "cshd={client_shard}-"
             + "enc={encrypt}-"
             + "nmsg={num_msg}-"
-            + "msg_inter_ms={msg_inter_ms}-"
-            + "ing_wrk={ingest_workers}-"
-            + "par_num={parser_machines}-"
-            + "par_pcs={parser_procs}-"
-            + "par_rep_int_ms={parser_report_interval_ms}-"
+            + "intms={msg_inter_ms}-"
+            + "iwrk={ingest_workers}-"
+            + "pn={parser_machines}-"
+            + "pps={parser_procs}-"
+            + "prpintms={parser_report_interval_ms}-"
             + "i={i}")
         desc = template.format(
             kafka=exp['pubsub-kafka'],
@@ -529,7 +662,9 @@ if __name__ == '__main__':
     agenda.task("Connected to machines")
     for c in all_conns:
         m = all_conns[c]
-        m.run(f"mkdir -p {args.outdir}", wd=m.dir)
+        m.run(f"mkdir -p {args.outdir}", wd=m.dir, quiet=True)
+    if not os.path.exists(f"{args.outdir}"):
+        sh.run(f"mkdir -p {args.outdir}", shell=True)
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
 

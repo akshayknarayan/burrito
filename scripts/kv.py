@@ -92,12 +92,12 @@ class ConnectionWrapper(Connection):
     def check_code(self, ret) -> bool:
         return ret.exited == 0
 
-    def file_exists(self, fname):
-        res = self.run(f"ls {fname}")
+    def file_exists(self, fname, **kwargs):
+        res = self.run(f"ls {fname}", **kwargs)
         return res.exited == 0
 
-    def prog_exists(self, prog):
-        res = self.run(f"which {prog}")
+    def prog_exists(self, prog, **kwargs):
+        res = self.run(f"which {prog}", **kwargs)
         return res.exited == 0
 
     def check_proc(self, proc_name, proc_outs):
