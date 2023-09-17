@@ -1,5 +1,6 @@
 import argparse
 import shutil
+import threading
 import toml
 import os
 import agenda
@@ -485,6 +486,11 @@ def connect(machine_cfg):
     conn.addr = machine_cfg['ip'] if 'ip' in machine_cfg else ip
     return (conn, commit)
 
+def do_compile(m):
+    out = m.run("cargo build --release", wd=f"{m.dir}/elk-app-logparser")
+    if not m.check_code(out):
+        raise Exception(f"could not compile on {m.name}")
+
 def num_confs(cfg):
     exp = cfg['exp']
     tot = exp['iterations']
@@ -652,9 +658,22 @@ if __name__ == '__main__':
         l['conn'] = cn
     (cfg["machines"]["consumer"]["conn"], consumer_commit) = connect(cfg["machines"]["consumer"])
     all_conns[cfg["machines"]["consumer"]["conn"].addr] = cfg["machines"]["consumer"]["conn"]
-    if not all(c == producer_commit for c in [logingest_commit, consumer_commit] + list(logparser_commits)):
-        agenda.subfailure(f"not all commits equal: {[logingest_commit, consumer_commit] + list(logparser_commits)}")
+    local_commit = sh.run("git rev-parse --short HEAD", shell=True, capture_output=True, text=True, check=True).stdout.strip()
+    if not all(c == local_commit for c in [producer_commit, logingest_commit, consumer_commit] + list(logparser_commits)):
+        agenda.subfailure(f"not all commits equal: {[local_commit, producer_commit, logingest_commit, consumer_commit] + list(logparser_commits)}")
         raise Exception("Commits mismatched on machines")
+
+    console = Console()
+    with console.status("compiling elk-app") as status:
+        ts = [threading.Thread(target=do_compile, args=(m,)) for m in [
+            cfg['machines']['producer']['conn'],
+            cfg['machines']['logingest']['conn'],
+            cfg['machines']['logparser']['conn'],
+            cfg['machines']['consumer']['conn'],
+        ]]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+    agenda.task("done compiling")
 
     # connect to the redis and kafka machines.
     (cfg['machines']['redis']['conn'], _) = connect(cfg['machines']['redis'])
