@@ -235,9 +235,23 @@ impl ChunnelConnection for KafkaConn {
                 };
 
                 trace!(?topic_id, "sending message");
-                match self.producer.send(fr, rdkafka::util::Timeout::Never).await {
-                    Ok((_, _)) => (),
-                    Err((e, _)) => return Err::<_, Report>(e.into()).wrap_err("kafka send"),
+                match {
+                    match self.producer.send_result(fr) {
+                        Ok(f) => f.await,
+                        Err((e, _)) => {
+                            return Err::<_, Report>(e.into())
+                                .wrap_err("kafka internal queue is full")
+                        }
+                    }
+                } {
+                    Ok(Ok((_, _))) => (),
+                    Err(_) => {
+                        // we won't cancel the future without cancelling this future.
+                        unreachable!()
+                    }
+                    Ok(Err((e, _))) => {
+                        return Err::<_, Report>(e.into()).wrap_err("kafka error on send");
+                    }
                 }
             }
 

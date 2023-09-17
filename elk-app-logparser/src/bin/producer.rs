@@ -74,13 +74,10 @@ fn main() -> Result<(), Report> {
         let cn = connect::connect(opt.connect_addr, opt.redis_addr, opt.encr_spec)
             .await
             .wrap_err("connect error")?;
-        let producer = get_line_producer(
-            opt.log_file,
-            opt.produce_interarrival_ms
-                .map(|i| Duration::from_millis(i as _))
-                .unwrap_or_else(|| Duration::from_secs(1)),
-        )
-        .await?;
+        let interval = opt.produce_interarrival_ms
+            .map(|i| Duration::from_millis(i as _))
+            .unwrap_or_else(|| Duration::from_secs(1));
+        let producer = get_line_producer(opt.log_file, interval).await?;
         let mut producer = std::pin::pin!(producer);
         let mut rem_line_count = opt.tot_message_limit;
         let mut outf = if let Some(filename) = opt.stats_file {
@@ -91,6 +88,7 @@ fn main() -> Result<(), Report> {
             None
         };
 
+        let expected_dur = opt.tot_message_limit.map(|o|  Duration::from_secs((interval.as_secs_f64() * (o as f64) / 16.) as u64));
         info!(?opt.connect_addr, ?rem_line_count, "got connection, starting");
         let clk = quanta::Clock::new();
         let mut slots: Vec<_> = (0..16).map(|_| None).collect();
@@ -130,6 +128,7 @@ fn main() -> Result<(), Report> {
                 );
             }
 
+
             tot_bytes += burst_bytes;
             tot_msgs += burst_len;
             let t = clk.delta_as_nanos(start, now) / 1_000;
@@ -146,6 +145,14 @@ fn main() -> Result<(), Report> {
                 f.write_all(line.as_bytes()).await?;
             } else {
                 info!(?t, ?tot_msgs, ?tot_bytes, "stats");
+            }
+
+            if let Some(expect) = expected_dur {
+                if clk.delta(start, now) > expect * 2 {
+                    let time = clk.delta(start, now);
+                    warn!(?time, ?expected_dur, "exiting");
+                    break;
+                }
             }
         }
 

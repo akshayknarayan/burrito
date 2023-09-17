@@ -252,7 +252,7 @@ async fn serve_one_cn(
     line_processor: &Arc<impl ProcessLine<(SocketAddr, Line)> + Send + Sync + 'static>,
 ) -> Result<(), Report> {
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
-    let mut to_process: Vec<(SocketAddr, Line)> = Vec::with_capacity(32);
+    let mut to_process: Vec<(SocketAddr, Line)> = Vec::with_capacity(128);
     let mut acks = Vec::with_capacity(16);
     let mut process_fut = None;
     debug!("new connection");
@@ -267,10 +267,17 @@ async fn serve_one_cn(
                 FEither::Right((res, _)) => {
                     res?;
                     trace!("done processing batch");
+                    if !acks.is_empty() {
+                        cn.send(acks.drain(..)).await?;
+                    }
+
                     if !to_process.is_empty() {
                         let new = Vec::with_capacity(16);
                         let processing = std::mem::replace(&mut to_process, new);
-                        trace!(batch_len = ?processing.len(), "done processing batch");
+                        trace!(batch_len = ?processing.len(), "starting new batch");
+                        if processing.len() > 128 {
+                            warn!(batch_len = ?processing.len(), "large batch")
+                        }
                         process_fut = Some(line_processor.process_lines(processing.into_iter()));
                     }
                     continue;
@@ -289,19 +296,26 @@ async fn serve_one_cn(
         };
 
         trace!(sz = ?msgs.iter().map_while(|x| x.as_ref().map(|_| 1)).sum::<usize>(), "got batch");
-        acks.clear();
-        acks.extend(
-            msgs.iter()
-                .filter_map(|m| m.as_ref().map(|(a, _)| (*a, Line::Ack))),
-        );
-        let num_acks = acks.len();
-        cn.send(acks.drain(..)).await?;
         to_process.extend(msgs.iter_mut().map_while(Option::take));
-        trace!(?num_acks, backlog = ?to_process.len(), "sent acks");
+        // this has the effect of applying backpressure to the producer
+        if to_process.len() < 64 {
+            acks.clear();
+            acks.extend(
+                msgs.iter()
+                    .filter_map(|m| m.as_ref().map(|(a, _)| (*a, Line::Ack))),
+            );
+            let num_acks = acks.len();
+            cn.send(acks.drain(..)).await?;
+            trace!(?num_acks, backlog = ?to_process.len(), "sent acks");
+        }
+
         if process_fut.is_none() && !to_process.is_empty() {
             let new = Vec::with_capacity(16);
             let processing = std::mem::replace(&mut to_process, new);
-            trace!(batch_len = ?processing.len(), "done processing batch");
+            trace!(batch_len = ?processing.len(), "starting new batch");
+            if processing.len() > 128 {
+                warn!(batch_len = ?processing.len(), "large batch")
+            }
             process_fut = Some(line_processor.process_lines(processing.into_iter()));
         }
     }
