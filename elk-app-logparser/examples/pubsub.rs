@@ -120,6 +120,12 @@ async fn inner(
     mut cn_state_watcher: watch::Receiver<ConnState>,
 ) -> Result<(), Report> {
     let mut curr_cn_state = *cn_state_watcher.borrow_and_update();
+    let (s, mut r) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        info!("received ctrl-c, notifying main task");
+        s.send(()).unwrap();
+    });
     if opt.subscriber {
         let mut slots = vec![None; 16];
         loop {
@@ -128,6 +134,9 @@ async fn inner(
                     for m in ms?.iter_mut().map_while(Option::take) {
                         info!(?m, "received");
                     }
+                }
+                _ = &mut r => {
+                    break;
                 }
                 _ = cn_state_watcher.changed() => {
                     let cn_state = *cn_state_watcher.borrow_and_update();
@@ -155,11 +164,6 @@ async fn inner(
                 )
             })
             .batching(|i| Some(i.take(16).collect::<Vec<_>>()));
-        let (s, mut r) = oneshot::channel();
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.unwrap();
-            s.send(()).unwrap();
-        });
 
         for batch in line_groups {
             if r.try_recv().is_ok() {
@@ -174,8 +178,9 @@ async fn inner(
             info!("sent");
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-
-        delete_topic(curr_cn_state, &opt.kafka_addr, &mut gcp_client, TOPIC_NAME).await?;
-        Ok(())
     }
+
+    info!("cleanup and exit");
+    delete_topic(curr_cn_state, &opt.kafka_addr, &mut gcp_client, TOPIC_NAME).await?;
+    Ok(())
 }

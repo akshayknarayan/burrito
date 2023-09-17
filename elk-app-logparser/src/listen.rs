@@ -8,6 +8,7 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::PathBuf,
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -38,12 +39,10 @@ use crate::{
 };
 
 pub trait ProcessLine<L> {
-    type Future<'a>: Future<Output = Result<(), Self::Error>>
-    where
-        Self: 'a,
-        L: 'a;
-    type Error: Into<Report> + Send + Sync + 'static;
-    fn process_lines<'a>(&'a self, line_batch: &'a mut [Option<L>]) -> Self::Future<'a>;
+    fn process_lines<'a>(
+        &'a self,
+        line_batch: impl Iterator<Item = L> + Send + 'a,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + 'a>>;
 }
 
 pub fn serve(
@@ -253,15 +252,35 @@ async fn serve_one_cn(
     line_processor: &Arc<impl ProcessLine<(SocketAddr, Line)> + Send + Sync + 'static>,
 ) -> Result<(), Report> {
     let mut slots: Vec<_> = (0..16).map(|_| None).collect();
+    let mut to_process: Vec<(SocketAddr, Line)> = Vec::with_capacity(32);
     let mut acks = Vec::with_capacity(16);
+    let mut process_fut = None;
     debug!("new connection");
     loop {
-        trace!("call recv");
-        let msgs = match cn
-            .recv(&mut slots)
-            .await
-            .wrap_err("logparser/worker: Error while processing requests")
-        {
+        let recvd = if let Some(proc_fut) = process_fut.take() {
+            use futures_util::future::Either as FEither;
+            match futures_util::future::select(cn.recv(&mut slots), proc_fut).await {
+                FEither::Left((recvd, pf)) => {
+                    process_fut = Some(pf);
+                    recvd
+                }
+                FEither::Right((res, _)) => {
+                    res?;
+                    trace!("done processing batch");
+                    if !to_process.is_empty() {
+                        let new = Vec::with_capacity(16);
+                        let processing = std::mem::replace(&mut to_process, new);
+                        trace!(batch_len = ?processing.len(), "done processing batch");
+                        process_fut = Some(line_processor.process_lines(processing.into_iter()));
+                    }
+                    continue;
+                }
+            }
+        } else {
+            cn.recv(&mut slots).await
+        };
+
+        let msgs = match recvd {
             Ok(ms) => ms,
             Err(e) => {
                 warn!(err = ?e, "exiting on recv error");
@@ -275,12 +294,16 @@ async fn serve_one_cn(
             msgs.iter()
                 .filter_map(|m| m.as_ref().map(|(a, _)| (*a, Line::Ack))),
         );
+        let num_acks = acks.len();
         cn.send(acks.drain(..)).await?;
-        line_processor
-            .process_lines(msgs)
-            .await
-            .map_err(Into::into)?;
-        trace!("done processing batch");
+        to_process.extend(msgs.iter_mut().map_while(Option::take));
+        trace!(?num_acks, backlog = ?to_process.len(), "sent acks");
+        if process_fut.is_none() && !to_process.is_empty() {
+            let new = Vec::with_capacity(16);
+            let processing = std::mem::replace(&mut to_process, new);
+            trace!(batch_len = ?processing.len(), "done processing batch");
+            process_fut = Some(line_processor.process_lines(processing.into_iter()));
+        }
     }
 }
 
@@ -514,9 +537,8 @@ where
                 }
 
                 recvs
-                    .process_lines(ms)
+                    .process_lines(ms.iter_mut().map_while(Option::take))
                     .await
-                    .map_err(Into::into)
                     .wrap_err("serve_local: process lines handler")?;
             }
         }

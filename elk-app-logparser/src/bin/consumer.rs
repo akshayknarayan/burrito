@@ -63,14 +63,12 @@ struct Process {
 }
 
 impl ProcessLine<EstOutputRateHist> for Process {
-    type Error = Report;
-    type Future<'a> = Pin<Box<dyn Future<Output = Result<(), Self::Error>> + 'a>>;
     fn process_lines<'a>(
         &'a self,
-        line_batch: &'a mut [Option<EstOutputRateHist>],
-    ) -> Self::Future<'a> {
+        line_batch: impl Iterator<Item = EstOutputRateHist> + Send + 'a,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + 'a>> {
         let mut num_records_observed = 0;
-        for est_output in line_batch.iter_mut().map_while(Option::take) {
+        for est_output in line_batch {
             let client_ip = est_output.client_ip;
             let num_records = est_output.len();
             if num_records > 0 {

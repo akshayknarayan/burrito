@@ -8,7 +8,8 @@ use bertha::ChunnelConnection;
 use color_eyre::eyre::{Report, WrapErr};
 use elk_app_logparser::{
     connect,
-    listen::{self, Line, ProcessLine},
+    listen::{self, ProcessLine},
+    parse_log::Line,
 };
 use structopt::{clap::ArgGroup, StructOpt};
 use tracing::info;
@@ -93,7 +94,7 @@ fn server(
         num_workers,
         redis_addr,
         DoNothing,
-        false,
+        elk_app_logparser::EncrSpec::AllowNone,
         None,
     )
 }
@@ -105,9 +106,13 @@ fn client(connect_addr: SocketAddr, redis_addr: String) -> Result<(), Report> {
         .wrap_err("Building tokio runtime")?;
     rt.block_on(async move {
         info!("starting client");
-        let cn = connect::connect(connect_addr, redis_addr, false)
-            .await
-            .wrap_err("connect error")?;
+        let cn = connect::connect(
+            connect_addr,
+            Some(redis_addr),
+            elk_app_logparser::EncrSpec::AllowNone,
+        )
+        .await
+        .wrap_err("connect error")?;
         info!(?connect_addr, "got connection, starting");
         for _ in 0..100 {
             cn.send((0..10).map(|i| Line::Report(format!("{} abcdefg", i))))

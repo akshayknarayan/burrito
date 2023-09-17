@@ -250,7 +250,13 @@ async fn conn_negotiation_manager(
                 let cn_state = if kafka_gcp_handle.is_some() {
                     cn_state.unwrap_or(ConnState::KafkaOrdering)
                 } else {
-                    cn_state.expect("if no kafka, gcp must be active")
+                    match cn_state {
+                        Some(c) => c,
+                        None => {
+                            warn!("expect gcp to be active if no kafka");
+                            return;
+                        }
+                    }
                 };
                 cn_state_watcher.send_replace(cn_state);
                 // make a new future

@@ -133,20 +133,14 @@ impl<C> ProcessLine<(SocketAddr, Line)> for PublishLines<C>
 where
     C: ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send + Sync + 'static,
 {
-    type Error = Report;
-    type Future<'a> = Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
-
     fn process_lines<'a>(
         &'a self,
-        line_batch: &'a mut [Option<(SocketAddr, Line)>],
-    ) -> Self::Future<'a> {
-        let str_msgs = line_batch
-            .iter_mut()
-            .map_while(Option::take)
-            .filter_map(|x| match x.1 {
-                Line::Report(s) => Some(s),
-                Line::Ack => None,
-            });
+        line_batch: impl Iterator<Item = (SocketAddr, Line)> + Send + 'a,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + 'a>> {
+        let str_msgs = line_batch.filter_map(|x| match x.1 {
+            Line::Report(s) => Some(s),
+            Line::Ack => None,
+        });
         let lines = parse_raw(str_msgs);
         Box::pin(async move {
             let mut num_records = 0;

@@ -14,7 +14,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 };
 use tokio_stream::wrappers::LinesStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
@@ -120,6 +120,7 @@ fn main() -> Result<(), Report> {
             let el = clk.delta(then, now);
             then = now;
             let num_acks = ms.iter_mut().map_while(Option::take).count();
+            trace!(?num_acks, ?burst_len, ?el, "got acks");
             if num_acks != burst_len {
                 warn!(
                     ?num_acks,
