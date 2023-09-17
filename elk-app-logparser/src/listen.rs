@@ -268,6 +268,8 @@ async fn serve_one_cn(
                     res?;
                     trace!("done processing batch");
                     if !acks.is_empty() {
+                        let delayed_acks = acks.len();
+                        debug!(?delayed_acks, "sending delayed acks");
                         cn.send(acks.drain(..)).await?;
                     }
 
@@ -298,7 +300,7 @@ async fn serve_one_cn(
         trace!(sz = ?msgs.iter().map_while(|x| x.as_ref().map(|_| 1)).sum::<usize>(), "got batch");
         to_process.extend(msgs.iter_mut().map_while(Option::take));
         // this has the effect of applying backpressure to the producer
-        if to_process.len() < 64 {
+        if to_process.len() < 128 {
             acks.clear();
             acks.extend(
                 msgs.iter()
@@ -307,6 +309,8 @@ async fn serve_one_cn(
             let num_acks = acks.len();
             cn.send(acks.drain(..)).await?;
             trace!(?num_acks, backlog = ?to_process.len(), "sent acks");
+        } else {
+            debug!(?num_acks, backlog = ?to_process.len(), "applying backpressure");
         }
 
         if process_fut.is_none() && !to_process.is_empty() {

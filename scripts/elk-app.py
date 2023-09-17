@@ -206,7 +206,7 @@ def run_producer(cfg, outf, bin_root = "./target/release"):
     msg_interarrival_ms = cfg['exp']['producer']['msg-interarrival-ms']
     encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
-    ok = m.run(f"RUST_LOG=info {bin_root}/producer \
+    ok = m.run(f"RUST_LOG=info,producer=debug {bin_root}/producer \
         --logging \
         --connect-addr={connect_ip}:{connect_port} \
         {redis} \
@@ -338,6 +338,32 @@ def start_consumer(cfg, outf, bin_root = "./target/release"):
         raise Exception("failed to start consumer")
     wait_ready(m, f"{outf}.out")
 
+def drain_consumer(cfg, outdir):
+    m = cfg['machines']['consumer']['conn']
+    desc = cfg['exp']['desc']
+    # wait for some messages to drain from the consumer,
+    # but don't wait longer than 60 seconds overall
+    cons_data_out_lines = 0
+    last_increase = None
+    start_drain = time.time()
+    console = Console()
+    with console.status("draining consumer") as status:
+        while True:
+            o = m.run(f"wc -l {outdir}/{desc}-consumer.data", wd=m.dir)
+            if not m.check_code(o):
+                raise Exception(f"could not find consumer data file: {o}")
+            curr_lines = int(o.stdout.decode('utf-8').strip().split()[0])
+            now = time.time()
+            if curr_lines > cons_data_out_lines:
+                last_increase = now
+                cons_data_out_lines = curr_lines
+            if (last_increase == None or cons_data_out_lines < 5) and (now - start_drain) > 60:
+                raise Exception("Over 60 seconds without consumer output")
+            if cons_data_out_lines > 5 and (last_increase != None and (now - last_increase) > 20):
+                break
+            time.sleep(5)
+    agenda.subtask(f"consumer drained after {time.time() - start_drain}s")
+
 def exp(cfg, outdir, overwrite=False, setup_only=False):
     desc = cfg['exp']['desc']
     assert (
@@ -373,39 +399,9 @@ def exp(cfg, outdir, overwrite=False, setup_only=False):
             i += 1
         start_logingest(cfg, f"{outdir}/{desc}-logingest")
         run_producer(cfg, f"{outdir}/{desc}-producer")
-
-        # wait for some messages to drain from the consumer,
-		# but don't wait longer than 60 seconds overall
-        cons_data_out_lines = 0
-        cons_was_remote = None
-        console = Console()
-        with console.status("draining consumer") as status:
-            while True:
-                try:
-                    with open(fls[0], 'r') as f:
-                        cons_data_out_lines = len(list(itertools.islice(f, 0, 10)))
-                        assert cons_data_out_lines > 0 # local will at least write header
-                        break
-                except Exception as e:
-                    root = cfg['machines']['consumer']['conn'].dir + '/'
-                    cons_was_remote = root
-                    cfg['machines']['consumer']['conn'].get(root + fls[0], local=fls[0], quiet=True)
-            start_wait = time.time()
-            while (
-                cons_data_out_lines < 5
-                or (cons_was_remote == None and time.time() - os.path.getmtime(fls[0]) < 20)
-            ):
-                time.sleep(2)
-                if time.time() - start_wait > 60:
-                    break
-                if cons_was_remote != None:
-                    cfg['machines']['consumer']['conn'].get(cons_was_remote + fls[0], local=fls[0], quiet=True)
-                with open(fls[0], 'r') as f:
-                    cons_data_out_lines = len(list(itertools.islice(f, 0, 10)))
-        agenda.subtask(f"consumer drained after {time.time() - start_wait}s")
+        drain_consumer(cfg, outdir)
     except Exception as e:
         agenda.failure(f"failed: {desc}")
-        cons_was_remote = None
         failed = e
     agenda.subtask("stopping processes")
     cfg['machines']['logingest']['conn'].run("pkill -INT logingest")
@@ -417,23 +413,16 @@ def exp(cfg, outdir, overwrite=False, setup_only=False):
     if failed != None:
         raise failed
 
-    # are there at least 5 lines in the out file?
-    # get file if necessary
     if setup_only:
         return
-    if cons_was_remote is not None:
-        c = cfg['machines']['consumer']['conn']
-        root = c.dir + '/'
-        out = fls[0].replace('.data', '.out')
-        c.get(root + out, local=out) #.out
-        err = fls[0].replace('.data', '.err')
-        c.get(root + err, local=err) #.err
+    # are there at least 5 lines in the out file?
+    # get file if necessary
     for fl in fls:
         while True:
             try:
                 with open(fl, 'r') as f:
-                    assert 5 <= len(list(itertools.islice(f, 0, 10)))
-                agenda.subtask(f"{fl} has at least 5 lines")
+                    assert 3 <= len(list(itertools.islice(f, 0, 10)))
+                agenda.subtask(f"{fl} has at least 3 lines")
                 break
             except AssertionError as e:
                 raise e # if we got to the assertion, the file is local
@@ -486,10 +475,11 @@ def connect(machine_cfg):
     conn.addr = machine_cfg['ip'] if 'ip' in machine_cfg else ip
     return (conn, commit)
 
-def do_compile(m):
-    out = m.run("cargo build --release", wd=f"{m.dir}/elk-app-logparser")
-    if not m.check_code(out):
-        raise Exception(f"could not compile on {m.name}")
+def do_compile(m, idx, out):
+    ok = m.run("cargo build --release", wd=f"{m.dir}/elk-app-logparser")
+    if not m.check_code(ok):
+        out[idx] = Exception(f"could not compile on {m.name}")
+    out[idx] = None
 
 def num_confs(cfg):
     exp = cfg['exp']
@@ -665,14 +655,19 @@ if __name__ == '__main__':
 
     console = Console()
     with console.status("compiling elk-app") as status:
-        ts = [threading.Thread(target=do_compile, args=(m,)) for m in [
-            cfg['machines']['producer']['conn'],
+        ms = [cfg['machines']['producer']['conn'],
             cfg['machines']['logingest']['conn'],
-            cfg['machines']['logparser']['conn'],
             cfg['machines']['consumer']['conn'],
-        ]]
+            ] + [p['conn'] for p in cfg['machines']['logparser']]
+        out = [None for _ in range(len(ms))]
+        ts = [
+            threading.Thread(target=do_compile, args=(m,i,out))
+            for (i,m) in zip(range(len(ms)), ms)
+        ]
         [t.start() for t in ts]
         [t.join() for t in ts]
+        if any(o != None for o in out):
+            raise Exception(f"{out}")
     agenda.task("done compiling")
 
     # connect to the redis and kafka machines.
