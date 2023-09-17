@@ -364,6 +364,7 @@ def exp(cfg, outdir, overwrite=False, setup_only=False):
         if setup_only:
             raise Exception("only doing setup")
         start_consumer(cfg, f"{outdir}/{desc}-consumer")
+        time.sleep(5)
         i = 0
         for logparser_machine_idx in range(cfg["exp"]["logparser"]["machines"]):
             c = cfg['machines']['logparser'][logparser_machine_idx]
@@ -387,7 +388,7 @@ def exp(cfg, outdir, overwrite=False, setup_only=False):
                 except Exception as e:
                     root = cfg['machines']['consumer']['conn'].dir + '/'
                     cons_was_remote = root
-                    cfg['machines']['consumer']['conn'].get(root + fls[0], local=fls[0])
+                    cfg['machines']['consumer']['conn'].get(root + fls[0], local=fls[0], quiet=True)
             start_wait = time.time()
             while (
                 cons_data_out_lines < 5
@@ -397,7 +398,7 @@ def exp(cfg, outdir, overwrite=False, setup_only=False):
                 if time.time() - start_wait > 60:
                     break
                 if cons_was_remote != None:
-                    cfg['machines']['consumer']['conn'].get(cons_was_remote + fls[0], local=fls[0])
+                    cfg['machines']['consumer']['conn'].get(cons_was_remote + fls[0], local=fls[0], quiet=True)
                 with open(fls[0], 'r') as f:
                     cons_data_out_lines = len(list(itertools.islice(f, 0, 10)))
         agenda.subtask(f"consumer drained after {time.time() - start_wait}s")

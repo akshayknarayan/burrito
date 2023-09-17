@@ -128,28 +128,29 @@ class ConnectionWrapper(Connection):
         r = self.run(f"ls {path}")
         return r.stdout.strip().replace("'", "")
 
-    def put(self, local_file, remote=None, preserve_mode=True):
+    def put(self, local_file, remote=None, preserve_mode=True, quiet=False):
         if remote and remote[0] == "~":
             remote = remote[2:]
-        agenda.subtask("[{}] scp localhost:{} -> {}:{}".format(
-            self.addr,
-            local_file,
-            self.addr,
-            remote
-        ))
+        if not quiet:
+            agenda.subtask("[{}] scp localhost:{} -> {}:{}".format(
+                self.addr,
+                local_file,
+                self.addr,
+                remote
+            ))
 
         return super().put(local_file, remote, preserve_mode)
 
-    def get(self, remote_file, local=None, preserve_mode=True):
+    def get(self, remote_file, local=None, preserve_mode=True, quiet=False):
         if local is None:
             local = remote_file
-
-        agenda.subtask("[{}] scp {}:{} -> localhost:{}".format(
-            self.addr,
-            self.addr,
-            remote_file,
-            local
-        ))
+        if not quiet:
+            agenda.subtask("[{}] scp {}:{} -> localhost:{}".format(
+                self.addr,
+                self.addr,
+                remote_file,
+                local
+            ))
 
         return super().get(remote_file, local=local, preserve_mode=preserve_mode)
 

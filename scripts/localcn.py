@@ -98,8 +98,10 @@ class LocalCn:
     def local_path(self, path):
         return path
 
-    def put(self, local_file, remote=None, preserve_mode=True):
-        agenda.subtask("local put no-op")
+    def put(self, quiet=False, **kwargs):
+        if not quiet:
+            agenda.subtask("local put no-op")
 
-    def get(self, remote_file, local=None, preserve_mode=True):
-        agenda.subtask("local get no-op")
+    def get(self, quiet=False, **kwargs):
+        if not quiet:
+            agenda.subtask("local get no-op")
