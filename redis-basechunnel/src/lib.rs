@@ -173,62 +173,69 @@ impl RendezvousBackend for RedisBase {
                 // if the round didn't change, then no transition has happened, so the semantics
                 // won't have changed.
                 // if it did change, then we need to look for the staged semantics.
-                if round_ctr == curr_round {
-                    trace!(?round_ctr, ?conn_count, "Same round");
-                    let present_semantics: RendezvousEntry =
-                        bincode::deserialize(&got_value).wrap_err("deserialize entry")?;
-                    ensure!(
-                        present_semantics == curr_entry,
-                        "KV store polluted: round didn't advance but semantics changed"
-                    );
-                    Ok(NegotiateRendezvousResult::Matched {
-                        num_participants: conn_count,
-                        round_number: round_ctr,
-                    })
-                } else if round_ctr > curr_round {
-                    let staged_key = format!("{}-{}-staged", &addr, round_ctr);
-                    debug!(?round_ctr, ?conn_count, ?staged_key, "New round");
-                    let mut r = redis::pipe();
-                    let insert_time = std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                        .as_millis() as u64;
-                    let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                        .as_millis() as u64;
-                    let (staged_val, _, _, conn_count): (Option<Vec<u8>>, isize, isize, usize) = r
-                        .atomic()
-                        .get(&staged_key)
-                        .zrembyscore(&addr_ctr, 0usize, expiry_time)
-                        .zadd(&addr_ctr, &self.client_name, insert_time as usize)
-                        .zcard(&addr_ctr)
-                        .query_async(&mut self.redis_conn)
-                        .await?;
-                    let staged_val = staged_val.ok_or_else(|| {
-                        eyre!(
+                match round_ctr.cmp(&curr_round) {
+                    std::cmp::Ordering::Equal => {
+                        trace!(?round_ctr, ?conn_count, "Same round");
+                        let present_semantics: RendezvousEntry =
+                            bincode::deserialize(&got_value).wrap_err("deserialize entry")?;
+                        ensure!(
+                            present_semantics == curr_entry,
+                            "KV store polluted: round didn't advance but semantics changed"
+                        );
+                        Ok(NegotiateRendezvousResult::Matched {
+                            num_participants: conn_count,
+                            round_number: round_ctr,
+                        })
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let staged_key = format!("{}-{}-staged", &addr, round_ctr);
+                        debug!(?round_ctr, ?conn_count, ?staged_key, "New round");
+                        let (staged_val, conn_count) = loop {
+                            let mut r = redis::pipe();
+                            let insert_time = std::time::SystemTime::now()
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                                .as_millis() as u64;
+                            let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                                .as_millis() as u64;
+                            let (staged_val, _, _, conn_count): (
+                                Option<Vec<u8>>,
+                                isize,
+                                isize,
+                                usize,
+                            ) = r
+                                .atomic()
+                                .get(&staged_key)
+                                .zrembyscore(&addr_ctr, 0usize, expiry_time)
+                                .zadd(&addr_ctr, &self.client_name, insert_time as usize)
+                                .zcard(&addr_ctr)
+                                .query_async(&mut self.redis_conn)
+                                .await?;
+                            if let Some(sv) = staged_val {
+                                break (sv, conn_count);
+                            }
+                        };
+                        ensure!(
+                            !staged_val.is_empty(),
                             "KV store polluted: new round {:?} but staged_val key {:?} empty",
                             round_ctr,
                             &staged_key
-                        )
-                    })?;
-                    ensure!(
-                        !staged_val.is_empty(),
-                        "KV store polluted: new round {:?} but staged_val key {:?} empty",
-                        round_ctr,
-                        &staged_key
-                    );
-                    let present_semantics: RendezvousEntry =
-                        bincode::deserialize(&staged_val).wrap_err("deserialize entry")?;
-                    Ok(NegotiateRendezvousResult::NoMatch {
-                        entry: present_semantics,
-                        num_participants: conn_count,
-                        round_number: round_ctr,
-                    })
-                } else {
-                    bail!(
+                        );
+                        let present_semantics: RendezvousEntry =
+                            bincode::deserialize(&staged_val).wrap_err("deserialize entry")?;
+                        Ok(NegotiateRendezvousResult::NoMatch {
+                            entry: present_semantics,
+                            num_participants: conn_count,
+                            round_number: round_ctr,
+                        })
+                    }
+                    std::cmp::Ordering::Less => {
+                        bail!(
                         "KV store polluted: round_ctr ticked backwards: local_curr={:?}, got={:?}",
                         curr_round,
                         round_ctr
                     );
+                    }
                 }
             }
             .instrument(debug_span!("redis_poll", addr = ?&a)),
@@ -520,15 +527,28 @@ impl RendezvousBackend for RedisBase {
                     // we can be an applier if -staged matches what we are trying to commit.
                     // otherwise, we will error out.
                     let mut r = redis::pipe();
-                    let (present_semantics, curr_count, _, _, conn_count): (Vec<u8>, usize, isize, isize, usize) = r
-                        .atomic()
-                        .get(&staged_val)
-                        .get(&staged_commit_counter)
-                    .zrembyscore(&addr_members, 0, expiry_time)
-                    .zadd(&addr_members, &self.client_name, insert_time as usize)
-                    .zcard(&addr_members)
-                        .query_async(&mut self.redis_conn)
-                        .await?;
+                    // the committer might have written the lock but not yet the data.
+                    let (present_semantics, curr_count, conn_count) = loop {
+                        let insert_time = std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                            .as_millis() as u64;
+                        let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                            .as_millis() as u64;
+                        let (ps, curr_cnt, _, _, conn_cnt): (Option<Vec<u8>>, Option<usize>, (), (), usize) = r
+                            .atomic()
+                            .get(&staged_val)
+                            .get(&staged_commit_counter)
+                            .zrembyscore(&addr_members, 0, expiry_time)
+                            .zadd(&addr_members, &self.client_name, insert_time as usize)
+                            .zcard(&addr_members)
+                            .query_async(&mut self.redis_conn)
+                            .await?;
+                        if let (Some(p), Some(c)) = (ps, curr_cnt) {
+                             break (p, c, conn_cnt);
+                        }
+                    };
+
                     ensure!(present_semantics == neg_nonce, "Incompatible commit already in progress on {:?}, round {:?}", &addr, round_ctr);
                     ensure!(conn_count > 1, "KV store polluted on {:?}: {:?} participants but found existing commit for round {:?}", &addr, conn_count, round_ctr);
                     // we are an applier now.
