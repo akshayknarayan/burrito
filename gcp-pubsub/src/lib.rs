@@ -557,7 +557,11 @@ impl ChunnelConnection for OrderedPubSubConn {
         'buf: 'cn,
     {
         Box::pin(async move {
-            let ms = self.inner.recv(msgs_buf).await?;
+            let ms = self
+                .inner
+                .recv(msgs_buf)
+                .await
+                .wrap_err("ordered pubsub conn inner recv")?;
             for (
                 MessageQueueAddr {
                     ref mut topic_id, ..
@@ -615,25 +619,26 @@ async fn make_subscriptions(
         |(topic_id, (mut top, sub_id))| {
             let mut c = ps_client.clone();
             async move {
-            let sub_conf =
-                SubscriptionConfig::default().ack_deadline(chrono::Duration::seconds(15));
-            let sub_conf = if with_ordering {
-                sub_conf.enable_message_ordering()
-            } else {
-                sub_conf
-            };
+                let sub_conf =
+                    SubscriptionConfig::default().ack_deadline(chrono::Duration::seconds(15));
+                let sub_conf = if with_ordering {
+                    sub_conf.enable_message_ordering()
+                } else {
+                    sub_conf
+                };
 
-            debug!(?topic_id, ?sub_id, "create subscription");
-            match top.create_subscription(&sub_id, sub_conf).await {
-                Err(Error::Status(s)) if s.code() == tonic::Code::AlreadyExists => {
-                    // get handle instead
-                    let s = c.subscription(&sub_id).await?;
-                    Ok((topic_id, s.ok_or_else(|| eyre!("create_subscription returned AlreadyExists but fetching subscription failed"))?))
+                debug!(?topic_id, ?sub_id, "create subscription");
+                match top.create_subscription(&sub_id, sub_conf).await {
+                    Err(Error::Status(s)) if s.code() == tonic::Code::AlreadyExists => {
+                        // get handle instead
+                        let s = c.subscription(&sub_id).await?;
+                        Ok((topic_id, s.ok_or_else(|| eyre!("create_subscription returned AlreadyExists but fetching subscription failed"))?))
+                    }
+                    Ok(s) => Ok::<_, Report>((topic_id, s)),
+                    Err(e) => Err(Report::from(e)),
                 }
-                Ok(s) => Ok::<_, Report>((topic_id, s)),
-                Err(e) => Err(Report::from(e)),
             }
-        }}
+        }
     ))
     .await?
     .into_iter()
