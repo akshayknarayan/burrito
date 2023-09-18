@@ -1023,10 +1023,26 @@ where
                     let (wanted_stack, done) = wt.expect("want_transition sender won't drop");
                     if !uhs[idx].is_active() {
                         done.send(Err(eyre!("Select is not active"))).expect("oneshot receiver won't drop");
-                    } else {
-                        let res = self.handle_trigger(idx, wanted_stack).await;
-                        debug!(worked = ?res.is_ok(), "done attempting transition");
-                        done.send(res).expect("oneshot receiver won't drop");
+                        continue;
+                    }
+
+                    let res = self.handle_trigger(idx, wanted_stack).await;
+                    match res {
+                        Err(err) => {
+                            debug!(?err, "transition commit failed, checking apply");
+                            // need to poll_entry in the failure case
+                            let notify_res = self.negotiator.poll_entry(
+                                self.addr.clone(),
+                                self.curr_entry.clone(),
+                                self.curr_round
+                            ).await.map_err(Into::into);
+                            let res = self.handle_notify(notify_res).await;
+                            done.send(res).expect("oneshot receiver won't drop");
+                        }
+                        Ok(o) => {
+                            debug!(worked = "true", "done attempting transition");
+                            done.send(Ok(o)).expect("oneshot receiver won't drop");
+                        }
                     }
                 }
                 notify_res = self.negotiator.notify(self.addr.clone(), self.curr_entry.clone(), self.curr_round) => {
