@@ -206,7 +206,7 @@ def run_producer(cfg, outf, bin_root = "./target/release"):
     msg_interarrival_ms = cfg['exp']['producer']['msg-interarrival-ms']
     encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
-    ok = m.run(f"RUST_LOG=info,producer=debug {bin_root}/producer \
+    ok = m.run(f"RUST_LOG=info {bin_root}/producer \
         --logging \
         --connect-addr={connect_ip}:{connect_port} \
         {redis} \
@@ -349,7 +349,7 @@ def drain_consumer(cfg, outdir):
     console = Console()
     with console.status("draining consumer") as status:
         while True:
-            o = m.run(f"wc -l {outdir}/{desc}-consumer.data", wd=m.dir)
+            o = m.run(f"wc -l {outdir}/{desc}-consumer.data", wd=m.dir, quiet=True)
             if not m.check_code(o):
                 raise Exception(f"could not find consumer data file: {o}")
             curr_lines = int(o.stdout.decode('utf-8').strip().split()[0])
@@ -359,7 +359,7 @@ def drain_consumer(cfg, outdir):
                 cons_data_out_lines = curr_lines
             if (last_increase == None or cons_data_out_lines < 5) and (now - start_drain) > 60:
                 raise Exception("Over 60 seconds without consumer output")
-            if cons_data_out_lines > 5 and (last_increase != None and (now - last_increase) > 20):
+            if cons_data_out_lines > 5 and (last_increase != None and (now - last_increase) > 15):
                 break
             time.sleep(5)
     agenda.subtask(f"consumer drained after {time.time() - start_drain}s")
@@ -649,7 +649,7 @@ if __name__ == '__main__':
     (cfg["machines"]["consumer"]["conn"], consumer_commit) = connect(cfg["machines"]["consumer"])
     all_conns[cfg["machines"]["consumer"]["conn"].addr] = cfg["machines"]["consumer"]["conn"]
     local_commit = sh.run("git rev-parse --short HEAD", shell=True, capture_output=True, text=True, check=True).stdout.strip()
-    if not all(c == local_commit for c in [producer_commit, logingest_commit, consumer_commit] + list(logparser_commits)):
+    if not all(c == local_commit for c in [x.decode('utf-8') if type(x) == bytes else x for x in [producer_commit, logingest_commit, consumer_commit] + list(logparser_commits)]):
         agenda.subfailure(f"not all commits equal: {[local_commit, producer_commit, logingest_commit, consumer_commit] + list(logparser_commits)}")
         raise Exception("Commits mismatched on machines")
 
