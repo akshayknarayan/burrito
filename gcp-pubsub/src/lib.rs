@@ -5,17 +5,19 @@
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
-use futures_util::future::ready;
-use futures_util::stream::{FuturesUnordered, TryStreamExt};
-use google_cloud::pubsub::{Client, PublishMessage, Subscription, SubscriptionConfig, Topic};
+use google_cloud::error::Error;
+use google_cloud::pubsub::{
+    Client, Message, PublishMessage, Subscription, SubscriptionConfig, Topic,
+};
 use queue_steer::{
     MessageQueueAddr, MessageQueueCaps, MessageQueueOrdering, MessageQueueReliability,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 use tracing::{debug, trace};
 
 /// The underlying client to Google PubSub.
@@ -138,7 +140,9 @@ pub async fn delete_topic(client: &mut Client, mut name: String) -> Result<(), R
 #[derive(Clone)]
 pub struct PubSubChunnel {
     client: Client,
-    recv_topics: Vec<String>,
+    // map from topic name to optionally the name of a subscription to attach to.
+    // if subscription is none, make a new one which will broadcast messages.
+    recv_topics: HashMap<String, Option<String>>,
 }
 
 impl Debug for PubSubChunnel {
@@ -150,12 +154,17 @@ impl Debug for PubSubChunnel {
 }
 
 impl PubSubChunnel {
-    pub fn new(client: Client, recv_topics: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+    /// `recv_topics` maps from topic name to optionally the name of a subscription to attach to on
+    /// that topic. If subscription is none, make a new one which will broadcast messages.
+    pub fn new(
+        client: Client,
+        recv_topics: impl IntoIterator<Item = (impl AsRef<str>, Option<impl AsRef<str>>)>,
+    ) -> Self {
         Self {
             client,
             recv_topics: recv_topics
                 .into_iter()
-                .map(|s| s.as_ref().to_owned())
+                .map(|(t, s)| (t.as_ref().to_owned(), s.map(|x| x.as_ref().to_owned())))
                 .collect(),
         }
     }
@@ -194,6 +203,7 @@ pub struct PubSubConn {
     ps_client: Client,
     subscriptions: HashMap<String, Subscription>,
     topics: Arc<Mutex<HashMap<String, Topic>>>,
+    recv_cache: Arc<TokioMutex<VecDeque<(String, Message)>>>,
 }
 
 impl std::fmt::Debug for PubSubConn {
@@ -205,7 +215,7 @@ impl std::fmt::Debug for PubSubConn {
 impl PubSubConn {
     pub async fn new(
         ps_client: Client,
-        recv_topics: impl IntoIterator<Item = impl AsRef<str>>,
+        recv_topics: HashMap<String, Option<String>>,
     ) -> Result<Self, Report> {
         let (subscriptions, topics_cached) =
             make_subscriptions(ps_client.clone(), recv_topics, false).await?;
@@ -214,6 +224,7 @@ impl PubSubConn {
             ps_client,
             subscriptions,
             topics: Arc::new(Mutex::new(topics_cached)),
+            recv_cache: Default::default(),
         })
     }
 
@@ -311,105 +322,124 @@ impl ChunnelConnection for PubSubConn {
     where
         'buf: 'cn,
     {
-        let mut subs = self.subscriptions.clone();
+        let subs = self.subscriptions.clone();
         trace!("called recv");
         Box::pin(async move {
             // first check for things we can return immediately.
-            let mut remaining_slots = msgs_buf.len();
-            for (topic_id, sub) in &mut subs {
-                let sub_buffer_len = sub.buffer_len();
-                if sub_buffer_len > 0 {
-                    for mut m in sub.drain_buffer(msgs_buf.len()) {
-                        m.ack()
-                            .await
-                            .wrap_err_with(|| eyre!("ACKing message {:?}", m.id()))?;
-                        let body = std::string::String::from_utf8(m.take_data())?;
-                        // ordering_key is empty string if none was set
-                        let group = m.take_ordering_key();
-                        let group = if group.is_empty() { None } else { Some(group) };
-                        msgs_buf[msgs_buf.len() - remaining_slots] = Some((
-                            MessageQueueAddr {
-                                topic_id: topic_id.clone(),
-                                group,
-                            },
-                            body,
-                        ));
-                        remaining_slots -= 1;
-                        if remaining_slots == 0 {
-                            trace!(num_msgs = ?msgs_buf.len(), "returning");
-                            return Ok(&mut msgs_buf[..]);
+            // because we clone the subscriptions, any messages go into the cloned versions of the
+            // buffers, so checking for existing stuff in the subscription is useless. we need to
+            // maintain our own buffer.
+
+            async fn ack_and_drain_locked_cache(
+                rcg: &mut MutexGuard<'_, VecDeque<(String, Message)>>,
+                limit: usize,
+            ) -> Result<Vec<(MessageQueueAddr, String)>, Report> {
+                let idx = std::cmp::min(limit, rcg.len());
+                let c: Vec<_> = rcg.range(..idx).cloned().collect();
+                futures_util::future::try_join_all(c.into_iter().map(
+                    |(topic_received_on, mut m)| {
+                        async move {
+                            m.ack()
+                                .await
+                                .wrap_err_with(|| eyre!("ACKing message {:?}", m.id()))?;
+                            let body = std::string::String::from_utf8(m.take_data())?;
+                            // ordering_key is empty string if none was set
+                            let group = m.take_ordering_key();
+                            let group = if group.is_empty() { None } else { Some(group) };
+                            trace!(?topic_received_on, ?group, "recvd msg");
+                            Ok::<_, Report>((
+                                MessageQueueAddr {
+                                    topic_id: topic_received_on,
+                                    group,
+                                },
+                                body,
+                            ))
                         }
+                    },
+                ))
+                .await
+            }
+
+            // we try_lock, since if someone else is holding the lock we can just continue to
+            // receiving things. we need to hold the lock until the acks are done and we return
+            // since otherwise we might return the same messages twice.
+            // if this future is dropped, the message clone will be dropped and the lock will get
+            // unlocked, but we won't lose the messages since we cloned them to ack.
+            if let Ok(mut rcg) = self.recv_cache.try_lock() {
+                if !rcg.is_empty() {
+                    let rcg_len = rcg.len();
+                    let acked = ack_and_drain_locked_cache(&mut rcg, msgs_buf.len()).await?;
+                    let num_msgs = acked.len();
+                    for (a, slot) in acked.into_iter().zip(msgs_buf.into_iter()) {
+                        *slot = Some(a);
                     }
+
+                    // now we can finally dump the cache messages since we are returning them
+                    rcg.rotate_left(num_msgs);
+                    rcg.truncate(rcg_len - num_msgs);
+                    trace!(?num_msgs, "returning");
+                    return Ok(&mut msgs_buf[..num_msgs]);
                 }
             }
 
-            if remaining_slots < msgs_buf.len() {
-                let num_msgs = msgs_buf.len() - remaining_slots;
-                trace!(?num_msgs, "returning");
-                return Ok(&mut msgs_buf[..num_msgs]);
+            async fn sub_receive(
+                topic: String,
+                mut sub: Subscription,
+                remaining_slots: usize,
+            ) -> Result<(String, Subscription, Vec<(String, Message)>), Report> {
+                let sub_id = sub.id().to_owned();
+                let msgs = sub
+                    .receive_multiple(remaining_slots)
+                    .await
+                    .wrap_err_with(|| {
+                        eyre!(
+                            "receive messages topic={:?} subscription={:?}",
+                            &topic,
+                            sub_id,
+                        )
+                    })?;
+                let ms = msgs.map(|m| (topic.clone(), m)).collect();
+                Ok((topic, sub, ms))
             }
 
             // now poll everything
-            let futs = subs.iter_mut().map(|(topic, sub)| {
-                Box::pin(async move {
-                    let sub_id = sub.id().to_owned();
-                    let msgs = sub
-                        .receive_multiple(remaining_slots)
-                        .await
-                        .wrap_err_with(|| {
-                            eyre!(
-                                "receive messages topic={:?} subscription={:?}",
-                                topic,
-                                sub_id,
-                            )
-                        })?;
-                    Ok::<_, Report>((topic.clone(), msgs))
-                })
-            });
-
-            let (topic_received_on, msgs_recvd): (_, Vec<_>) = {
-                let ((topic_received_on, msgs_recvd_iter), _leftover_futs) =
-                    futures_util::future::select_ok(futs).await?;
-                Ok::<_, Report>((topic_received_on, msgs_recvd_iter.collect()))
-            }?;
-            trace!(?topic_received_on, "got messages");
-
-            let acked: FuturesUnordered<_> = msgs_recvd
+            let mut futs = subs
                 .into_iter()
-                .map(|mut m| {
-                    let topic_received_on = topic_received_on.clone();
-                    async move {
-                        m.ack()
-                            .await
-                            .wrap_err_with(|| eyre!("ACKing message {:?}", m.id()))?;
-                        let body = std::string::String::from_utf8(m.take_data())?;
-                        // ordering_key is empty string if none was set
-                        let group = m.take_ordering_key();
-                        let group = if group.is_empty() { None } else { Some(group) };
-                        trace!(?topic_received_on, ?group, "recvd msg");
-                        Ok::<_, Report>((
-                            MessageQueueAddr {
-                                topic_id: topic_received_on.clone(),
-                                group,
-                            },
-                            body,
-                        ))
-                    }
-                })
+                .map(|(topic, sub)| Box::pin(sub_receive(topic, sub, msgs_buf.len())))
                 .collect();
-            acked
-                .try_for_each(|m| {
-                    msgs_buf[msgs_buf.len() - remaining_slots] = Some(m);
-                    remaining_slots -= 1;
-                    if remaining_slots == 0 {
-                        ready(Err(eyre!("")))
-                    } else {
-                        ready(Ok(()))
-                    }
-                })
-                .await
-                .unwrap_or(());
-            let num_msgs = msgs_buf.len() - remaining_slots;
+            let (topic_received_on, msgs_recvd) = loop {
+                let ((topic_received_on, sub, msgs_recvd), mut leftover_futs): (
+                    (_, _, Vec<_>),
+                    Vec<_>,
+                ) = futures_util::future::select_ok(futs).await?;
+                if msgs_recvd.is_empty() {
+                    trace!(?topic_received_on, "received empty, retrying");
+                    leftover_futs.push(Box::pin(sub_receive(
+                        topic_received_on,
+                        sub,
+                        msgs_buf.len(),
+                    )));
+                    futs = leftover_futs;
+                    continue;
+                }
+
+                break (topic_received_on, msgs_recvd);
+            };
+
+            trace!(?topic_received_on, num = msgs_recvd.len(), "got messages");
+            // get the lock and dump into cache before trying to ack
+            let mut rcg = self.recv_cache.lock().await;
+            rcg.extend(msgs_recvd);
+            let rcg_len = rcg.len();
+            let acked = ack_and_drain_locked_cache(&mut rcg, msgs_buf.len()).await?;
+            let num_msgs = acked.len();
+            for (a, slot) in acked.into_iter().zip(msgs_buf.into_iter()) {
+                *slot = Some(a);
+            }
+
+            // now we can finally dump the cache messages since we are returning them
+            rcg.rotate_left(num_msgs);
+            rcg.truncate(rcg_len - num_msgs);
             trace!(?num_msgs, "returning");
             return Ok(&mut msgs_buf[..num_msgs]);
         })
@@ -460,12 +490,11 @@ pub struct OrderedPubSubConn {
 impl OrderedPubSubConn {
     pub async fn new(
         ps_client: Client,
-        recv_topics: impl IntoIterator<Item = impl AsRef<str>>,
+        recv_topics: HashMap<String, Option<String>>,
     ) -> Result<Self, Report> {
-        let recv_ordered_topics = recv_topics.into_iter().map(|t| {
-            let mut s = t.as_ref().to_owned();
-            s.push_str(ORDERING_TOPIC_SUFFIX);
-            s
+        let recv_ordered_topics = recv_topics.into_iter().map(|(mut t, s)| {
+            t.push_str(ORDERING_TOPIC_SUFFIX);
+            (t, s)
         });
         let (subscriptions, topics) =
             make_subscriptions(ps_client.clone(), recv_ordered_topics, true).await?;
@@ -475,14 +504,19 @@ impl OrderedPubSubConn {
                 ps_client,
                 subscriptions,
                 topics: Arc::new(Mutex::new(topics)),
+                recv_cache: Default::default(),
             },
         })
     }
 
     pub async fn convert(mut inner: PubSubConn) -> Result<Self, Report> {
-        let topics: Vec<_> = inner.subscriptions.keys().cloned().collect();
+        let topics: HashMap<_, _> = inner
+            .subscriptions
+            .iter()
+            .map(|(t, s)| (t.to_owned(), Some(s.id().to_owned())))
+            .collect();
         inner.cleanup().await?;
-        Self::new(inner.ps_client, topics.iter().map(String::as_str)).await
+        Self::new(inner.ps_client, topics).await
     }
 
     pub async fn cleanup(&mut self) -> Result<(), Report> {
@@ -545,38 +579,42 @@ impl ChunnelConnection for OrderedPubSubConn {
     }
 }
 
+/// Return handles to the subscriptions to the given topics, creating them if they don't already
+/// exist.
+///
+/// `topics`: topic_id -> subscription name to use for that topic (if none, generate a name)
+/// returns: ((topic_id -> subscription handle), (topic_id, topic handle))
 async fn make_subscriptions(
     ps_client: Client,
-    topics: impl IntoIterator<Item = impl AsRef<str>>,
+    topics: impl IntoIterator<Item = (String, Option<String>)>,
     with_ordering: bool,
 ) -> Result<(HashMap<String, Subscription>, HashMap<String, Topic>), Report> {
     trace!(?with_ordering, "starting make_subscriptions");
-    let mut topic_handles: HashMap<_, _> =
-        futures_util::future::try_join_all(topics.into_iter().map(|topic_id| {
+    let (topic_handles, topic_to_sub_name): (HashMap<_, _>, HashMap<_, _>) =
+        futures_util::future::try_join_all(topics.into_iter().map(|(topic_id, sub_id)| {
             let mut ps_client = ps_client.clone();
             async move {
-                let topic_id = topic_id.as_ref();
                 trace!(?topic_id, "get topic handle");
                 let topic = ps_client
-                    .topic(topic_id)
+                    .topic(&topic_id)
                     .await
                     .wrap_err_with(|| eyre!("get topic {:?}", &topic_id))?;
                 trace!(?topic_id, "retrieved topic handle");
-
+                let top = topic.ok_or_else(|| eyre!("Topic not found: {:?}", &topic_id))?;
                 Ok::<_, Report>((
-                    topic_id.to_owned(),
-                    topic.ok_or_else(|| eyre!("Topic not found: {:?}", &topic_id))?,
+                    (topic_id.clone(), top.clone()),
+                    (topic_id, (top, sub_id.unwrap_or_else(gen_resource_id))),
                 ))
             }
         }))
         .await?
         .into_iter()
-        .collect();
+        .unzip();
     trace!("done getting topic handles");
-
-    let subs = futures_util::future::try_join_all(topic_handles.iter_mut().map(
-        |(topic_id, topic)| async move {
-            let sub_id = gen_resource_id();
+    let subs = futures_util::future::try_join_all(topic_to_sub_name.into_iter().map(
+        |(topic_id, (mut top, sub_id))| {
+            let mut c = ps_client.clone();
+            async move {
             let sub_conf =
                 SubscriptionConfig::default().ack_deadline(chrono::Duration::seconds(15));
             let sub_conf = if with_ordering {
@@ -586,19 +624,20 @@ async fn make_subscriptions(
             };
 
             debug!(?topic_id, ?sub_id, "create subscription");
-            Ok::<_, Report>((
-                topic.id().to_owned(),
-                topic
-                    .create_subscription(&sub_id, sub_conf)
-                    .await
-                    .wrap_err_with(|| eyre!("create_subscription {:?}", &topic_id))?,
-            ))
-        },
+            match top.create_subscription(&sub_id, sub_conf).await {
+                Err(Error::Status(s)) if s.code() == tonic::Code::AlreadyExists => {
+                    // get handle instead
+                    let s = c.subscription(&sub_id).await?;
+                    Ok((topic_id, s.ok_or_else(|| eyre!("create_subscription returned AlreadyExists but fetching subscription failed"))?))
+                }
+                Ok(s) => Ok::<_, Report>((topic_id, s)),
+                Err(e) => Err(Report::from(e)),
+            }
+        }}
     ))
     .await?
     .into_iter()
     .collect();
-
     Ok((subs, topic_handles))
 }
 
@@ -624,14 +663,107 @@ mod test {
     };
     use google_cloud::pubsub::Client;
     use queue_steer::MessageQueueAddr;
-    use std::iter::once;
-    use std::sync::Once;
-    use tracing::info;
+    use std::{collections::HashMap, iter::once};
+    use std::{collections::HashSet, sync::Once};
+    use tracing::{info, info_span};
     use tracing_error::ErrorLayer;
     use tracing_futures::Instrument;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     pub static COLOR_EYRE: Once = Once::new();
+
+    #[ignore]
+    #[test]
+    fn shared_subscription() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(ErrorLayer::default());
+        let _guard = subscriber.set_default();
+        COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        const TEST_TOPIC_URL: &str = "my-topic3";
+        const SUB_NAME: &str = "my-sub1";
+        let res = rt.block_on(async move {
+            let project_name =
+                std::env::var("GCLOUD_PROJECT_NAME").wrap_err("GCLOUD_PROJECT_NAME env var")?;
+            let mut gcloud_client = Client::new(project_name.clone())
+                .await
+                .wrap_err("make client")?;
+            super::make_topic(&mut gcloud_client, TEST_TOPIC_URL.to_owned())
+                .await
+                .wrap_err("make my-topic3")?;
+
+            let pcn = PubSubConn::new(gcloud_client.clone(), Default::default())
+                .await
+                .wrap_err("making publisher")?;
+
+            let rcn1 = PubSubConn::new(
+                gcloud_client.clone(),
+                [(TEST_TOPIC_URL.to_owned(), Some(SUB_NAME.to_owned()))]
+                    .into_iter()
+                    .collect(),
+            )
+            .await
+            .wrap_err("making chunnel")?;
+            let rcn2 = PubSubConn::new(
+                gcloud_client.clone(),
+                [(TEST_TOPIC_URL.to_owned(), Some(SUB_NAME.to_owned()))]
+                    .into_iter()
+                    .collect(),
+            )
+            .await
+            .wrap_err("making chunnel")?;
+
+            let a = MessageQueueAddr {
+                topic_id: TEST_TOPIC_URL.to_string(),
+                group: None,
+            };
+            pcn.send((0..20).map(|i| (a.clone(), i.to_string())))
+                .await?;
+            let mut slots1: Vec<_> = (0..20).map(|_| None).collect();
+            let mut slots2: Vec<_> = (0..20).map(|_| None).collect();
+            let mut remaining: HashSet<String> = (0..20).map(|i| i.to_string()).collect();
+            while !remaining.is_empty() {
+                use futures_util::future::Either as FEither;
+                let (ms, r) = futures_util::future::select(
+                    rcn1.recv(&mut slots1[..]).instrument(info_span!("conn 1")),
+                    rcn2.recv(&mut slots2[..]).instrument(info_span!("conn 2")),
+                )
+                .await
+                .factor_first();
+                let rcv_on_left = match r {
+                    FEither::Left(_) => false,
+                    FEither::Right(_) => true,
+                };
+                for (_, m) in ms?.iter_mut().map_while(Option::take) {
+                    info!(?m, ?rcv_on_left, "received");
+                    if !remaining.remove(&m) {
+                        color_eyre::eyre::bail!("duplicate or invalid value {}", m);
+                    }
+                }
+            }
+
+            Ok(())
+        });
+        rt.block_on(async move {
+            let project_name =
+                std::env::var("GCLOUD_PROJECT_NAME").wrap_err("GCLOUD_PROJECT_NAME env var")?;
+            let mut gcloud_client = Client::new(project_name.clone())
+                .await
+                .wrap_err("make client")?;
+            super::delete_topic(&mut gcloud_client, TEST_TOPIC_URL.to_owned())
+                .await
+                .wrap_err("delete my-topic1")?;
+            Ok::<_, Report>(())
+        })
+        .unwrap();
+        res.unwrap();
+    }
 
     #[ignore]
     #[test]
@@ -644,11 +776,10 @@ mod test {
         COLOR_EYRE.call_once(|| color_eyre::install().unwrap_or(()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .enable_io()
+            .enable_all()
             .build()
             .unwrap();
-        const TEST_TOPIC_URL: &str = "my-topic1";
+        const TEST_TOPIC_URL: &str = "my-topic2";
 
         let res = rt.block_on(
             async move {
@@ -662,10 +793,13 @@ mod test {
                     .await
                     .wrap_err("make my-topic1")?;
 
-                let mut rch = OrderedPubSubConn::new(gcloud_client.clone(), vec![TEST_TOPIC_URL])
-                    .await
-                    .wrap_err("making chunnel")?;
-                let mut sch = OrderedPubSubConn::new(gcloud_client, vec![])
+                let mut rch = OrderedPubSubConn::new(
+                    gcloud_client.clone(),
+                    [(TEST_TOPIC_URL.to_owned(), None)].into_iter().collect(),
+                )
+                .await
+                .wrap_err("making chunnel")?;
+                let mut sch = OrderedPubSubConn::new(gcloud_client, HashMap::default())
                     .await
                     .wrap_err("making chunnel")?;
 
@@ -770,7 +904,7 @@ mod test {
             .enable_io()
             .build()
             .unwrap();
-        const TEST_TOPIC_URL: &str = "my-topic";
+        const TEST_TOPIC_URL: &str = "my-topic1";
 
         let res = rt.block_on(
             async move {
@@ -781,9 +915,12 @@ mod test {
                     .await
                     .wrap_err("make my-topic")?;
 
-                let mut ch = PubSubConn::new(gcloud_client, vec![TEST_TOPIC_URL])
-                    .await
-                    .wrap_err("making chunnel")?;
+                let mut ch = PubSubConn::new(
+                    gcloud_client,
+                    [(TEST_TOPIC_URL.to_owned(), None)].into_iter().collect(),
+                )
+                .await
+                .wrap_err("making chunnel")?;
 
                 let a = MessageQueueAddr {
                     topic_id: TEST_TOPIC_URL.to_string(),
