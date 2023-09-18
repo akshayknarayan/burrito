@@ -67,33 +67,29 @@ impl ProcessLine<EstOutputRateHist> for Process {
         &'a self,
         line_batch: impl Iterator<Item = EstOutputRateHist> + Send + 'a,
     ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + 'a>> {
-        let mut num_records_observed = 0;
-        for est_output in line_batch {
-            let client_ip = est_output.client_ip;
-            let num_records = est_output.len();
-            if num_records > 0 {
-                let msg = est_output
-                    .iter_quantiles(2)
-                    .map(|iv| {
+        let (num_records_observed, msg) = line_batch.fold(
+            (0, String::new()),
+            |(num_records_observed, mut msg), est_output| {
+                let client_ip = est_output.client_ip;
+                let num_records = est_output.len();
+                if num_records > 0 {
+                    msg.push_str(&format!("[{}]: Hist({}) | ", client_ip, num_records));
+                    for (q, v, c) in est_output.iter_quantiles(2).map(|iv| {
                         let quantile = iv.quantile_iterated_to();
                         let value = iv.value_iterated_to();
                         let cnt = iv.count_since_last_iteration();
                         (quantile, value, cnt)
-                    })
-                    .fold(
-                        format!("[{}]: Hist({}) | ", client_ip, num_records),
-                        |mut acc, (q, v, c)| {
-                            let m = format!("[{}]({}): {} | ", q, v, c);
-                            acc.push_str(&m);
-                            acc
-                        },
-                    );
-                info!(?msg, "got histogram update");
-            }
+                    }) {
+                        let m = format!("[{}]({}): {} | ", q, v, c);
+                        msg.push_str(&m);
+                    }
+                }
 
-            num_records_observed += num_records;
-        }
+                (num_records_observed + num_records, msg)
+            },
+        );
 
+        info!(?num_records_observed, ?msg, "consumer update");
         if num_records_observed > 0 {
             let recv_ts = self.clk.raw();
             // blocking not possible on unbounded channel
