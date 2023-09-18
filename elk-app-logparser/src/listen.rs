@@ -310,6 +310,7 @@ async fn serve_one_cn(
             cn.send(acks.drain(..)).await?;
             trace!(?num_acks, backlog = ?to_process.len(), "sent acks");
         } else {
+            let num_acks = acks.len();
             debug!(?num_acks, backlog = ?to_process.len(), "applying backpressure");
         }
 

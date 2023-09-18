@@ -49,12 +49,12 @@ macro_rules! gcp_stack {
             CxList::from(ord)
                 .wrap(SerializeChunnel::default())
                 .wrap(Base64Chunnel::default())
-                .wrap(PubSubChunnel::new($gcloud_client.clone(), [$topic])),
+                .wrap(PubSubChunnel::new($gcloud_client.clone(), [($topic, Some("elk-logparser"))])),
             CxList::from(SerializeChunnel::default())
                 .wrap(Base64Chunnel::default())
                 .wrap(OrderedPubSubChunnel::from(PubSubChunnel::new(
                     $gcloud_client.clone(),
-                    [$topic],
+                    [($topic, Some("elk-logparser"))],
                 ))),
         )))
     }};
