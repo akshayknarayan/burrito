@@ -298,14 +298,13 @@ async fn serve_one_cn(
         };
 
         trace!(sz = ?msgs.iter().map_while(|x| x.as_ref().map(|_| 1)).sum::<usize>(), "got batch");
+        acks.extend(
+            msgs.iter()
+                .filter_map(|m| m.as_ref().map(|(a, _)| (*a, Line::Ack))),
+        );
         to_process.extend(msgs.iter_mut().map_while(Option::take));
         // this has the effect of applying backpressure to the producer
         if to_process.len() < 128 {
-            acks.clear();
-            acks.extend(
-                msgs.iter()
-                    .filter_map(|m| m.as_ref().map(|(a, _)| (*a, Line::Ack))),
-            );
             let num_acks = acks.len();
             cn.send(acks.drain(..)).await?;
             trace!(?num_acks, backlog = ?to_process.len(), "sent acks");
