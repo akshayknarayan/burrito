@@ -136,6 +136,14 @@ async fn logparser(opt: Opt) -> Result<(), Report> {
     }
 }
 
+async fn do_recv<C: ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send>(
+    conn: &C,
+    mut buf: Vec<Option<(MessageQueueAddr, ParsedLine)>>,
+) -> Result<Vec<Option<(MessageQueueAddr, ParsedLine)>>, Report> {
+    conn.recv(&mut buf[..]).await?;
+    Ok(buf)
+}
+
 async fn inner(
     opt: Opt,
     conn: impl ChunnelConnection<Data = (MessageQueueAddr, ParsedLine)> + Send,
@@ -152,16 +160,21 @@ async fn inner(
     let fwd_conn = connect::connect_local(opt.forward_addr, local_root, opt.encr_spec).await?;
 
     info!(?curr_cn_state, "ready");
-    let mut slots = vec![None; 16];
     let mut processed_entries = 0;
     let mut received_lines: HashMap<IpAddr, Vec<ParsedLine>> = Default::default();
     let mut est_output_rates: HashMap<IpAddr, EstOutputRate> = Default::default();
     let mut send_wait = Either::Left(futures_util::future::pending());
+    let mut recv_fut = Box::pin(do_recv(&conn, vec![None; 32]));
     let interval = Duration::from_millis(opt.interval_ms);
     loop {
         tokio::select! {
-            ms = conn.recv(&mut slots[..]) => {
-                handle_recv(ms?, &mut received_lines, &mut est_output_rates, &mut send_wait, &mut processed_entries, interval, clk.raw(), &s)?;
+            ms = &mut recv_fut => {
+                let mut b = ms?;
+                let processed = handle_recv(&mut b[..], &mut received_lines, &mut est_output_rates, &mut send_wait, &mut processed_entries, interval, clk.raw(), &s)?;
+                if processed >= (b.len() * 3 / 4) {
+                    b.resize(std::cmp::min(b.len() * 2, 512), None);
+                }
+                recv_fut = Box::pin(do_recv(&conn, b));
             }
             // dump output <interval> after we see an entry, then reset the counter
             _ = &mut send_wait, if send_wait.is_right() => {
@@ -198,7 +211,7 @@ async fn inner(
         interval: Duration,
         recv_ts: u64,
         sender: &flume::Sender<ProcessRecord>,
-    ) -> Result<(), Report> {
+    ) -> Result<usize, Report> {
         let mut processed_entries = 0;
         for v in received_lines.values_mut() {
             v.clear();
@@ -240,6 +253,6 @@ async fn inner(
             return Err(eyre!("Exiting due to channel send failure"));
         }
 
-        Ok(())
+        Ok(processed_entries)
     }
 }
