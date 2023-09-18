@@ -352,7 +352,8 @@ def drain_consumer(cfg, outdir):
             o = m.run(f"wc -l {outdir}/{desc}-consumer.data", wd=m.dir, quiet=True)
             if not m.check_code(o):
                 raise Exception(f"could not find consumer data file: {o}")
-            curr_lines = int(o.stdout.decode('utf-8').strip().split()[0])
+            out = o.stdout if type(o.stdout) == str else o.stdout.decode('utf-8')
+            curr_lines = int(out.strip().split()[0])
             now = time.time()
             if curr_lines > cons_data_out_lines:
                 last_increase = now
@@ -410,6 +411,7 @@ def exp(cfg, outdir, overwrite=False, setup_only=False):
     cfg["machines"]["consumer"]["conn"].run("pkill -INT consumer")
     stop_kafka(cfg)
     stop_redis(cfg)
+    sh.run("gcloud pubsub subscriptions delete elk-logparser elk-logparser.ord", shell=True)
     if failed != None:
         raise failed
 
