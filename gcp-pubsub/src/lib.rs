@@ -329,7 +329,6 @@ impl ChunnelConnection for PubSubConn {
             // because we clone the subscriptions, any messages go into the cloned versions of the
             // buffers, so checking for existing stuff in the subscription is useless. we need to
             // maintain our own buffer.
-
             async fn ack_and_drain_locked_cache(
                 rcg: &mut MutexGuard<'_, VecDeque<(String, Message)>>,
                 limit: usize,
@@ -492,8 +491,9 @@ impl OrderedPubSubConn {
         ps_client: Client,
         recv_topics: HashMap<String, Option<String>>,
     ) -> Result<Self, Report> {
-        let recv_ordered_topics = recv_topics.into_iter().map(|(mut t, s)| {
+        let recv_ordered_topics = recv_topics.into_iter().map(|(mut t, mut s)| {
             t.push_str(ORDERING_TOPIC_SUFFIX);
+            s.as_mut().map(|x| x.push_str(ORDERING_TOPIC_SUFFIX));
             (t, s)
         });
         let (subscriptions, topics) =
