@@ -106,8 +106,9 @@ pub async fn connect(
         negotiate_rendezvous(st, redis, topic.to_owned(), |np, select| {
             if Arc::ptr_eq(select, &gcp_switch_ordering_handle) {
                 match np {
-                    1 | 2 => Some(Either::Left(())),
-                    3.. => Some(Either::Right(())),
+                    //1 | 2 => Some(Either::Left(())),
+                    //3.. => Some(Either::Right(())),
+                    1.. => Some(Either::Right(())),
                     _ => unreachable!(),
                 }
             } else {
@@ -152,8 +153,9 @@ pub async fn connect_gcp_only(
             if Arc::ptr_eq(select, &gcp_switch_ordering_handle) {
                 info!(?np, "prefer Right when np >= 3");
                 match np {
-                    1 | 2 => Some(Either::Left(())),
-                    3.. => Some(Either::Right(())),
+                    //1 | 2 => Some(Either::Left(())),
+                    //3.. => Some(Either::Right(())),
+                    1.. => Some(Either::Right(())),
                     _ => unreachable!(),
                 }
             } else {
