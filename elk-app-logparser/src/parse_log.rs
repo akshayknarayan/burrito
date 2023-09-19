@@ -61,12 +61,14 @@ const SAMPLE_IPS: [IpAddr; 10] = [
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
 ];
 
+const SAMPLE_PAYLOAD: &'static str = unsafe { std::str::from_utf8_unchecked(&['a' as _; 128]) };
+
 pub fn sample_parsed_lines() -> impl Iterator<Item = ParsedLine> {
     (0usize..).map(move |i| {
         let ips_idx = i % SAMPLE_IPS.len();
         ParsedLine {
             client_ip: SAMPLE_IPS[ips_idx],
-            text: "foo".to_owned(),
+            text: SAMPLE_PAYLOAD.to_owned(),
         }
     })
 }
@@ -80,20 +82,33 @@ pub fn sample_logentry_lines() -> impl Iterator<Item = String> {
         DateTime::parse_from_rfc3339("1996-12-19T16:39:57.125-08:00")
             .unwrap()
             .into();
-    sample_parsed_lines()
-        .enumerate()
-        .map(move |(i, ParsedLine { client_ip, text })| {
-            let timestamp =
-                sample_start_time + Duration::milliseconds((i * SAMPLE_INTERARRIVAL_MS) as i64);
-            format!(
-                "{ip} - - [{ts}] \"{txt}\" {sc} {os}",
-                ip = client_ip,
-                ts = timestamp.to_rfc3339(),
-                txt = text,
-                sc = SAMPLE_STATUS_CODE,
-                os = SAMPLE_OBJ_SIZE,
-            )
-        })
+    lines_from_ts(
+        (0..)
+            .map(move |i| {
+                sample_start_time + Duration::milliseconds((i * SAMPLE_INTERARRIVAL_MS) as i64)
+            })
+            .zip(sample_parsed_lines()),
+    )
+}
+
+pub fn live_logentry_lines() -> impl Iterator<Item = String> {
+    let ts = std::iter::repeat(()).map(|_| chrono::Utc::now());
+    lines_from_ts(ts.zip(sample_parsed_lines()))
+}
+
+fn lines_from_ts(
+    ts: impl Iterator<Item = (DateTime<Utc>, ParsedLine)>,
+) -> impl Iterator<Item = String> {
+    ts.map(|(timestamp, ParsedLine { client_ip, text })| {
+        format!(
+            "{ip} - - [{ts}] \"{txt}\" {sc} {os}",
+            ip = client_ip,
+            ts = timestamp.to_rfc3339(),
+            txt = text,
+            sc = SAMPLE_STATUS_CODE,
+            os = SAMPLE_OBJ_SIZE,
+        )
+    })
 }
 
 pub fn parse_raw(lines: impl Iterator<Item = String>) -> impl Iterator<Item = ParsedLine> {

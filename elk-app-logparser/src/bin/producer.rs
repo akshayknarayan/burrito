@@ -20,7 +20,7 @@ use tracing_subscriber::prelude::*;
 
 use elk_app_logparser::{
     connect,
-    parse_log::{sample_logentry_lines, Line},
+    parse_log::{live_logentry_lines, Line},
     EncrSpec,
 };
 
@@ -195,7 +195,7 @@ async fn get_line_producer(
                 )
             } else {
                 Either::Right(futures_util::stream::iter(
-                    sample_logentry_lines().map(|x| Line::Report(x)),
+                    live_logentry_lines().map(|x| Line::Report(x)),
                 ))
             }
             .ready_chunks(16),
