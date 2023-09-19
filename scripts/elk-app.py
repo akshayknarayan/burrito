@@ -179,12 +179,12 @@ def stop_kafka(cfg):
     m.run("microk8s kubectl delete -f ./scripts/elk-app/kafka-deployment.yml", wd=m.dir, quiet=True)
     agenda.subtask("stopped kafka")
 
-def wait_ready(m: ConnectionWrapper, outf, search_string="ready"):
+def wait_ready(m: ConnectionWrapper, outf, search_string=" ready "):
     console = Console()
-    with console.status(f"[{m.name}] wait for {search_string} in {m.dir}/{outf}") as status:
+    with console.status(f"[{m.name}] wait for '{search_string}' in {m.dir}/{outf}") as status:
         now = time.time()
         while True:
-            sc = m.run(f"grep -q {search_string} {outf}", wd=m.dir, quiet=True)
+            sc = m.run(f"grep -q '{search_string}' {outf}", wd=m.dir, quiet=True)
             if m.check_code(sc):
                 break
             if time.time() - now > 15:
@@ -242,7 +242,7 @@ def start_logingest(cfg, outf, bin_root = "./target/release"):
     num_workers = cfg['exp']['logingest']['workers']
     encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
-    ok = m.run(f"RUST_LOG=info GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logingest \
+    ok = m.run(f"RUST_LOG=info,gcp_pubsub=debug GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logingest \
         --logging \
         --gcp-project-name={gcp_project} \
         --redis-addr={redis_addr} \
@@ -287,7 +287,7 @@ def start_logparser(m, cfg, outf, bin_root = "./target/release"):
 
     num_parsers = cfg['exp']['logparser']['processes-per-machine']
     for proc_num in range(num_parsers):
-        ok = m.run(f"RUST_LOG=info GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logparser \
+        ok = m.run(f"RUST_LOG=info,gcp_pubsub=debug GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logparser \
             --logging \
             --gcp-project-name={gcp_project} \
             --redis-addr={redis_addr} \
@@ -305,8 +305,6 @@ def start_logparser(m, cfg, outf, bin_root = "./target/release"):
             )
         if not m.check_code(ok):
             raise Exception(f"failed to start logparser {proc_num}")
-    agenda.subtask(f"[{m.name}] wait for {num_parsers} logparsers start")
-    for proc_num in range(num_parsers):
         wait_ready(m, f"{outf}-{proc_num}.out")
 
 def start_consumer(cfg, outf, bin_root = "./target/release"):
@@ -365,7 +363,7 @@ def drain_consumer(cfg, outdir):
             time.sleep(5)
     agenda.subtask(f"consumer drained after {time.time() - start_drain}s")
 
-def exp(cfg, outdir, overwrite=False, setup_only=False):
+def exp(cfg, outdir, overwrite=False, setup_only=False, debug=False):
     desc = cfg['exp']['desc']
     assert (
         cfg["exp"]["logparser"]['machines']
@@ -391,15 +389,15 @@ def exp(cfg, outdir, overwrite=False, setup_only=False):
         start_kafka(cfg)
         if setup_only:
             raise Exception("only doing setup")
-        start_consumer(cfg, f"{outdir}/{desc}-consumer")
+        start_consumer(cfg, f"{outdir}/{desc}-consumer", bin_root='./target/debug' if debug else "./target/release")
         time.sleep(5)
         i = 0
         for logparser_machine_idx in range(cfg["exp"]["logparser"]["machines"]):
             c = cfg['machines']['logparser'][logparser_machine_idx]
-            start_logparser(c['conn'], cfg, f"{outdir}/{desc}-logparser-{i}")
+            start_logparser(c['conn'], cfg, f"{outdir}/{desc}-logparser-{i}", bin_root='./target/debug' if debug else "./target/release")
             i += 1
         start_logingest(cfg, f"{outdir}/{desc}-logingest")
-        run_producer(cfg, f"{outdir}/{desc}-producer")
+        run_producer(cfg, f"{outdir}/{desc}-producer", bin_root='./target/debug' if debug else "./target/release")
         drain_consumer(cfg, outdir)
     except Exception as e:
         agenda.failure(f"failed: {desc}")
@@ -624,6 +622,7 @@ if __name__ == '__main__':
     parser.add_argument('--gcp_creds_path', type=str, required=False)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--setup_only', action='store_true',  required=False)
+    parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
     agenda.task(f"reading cfg {args.config}")
     cfg = toml.load(args.config)
@@ -655,22 +654,23 @@ if __name__ == '__main__':
         agenda.subfailure(f"not all commits equal: {[local_commit, producer_commit, logingest_commit, consumer_commit] + list(logparser_commits)}")
         raise Exception("Commits mismatched on machines")
 
-    console = Console()
-    with console.status("compiling elk-app") as status:
-        ms = [cfg['machines']['producer']['conn'],
-            cfg['machines']['logingest']['conn'],
-            cfg['machines']['consumer']['conn'],
-            ] + [p['conn'] for p in cfg['machines']['logparser']]
-        out = [None for _ in range(len(ms))]
-        ts = [
-            threading.Thread(target=do_compile, args=(m,i,out))
-            for (i,m) in zip(range(len(ms)), ms)
-        ]
-        [t.start() for t in ts]
-        [t.join() for t in ts]
-        if any(o != None for o in out):
-            raise Exception(f"{out}")
-    agenda.task("done compiling")
+    if not args.debug:
+        console = Console()
+        with console.status("compiling elk-app") as status:
+            ms = [cfg['machines']['producer']['conn'],
+                cfg['machines']['logingest']['conn'],
+                cfg['machines']['consumer']['conn'],
+                ] + [p['conn'] for p in cfg['machines']['logparser']]
+            out = [None for _ in range(len(ms))]
+            ts = [
+                threading.Thread(target=do_compile, args=(m,i,out))
+                for (i,m) in zip(range(len(ms)), ms)
+            ]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+            if any(o != None for o in out):
+                raise Exception(f"{out}")
+        agenda.task("done compiling")
 
     # connect to the redis and kafka machines.
     (cfg['machines']['redis']['conn'], _) = connect(cfg['machines']['redis'])
@@ -692,5 +692,5 @@ if __name__ == '__main__':
     cfgs = iter_confs(cfg)
     for c in cfgs:
         agenda.task(f"{num_remaining} experiments remaining")
-        exp(c, args.outdir, setup_only=args.setup_only)
+        exp(c, args.outdir, setup_only=args.setup_only, debug=args.debug)
         num_remaining -= 1
