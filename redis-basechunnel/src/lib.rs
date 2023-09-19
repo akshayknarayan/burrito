@@ -50,6 +50,7 @@ impl RedisBase {
 lazy_static::lazy_static! {
     static ref ROUND_CTR_LOCK_SCRIPT: redis::Script = redis::Script::new(include_str!("./transition.lua"));
     static ref TRY_INIT_SCRIPT: redis::Script = redis::Script::new(include_str!("./tryinit.lua"));
+    static ref POLL_ENTRY_SCRIPT: redis::Script = redis::Script::new(include_str!("./pollentry.lua"));
 }
 
 // TODO XXX replace expiry_time with redis server TIME.
@@ -72,55 +73,75 @@ impl RendezvousBackend for RedisBase {
         addr_ctr.push_str("-members");
         let mut round_ctr = addr.clone();
         round_ctr.push_str("-roundctr");
+        let mut addr_join_lock = addr.clone();
+        addr_join_lock.push_str("-joinlock");
+        let joinlock_wait = format!("__keyspace@*__:{}", &addr_join_lock);
         Box::pin(
             async move {
                 let neg_nonce = bincode::serialize(&offer).wrap_err("serialize entry")?;
-                let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                    .as_millis() as u64;
-                let insert_time = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                    .as_millis() as u64;
-
-                let (joined, round_ctr_value, conn_count, got_semantics): (
-                    bool,
-                    usize,
-                    usize,
-                    Vec<u8>,
-                ) = TRY_INIT_SCRIPT
-                    .key(&addr)
-                    .key(&round_ctr)
-                    .key(&addr_ctr)
-                    .arg(&neg_nonce[..])
-                    .arg(&self.client_name)
-                    .arg(expiry_time)
-                    .arg(insert_time)
-                    .invoke_async(&mut self.redis_conn)
-                    .await
-                    .wrap_err_with(|| eyre!("try_init failed on {:?}", &addr))?;
-                if joined {
-                    Ok(NegotiateRendezvousResult::Matched {
-                        num_participants: 1,
-                        round_number: round_ctr_value,
-                    })
-                } else {
-                    debug!(res = "existed", ?conn_count, "got try_init response");
-                    // was not set, which means someone was already here.
-                    if conn_count == 0 {
-                        // setnx failed, but we're the only ones home. override.
-                        self.transition(addr.clone(), offer).await?;
-                        Ok(NegotiateRendezvousResult::Matched {
-                            num_participants: 1,
-                            round_number: round_ctr_value,
-                        })
-                    } else {
-                        let present_semantics: RendezvousEntry =
-                            bincode::deserialize(&got_semantics).wrap_err("deserialize entry")?;
-                        Ok(NegotiateRendezvousResult::NoMatch {
-                            entry: present_semantics,
-                            num_participants: conn_count,
-                            round_number: round_ctr_value,
-                        })
+                loop {
+                    let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                        .as_millis() as u64;
+                    let insert_time = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                        .as_millis() as u64;
+                    let (created, round_ctr_value, conn_count, got_semantics): (
+                        usize,
+                        usize,
+                        usize,
+                        Vec<u8>,
+                    ) = TRY_INIT_SCRIPT
+                        .key(&addr)
+                        .key(&round_ctr)
+                        .key(&addr_ctr)
+                        .key(&addr_join_lock)
+                        .arg(&neg_nonce[..])
+                        .arg(&self.client_name)
+                        .arg(expiry_time)
+                        .arg(insert_time)
+                        .invoke_async(&mut self.redis_conn)
+                        .await
+                        .wrap_err_with(|| eyre!("try_init failed on {:?}", &addr))?;
+                    debug!(
+                        ?created,
+                        ?conn_count,
+                        ?round_ctr_value,
+                        "got try_init response"
+                    );
+                    match created {
+                        2 => {
+                            return Ok(NegotiateRendezvousResult::Matched {
+                                num_participants: conn_count,
+                                round_number: round_ctr_value,
+                            });
+                        }
+                        1 if conn_count == 0 => {
+                            // setnx failed, but we're the only ones home. override.
+                            self.transition(addr.clone(), offer).await?;
+                            return Ok(NegotiateRendezvousResult::Matched {
+                                num_participants: 1,
+                                round_number: round_ctr_value,
+                            });
+                        }
+                        1 => {
+                            let present_semantics: RendezvousEntry =
+                                bincode::deserialize(&got_semantics)
+                                    .wrap_err("deserialize entry")?;
+                            return Ok(NegotiateRendezvousResult::NoMatch {
+                                entry: present_semantics,
+                                num_participants: conn_count,
+                                round_number: round_ctr_value,
+                            });
+                        }
+                        0 => {
+                            debug!(?addr, "joinlock is locked, waiting");
+                            self.redis_pubsub.psubscribe(&joinlock_wait).await?;
+                            self.redis_pubsub.on_message().next().await.unwrap();
+                            self.redis_pubsub.punsubscribe(&joinlock_wait).await?;
+                            continue;
+                        }
+                        i => return Err(eyre!("Invalid return value from try_init: {}", i)),
                     }
                 }
             }
@@ -140,10 +161,12 @@ impl RendezvousBackend for RedisBase {
     ) -> Pin<Box<dyn Future<Output = Result<NegotiateRendezvousResult, Self::Error>> + Send + 'a>>
     {
         let a = addr.clone();
-        let mut addr_ctr = addr.clone();
-        addr_ctr.push_str("-members");
+        let mut addr_members_key = addr.clone();
+        addr_members_key.push_str("-members");
         let mut round_ctr_key = addr.clone();
         round_ctr_key.push_str("-roundctr");
+        let mut addr_join_lock_key = addr.clone();
+        addr_join_lock_key.push_str("-joinlock");
         Box::pin(
             async move {
                 let insert_time = std::time::SystemTime::now()
@@ -152,23 +175,24 @@ impl RendezvousBackend for RedisBase {
                 let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                     .as_millis() as u64;
-                let mut r = redis::pipe();
-                let (got_value, round_ctr, _, _, conn_count): (
-                    Vec<u8>,
-                    usize,
-                    isize,
-                    isize,
-                    usize,
-                ) = r
-                    .atomic()
-                    .get(&addr)
-                    .get(&round_ctr_key)
-                    .zrembyscore(&addr_ctr, 0usize, expiry_time)
-                    .zadd(&addr_ctr, &self.client_name, insert_time as usize)
-                    .zcard(&addr_ctr)
-                    .query_async(&mut self.redis_conn)
-                    .await?;
-
+                let (got_value, round_ctr, conn_count): (
+                    Option<Vec<u8>>,
+                    Option<usize>,
+                    Option<usize>,
+                ) = POLL_ENTRY_SCRIPT
+                    .key(&addr)
+                    .key(&round_ctr_key)
+                    .key(&addr_members_key)
+                    .key(&addr_join_lock_key)
+                    .arg(&self.client_name)
+                    .arg(expiry_time)
+                    .arg(insert_time)
+                    .invoke_async(&mut self.redis_conn)
+                    .await
+                    .wrap_err_with(|| eyre!("poll_entry failed on {:?}", &addr))?;
+                let got_value = got_value.ok_or_else(|| eyre!("nonce value was nil"))?;
+                let round_ctr = round_ctr.ok_or_else(|| eyre!("round-ctr was nil"))?;
+                let conn_count = conn_count.ok_or_else(|| eyre!("conn-count was nil"))?;
                 // first, check the round.
                 // if the round didn't change, then no transition has happened, so the semantics
                 // won't have changed.
@@ -178,14 +202,20 @@ impl RendezvousBackend for RedisBase {
                         trace!(?round_ctr, ?conn_count, "Same round");
                         let present_semantics: RendezvousEntry =
                             bincode::deserialize(&got_value).wrap_err("deserialize entry")?;
-                        ensure!(
-                            present_semantics == curr_entry,
-                            "KV store polluted: round didn't advance but semantics changed"
-                        );
-                        Ok(NegotiateRendezvousResult::Matched {
-                            num_participants: conn_count,
-                            round_number: round_ctr,
-                        })
+                        if present_semantics == curr_entry {
+                            Ok(NegotiateRendezvousResult::Matched {
+                                num_participants: conn_count,
+                                round_number: round_ctr,
+                            })
+                        } else {
+                            // if we tried to transition and converted to applier, this is how we
+                            // find the new entry.
+                            Ok(NegotiateRendezvousResult::NoMatch {
+                                entry: present_semantics,
+                                num_participants: conn_count,
+                                round_number: round_ctr,
+                            })
+                        }
                     }
                     std::cmp::Ordering::Greater => {
                         let staged_key = format!("{}-{}-staged", &addr, round_ctr);
@@ -206,9 +236,9 @@ impl RendezvousBackend for RedisBase {
                             ) = r
                                 .atomic()
                                 .get(&staged_key)
-                                .zrembyscore(&addr_ctr, 0usize, expiry_time)
-                                .zadd(&addr_ctr, &self.client_name, insert_time as usize)
-                                .zcard(&addr_ctr)
+                                .zrembyscore(&addr_members_key, 0usize, expiry_time)
+                                .zadd(&addr_members_key, &self.client_name, insert_time as usize)
+                                .zcard(&addr_members_key)
                                 .query_async(&mut self.redis_conn)
                                 .await?;
                             if let Some(sv) = staged_val {
@@ -240,6 +270,39 @@ impl RendezvousBackend for RedisBase {
             }
             .instrument(debug_span!("redis_poll", addr = ?&a)),
         )
+    }
+
+    fn leave<'a>(
+        &'a mut self,
+        addr: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        let mut addr_members_key = addr.clone();
+        addr_members_key.push_str("-members");
+        let mut addr_join_lock_key = addr.clone();
+        addr_join_lock_key.push_str("-joinlock");
+        Box::pin(async move {
+            self.redis_pubsub
+                .punsubscribe::<Option<String>>(None)
+                .await
+                .wrap_err("unsubscribe")?;
+            let mut r = redis::pipe();
+            let v: Option<String> = r
+                .get(&addr_join_lock_key)
+                .query_async(&mut self.redis_conn)
+                .await?;
+            let mut r = redis::pipe();
+            if v.is_some_and(|s| s == addr) {
+                r.del(&addr_join_lock_key)
+                    .query_async(&mut self.redis_conn)
+                    .await?;
+                Ok(())
+            } else {
+                r.zrem(&addr_members_key, &self.client_name)
+                    .query_async(&mut self.redis_conn)
+                    .await?;
+                Ok(())
+            }
+        })
     }
 
     /// After how long without a poll should this connection endpoint be considered dead?
@@ -276,8 +339,8 @@ impl RendezvousBackend for RedisBase {
         Self: Send,
     {
         let a = addr.clone();
-        let mut addr_members = addr.clone();
-        addr_members.push_str("-members");
+        let mut addr_members_key = addr.clone();
+        addr_members_key.push_str("-members");
         let mut round_ctr_key = addr.clone();
         round_ctr_key.push_str("-roundctr");
         Box::pin(
@@ -293,15 +356,6 @@ impl RendezvousBackend for RedisBase {
                         return Ok(x);
                     }
                 };
-
-                // there are 2 keys to listen on:
-                // 1. -members covers cases (1) and (2) above (join or leave)
-                // 2. -roundctr covers case (3) (transition)
-                let channel_name = format!("__keyspace@*__:{}", &addr_members);
-                let channel_ctr_name = format!("__keyspace@*__:{}", &round_ctr_key);
-                self.redis_pubsub.psubscribe(&channel_name).await?;
-                self.redis_pubsub.psubscribe(&channel_ctr_name).await?;
-                debug!(?channel_name, ?channel_ctr_name, "waiting for events");
 
                 // there is a race between the round_ctr incremented -> our notification -> read
                 // and the staged-key being written. During this time poll_entry might return the
@@ -432,6 +486,14 @@ impl RendezvousBackend for RedisBase {
                     }
                 }
 
+                // there are 2 keys to listen on:
+                // 1. -members covers cases (1) and (2) above (join or leave)
+                // 2. -roundctr covers case (3) (transition)
+                let channel_name = format!("__keyspace@*__:{}", &addr_members_key);
+                let channel_ctr_name = format!("__keyspace@*__:{}", &round_ctr_key);
+                self.redis_pubsub.psubscribe(&channel_name).await?;
+                self.redis_pubsub.psubscribe(&channel_ctr_name).await?;
+                debug!(?channel_name, ?channel_ctr_name, "waiting for events");
                 let res =
                     notify_refresh_loop(self, addr, curr_entry, curr_round, curr_num_participants)
                         .await;
@@ -446,18 +508,19 @@ impl RendezvousBackend for RedisBase {
     /// Transition to the new semantics `new_entry` on `addr`.
     ///
     /// Begins a commit. Returns once the staged update counter reaches the number of unexpired
-    /// partiparticipants.
-    /// At that time the new semantics are in play.
+    /// participants. At that time the new semantics are in play.
     fn transition<'a>(
         &'a mut self,
         addr: String,
         new_entry: RendezvousEntry,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>> {
         let a = addr.clone();
-        let mut addr_members = addr.clone();
-        addr_members.push_str("-members");
+        let mut addr_members_key = addr.clone();
+        addr_members_key.push_str("-members");
         let mut round_ctr_key = addr.clone();
         round_ctr_key.push_str("-roundctr");
+        let mut addr_join_lock_key = addr.clone();
+        addr_join_lock_key.push_str("-joinlock");
 
         // 1. get the round counter.
         // if even: there's no transition happening now, we can go ahead
@@ -473,14 +536,19 @@ impl RendezvousBackend for RedisBase {
         // if applier:
         // 2. read staged key. if == our proposal, just call wait_commit and exit once it returns.
         //    otherwise, error out.
-
         Box::pin(
             async move {
                 let neg_nonce = bincode::serialize(&new_entry).wrap_err("serialize entry")?;
                 trace!("starting transition");
-                let (locked, round_ctr): (bool, usize) = ROUND_CTR_LOCK_SCRIPT.key(&round_ctr_key).invoke_async(&mut self.redis_conn).await.wrap_err("start transition failed")?;
-                let staged_val = format!("{}-{}-staged", &addr, round_ctr);
-                let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
+                let (locked, round_ctr): (bool, usize) = ROUND_CTR_LOCK_SCRIPT
+                    .key(&round_ctr_key)
+                    .key(&addr_join_lock_key)
+                    .arg(&self.client_name)
+                    .invoke_async(&mut self.redis_conn)
+                    .await
+                    .wrap_err("start transition failed")?;
+                let staged_val_key = format!("{}-{}-staged", &addr, round_ctr);
+                let staged_commit_counter_key = format!("{}-{}-committed-cnt", &addr, round_ctr);
 
                 let insert_time = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
@@ -494,15 +562,15 @@ impl RendezvousBackend for RedisBase {
                     let mut r = redis::pipe();
                     let (set_staged, set_commit_ctr, _, _, conn_count): (isize, isize, isize, isize, usize) = r
                         .atomic()
-                        .set_nx(&staged_val, neg_nonce.clone())
-                        .set_nx(&staged_commit_counter, 1)
-                        .zrembyscore(&addr_members, 0, expiry_time)
-                        .zadd(&addr_members, &self.client_name, insert_time as usize)
-                        .zcard(&addr_members)
+                        .set_nx(&staged_val_key, neg_nonce.clone())
+                        .set_nx(&staged_commit_counter_key, 1)
+                        .zrembyscore(&addr_members_key, 0, expiry_time)
+                        .zadd(&addr_members_key, &self.client_name, insert_time as usize)
+                        .zcard(&addr_members_key)
                         .query_async(&mut self.redis_conn)
                         .await.wrap_err("Set staged value")?;
                     ensure!(set_staged == 1 && set_commit_ctr == 1, "Polluted KV store: Locked commit but staged values already present");
-                    trace!(?set_staged, ?staged_val, "Wrote staged value");
+                    trace!(?set_staged, ?staged_val_key, "Wrote staged value");
                     if conn_count > 1 {
                         self.wait_committer(addr.clone(), round_ctr, 1, conn_count).await?;
                     } else {
@@ -512,7 +580,17 @@ impl RendezvousBackend for RedisBase {
                     // done. write to real key, delete staging keys, and re-incr round counter to even
                     let mut r = redis::pipe();
                     trace!("Cleaning up commit keys");
-                    let (_, _, _, round_ctr): ((), isize, isize, usize) = match r.atomic().set(&addr, neg_nonce).del(&staged_val).del(&staged_commit_counter).incr(&round_ctr_key, 1usize).query_async(&mut self.redis_conn).await.wrap_err("Cleanup on commit keys") {
+                    let (_, _, _, round_ctr): ((), isize, isize, usize) = match {
+                        r
+                            .atomic()
+                            .set(&addr, neg_nonce)
+                            .del(&staged_val_key)
+                            .del(&staged_commit_counter_key)
+                            .incr(&round_ctr_key, 1usize)
+                            .query_async(&mut self.redis_conn)
+                            .await
+                            .wrap_err("Cleanup on commit keys")
+                    } {
                         Ok(x) => x,
                         Err(e) => {
                             tracing::error!(err = ?&e, "cleanup commit failed");
@@ -523,33 +601,34 @@ impl RendezvousBackend for RedisBase {
                     debug!("Wrote committed semantics and cleaned up commit keys");
                     Ok(round_ctr)
                 } else {
-                    debug!(?round_ctr, "Existing in-progress transition, try converting to applier");
-                    // we can be an applier if -staged matches what we are trying to commit.
-                    // otherwise, we will error out.
+                    debug!(?round_ctr, "Existing in-progress transition, convert to applier");
+                    // it's impossible to tell here whether the new stack will apply, so we are
+                    // just going to become an applier and wait for commit, then return the stack.
+                    // if at that point the stack is incompatible, we can error out or start a new
+                    // transition.
                     let mut r = redis::pipe();
-                    // the committer might have written the lock but not yet the data.
-                    let (present_semantics, curr_count, conn_count) = loop {
+                    // the committer might have written the lock but not yet the data, so loop on
+                    // reading it since we know it is coming.
+                    let (curr_count, conn_count) = loop {
                         let insert_time = std::time::SystemTime::now()
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                             .as_millis() as u64;
                         let expiry_time = (std::time::SystemTime::now() - self.liveness_timeout)
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                             .as_millis() as u64;
-                        let (ps, curr_cnt, _, _, conn_cnt): (Option<Vec<u8>>, Option<usize>, (), (), usize) = r
+                        let (curr_cnt, _, _, conn_cnt): (Option<usize>, (), (), usize) = r
                             .atomic()
-                            .get(&staged_val)
-                            .get(&staged_commit_counter)
-                            .zrembyscore(&addr_members, 0, expiry_time)
-                            .zadd(&addr_members, &self.client_name, insert_time as usize)
-                            .zcard(&addr_members)
+                            .get(&staged_commit_counter_key)
+                            .zrembyscore(&addr_members_key, 0, expiry_time)
+                            .zadd(&addr_members_key, &self.client_name, insert_time as usize)
+                            .zcard(&addr_members_key)
                             .query_async(&mut self.redis_conn)
                             .await?;
-                        if let (Some(p), Some(c)) = (ps, curr_cnt) {
-                             break (p, c, conn_cnt);
+                        if let Some(c) = curr_cnt {
+                             break (c, conn_cnt);
                         }
                     };
 
-                    ensure!(present_semantics == neg_nonce, "Incompatible commit already in progress on {:?}, round {:?}", &addr, round_ctr);
                     ensure!(conn_count > 1, "KV store polluted on {:?}: {:?} participants but found existing commit for round {:?}", &addr, conn_count, round_ctr);
                     // we are an applier now.
                     debug!(?round_ctr, ?curr_count, ?conn_count, "Converted to applier");
@@ -607,15 +686,14 @@ impl RedisBase {
         let channel_name = format!("__keyspace@*__:{}", &staged_commit_counter);
         self.redis_pubsub.psubscribe(&channel_name).await?;
         debug!(this = "applier", "waiting on further updates");
+        let mut refresh_to = Box::pin(tokio::time::sleep(self.liveness_timeout / 2));
         loop {
             // wait for some event on the key.
             // redis subscribe will never return None.
-            let refresh_to = tokio::time::sleep(self.liveness_timeout / 2);
-            tokio::pin!(refresh_to);
             let mut do_refresh = false;
             let done = match futures_util::future::select(
                 self.redis_pubsub.on_message().next(),
-                refresh_to,
+                &mut refresh_to,
             )
             .await
             {
@@ -629,13 +707,13 @@ impl RedisBase {
                     }
 
                     debug!(?msg, ?event, ?round_ctr, "staged-update value changed");
-
                     event.contains("del")
                 }
                 futures_util::future::Either::Left((None, _)) => unreachable!(),
                 futures_util::future::Either::Right((_, _pubsub_fut)) => {
                     // it's fine to drop pubsub_fut and make a new one the next iteration?
                     // reset expiry since we are still alive.
+                    refresh_to = Box::pin(tokio::time::sleep(self.liveness_timeout / 2));
                     do_refresh = true;
                     false
                 }
@@ -705,7 +783,7 @@ impl RedisBase {
             let refresh_to = tokio::time::sleep(self.liveness_timeout / 2);
             tokio::pin!(refresh_to);
             let mut do_refresh = false;
-            let done = match futures_util::future::select(
+            let mut done = match futures_util::future::select(
                 self.redis_pubsub.on_message().next(),
                 refresh_to,
             )
@@ -748,6 +826,8 @@ impl RedisBase {
                 .await?;
                 curr_commit_count = staged;
                 tot_participant_count = conn_count;
+                debug!(?staged, ?tot_participant_count, "refreshed committer");
+                done = staged == tot_participant_count;
             }
 
             if done {
@@ -769,24 +849,28 @@ async fn refresh_commit(
     let mut addr_members = addr.to_owned();
     addr_members.push_str("-members");
     let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
-    let mut r = redis::pipe();
-    let insert_time = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-        .as_millis() as u64;
-    let expiry_time = (std::time::SystemTime::now() - liveness_timeout)
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-        .as_millis() as u64;
-    let (staged, _, _, conn_count): (usize, isize, isize, usize) = r
-        .atomic()
-        .get(&staged_commit_counter)
-        .zrembyscore(&addr_members, 0usize, expiry_time)
-        .zadd(&addr_members, client_name, insert_time as usize)
-        .zcard(&addr_members)
-        .query_async(redis_conn)
-        .await
-        .wrap_err("refresh_commit failed")?;
-    trace!(?staged, ?conn_count, "refreshed client expiry");
-    Ok((staged, conn_count))
+    loop {
+        let mut r = redis::pipe();
+        let insert_time = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+            .as_millis() as u64;
+        let expiry_time = (std::time::SystemTime::now() - liveness_timeout)
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+            .as_millis() as u64;
+        let (staged, _, _, conn_count): (Option<usize>, isize, isize, usize) = r
+            .atomic()
+            .get(&staged_commit_counter)
+            .zrembyscore(&addr_members, 0usize, expiry_time)
+            .zadd(&addr_members, client_name, insert_time as usize)
+            .zcard(&addr_members)
+            .query_async(redis_conn)
+            .await
+            .wrap_err("refresh_commit failed")?;
+        trace!(?staged, ?conn_count, "refreshed client expiry");
+        if let Some(s) = staged {
+            return Ok((s, conn_count));
+        }
+    }
 }
 
 async fn refresh_client(

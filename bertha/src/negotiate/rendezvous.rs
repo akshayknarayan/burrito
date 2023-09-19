@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex as TokioMutex};
 use tracing::{debug, debug_span, instrument, trace, Instrument};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RendezvousEntry {
     pub nonce: StackNonce,
 }
@@ -224,7 +224,8 @@ pub trait Prefer {
         &mut self,
         _num_participants: usize,
         _selector: impl Fn(usize, &Arc<UpgradeHandle>) -> Option<Either<(), ()>>,
-    ) {
+    ) -> bool {
+        false
     }
 }
 
@@ -239,9 +240,9 @@ where
         &mut self,
         num_participants: usize,
         selector: impl Fn(usize, &Arc<UpgradeHandle>) -> Option<Either<(), ()>>,
-    ) {
-        self.head.prefer(num_participants, &selector);
-        self.tail.prefer(num_participants, &selector);
+    ) -> bool {
+        self.head.prefer(num_participants, &selector)
+            || self.tail.prefer(num_participants, &selector)
     }
 }
 
@@ -254,10 +255,18 @@ where
         &mut self,
         num_participants: usize,
         selector: impl Fn(usize, &Arc<UpgradeHandle>) -> Option<Either<(), ()>>,
-    ) {
-        <Select<T1, T2> as Prefer>::prefer(&mut self.inner, num_participants, &selector);
+    ) -> bool {
+        let inner =
+            <Select<T1, T2> as Prefer>::prefer(&mut self.inner, num_participants, &selector);
         if let Some(opt) = selector(num_participants, &self.handle) {
+            let ch = matches!(
+                (opt, self.inner.prefer),
+                (Either::Left(_), Either::Right(_)) | (Either::Right(_), Either::Left(_))
+            );
             self.inner.prefer = opt;
+            ch
+        } else {
+            inner
         }
     }
 }
@@ -271,9 +280,9 @@ where
         &mut self,
         num_participants: usize,
         selector: impl Fn(usize, &Arc<UpgradeHandle>) -> Option<Either<(), ()>>,
-    ) {
-        self.left.prefer(num_participants, &selector);
-        self.right.prefer(num_participants, &selector);
+    ) -> bool {
+        self.left.prefer(num_participants, &selector)
+            || self.right.prefer(num_participants, &selector)
     }
 }
 
@@ -741,57 +750,95 @@ where
             // if Matched, we joined the connection.
             (None, num_participants, round_number)
         }
+        // we have only called `try_init`, which does *not* increment num_participants if the
+        // semantics did not match, so we have to +1 to include ourselves here.
         NegotiateRendezvousResult::NoMatch {
             num_participants,
             round_number,
             entry,
-        } => (Some(entry), num_participants, round_number),
+        } => (Some(entry), num_participants + 1, round_number),
     };
 
-    debug!(matched = entry.is_none(), num_selects = ?handles.len(), "try_init completed");
-    let (entry, mut applied) = if let Some(existing_remote_stack) = entry {
-        match stack.clone().apply(existing_remote_stack.clone().nonce) {
-            Ok(ApplyResult { applied, .. }) => {
-                debug!("remote stack was compatible, applied");
-                (existing_remote_stack, applied)
-            }
-            Err(orig_apply_error) => {
-                debug!(
-                    ?existing_remote_stack,
-                    "remote stack was incompatible, asking for selection input"
-                );
+    debug!(matched = entry.is_none(), num_selects = ?handles.len(), ?num_participants, "try_init completed");
+    // here, we give the caller a chance to react to new connection information (the number of
+    // participants) before we try to do anything else (either try to apply the remote nonce or
+    // transition the connection)
+    let changed = stack.prefer(num_participants, selector);
+    let (entry, mut applied) = if changed {
+        // case 1: the policy indicates a change. we try to transition, the rest doesn't matter.
+        //
+        // TODO there is no way currently to ask the remote for alternate stacks. this
+        // means that if the local picked stack is not compatible, and the remote stack is
+        // not locally compatible, but there is a third option on both sides that *is*
+        // compatible, we will miss it.
+        let picked = solo_monomorphize(stack.clone()).wrap_err("Malformed chunnel stack")?;
+        debug!(?picked, "transition to new stack");
+        round_number = rendezvous_point
+            .transition(
+                addr.clone(),
+                RendezvousEntry { nonce: picked.clone() },
+            )
+            .await
+            .map_err(Into::into)
+            .wrap_err_with(|| eyre!("Transition failed after trying to apply remote stack failed. The stacks must be incompatible."))?;
 
-                // TODO there is no way currently to ask the remote for alternate stacks. this
-                // means that if the local picked stack is not compatible, and the remote stack is
-                // not locally compatible, but there is a third option on both sides that *is*
-                // compatible, we will miss it.
-                //
-                // here, we give the caller a chance to react to new connection information (the
-                // number of participants) before we try to transition the connection to a new
-                // stack. we have only called `try_init`, which does *not* increment
-                // num_participants if the semantics did not match, so we have to +1 to include
-                // ourselves here.
-                stack.prefer(num_participants + 1, selector);
-                let picked =
-                    solo_monomorphize(stack.clone()).wrap_err("Malformed chunnel stack")?;
-                debug!(?picked, "transition to new stack");
-                round_number = rendezvous_point
-                    .transition(
-                        addr.clone(),
-                        RendezvousEntry {
-                            nonce: picked.clone(),
-                        },
-                    )
-                    .await
-                    .map_err(Into::into)
-                    .wrap_err_with(|| eyre!("Transition failed after trying to apply remote stack failed. The stacks must be incompatible.").wrap_err(orig_apply_error))?;
-                let ApplyResult { applied, .. } = stack
-                    .apply(picked.clone())
-                    .expect("solo_monomorphize means self-application will work");
-                (RendezvousEntry { nonce: picked }, applied)
+        let r = rendezvous_point
+            .poll_entry(addr.clone(), RendezvousEntry::default(), round_number)
+            .await
+            .map_err(Into::into)?;
+        let p = match r {
+            NegotiateRendezvousResult::NoMatch { entry: p, .. } => p,
+            _ => RendezvousEntry {
+                nonce: picked.clone(),
+            },
+        };
+
+        let ApplyResult { applied, .. } = stack
+            .apply(p.nonce)
+            .wrap_err_with(|| "post-transition apply failed")?;
+        (RendezvousEntry { nonce: picked }, applied)
+    } else if let Some(existing_remote_stack) = entry {
+        // case 2: the policy didn't indicate a change, but we haven't joined the connection and
+        // took the joinlock. if we can apply the remote stack, great, do that and join the
+        // connection, unlocking joinlock (by calling poll_entry()). otherwise error and leave()
+        // the connection, which also unlocks joinlock.
+        let res = stack.clone().apply(existing_remote_stack.clone().nonce);
+        if res.is_err() {
+            // have to unlock
+            rendezvous_point
+                .leave(addr.clone())
+                .await
+                .map_err(Into::into)?;
+            // we will fail out at the ? below
+        }
+
+        let ApplyResult { applied, .. } = res
+            .wrap_err_with(|| {
+                eyre!("stack {:?} did not change preferences upon knowing that num_participants={}, but then could not apply remote stack {:?}", &stack, num_participants + 1, &existing_remote_stack)
+            })?;
+        debug!(num_participants = ?num_participants + 1, "remote stack was compatible, applied");
+        // unlock the joinlock
+        let entry = rendezvous_point
+            .poll_entry(addr.clone(), existing_remote_stack.clone(), round_number)
+            .await
+            .map_err(Into::into)
+            .wrap_err_with(|| eyre!("poll_entry to unlock join failed"))?;
+        match entry {
+            NegotiateRendezvousResult::Matched { .. } => (),
+            NegotiateRendezvousResult::NoMatch { round_number, .. } => {
+                // TODO this is technically unsafe because the connection we're about to return
+                // might not be compatible.
+                //unimplemented!("need to check stack compatibility and call staged_update, etc")
+                tracing::warn!(
+                    ?round_number,
+                    "ignoring nomatch for now, we will catch it later"
+                );
             }
         }
+        (existing_remote_stack, applied)
     } else {
+        // case 3: the policy didn't indicate a change and we are compatible with the connection
+        // as-is, so we didn't need the joinlock. apply() and return.
         let ApplyResult { applied, .. } = stack
             .apply(picked.clone())
             .expect("solo_monomorphize means self-application will work");

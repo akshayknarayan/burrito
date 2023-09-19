@@ -8,6 +8,7 @@
 -- KEYS[1]: addr
 -- KEYS[2]: addr-round ctr key
 -- KEYS[3]: addr-members set key
+-- KEYS[4]: addr-join-lock set key
 -- 
 -- value args:
 -- ARGV[1]: proposed nonce
@@ -16,7 +17,7 @@
 -- ARGV[4]: client insert time
 --
 -- returns 4-tuple:
--- joined: bool. true if zadd happened, false otherwise.
+-- joined: usize. 2 if zadd happened, 1 if it did not but addr-join-lock was acquired, 0 otherwise.
 -- round_ctr: usize. the current round number (0 if key freshly created)
 -- conn_count: usize. the current number of participants (including ourselves if joined == true)
 -- semantics: the value at addr after this script is over. safe to ignore if joined = true.
@@ -25,7 +26,7 @@ local was_set = redis.call('setnx', KEYS[1], ARGV[1])
 redis.call('zremrangebyscore', KEYS[3], 0, ARGV[3])
 
 -- 1 means success
-if (was_set == 1) 
+if (was_set == 1)
 then
     if (redis.call('setnx', KEYS[2], 0) ~= 1) then
         return redis.error_reply("KV store polluted: roundctr key already present")
@@ -33,7 +34,7 @@ then
     -- join
     redis.call('zadd', KEYS[3], ARGV[4], ARGV[2])
     local conn_count = redis.call('zcard', KEYS[3])
-    return { true, 0, conn_count, ARGV[1] }
+    return { 2, 0, conn_count, ARGV[1] }
 else -- the addr key was already set.
     local existing_semantics = redis.call('get', KEYS[1])
     local round_ctr = redis.call('get', KEYS[2])
@@ -42,9 +43,14 @@ else -- the addr key was already set.
         -- join
         redis.call('zadd', KEYS[3], ARGV[4], ARGV[2])
         local conn_count = redis.call('zcard', KEYS[3])
-        return { true, round_ctr, conn_count, ARGV[1] }
+        return { 2, round_ctr, conn_count, ARGV[1] }
     else
         local conn_count = redis.call('zcard', KEYS[3])
-        return { false, round_ctr, conn_count, existing_semantics }
+        if (redis.call('set', KEYS[4], ARGV[2], "NX", "EX", 3) == nil)
+        then
+            return { 0, round_ctr, conn_count, existing_semantics }
+        else
+            return { 1, round_ctr, conn_count, existing_semantics }
+        end
     end
 end
