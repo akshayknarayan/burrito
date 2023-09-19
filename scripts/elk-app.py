@@ -409,7 +409,6 @@ def exp(cfg, outdir, overwrite=False, setup_only=False, debug=False):
     cfg["machines"]["consumer"]["conn"].run("pkill -INT consumer")
     stop_kafka(cfg)
     stop_redis(cfg)
-    sh.run("gcloud pubsub subscriptions delete elk-logparser elk-logparser.ord", shell=True)
     if failed != None:
         raise failed
 
@@ -421,7 +420,7 @@ def exp(cfg, outdir, overwrite=False, setup_only=False, debug=False):
         while True:
             try:
                 with open(fl, 'r') as f:
-                    assert 3 <= len(list(itertools.islice(f, 0, 10)))
+                    assert 3 <= len(list(itertools.islice(f, 0, 10))), f"{fl} had < 3 lines"
                 agenda.subtask(f"{fl} has at least 3 lines")
                 break
             except AssertionError as e:
@@ -563,7 +562,7 @@ def iter_confs(cfg):
             parser_machines=exp['logparser']['machines'],
             parser_procs=exp['logparser']['processes-per-machine'],
             parser_report_interval_ms=exp['logparser']['interval-ms'],
-            i=0,
+            i=exp['iteration'],
         )
         exp['desc'] = desc
         cfg['exp'] = exp
@@ -694,3 +693,4 @@ if __name__ == '__main__':
         agenda.task(f"{num_remaining} experiments remaining")
         exp(c, args.outdir, setup_only=args.setup_only, debug=args.debug)
         num_remaining -= 1
+    sh.run("gcloud pubsub subscriptions delete elk-logparser elk-logparser.ord", shell=True)

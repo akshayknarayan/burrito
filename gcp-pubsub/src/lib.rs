@@ -5,6 +5,7 @@
 
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
+use futures_util::TryFutureExt;
 use google_cloud::error::Error;
 use google_cloud::pubsub::{
     Client, Message, PublishMessage, Subscription, SubscriptionConfig, Topic,
@@ -17,6 +18,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 use tracing::{debug, trace};
 
@@ -387,17 +389,33 @@ impl ChunnelConnection for PubSubConn {
                 remaining_slots: usize,
             ) -> Result<(String, Subscription, Vec<(String, Message)>), Report> {
                 let sub_id = sub.id().to_owned();
-                let msgs = sub
-                    .receive_multiple(remaining_slots)
-                    .await
-                    .wrap_err_with(|| {
-                        eyre!(
-                            "receive messages topic={:?} subscription={:?}",
-                            &topic,
-                            sub_id,
-                        )
-                    })?;
-                let ms = msgs.map(|m| (topic.clone(), m)).collect();
+                let mut fail_count = 0;
+                let (topic, ms) = loop {
+                    match sub
+                        .receive_multiple(remaining_slots)
+                        .map_ok(|ms| ms.map(|m| (topic.clone(), m)).collect())
+                        .await
+                    {
+                        Ok(ms) => {
+                            break (topic, ms);
+                        }
+                        Err(r) => {
+                            fail_count += 1;
+                            if fail_count > 10 {
+                                return Err(r).wrap_err_with(|| {
+                                    eyre!(
+                                        "receive messages topic={:?} subscription={:?}",
+                                        &topic,
+                                        sub_id,
+                                    )
+                                });
+                            }
+
+                            debug!(?r, ?fail_count, "subscription fetch failed, retrying");
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                };
                 Ok((topic, sub, ms))
             }
 
@@ -410,7 +428,9 @@ impl ChunnelConnection for PubSubConn {
                 let ((topic_received_on, sub, msgs_recvd), mut leftover_futs): (
                     (_, _, Vec<_>),
                     Vec<_>,
-                ) = futures_util::future::select_ok(futs).await?;
+                ) = futures_util::future::select_ok(futs)
+                    .await
+                    .wrap_err("receiving all subscriptions failed")?;
                 if msgs_recvd.is_empty() {
                     trace!(?topic_received_on, "received empty, retrying");
                     leftover_futs.push(Box::pin(sub_receive(
@@ -631,6 +651,7 @@ async fn make_subscriptions(
                 match top.create_subscription(&sub_id, sub_conf).await {
                     Err(Error::Status(s)) if s.code() == tonic::Code::AlreadyExists => {
                         // get handle instead
+                        debug!(?topic_id, ?sub_id, "fetch subscription handle");
                         let s = c.subscription(&sub_id).await?;
                         Ok((topic_id, s.ok_or_else(|| eyre!("create_subscription returned AlreadyExists but fetching subscription failed"))?))
                     }

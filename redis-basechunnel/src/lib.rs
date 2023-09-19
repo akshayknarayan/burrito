@@ -75,7 +75,7 @@ impl RendezvousBackend for RedisBase {
         round_ctr.push_str("-roundctr");
         let mut addr_join_lock = addr.clone();
         addr_join_lock.push_str("-joinlock");
-        let joinlock_wait = format!("__keyspace@*__:{}", &addr_join_lock);
+        let joinlock_wait = format!("__keyspace@*__:{} del", &addr_join_lock);
         Box::pin(
             async move {
                 let neg_nonce = bincode::serialize(&offer).wrap_err("serialize entry")?;
@@ -451,10 +451,12 @@ impl RendezvousBackend for RedisBase {
                                     break 'notify;
                                 }
                                 futures_util::future::Either::Left((None, _)) => {
-                                    return Err(eyre!("redis server shut down"))
+                                    trace!("message stream returned None");
+                                    continue;
+                                    //return Err(eyre!("redis server shut down"))
                                 }
                                 futures_util::future::Either::Right((_, _pubsub_fut)) => {
-                                    refresh_client(
+                                    let (round_ctr, conn_count) = refresh_client(
                                         &mut this.redis_conn,
                                         this.liveness_timeout,
                                         &this.client_name,
@@ -462,6 +464,10 @@ impl RendezvousBackend for RedisBase {
                                     )
                                     .await
                                     .wrap_err("call to refresh_client")?;
+                                    if round_ctr > curr_round || conn_count != curr_num_participants
+                                    {
+                                        break 'notify;
+                                    }
                                     next_refresh_time =
                                         Instant::now() + (this.liveness_timeout / 2);
                                 }
@@ -490,15 +496,17 @@ impl RendezvousBackend for RedisBase {
                 // 1. -members covers cases (1) and (2) above (join or leave)
                 // 2. -roundctr covers case (3) (transition)
                 let channel_name = format!("__keyspace@*__:{}", &addr_members_key);
-                let channel_ctr_name = format!("__keyspace@*__:{}", &round_ctr_key);
-                self.redis_pubsub.psubscribe(&channel_name).await?;
-                self.redis_pubsub.psubscribe(&channel_ctr_name).await?;
+                let channel_ctr_name = format!("__keyspace@*__:{} incrby", &round_ctr_key);
                 debug!(?channel_name, ?channel_ctr_name, "waiting for events");
+                self.redis_pubsub
+                    .psubscribe(&[&channel_name, &channel_ctr_name])
+                    .await?;
                 let res =
                     notify_refresh_loop(self, addr, curr_entry, curr_round, curr_num_participants)
                         .await;
-                self.redis_pubsub.punsubscribe(&channel_name).await?;
-                self.redis_pubsub.punsubscribe(&channel_ctr_name).await?;
+                self.redis_pubsub
+                    .punsubscribe(&[&channel_name, &channel_ctr_name])
+                    .await?;
                 res
             }
             .instrument(debug_span!("redis_notify", addr = ?&a)),
@@ -681,7 +689,10 @@ impl RedisBase {
         addr_members.push_str("-members");
         let mut round_ctr_key = addr.clone();
         round_ctr_key.push_str("-roundctr");
-        self.redis_pubsub.punsubscribe("*").await?;
+        self.redis_pubsub
+            .punsubscribe::<Option<String>>(None)
+            .await
+            .wrap_err("unsubscribe")?;
         let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
         let channel_name = format!("__keyspace@*__:{}", &staged_commit_counter);
         self.redis_pubsub.psubscribe(&channel_name).await?;
@@ -698,18 +709,18 @@ impl RedisBase {
             .await
             {
                 futures_util::future::Either::Left((Some(msg), _)) => {
-                    let event = msg
-                        .get_payload::<String>()
-                        .wrap_err_with(|| eyre!("Get payload from message: {:?}", &msg))?;
                     if !msg.get_channel::<String>()?.ends_with("committed-cnt") {
                         debug!(?msg, "got spurious notification");
                         continue;
                     }
 
+                    let event = msg
+                        .get_payload::<String>()
+                        .wrap_err_with(|| eyre!("Get payload from message: {:?}", &msg))?;
                     debug!(?msg, ?event, ?round_ctr, "staged-update value changed");
                     event.contains("del")
                 }
-                futures_util::future::Either::Left((None, _)) => unreachable!(),
+                futures_util::future::Either::Left((None, _)) => continue,
                 futures_util::future::Either::Right((_, _pubsub_fut)) => {
                     // it's fine to drop pubsub_fut and make a new one the next iteration?
                     // reset expiry since we are still alive.
@@ -772,9 +783,12 @@ impl RedisBase {
     ) -> Result<(), Report> {
         let mut addr_members = addr.clone();
         addr_members.push_str("-members");
-        self.redis_pubsub.punsubscribe("*").await?;
+        self.redis_pubsub
+            .punsubscribe::<Option<String>>(None)
+            .await
+            .wrap_err("unsubscribe")?;
         let staged_commit_counter = format!("{}-{}-committed-cnt", &addr, round_ctr);
-        let channel_name = format!("__keyspace@*__:{}", &staged_commit_counter);
+        let channel_name = format!("__keyspace@*__:{} incrby", &staged_commit_counter);
         self.redis_pubsub.psubscribe(&channel_name).await?;
         debug!(this = "committer", "waiting on further updates");
         loop {
@@ -878,9 +892,11 @@ async fn refresh_client(
     liveness_timeout: Duration,
     client_name: &str,
     addr: &str,
-) -> Result<(), Report> {
+) -> Result<(usize, usize), Report> {
     let mut addr_members = addr.to_owned();
     addr_members.push_str("-members");
+    let mut round_ctr_key = addr.to_owned();
+    round_ctr_key.push_str("-roundctr");
     let mut r = redis::pipe();
     let insert_time = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)?
@@ -888,15 +904,16 @@ async fn refresh_client(
     let expiry_time = (std::time::SystemTime::now() - liveness_timeout)
         .duration_since(std::time::SystemTime::UNIX_EPOCH)?
         .as_millis() as u64;
-    let (_, _, _): (isize, isize, usize) = r
+    let (_, _, roundctr, conncnt): ((), (), usize, usize) = r
         .atomic()
         .zrembyscore(&addr_members, 0usize, expiry_time)
         .zadd(&addr_members, client_name, insert_time as usize)
+        .get(&round_ctr_key)
         .zcard(&addr_members)
         .query_async(redis_conn)
         .await
         .wrap_err("refresh_client redis query failed")?;
-    Ok(())
+    Ok((roundctr, conncnt))
 }
 
 fn rand_name() -> String {
