@@ -1,4 +1,6 @@
 import argparse
+import random
+import string
 import shutil
 import threading
 import toml
@@ -10,6 +12,9 @@ import time
 import itertools
 import subprocess as sh
 from rich.console import Console
+
+def rand_string():
+    return ''.join(random.choice(string.ascii_lowercase) for _ in range(10))
 
 def start_redis(cfg):
     m = cfg['machines']['redis']['conn']
@@ -568,6 +573,8 @@ def iter_confs(cfg):
         )
         exp['desc'] = desc
         cfg['exp'] = exp
+        name_base = '-'.join(cfg['conf']['topic-name'].split('-')[:-1])
+        cfg['conf']['topic-name'] = f"{name_base}-{rand_string()}"
         yield cfg
 
 # # Sample config
@@ -695,4 +702,3 @@ if __name__ == '__main__':
         agenda.task(f"{num_remaining} experiments remaining")
         exp(c, args.outdir, setup_only=args.setup_only, debug=args.debug)
         num_remaining -= 1
-    sh.run("gcloud pubsub subscriptions delete elk-logparser elk-logparser.ord", shell=True)

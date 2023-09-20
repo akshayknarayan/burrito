@@ -45,16 +45,18 @@ macro_rules! gcp_stack {
         let mut ord = OrderedChunnel::default();
         ord.ordering_threshold(10);
         let ord: Ordered = ord.into();
+        let mut sub_name = $topic.to_owned();
+        sub_name.push_str("-elk-subscription");
         UpgradeSelect::from_select(Select::from((
             CxList::from(ord)
                 .wrap(SerializeChunnel::default())
                 .wrap(Base64Chunnel::default())
-                .wrap(PubSubChunnel::new($gcloud_client.clone(), [($topic, Some("elk-logparser"))])),
+                .wrap(PubSubChunnel::new($gcloud_client.clone(), [($topic, Some(sub_name.clone()))])),
             CxList::from(SerializeChunnel::default())
                 .wrap(Base64Chunnel::default())
                 .wrap(OrderedPubSubChunnel::from(PubSubChunnel::new(
                     $gcloud_client.clone(),
-                    [($topic, Some("elk-logparser"))],
+                    [($topic, Some(sub_name.clone()))],
                 ))),
         )))
     }};
