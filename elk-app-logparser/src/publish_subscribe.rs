@@ -91,7 +91,11 @@ pub async fn connect(
     let (st, kafka_gcp_handle) = UpgradeSelect::from_select(Select::from((
         CxList::from(SerializeChunnel::default())
             .wrap(Base64Chunnel::default())
-            .wrap(KafkaChunnel::new(kafka_addr, [topic])),
+            .wrap(KafkaChunnel::new(
+                kafka_addr,
+                [topic],
+                Some("elk-logparser"),
+            )),
         gcp_st,
     )));
 

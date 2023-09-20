@@ -72,6 +72,7 @@ pub async fn delete_topic(addr: String, name: Vec<String>) -> Result<(), Report>
 pub struct KafkaChunnel {
     addr: String,
     topics: Vec<String>,
+    consumer_group: Option<String>,
     producer_cfg: Option<ClientConfig>,
     consumer_cfg: Option<ClientConfig>,
 }
@@ -85,10 +86,16 @@ impl Debug for KafkaChunnel {
 }
 
 impl KafkaChunnel {
-    pub fn new<'a>(addr: &str, recv_topics: impl IntoIterator<Item = &'a str>) -> Self {
+    /// recv_topics: (topic, Option<consumer_group_id>)
+    pub fn new<'a>(
+        addr: &str,
+        recv_topics: impl IntoIterator<Item = &'a str>,
+        consumer_group_id: Option<&str>,
+    ) -> Self {
         Self {
             addr: addr.to_owned(),
             topics: recv_topics.into_iter().map(|s| s.to_owned()).collect(),
+            consumer_group: consumer_group_id.map(|s| s.to_owned()),
             producer_cfg: None,
             consumer_cfg: None,
         }
@@ -121,10 +128,9 @@ impl<InC> Chunnel<InC> for KafkaChunnel {
                 .clone()
                 .unwrap_or_else(|| default_producer_cfg(&self.addr));
             producer_cfg.set("bootstrap.servers", &self.addr);
-            let mut consumer_cfg = self
-                .consumer_cfg
-                .clone()
-                .unwrap_or_else(|| default_consumer_cfg(&self.addr));
+            let mut consumer_cfg = self.consumer_cfg.clone().unwrap_or_else(|| {
+                default_consumer_cfg(&self.addr, self.consumer_group.as_ref().map(|s| s.as_str()))
+            });
             consumer_cfg.set("bootstrap.servers", &self.addr);
             let cn = KafkaConn::new_with_cfg(producer_cfg, consumer_cfg)?;
             let t: Vec<&str> = self.topics.iter().map(|s| s.as_str()).collect();
@@ -162,14 +168,19 @@ impl std::fmt::Debug for KafkaConn {
     }
 }
 
-fn default_consumer_cfg(addr: &str) -> ClientConfig {
+fn default_consumer_cfg(addr: &str, consumer_group_id: Option<&str>) -> ClientConfig {
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", addr);
-    cfg.set("group.id", gen_resource_id())
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "smallest")
-        .set("enable.partition.eof", "false")
-        .set("socket.nagle.disable", "true");
+    cfg.set(
+        "group.id",
+        consumer_group_id
+            .map(str::to_owned)
+            .unwrap_or_else(gen_resource_id),
+    )
+    .set("enable.auto.commit", "false")
+    .set("auto.offset.reset", "smallest")
+    .set("enable.partition.eof", "false")
+    .set("socket.nagle.disable", "true");
     cfg
 }
 
@@ -182,14 +193,14 @@ fn default_producer_cfg(addr: &str) -> ClientConfig {
 
 impl KafkaConn {
     pub fn new(addr: &str) -> Result<Self, Report> {
-        Self::new_with_cfg(default_producer_cfg(addr), default_consumer_cfg(addr))
+        Self::new_with_cfg(default_producer_cfg(addr), default_consumer_cfg(addr, None))
     }
 
     pub fn new_with_batch_size(addr: &str, batch_size_bytes: usize) -> Result<Self, Report> {
         let mut cfg = default_producer_cfg(addr);
         cfg.set("batch.size", batch_size_bytes.to_string());
         tracing::debug!(?batch_size_bytes, "kafka producer config");
-        Self::new_with_cfg(cfg, default_consumer_cfg(addr))
+        Self::new_with_cfg(cfg, default_consumer_cfg(addr, None))
     }
 
     pub fn new_with_cfg(
