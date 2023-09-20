@@ -3,7 +3,8 @@
 use bertha::{Chunnel, ChunnelConnection, Negotiate};
 use color_eyre::eyre::{eyre, Report, WrapErr};
 use futures_util::future::{ready, Ready};
-use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use queue_steer::{
     MessageQueueAddr, MessageQueueCaps, MessageQueueOrdering, MessageQueueReliability,
 };
@@ -188,6 +189,7 @@ fn default_producer_cfg(addr: &str) -> ClientConfig {
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", addr)
         .set("linger.ms", "1")
+        .set("queue.buffering.max.ms", "0.5")
         .set("socket.nagle.disable", "true");
     cfg
 }
@@ -234,40 +236,41 @@ impl ChunnelConnection for KafkaConn {
         <B as IntoIterator>::IntoIter: Send,
     {
         Box::pin(async move {
-            // producer.send() uses internal buffering, so it is not expected to be necessary
-            // to await the sends in this loop concurrently.
-            for (MessageQueueAddr { topic_id, group }, body) in burst {
-                let fr = FutureRecord {
-                    topic: &topic_id,
-                    partition: None,
-                    payload: Some(&body),
-                    key: group.as_ref(),
-                    timestamp: Some(time()),
-                    headers: None,
-                };
+            let delivery_ack_futs: Result<FuturesUnordered<_>, _> = burst
+                .into_iter()
+                .map(|(MessageQueueAddr { topic_id, group }, body)| {
+                    let fr = FutureRecord {
+                        topic: &topic_id,
+                        partition: None,
+                        payload: Some(&body),
+                        key: group.as_ref(),
+                        timestamp: Some(time()),
+                        headers: None,
+                    };
 
-                trace!(?topic_id, "sending message");
-                match {
-                    match self.producer.send_result(fr) {
-                        Ok(f) => f.await,
-                        Err((e, _)) => {
-                            return Err::<_, Report>(e.into())
-                                .wrap_err("kafka internal queue is full")
-                        }
-                    }
-                } {
-                    Ok(Ok((_, _))) => (),
-                    Err(_) => {
-                        // we won't cancel the future without cancelling this future.
-                        unreachable!()
-                    }
-                    Ok(Err((e, _))) => {
-                        return Err::<_, Report>(e.into()).wrap_err("kafka error on send");
-                    }
-                }
+                    let x = self
+                        .producer
+                        .send_result(fr)
+                        .map_err(|(e, _)| Report::from(e).wrap_err("kafka internal queue full"))
+                        // the outer result is for cancellation, which won't happen without
+                        // cancelling this future.
+                        .map(|f| f.map(Result::unwrap));
+                    x
+                })
+                .collect();
+
+            #[derive(Clone, Copy, Debug, Default)]
+            struct Discard;
+            impl<A> Extend<A> for Discard {
+                fn extend<T: IntoIterator<Item = A>>(&mut self, _: T) {}
             }
 
-            Ok(())
+            let delivery_ack_futs =
+                delivery_ack_futs.wrap_err("constructing kafka delivery future failed")?;
+            match delivery_ack_futs.try_collect().await {
+                Ok(Discard) => Ok(()),
+                Err((err, _msg)) => Err(Report::from(err)).wrap_err("kafka send error"),
+            }
         })
     }
 
@@ -280,18 +283,16 @@ impl ChunnelConnection for KafkaConn {
     {
         Box::pin(
             async move {
-                let sub = self.consumer.subscription()?;
-                let topics: Vec<_> = sub
-                    .elements()
-                    .into_iter()
-                    .map(|s| s.topic().to_owned())
-                    .collect();
-                trace!(?topics, "receiving");
+                if msgs_buf.is_empty() {
+                    return Ok(&mut msgs_buf[..]);
+                }
+
+                trace!("receiving");
                 use rdkafka::message::Message;
                 let kafka_stream = self.consumer.stream();
 
                 let mut slot_idx = 0;
-                for (msg, slot) in kafka_stream
+                for (m, slot) in kafka_stream
                     .ready_chunks(msgs_buf.len())
                     .next()
                     .await
@@ -299,26 +300,49 @@ impl ChunnelConnection for KafkaConn {
                     .into_iter()
                     .zip(msgs_buf.iter_mut())
                 {
-                    let msg = msg?;
-                    let key = if let Some(Ok(s)) = msg.key_view::<str>() {
-                        Some(s.to_owned())
-                    } else {
-                        None
-                    };
-                    let body = if let Some(Ok(s)) = msg.payload_view::<str>() {
-                        s.to_owned()
-                    } else {
-                        String::new()
-                    };
+                    let m = m.wrap_err("kafka receive error")?;
+                    if let Some((ref mut addr_slot, ref mut body_slot)) = slot.as_mut() {
+                        let topic_id = m.topic();
+                        addr_slot.topic_id.clear();
+                        addr_slot.topic_id.push_str(topic_id);
+                        if let Some(Ok(group_str)) = m.key_view::<str>() {
+                            addr_slot
+                                .group
+                                .get_or_insert_with(Default::default)
+                                .push_str(group_str)
+                        } else {
+                            addr_slot.group = None;
+                        }
 
-                    let topic_id = msg.topic().to_owned();
-                    *slot = Some((
-                        MessageQueueAddr {
-                            topic_id,
-                            group: key,
-                        },
-                        body,
-                    ));
+                        let body_str = m
+                            .payload_view::<str>()
+                            .transpose()
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        body_slot.clear();
+                        body_slot.push_str(body_str);
+                    } else {
+                        let key = if let Some(Ok(s)) = m.key_view::<str>() {
+                            Some(s.to_owned())
+                        } else {
+                            None
+                        };
+                        let body = if let Some(Ok(s)) = m.payload_view::<str>() {
+                            s.to_owned()
+                        } else {
+                            String::new()
+                        };
+                        let topic_id = m.topic().to_owned();
+                        *slot = Some((
+                            MessageQueueAddr {
+                                topic_id,
+                                group: key,
+                            },
+                            body,
+                        ));
+                    }
+
                     slot_idx += 1;
                 }
 
