@@ -42,6 +42,7 @@ def start_redis(cfg):
 
 def stop_redis(cfg):
     m = cfg['machines']['redis']['conn']
+    console = Console()
     with console.status(f"stopping redis") as status:
         m.run("microk8s kubectl delete --wait=true -f ./scripts/elk-app/redis.yaml", wd=m.dir, quiet=True)
     agenda.subtask("stopped redis")
@@ -182,6 +183,7 @@ def start_kafka(cfg):
 def stop_kafka(cfg):
     m = cfg['machines']['redis']['conn']
     m.run("pkill -INT kubectl", quiet=True)
+    console = Console()
     with console.status(f"stopping kafka") as status:
         m.run("microk8s kubectl delete --wait=true -f ./scripts/elk-app/kafka-deployment.yml", wd=m.dir, quiet=True)
     agenda.subtask("stopped kafka")
@@ -249,7 +251,7 @@ def start_logingest(cfg, outf, bin_root = "./target/release"):
     num_workers = cfg['exp']['logingest']['workers']
     encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
-    ok = m.run(f"RUST_LOG=info,gcp_pubsub=debug GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logingest \
+    ok = m.run(f"RUST_LOG=info GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logingest \
         --logging \
         --gcp-project-name={gcp_project} \
         --redis-addr={redis_addr} \
@@ -294,7 +296,7 @@ def start_logparser(m, cfg, outf, bin_root = "./target/release"):
 
     num_parsers = cfg['exp']['logparser']['processes-per-machine']
     for proc_num in range(num_parsers):
-        ok = m.run(f"RUST_LOG=info,gcp_pubsub=debug GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logparser \
+        ok = m.run(f"RUST_LOG=info GOOGLE_APPLICATION_CREDENTIALS={gcp_key_path} {bin_root}/logparser \
             --logging \
             --gcp-project-name={gcp_project} \
             --redis-addr={redis_addr} \

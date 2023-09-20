@@ -89,8 +89,8 @@ impl ProcessLine<EstOutputRateHist> for Process {
             },
         );
 
-        info!(?num_records_observed, ?msg, "consumer update");
         if num_records_observed > 0 {
+            debug!(?num_records_observed, ?msg, "consumer update");
             let recv_ts = self.clk.raw();
             // blocking not possible on unbounded channel
             if let Err(err) = self.s.try_send(ProcessRecord {

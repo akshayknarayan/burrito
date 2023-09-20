@@ -187,6 +187,7 @@ fn default_consumer_cfg(addr: &str, consumer_group_id: Option<&str>) -> ClientCo
 fn default_producer_cfg(addr: &str) -> ClientConfig {
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", addr)
+        .set("linger.ms", "1")
         .set("socket.nagle.disable", "true");
     cfg
 }

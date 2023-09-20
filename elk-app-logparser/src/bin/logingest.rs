@@ -158,7 +158,7 @@ where
             });
             self.inner.send(parsed_lines).await?;
             let cn_state = *self.cn_state_watcher.borrow();
-            trace!(?cn_state, ?self.topic_id,  "sent lines");
+            trace!(?num_records, ?cn_state, ?self.topic_id,  "sent lines");
 
             let recv_ts = self.clk.raw();
             // blocking not possible on unbounded channel

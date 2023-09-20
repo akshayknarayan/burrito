@@ -178,7 +178,7 @@ async fn inner(
             }
             // dump output <interval> after we see an entry, then reset the counter
             _ = &mut send_wait, if send_wait.is_right() => {
-                info!(?processed_entries, "sending histograms");
+                debug!(?processed_entries, "sending histograms");
                 fwd_conn
                     .send(est_output_rates.drain().filter_map(|(group, est_output)| {
                         if est_output.len() > 0 {
