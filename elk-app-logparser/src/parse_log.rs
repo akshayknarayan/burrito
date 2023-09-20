@@ -19,7 +19,7 @@ use hdrhistogram::{
     serialization::{Deserializer, Serializer, V2Serializer},
     Histogram,
 };
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub enum Line {
@@ -343,9 +343,16 @@ where
                 };
 
                 let mut c = Cursor::new(&v[offset..]);
-                let h: Histogram<u64> = d.deserialize(&mut c)?;
-                msgs_buf[slot_idx] = Some((a, EstOutputRateHist { client_ip, h }));
-                slot_idx += 1;
+                match d.deserialize(&mut c) {
+                    Ok(h) => {
+                        msgs_buf[slot_idx] = Some((a, EstOutputRateHist { client_ip, h }));
+                        slot_idx += 1;
+                    }
+                    Err(err) => {
+                        debug!(?err, "Could not deserialize histogram");
+                        continue;
+                    }
+                }
             }
 
             Ok(&mut msgs_buf[..slot_idx])

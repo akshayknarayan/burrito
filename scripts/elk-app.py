@@ -37,7 +37,8 @@ def start_redis(cfg):
 
 def stop_redis(cfg):
     m = cfg['machines']['redis']['conn']
-    m.run("microk8s kubectl delete -f ./scripts/elk-app/redis.yaml", wd=m.dir, quiet=True)
+    with console.status(f"stopping redis") as status:
+        m.run("microk8s kubectl delete --wait=true -f ./scripts/elk-app/redis.yaml", wd=m.dir, quiet=True)
     agenda.subtask("stopped redis")
 
 kafka_yaml_template = '''
@@ -176,7 +177,8 @@ def start_kafka(cfg):
 def stop_kafka(cfg):
     m = cfg['machines']['redis']['conn']
     m.run("pkill -INT kubectl", quiet=True)
-    m.run("microk8s kubectl delete -f ./scripts/elk-app/kafka-deployment.yml", wd=m.dir, quiet=True)
+    with console.status(f"stopping kafka") as status:
+        m.run("microk8s kubectl delete --wait=true -f ./scripts/elk-app/kafka-deployment.yml", wd=m.dir, quiet=True)
     agenda.subtask("stopped kafka")
 
 def wait_ready(m: ConnectionWrapper, outf, search_string=" ready "):

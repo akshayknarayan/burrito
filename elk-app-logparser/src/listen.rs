@@ -546,13 +546,14 @@ where
         let recvs = Arc::clone(&recvs);
         async move {
             loop {
-                let ms = cn
-                    .recv(&mut slot)
-                    .await
-                    .wrap_err("serve_local: inner connection recv")?;
-                if ms.is_empty() || ms[0].is_none() {
-                    continue;
-                }
+                let ms = match cn.recv(&mut slot).await {
+                    Ok(ms) if ms.is_empty() || ms[0].is_none() => continue,
+                    Ok(ms) => ms,
+                    Err(err) => {
+                        debug!(?err, "inner connection error");
+                        continue;
+                    }
+                };
 
                 recvs
                     .process_lines(ms.iter_mut().map_while(Option::take))
