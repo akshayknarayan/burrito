@@ -157,12 +157,16 @@ impl EstOutputRate {
         }) {
             if let Some(prev_ts) = self.prev_ts {
                 // we are supposed to be guaranteed that ts > prev_ts.
-                if ts < prev_ts {
-                    warn!(?ts, ?prev_ts, "time ticked backwards");
-                    continue;
+                // XXX disable this for now
+                //if ts < prev_ts {
+                //    warn!(?ts, ?prev_ts, "time ticked backwards");
+                //    continue;
+                //}
+                let mut el = ts - prev_ts;
+                if el < Duration::zero() {
+                    el = Duration::zero();
                 }
 
-                let el = ts - prev_ts;
                 let est_rate = obj_size as f64
                     / el.to_std()
                         .expect("negative condition checked above")

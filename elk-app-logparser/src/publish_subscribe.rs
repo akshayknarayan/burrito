@@ -42,13 +42,17 @@ impl ConnState {
 macro_rules! gcp_stack {
     ($topic: expr, $gcloud_client: expr) => {{
         // We repeat SerializeChunnel in both sides because the SerializeChunnel is actually different in either case due to the different data types.
+        let mut sub_name = $topic.to_owned();
+        sub_name.push_str("-elk-subscription");
         let mut ord = OrderedChunnel::default();
         ord.ordering_threshold(10);
         let ord: Ordered = ord.into();
-        let mut sub_name = $topic.to_owned();
-        sub_name.push_str("-elk-subscription");
+        //let mut ord = OrderedChunnel::default();
+        //ord.ordering_threshold(10);
+        //let ord: Ordered = ord.into();
+        use bertha::util::Nothing;
         UpgradeSelect::from_select(Select::from((
-            CxList::from(ord)
+            CxList::from(Nothing::<()>::default()) // XXX ord -> nothing
                 .wrap(SerializeChunnel::default())
                 .wrap(Base64Chunnel::default())
                 .wrap(PubSubChunnel::new($gcloud_client.clone(), [($topic, Some(sub_name.clone()))])),
