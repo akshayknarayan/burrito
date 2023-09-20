@@ -102,16 +102,18 @@ fn main() -> Result<(), Report> {
             }
 
             let burst_len = burst.len();
-            let burst_bytes: usize = burst
-                .iter()
-                .map(|l| match l {
-                    Line::Report(s) => s.len(),
-                    Line::Ack => 0,
-                })
-                .sum();
+            let mut burst_bytes = 0;
+            cn.send(burst.into_iter().filter(|l| match l {
+                Line::Report(_) => true,
+                _ => false,
+            }).take_while(|l| match l {
+                Line::Report(s) => {
+                    burst_bytes += s.len();
+                    burst_bytes < 1024
+                }
+                _ => unreachable!(),
+            })).await?;
             rem_line_count = rem_line_count.map(|c| c.saturating_sub(burst_len));
-
-            cn.send(burst.into_iter()).await?;
             debug!(?burst_len, ?burst_bytes, "sent lines");
             let ms = cn.recv(&mut slots[..]).await?;
             let now = clk.raw();
