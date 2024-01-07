@@ -1,9 +1,18 @@
 //! Produce messages containing server log lines.
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use bertha::ChunnelConnection;
-use color_eyre::{eyre::WrapErr, Report};
+use color_eyre::{
+    eyre::{ensure, eyre, WrapErr},
+    Report,
+};
+use duration_str::parse;
 use futures_util::{
     future::{ready, Either},
     Stream, StreamExt,
@@ -12,6 +21,7 @@ use structopt::StructOpt;
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    time::Interval,
 };
 use tokio_stream::wrappers::LinesStream;
 use tracing::{debug, info, trace, warn};
@@ -38,6 +48,9 @@ struct Opt {
 
     #[structopt(long)]
     produce_interarrival_ms: Option<usize>,
+
+    #[structopt(long)]
+    variable_interarrival_ms: Option<VariableTicker>,
 
     #[structopt(long)]
     tot_message_limit: Option<usize>,
@@ -74,10 +87,21 @@ fn main() -> Result<(), Report> {
         let cn = connect::connect(opt.connect_addr, opt.redis_addr, opt.encr_spec)
             .await
             .wrap_err("connect error")?;
-        let interval = opt.produce_interarrival_ms
-            .map(|i| Duration::from_millis(i as _))
-            .unwrap_or_else(|| Duration::from_secs(1));
-        let producer = get_line_producer(opt.log_file, interval).await?;
+        let interval_mgr = if let Some(v) = opt.variable_interarrival_ms {
+            v
+        } else {
+            let interval = opt.produce_interarrival_ms
+                .map(|i| Duration::from_millis(i as _))
+                .unwrap_or_else(|| Duration::from_secs(1));
+            VariableTicker {
+                intervals: Vec::new(),
+                final_interval: interval,
+                curr_interval: None,
+            }
+        };
+
+        let expected_dur = opt.tot_message_limit.map(|m|  interval_mgr.expected_dur(m));
+        let producer = get_line_producer(opt.log_file, interval_mgr).await?;
         let mut producer = std::pin::pin!(producer);
         let mut rem_line_count = opt.tot_message_limit;
         let mut outf = if let Some(filename) = opt.stats_file {
@@ -88,7 +112,6 @@ fn main() -> Result<(), Report> {
             None
         };
 
-        let expected_dur = opt.tot_message_limit.map(|o|  Duration::from_secs((interval.as_secs_f64() * (o as f64) / 16.) as u64));
         info!(?opt.connect_addr, ?rem_line_count, "got connection, starting");
         let clk = quanta::Clock::new();
         let mut slots: Vec<_> = (0..16).map(|_| None).collect();
@@ -179,29 +202,127 @@ fn main() -> Result<(), Report> {
     })
 }
 
+#[derive(Debug)]
+struct VariableTicker {
+    intervals: Vec<(Duration, Duration)>,
+    final_interval: Duration,
+    curr_interval: Option<(Interval, Instant, Option<Duration>)>,
+}
+
+impl FromStr for VariableTicker {
+    type Err = Report;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut intervals = s
+            .split('|')
+            .map(|epoch_spec| {
+                let mut parts = epoch_spec.splitn(2, ':');
+                let int = parse(
+                    parts
+                        .next()
+                        .ok_or_else(|| eyre!("malformed interval spec {:?}", epoch_spec))?,
+                )?;
+
+                Ok::<_, Report>((int, parts.next().map(parse).transpose()?))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ensure!(!intervals.is_empty(), "need nonempty intervals list");
+        let (final_interval, d) = intervals.pop().unwrap();
+        ensure!(d.is_none(), "final interval cannot have limited duration");
+        let intervals = intervals
+            .into_iter()
+            .map(|(i, d)| {
+                if d.is_none() {
+                    Err(eyre!(
+                        "intermediate intervals must have limited epoch duration"
+                    ))
+                } else {
+                    Ok((i, d.unwrap()))
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            intervals,
+            final_interval,
+            curr_interval: None,
+        })
+    }
+}
+
+impl VariableTicker {
+    async fn tick(&mut self) {
+        match &mut self.curr_interval {
+            Some((ref mut i, ref mut s, d)) if d.is_some() && d.unwrap() > s.elapsed() => {
+                let (next_period, next_epoch) = match self.intervals.pop() {
+                    Some((int, dur)) => (int, Some(dur)),
+                    None => (self.final_interval, None),
+                };
+
+                *i = tokio::time::interval(next_period);
+                *s = Instant::now();
+                *d = next_epoch;
+            }
+            Some(_) => (),
+            None => {
+                let (next_period, next_epoch) = match self.intervals.pop() {
+                    Some((int, dur)) => (int, Some(dur)),
+                    None => (self.final_interval, None),
+                };
+
+                self.curr_interval = Some((
+                    tokio::time::interval(next_period),
+                    Instant::now(),
+                    next_epoch,
+                ));
+            }
+        }
+
+        self.curr_interval.as_mut().unwrap().0.tick().await;
+    }
+
+    fn expected_dur(&self, mut msg_limit: usize) -> Duration {
+        let t1 = self
+            .intervals
+            .iter()
+            .map(|(int, dur)| {
+                let ticks = (dur.as_secs_f64() / int.as_secs_f64()) as usize;
+                if ticks * 16 < msg_limit {
+                    msg_limit -= ticks * 16;
+                    *dur
+                } else {
+                    Duration::from_secs((int.as_secs_f64() * (msg_limit as f64) / 16.) as u64)
+                }
+            })
+            .sum();
+        if msg_limit > 0 {
+            t1 + Duration::from_secs(
+                (self.final_interval.as_secs_f64() * (msg_limit as f64) / 16.) as u64,
+            )
+        } else {
+            t1
+        }
+    }
+}
+
 async fn get_line_producer(
     log_file: Option<PathBuf>,
-    interval: Duration,
+    interval: VariableTicker,
 ) -> Result<impl Stream<Item = Vec<Line>>, Report> {
-    Ok(
-        futures_util::stream::unfold(tokio::time::interval(interval), |mut i| async move {
-            i.tick().await;
-            Some(((), i))
-        })
-        .zip(
-            if let Some(f) = log_file {
-                let reader = BufReader::new(File::open(&f).await?);
-                Either::Left(
-                    LinesStream::new(reader.lines())
-                        .filter_map(|x| ready(x.ok().map(Line::Report))),
-                )
-            } else {
-                Either::Right(futures_util::stream::iter(
-                    live_logentry_lines().map(|x| Line::Report(x)),
-                ))
-            }
-            .ready_chunks(16),
-        )
-        .map(|(_, x)| x),
+    Ok(futures_util::stream::unfold(interval, |mut i| async move {
+        i.tick().await;
+        Some(((), i))
+    })
+    .zip(
+        if let Some(f) = log_file {
+            let reader = BufReader::new(File::open(&f).await?);
+            Either::Left(
+                LinesStream::new(reader.lines()).filter_map(|x| ready(x.ok().map(Line::Report))),
+            )
+        } else {
+            Either::Right(futures_util::stream::iter(
+                live_logentry_lines().map(|x| Line::Report(x)),
+            ))
+        }
+        .ready_chunks(16),
     )
+    .map(|(_, x)| x))
 }
