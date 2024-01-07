@@ -1,3 +1,14 @@
+use std::{
+    fmt::Debug,
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize},
+        Arc,
+    },
+    time::Duration,
+};
+
 use bertha::{
     bincode::{Base64Chunnel, SerializeChunnel},
     negotiate_rendezvous,
@@ -12,8 +23,6 @@ use gcp_pubsub::{GcpClient, OrderedPubSubChunnel, PubSubChunnel};
 use kafka::KafkaChunnel;
 use queue_steer::{MessageQueueAddr, Ordered};
 use redis_basechunnel::RedisBase;
-use std::fmt::Debug;
-use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{info, instrument, warn};
 
@@ -36,6 +45,92 @@ impl ConnState {
 
     pub fn is_gcp(&self) -> bool {
         !self.is_kafka()
+    }
+}
+
+pub struct MeasureMessageRate<C> {
+    inner: C,
+    clk: quanta::Clock,
+    epoch_length: Duration,
+    epoch_start: Arc<AtomicU64>,
+    epoch_num_sent_messages: Arc<AtomicUsize>,
+    last_epoch_num_msgs_sender: watch::Sender<u64>,
+}
+
+impl MeasureMessageRate<()> {
+    pub fn new<C>(
+        inner: C,
+        epoch_length: Duration,
+        last_epoch_num_msgs_sender: watch::Sender<u64>,
+    ) -> MeasureMessageRate<C> {
+        let clk = quanta::Clock::new();
+        let now = clk.raw();
+        MeasureMessageRate {
+            inner,
+            clk,
+            epoch_length,
+            epoch_start: Arc::new(now.into()),
+            epoch_num_sent_messages: Default::default(),
+            last_epoch_num_msgs_sender,
+        }
+    }
+}
+
+impl<C> ChunnelConnection for MeasureMessageRate<C>
+where
+    C: ChunnelConnection + Send + Sync,
+    <C as ChunnelConnection>::Data: Send,
+{
+    type Data = C::Data;
+
+    fn send<'cn, B>(
+        &'cn self,
+        burst: B,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + Send + 'cn>>
+    where
+        B: IntoIterator<Item = Self::Data> + Send + 'cn,
+        <B as IntoIterator>::IntoIter: Send,
+    {
+        Box::pin(async move {
+            let b: Vec<_> = burst.into_iter().collect();
+            let num_msgs = b.len();
+            let now = self.clk.raw();
+            if self.clk.delta(
+                self.epoch_start.load(std::sync::atomic::Ordering::Relaxed),
+                now,
+            ) > self.epoch_length
+            {
+                let last_epoch_num_msgs = self
+                    .epoch_num_sent_messages
+                    .swap(num_msgs, std::sync::atomic::Ordering::SeqCst)
+                    as u64;
+                self.last_epoch_num_msgs_sender
+                    .send_if_modified(|s: &mut u64| {
+                        let diff = (*s).max(last_epoch_num_msgs) - (*s).min(last_epoch_num_msgs);
+                        // notify only if value changed by 10%
+                        let ret = diff > (last_epoch_num_msgs / 10);
+                        *s = last_epoch_num_msgs;
+                        ret
+                    });
+                self.epoch_start
+                    .store(now, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                self.epoch_num_sent_messages
+                    .fetch_add(num_msgs, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            self.inner.send(b.into_iter()).await
+        })
+    }
+
+    fn recv<'cn, 'buf>(
+        &'cn self,
+        msgs_buf: &'buf mut [Option<Self::Data>],
+    ) -> Pin<Box<dyn Future<Output = Result<&'buf mut [Option<Self::Data>], Report>> + Send + 'cn>>
+    where
+        'buf: 'cn,
+    {
+        self.inner.recv(msgs_buf)
     }
 }
 
@@ -115,6 +210,9 @@ pub async fn connect(
             }
         })
         .await?;
+    let (s, r) = tokio::sync::watch::channel(0);
+    let cn = MeasureMessageRate::new(cn, Duration::from_secs(1), s);
+
     let cn_state = gcp_switch_ordering_handle
         .current()
         .map(|e| match e {
@@ -131,6 +229,7 @@ pub async fn connect(
         stack_negotiation_manager,
         Some(kafka_gcp_handle),
         gcp_switch_ordering_handle,
+        Some(r),
     ));
     Ok((cn_state_watcher_r, cn))
 }
@@ -176,6 +275,7 @@ pub async fn connect_gcp_only(
         stack_negotiation_manager,
         None,
         gcp_switch_ordering_handle,
+        None,
     ));
     Ok((cn_state_watcher_r, cn))
 }
@@ -195,6 +295,7 @@ async fn conn_negotiation_manager(
     mut stack_negotiation_manager: StackUpgradeHandle<RedisBase>,
     kafka_gcp_handle: Option<Arc<UpgradeHandle>>,
     gcp_switch_ordering_handle: Arc<UpgradeHandle>,
+    mut msg_per_sec_watcher: Option<watch::Receiver<u64>>,
 ) {
     let mut num_participants_changed_listener = stack_negotiation_manager
         .conn_participants_changed_receiver
@@ -267,6 +368,10 @@ async fn conn_negotiation_manager(
                 cn_state_watcher.send_replace(cn_state);
                 // make a new future
                 gcp_changed = Box::pin(gcp_switch_ordering_handle.stack_changed());
+            }
+            _ = msg_per_sec_watcher.as_mut().unwrap().changed(), if msg_per_sec_watcher.is_some() => {
+                let msg_per_sec = msg_per_sec_watcher.as_mut().unwrap().borrow_and_update();
+                info!(?msg_per_sec, "message rate sample");
             }
         }
     }
