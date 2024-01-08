@@ -47,13 +47,10 @@ struct Opt {
     log_file: Option<PathBuf>,
 
     #[structopt(long)]
-    produce_interarrival_ms: Option<usize>,
+    produce_interarrival: VariableTicker,
 
     #[structopt(long)]
-    variable_interarrival_ms: Option<VariableTicker>,
-
-    #[structopt(long)]
-    tot_message_limit: Option<usize>,
+    message_limit: Option<String>,
 
     #[structopt(long, default_value = "allow-none")]
     encr_spec: EncrSpec,
@@ -87,23 +84,18 @@ fn main() -> Result<(), Report> {
         let cn = connect::connect(opt.connect_addr, opt.redis_addr, opt.encr_spec)
             .await
             .wrap_err("connect error")?;
-        let interval_mgr = if let Some(v) = opt.variable_interarrival_ms {
-            v
+        let interval_mgr = opt.produce_interarrival;
+        let (mut rem_line_count, expected_dur) = if let Some((r, d)) =
+            opt.message_limit
+                .as_ref()
+                .map(|m| interval_mgr.parse_limit(m)).transpose()?
+        {
+            (Some(r), Some(d))
         } else {
-            let interval = opt.produce_interarrival_ms
-                .map(|i| Duration::from_millis(i as _))
-                .unwrap_or_else(|| Duration::from_secs(1));
-            VariableTicker {
-                intervals: Vec::new(),
-                final_interval: interval,
-                curr_interval: None,
-            }
+            (None, None)
         };
-
-        let expected_dur = opt.tot_message_limit.map(|m|  interval_mgr.expected_dur(m));
         let producer = get_line_producer(opt.log_file, interval_mgr).await?;
         let mut producer = std::pin::pin!(producer);
-        let mut rem_line_count = opt.tot_message_limit;
         let mut outf = if let Some(filename) = opt.stats_file {
             let mut f = tokio::fs::File::create(filename).await?;
             f.write_all(b"since_start_us,tot_records,tot_bytes,records,bytes,elapsed_us,rate_records_per_sec,rate_bytes_per_sec\n").await?;
@@ -213,7 +205,7 @@ impl FromStr for VariableTicker {
     type Err = Report;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut intervals = s
-            .split('|')
+            .split('~')
             .map(|epoch_spec| {
                 let mut parts = epoch_spec.splitn(2, ':');
                 let int = parse(
@@ -251,7 +243,7 @@ impl FromStr for VariableTicker {
 impl VariableTicker {
     async fn tick(&mut self) {
         match &mut self.curr_interval {
-            Some((ref mut i, ref mut s, d)) if d.is_some() && d.unwrap() > s.elapsed() => {
+            Some((ref mut i, ref mut s, d)) if d.is_some() && d.unwrap() < s.elapsed() => {
                 let (next_period, next_epoch) = match self.intervals.pop() {
                     Some((int, dur)) => (int, Some(dur)),
                     None => (self.final_interval, None),
@@ -260,6 +252,7 @@ impl VariableTicker {
                 *i = tokio::time::interval(next_period);
                 *s = Instant::now();
                 *d = next_epoch;
+                info!(?next_epoch, ?next_period, "setting tick interval");
             }
             Some(_) => (),
             None => {
@@ -273,10 +266,35 @@ impl VariableTicker {
                     Instant::now(),
                     next_epoch,
                 ));
+                info!(?next_epoch, ?next_period, "setting tick interval");
             }
         }
 
         self.curr_interval.as_mut().unwrap().0.tick().await;
+    }
+
+    fn parse_limit(&self, msg_limit: &str) -> Result<(usize, Duration), Report> {
+        if let Ok(lim) = msg_limit.parse() {
+            Ok((lim, self.expected_dur(lim)))
+        } else {
+            let tot_dur = parse(msg_limit)?;
+            let mut rem_dur = tot_dur;
+            let lim = self
+                .intervals
+                .iter()
+                .map(|(int, dur)| {
+                    if rem_dur > *dur {
+                        rem_dur -= *dur;
+                        ((dur.as_secs_f64() / int.as_secs_f64()) * 16.) as usize
+                    } else {
+                        rem_dur = Duration::ZERO;
+                        ((rem_dur.as_secs_f64() / int.as_secs_f64()) * 16.) as usize
+                    }
+                })
+                .sum::<usize>()
+                + (((rem_dur.as_secs_f64() / self.final_interval.as_secs_f64()) * 16.) as usize);
+            Ok((lim, tot_dur))
+        }
     }
 
     fn expected_dur(&self, mut msg_limit: usize) -> Duration {
@@ -325,4 +343,28 @@ async fn get_line_producer(
         .ready_chunks(16),
     )
     .map(|(_, x)| x))
+}
+
+#[cfg(test)]
+mod t {
+    use super::VariableTicker;
+    use std::time::Duration;
+
+    #[test]
+    fn variable_ticker_parse() {
+        let x: VariableTicker = "50ms".parse().unwrap();
+        assert!(x.intervals.is_empty());
+        assert_eq!(x.final_interval, Duration::from_millis(50));
+        let x: VariableTicker = "50ms:10s~100ms:10s~50ms".parse().unwrap();
+        assert_eq!(x.intervals.len(), 2);
+        assert_eq!(
+            x.intervals[0],
+            (Duration::from_millis(50), Duration::from_secs(10))
+        );
+        assert_eq!(
+            x.intervals[1],
+            (Duration::from_millis(100), Duration::from_secs(10))
+        );
+        assert_eq!(x.final_interval, Duration::from_millis(50));
+    }
 }

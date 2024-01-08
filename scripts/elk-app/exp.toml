@@ -34,7 +34,7 @@ encrypt = ["allow-none", "auto-only", "tls-only", "quic-only"]
 [exp.producer]
 allow-client-sharding = [true, false]
 msg-limit = ["30s"]
-msg-interarrival-ms = [50, 100]
+msg-interarrival = [50, 100]
 
 [exp.logingest]
 workers = [2]

@@ -212,15 +212,15 @@ def run_producer(cfg, outf, bin_root = "./target/release"):
     connect_ip = cfg['machines']['logingest']['ip']
     connect_port = cfg['machines']['logingest']['port']
     msg_limit = cfg['exp']['producer']['msg-limit']
-    msg_interarrival_ms = cfg['exp']['producer']['msg-interarrival-ms']
+    msg_interarrival = cfg['exp']['producer']['msg-interarrival']
     encr_spec = cfg["exp"]["encrypt"]
     assert type(encr_spec) == str
     ok = m.run(f"RUST_LOG=info {bin_root}/producer \
         --logging \
         --connect-addr={connect_ip}:{connect_port} \
         {redis} \
-        --produce-interarrival-ms={msg_interarrival_ms} \
-        --tot-message-limit={msg_limit} \
+        --produce-interarrival={msg_interarrival} \
+        --message-limit={msg_limit} \
         --encr-spec={encr_spec} \
         --stats-file={outf}.data",
         background=False,
@@ -515,7 +515,7 @@ def iter_confs(cfg):
         exp['encrypt'],
         prod['allow-client-sharding'],
         prod['msg-limit'],
-        prod['msg-interarrival-ms'],
+        prod['msg-interarrival'],
         ing['workers'],
         par['machines'],
         par['processes-per-machine'],
@@ -530,7 +530,7 @@ def iter_confs(cfg):
                 'producer': {
                     'allow-client-sharding': conf[3],
                     'msg-limit': conf[4],
-                    'msg-interarrival-ms': conf[5],
+                    'msg-interarrival': conf[5],
                 },
                 'logingest': {
                     'workers': conf[6],
@@ -542,12 +542,6 @@ def iter_confs(cfg):
                 },
                 'iteration': conf[10],
         }
-        if type(exp['producer']['msg-limit']) == str:
-            assert exp['producer']['msg-limit'][-1] == 's', 'time-based msg-limit must be in seconds'
-            target_seconds = int(exp['producer']['msg-limit'][:-1])
-            inter_seconds = float(int(exp['producer']['msg-interarrival-ms'])) / 1000
-            exp['producer']['msg-limit'] = int(target_seconds / inter_seconds) * 16
-            agenda.subtask(f"set producer msg-limit to {exp['producer']['msg-limit']} from target {target_seconds}")
         template = (
             "kfka={kafka}-"
             + "fp={localfp}-"
@@ -566,7 +560,7 @@ def iter_confs(cfg):
             encrypt=exp['encrypt'].replace('-',''),
             client_shard=exp['producer']['allow-client-sharding'],
             num_msg=exp['producer']['msg-limit'],
-            msg_inter_ms=exp['producer']['msg-interarrival-ms'],
+            msg_inter_ms=exp['producer']['msg-interarrival'],
             ingest_workers=exp['logingest']['workers'],
             parser_machines=exp['logparser']['machines'],
             parser_procs=exp['logparser']['processes-per-machine'],
@@ -616,7 +610,7 @@ def iter_confs(cfg):
 # [exp.producer]
 # allow-client-sharding = [true, false]
 # msg-limit = [2500]
-# msg-interarrival-ms = [1000]
+# msg-interarrival = ["1000ms"]
 #
 # [exp.logingest]
 # workers = [2]
