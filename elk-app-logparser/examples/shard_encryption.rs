@@ -1,8 +1,4 @@
-use std::{
-    future::{ready, Ready},
-    net::SocketAddr,
-    time::Duration,
-};
+use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
 
 use bertha::ChunnelConnection;
 use color_eyre::eyre::{Report, WrapErr};
@@ -11,6 +7,7 @@ use elk_app_logparser::{
     listen::{self, ProcessLine},
     parse_log::Line,
 };
+use futures_util::future::ready;
 use structopt::{clap::ArgGroup, StructOpt};
 use tracing::info;
 use tracing_error::ErrorLayer;
@@ -70,14 +67,11 @@ impl<Line> ProcessLine<(SocketAddr, Line)> for DoNothing
 where
     Line: 'static,
 {
-    type Error = std::convert::Infallible;
-    type Future<'a> = Ready<Result<(), Self::Error>>;
-
     fn process_lines<'a>(
         &'a self,
-        _line_batch: &'a mut [Option<(SocketAddr, Line)>],
-    ) -> Self::Future<'a> {
-        ready(Ok(()))
+        _: impl Iterator<Item = (SocketAddr, Line)> + Send + 'a,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Report>> + 'a>> {
+        Box::pin(ready(Ok(())))
     }
 }
 
