@@ -295,7 +295,7 @@ async fn conn_negotiation_manager(
     mut stack_negotiation_manager: StackUpgradeHandle<RedisBase>,
     kafka_gcp_handle: Option<Arc<UpgradeHandle>>,
     gcp_switch_ordering_handle: Arc<UpgradeHandle>,
-    mut msg_per_sec_watcher: Option<watch::Receiver<u64>>,
+    msg_per_sec_watcher: Option<watch::Receiver<u64>>,
 ) {
     let mut num_participants_changed_listener = stack_negotiation_manager
         .conn_participants_changed_receiver
@@ -306,6 +306,12 @@ async fn conn_negotiation_manager(
     let mut monitor_connection_negotiation_state =
         std::pin::pin!(monitor_connection_negotiation_state);
     let mut transition_in_progress = Either::Left(futures_util::future::pending());
+    let (mut msg_per_sec_watcher, active_rate_watcher) = if let Some(w) = msg_per_sec_watcher {
+        (w, true)
+    } else {
+        let (_, r) = watch::channel(0);
+        (r, false)
+    };
     loop {
         tokio::select! {
             exit = &mut monitor_connection_negotiation_state => {
@@ -369,9 +375,19 @@ async fn conn_negotiation_manager(
                 // make a new future
                 gcp_changed = Box::pin(gcp_switch_ordering_handle.stack_changed());
             }
-            _ = msg_per_sec_watcher.as_mut().unwrap().changed(), if msg_per_sec_watcher.is_some() => {
-                let msg_per_sec = msg_per_sec_watcher.as_mut().unwrap().borrow_and_update();
+            _ = msg_per_sec_watcher.changed(), if active_rate_watcher && transition_in_progress.is_left() => {
+                let msg_per_sec = {
+                    let x = msg_per_sec_watcher.borrow_and_update();
+                    *x
+                };
                 info!(?msg_per_sec, "message rate sample");
+                if let Some(ref h) = kafka_gcp_handle {
+                    if msg_per_sec < 75 {
+                        transition_in_progress = Either::Right(Box::pin(h.trigger_right()) as Pin<Box<_>>);
+                    } else if msg_per_sec > 90 {
+                        transition_in_progress = Either::Right(Box::pin(h.trigger_left()) as Pin<Box<_>>);
+                    }
+                }
             }
         }
     }
