@@ -14,8 +14,10 @@ num-threads = 16
 num-threads = 16
 
 [exp]
-num_clients = [1,2,4,8,16,32,64]
+num_clients = [1]
 file_size = [50000000]
-datapath = ['kernel', 'dpdkthread', 'dpdkinline']
+datapath = ['dpdkinline']
 iters = 10
-bertha = [true, false]
+packet_size = [1460, 512, 256, 128, 64]
+bertha = ['raw', 'full:0', 'full:1', 'full:2', 'full:3', 'full:4', 'full:5']
+tcp = [false]

@@ -187,7 +187,7 @@ async fn serve_canonical(
         None,
         internal_cli,
         shard_stack,
-        offer.pop().unwrap(),
+        Some(offer.pop().unwrap()),
         &redis_addr,
     )
     .await

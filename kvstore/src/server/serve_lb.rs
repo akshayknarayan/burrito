@@ -99,7 +99,7 @@ pub async fn serve_lb(
         Some(shards_internal),
         UdpToShard::new(shard_connector),
         shard_stack,
-        offer.pop().unwrap(),
+        Some(offer.pop().unwrap()),
         &redis_addr,
     )
     .await

@@ -3,7 +3,7 @@
 //! Unlike [`bertha::udp`], TCP chunnels are always connection-oriented, so there is no equivalent
 //! of [`bertha::udp::UdpSkChunnel`].
 
-#![feature(iter_array_chunks)]
+//#![feature(iter_array_chunks)]
 
 use bertha::{Chunnel, ChunnelConnection, ChunnelConnector, ChunnelListener, Negotiate};
 use color_eyre::eyre::{bail, ensure, eyre, Report, WrapErr};

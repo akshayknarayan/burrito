@@ -20,7 +20,7 @@ ahash = "0.8"
 hdrhistogram = "7"
 base64 = "0.13"
 flume = "0.10"
-socket2 = "0.4"
+socket2 = { version = "0.4", features = ["all"] }
 
 [dev-dependencies]
 lazy_static = "1.4"
